@@ -1,0 +1,124 @@
+import { useEditorStore } from '../../stores/editorStore'
+import type { VoiceState } from '../../hooks/useVoiceRecorder'
+
+export type EditorAction = 'bold' | 'italic' | 'h1' | 'h2' | 'wikilink' | 'image'
+
+interface ToolbarProps {
+  canGoBack: boolean
+  canGoForward: boolean
+  onBack: () => void
+  onForward: () => void
+  onAction: (action: EditorAction) => void
+  onSave: () => void
+  voiceState?: VoiceState
+  voiceError?: string
+  voiceSegmentsDone?: number
+  onVoiceToggle?: () => void
+}
+
+export default function Toolbar({
+  canGoBack, canGoForward, onBack, onForward, onAction, onSave,
+  voiceState, voiceError, voiceSegmentsDone, onVoiceToggle,
+}: ToolbarProps) {
+  const { isDirty, viewMode, setViewMode } = useEditorStore()
+
+  const btn = (label: string, title: string, action: () => void, active = false) => (
+    <button
+      key={label}
+      title={title}
+      onClick={action}
+      style={{
+        padding: '4px 8px', borderRadius: '4px', fontSize: '13px',
+        color: active ? 'var(--color-accent)' : 'var(--color-text-secondary)',
+        background: active ? 'var(--color-accent-dim)' : 'transparent',
+        transition: 'all 0.1s',
+      }}
+      onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--color-text-primary)')}
+      onMouseLeave={(e) => (e.currentTarget.style.color = active ? 'var(--color-accent)' : 'var(--color-text-secondary)')}
+    >{label}</button>
+  )
+
+  const isEditing = viewMode === 'split' || viewMode === 'editor'
+
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: '4px',
+      padding: '6px 12px',
+      borderBottom: '1px solid var(--color-border)',
+      background: 'var(--color-bg-base)',
+      height: '40px',
+      flexShrink: 0,
+    }}>
+      {/* 導覽 */}
+      <button onClick={onBack} disabled={!canGoBack} title="上一篇 (⌘[)"
+        style={{ color: canGoBack ? 'var(--color-text-secondary)' : 'var(--color-border)', fontSize: '16px', padding: '2px 4px' }}>‹</button>
+      <button onClick={onForward} disabled={!canGoForward} title="下一篇 (⌘])"
+        style={{ color: canGoForward ? 'var(--color-text-secondary)' : 'var(--color-border)', fontSize: '16px', padding: '2px 4px' }}>›</button>
+
+      {/* 格式工具：僅在有編輯器時顯示 */}
+      {isEditing && <>
+        <div style={{ width: '1px', height: '20px', background: 'var(--color-border)', margin: '0 4px' }} />
+        {btn('B', '粗體 (⌘B)', () => onAction('bold'))}
+        {btn('I', '斜體 (⌘I)', () => onAction('italic'))}
+        {btn('H1', '標題 1', () => onAction('h1'))}
+        {btn('H2', '標題 2', () => onAction('h2'))}
+        <div style={{ width: '1px', height: '20px', background: 'var(--color-border)', margin: '0 4px' }} />
+        {btn('[[', '插入 Wikilink', () => onAction('wikilink'))}
+        {btn('🖼️', '插入圖片', () => onAction('image'))}
+      </>}
+
+      <div style={{ flex: 1 }} />
+
+      {/* 未儲存指示 */}
+      {isDirty && (
+        <div style={{ width: '6px', height: '6px', borderRadius: '50%', background: 'var(--color-warning)' }} title="未儲存" />
+      )}
+
+      {/* 語音輸入 */}
+      {onVoiceToggle && <>
+        <div style={{ width: '1px', height: '20px', background: 'var(--color-border)', margin: '0 2px' }} />
+        <button
+          onClick={onVoiceToggle}
+          disabled={voiceState === 'transcribing'}
+          title={
+            voiceState === 'recording'     ? '停止錄音'
+            : voiceState === 'transcribing' ? '辨識中…'
+            : voiceState === 'error'        ? (voiceError || '錯誤，點擊重試')
+            : '開始語音輸入'
+          }
+          style={{
+            padding: '4px 8px', borderRadius: '4px', fontSize: '13px',
+            color: voiceState === 'recording'     ? '#ef4444'
+                 : voiceState === 'error'          ? 'var(--color-warning, #f59e0b)'
+                 : voiceState === 'transcribing'   ? 'var(--color-accent)'
+                 : voiceState === 'done'            ? 'var(--color-success, #22c55e)'
+                 : 'var(--color-text-secondary)',
+            background: voiceState === 'recording'   ? 'rgba(239,68,68,0.10)'
+                       : voiceState === 'transcribing' ? 'var(--color-accent-dim)'
+                       : 'transparent',
+            transition: 'all 0.15s',
+            cursor: voiceState === 'transcribing' ? 'not-allowed' : 'pointer',
+          }}
+        >
+          {voiceState === 'recording'
+            ? `⏹ 停止${voiceSegmentsDone ? ` (${voiceSegmentsDone}段)` : ''}`
+            : voiceState === 'transcribing' ? '辨識中…'
+            : voiceState === 'done'          ? '🎙 ✓'
+            : voiceState === 'error'         ? '⚠ 重試'
+            : '🎙'}
+        </button>
+      </>}
+
+      {/* 儲存（編輯模式才有意義） */}
+      {isEditing && btn('儲存', '儲存 (⌘S)', onSave)}
+
+      {/* 模式切換 */}
+      {viewMode === 'preview' && btn('◧ 分割', '展開編輯器（分割視圖）', () => setViewMode('split'))}
+      {viewMode === 'split' && <>
+        {btn('▣ 純編', '切換為純編輯器', () => setViewMode('editor'))}
+        {btn('✕ 關閉編輯器', '關閉編輯器，回到預覽', () => setViewMode('preview'))}
+      </>}
+      {viewMode === 'editor' && btn('◨ 分割預覽', '開啟預覽（分割視圖）', () => setViewMode('split'))}
+    </div>
+  )
+}
