@@ -35,13 +35,22 @@ export default function ChatPanel() {
   const vaultConfigured = !!settings.vault_path
 
   // 持續監聽 llm:stderr → 寫入 debug
+  // 使用 cancelled flag 解決 React StrictMode 下 async listen() 的 race condition
+  // （cleanup 可能在 Promise resolve 前執行，導致舊 listener 未被移除而重複觸發）
   useEffect(() => {
+    let cancelled = false
     let unlisten: (() => void) | undefined
     listen<string>('llm:stderr', (event) => {
-      addLog('llm', 'warn', event.payload.trimEnd())
-    }).then((fn) => { unlisten = fn })
-    return () => unlisten?.()
-  }, [addLog])
+      useDebugStore.getState().addLog('llm', 'warn', event.payload.trimEnd())
+    }).then((fn) => {
+      if (cancelled) fn() // 已 cleanup，立即取消這個 listener
+      else unlisten = fn
+    })
+    return () => {
+      cancelled = true
+      unlisten?.()
+    }
+  }, []) // addLog 是 Zustand stable reference，不需要作為 dep
 
   // 自動捲動到底部
   useEffect(() => {

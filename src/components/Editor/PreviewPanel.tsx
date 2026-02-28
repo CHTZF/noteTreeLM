@@ -14,12 +14,24 @@ const md = new MarkdownIt({
   html: false,
   linkify: true,
   typographer: true,
+  breaks: true,
 }).use(mk, { engine: katex, delimiters: 'dollars', katexOptions: { throwOnError: false } })
 
 interface PreviewPanelProps {
   content: string
-  onWikilinkClick: (title: string) => void
+  onWikilinkClick: (title: string, anchor?: string) => void
   onEdit?: () => void
+  pendingAnchor?: string
+  onAnchorScrolled?: () => void
+}
+
+function slugifyHeading(text: string): string {
+  return text
+    .replace(/<[^>]*>/g, '')
+    .toLowerCase().trim()
+    .replace(/\s+/g, '-')
+    .replace(/[^\w\u4e00-\u9fff-]/g, '')
+    .replace(/-+/g, '-').replace(/^-|-$/g, '')
 }
 
 function guessMimeType(path: string): string {
@@ -49,12 +61,64 @@ const processWikilinks = (renderedHtml: string) => {
     const sizeAttr = size ? ` data-img-size="${size}"` : ''
     return `<img src="${filename.trim()}" alt="${filename.trim()}"${sizeAttr} />`
   })
-  // [[title|alias]] / [[title]] → <a>
-  result = result.replace(/\[\[([^\[\]|#]+)(?:#[^\[\]|]*)?\|?([^\[\]]*)\]\]/g, (_, title, alias) => {
+  // [[title#anchor|alias]] / [[title#anchor]] / [[title|alias]] / [[title]] → <a>
+  // 同時支援 ASCII # (U+0023) 與全形 ＃ (U+FF03) 作為錨點分隔符
+  result = result.replace(/\[\[([^\[\]|#＃]+)(?:[#＃]([^\[\]|]*))?\|?([^\[\]]*)\]\]/g, (_, title, anchor, alias) => {
     const display = (alias || title).trim()
-    return `<a href="#" data-wikilink="${title.trim()}" class="wikilink">${display}</a>`
+    const anchorAttr = anchor ? ` data-wikilink-anchor="${anchor.trim()}"` : ''
+    return `<a href="#" data-wikilink="${title.trim()}"${anchorAttr} class="wikilink">${display}</a>`
   })
   return result
+}
+
+// 標題 id + block id：在掛載到 DOM 前先於 detached div 處理，
+// 避免 useEffect 在首次 paint 後才跑導致 ^id 文字閃現
+function processHtmlForPreview(html: string): string {
+  const tmp = document.createElement('div')
+  tmp.innerHTML = html
+
+  // 為每個標題加上 id
+  tmp.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach((h) => {
+    if (!h.id) h.id = slugifyHeading(h.textContent || '')
+  })
+
+  // 處理段落 block id
+  Array.from(tmp.querySelectorAll('p')).forEach((p) => {
+    const text = p.textContent ?? ''
+
+    // 行內 block id：段落最後的文字節點以 "\s^block-id" 結尾
+    // 用 \s 而非空格，支援 ^id 寫在下一行（無空行）時 markdown-it 插入 \n 的情況
+    const lastChild = p.lastChild
+    if (lastChild?.nodeType === Node.TEXT_NODE) {
+      const m = lastChild.textContent?.match(/\s\^([\w-]+)$/)
+      if (m) {
+        p.id = m[1]
+        lastChild.textContent = lastChild.textContent!.replace(/\s\^[\w-]+$/, '')
+        return
+      }
+    }
+    // 獨立 block id 行（^id）：將 id 移至前一個元素（表格、段落等）並移除此段落
+    if (/^\^[\w-]+$/.test(text.trim())) {
+      const blockId = text.trim().slice(1)
+      const prev = p.previousElementSibling
+      if (prev && !prev.id) prev.id = blockId
+      p.remove()
+    }
+  })
+
+  // 處理表格欄位 block id（^id 可緊接在文字後，空格可選）
+  Array.from(tmp.querySelectorAll('td, th')).forEach((cell) => {
+    const lastChild = cell.lastChild
+    if (lastChild?.nodeType === Node.TEXT_NODE) {
+      const m = lastChild.textContent?.match(/\s?\^([\w-]+)$/)
+      if (m) {
+        cell.id = m[1]
+        lastChild.textContent = lastChild.textContent!.replace(/\s?\^[\w-]+$/, '')
+      }
+    }
+  })
+
+  return tmp.innerHTML
 }
 
 // 將圖片 src 解析為可用的圖片 URL
@@ -81,15 +145,19 @@ async function resolveImageSrc(src: string, vaultPath: string): Promise<string> 
   }
 }
 
-export default function PreviewPanel({ content, onWikilinkClick, onEdit }: PreviewPanelProps) {
+export default function PreviewPanel({ content, onWikilinkClick, onEdit, pendingAnchor, onAnchorScrolled }: PreviewPanelProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const { settings } = useSettingsStore()
 
-  // preprocessImageUrls 先編碼空格，讓 markdown-it 能正確解析含空格的路徑
-  // processWikilinks 在 md.render() 後注入 HTML，避免 html:false 轉義
-  const html = DOMPurify.sanitize(
-    processWikilinks(md.render(preprocessImageUrls(content))),
-    { ADD_ATTR: ['data-wikilink', 'class', 'data-img-size'] }
+  // 渲染管線：
+  //   preprocessImageUrls → md.render → processWikilinks → DOMPurify → processHtmlForPreview
+  // processHtmlForPreview 在 detached div 上同步處理標題 id 和 block id，
+  // 確保 ^id 文字在首次 paint 前就被移除（避免 useEffect 延遲造成的閃現）
+  const html = processHtmlForPreview(
+    DOMPurify.sanitize(
+      processWikilinks(md.render(preprocessImageUrls(content))),
+      { ADD_ATTR: ['data-wikilink', 'data-wikilink-anchor', 'class', 'data-img-size'] }
+    )
   )
 
   // 圖片後處理：套用尺寸 + 解析圖片路徑為 data URL
@@ -157,7 +225,8 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit }: Previ
 
       const wikilink = target.getAttribute('data-wikilink')
       if (wikilink) {
-        onWikilinkClick(wikilink)
+        const anchor = target.getAttribute('data-wikilink-anchor')
+        onWikilinkClick(wikilink, anchor || undefined)
         return
       }
 
@@ -171,6 +240,22 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit }: Previ
     container.addEventListener('click', handleClick)
     return () => container.removeEventListener('click', handleClick)
   }, [html, onWikilinkClick])
+
+  // 捲動到錨點（[[Note#Heading]] 或 [[Note#^block-id]]）
+  useEffect(() => {
+    if (!pendingAnchor || !containerRef.current) return
+    const id = pendingAnchor.startsWith('^')
+      ? pendingAnchor.slice(1)
+      : slugifyHeading(pendingAnchor)
+    const timer = setTimeout(() => {
+      const el = containerRef.current?.querySelector(`#${CSS.escape(id)}`)
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        onAnchorScrolled?.()
+      }
+    }, 50)
+    return () => clearTimeout(timer)
+  }, [html, pendingAnchor])
 
   return (
     <div style={{ flex: 1, position: 'relative', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>

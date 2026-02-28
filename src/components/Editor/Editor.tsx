@@ -1,4 +1,4 @@
-import { useEffect, useRef, useCallback } from 'react'
+import { useEffect, useRef, useCallback, useState } from 'react'
 import { EditorView, basicSetup } from 'codemirror'
 import { EditorState } from '@codemirror/state'
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
@@ -21,10 +21,10 @@ import { useVoiceRecorder } from '../../hooks/useVoiceRecorder'
 // CSS variables are live — when data-theme changes the editor repaints automatically
 const editorTheme = EditorView.theme({
   '&': { background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', height: '100%' },
-  '.cm-content': { padding: '24px 32px', fontFamily: 'var(--font-mono)', fontSize: 'var(--font-size-editor)', lineHeight: '1.7', caretColor: 'var(--color-accent)' },
+  '.cm-content': { padding: '24px 32px', fontFamily: 'var(--font-mono)', fontSize: 'var(--font-size-editor)', lineHeight: '1.7', caretColor: 'var(--color-accent)', WebkitUserSelect: 'text' },
   '.cm-gutters': { background: 'var(--color-bg-base)', borderRight: '1px solid var(--color-border)', color: 'var(--color-text-muted)' },
   '.cm-activeLine': { background: 'var(--color-accent-dim)' },
-  '&.cm-focused .cm-selectionBackground, .cm-selectionBackground': { background: 'rgba(124,140,248,0.25)' },
+  '&.cm-focused .cm-selectionBackground, .cm-selectionBackground': { background: 'rgba(124,140,248,0.4)' },
   '.cm-cursor': { borderLeftColor: 'var(--color-accent)' },
   '.cm-wikilink-mark': { color: 'var(--color-accent)', textDecoration: 'underline dotted' },
 })
@@ -44,6 +44,7 @@ export default function Editor({ canGoBack, canGoForward, onBack, onForward }: E
   const triggerAutoSaveRef = useRef<(content: string) => void>(() => {})
 
   const { currentPath, content, isDirty, viewMode, setContent, setDirty, setCurrentPath, setViewMode } = useEditorStore()
+  const [pendingAnchor, setPendingAnchor] = useState<string | undefined>(undefined)
   const { readNote, updateNote } = useVaultStore()
   const { settings } = useSettingsStore()
   const { push: navPush } = useNavigationStore()
@@ -51,6 +52,7 @@ export default function Editor({ canGoBack, canGoForward, onBack, onForward }: E
   const openNote = useCallback((path: string) => {
     navPush(path)
     setCurrentPath(path)
+    setPendingAnchor(undefined)  // 清除殘留 anchor（非錨點導航時）
   }, [navPush, setCurrentPath])
 
   // 載入筆記（帶 cancellation 防止快速切換時 race condition）
@@ -282,9 +284,15 @@ export default function Editor({ canGoBack, canGoForward, onBack, onForward }: E
   const showEditor = viewMode === 'split' || viewMode === 'editor'
   const showPreviewPane = viewMode === 'preview' || viewMode === 'split'
 
-  const wikilinkHandler = (title: string) => {
+  const wikilinkHandler = (title: string, anchor?: string) => {
     const note = useVaultStore.getState().notes.find((n) => n.title === title)
-    if (note) openNote(note.path)
+    if (!note) return
+    if (note.path === currentPath) {
+      setPendingAnchor(anchor)
+      return
+    }
+    openNote(note.path)
+    setPendingAnchor(anchor)
   }
 
   return (
@@ -334,6 +342,8 @@ export default function Editor({ canGoBack, canGoForward, onBack, onForward }: E
             content={content}
             onWikilinkClick={wikilinkHandler}
             onEdit={viewMode === 'preview' ? () => setViewMode('split') : undefined}
+            pendingAnchor={pendingAnchor}
+            onAnchorScrolled={() => setPendingAnchor(undefined)}
           />
         )}
       </div>

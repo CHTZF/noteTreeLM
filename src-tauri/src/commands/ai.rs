@@ -498,48 +498,313 @@ fn tool_read_note(rel_path: &str, vault_path: &str) -> String {
     }
 }
 
-/// 全文搜索 Vault（使用 SQLite FTS5）
-async fn tool_search_vault(query: &str, state: &AppState) -> String {
+// ── FTS 查詢清洗 ──────────────────────────────────────────────────────────────
+
+/// 去除口語指令詞，只保留核心主題詞
+/// 例：「幫我找筆記內 飲料」→「飲料」
+fn clean_fts_query(query: &str) -> String {
+    // 前綴指令詞（依長度降序，避免短詞先匹配）
+    const PREFIXES: &[&str] = &[
+        "請幫我搜尋", "請幫我搜索", "請幫我查找", "請幫我找",
+        "幫我搜尋", "幫我搜索", "幫我查找", "幫我找",
+        "幫我", "請找", "請搜尋", "請搜索", "請查",
+        "找一下", "查一下", "搜尋一下", "搜索一下",
+        "搜尋", "搜索", "查找", "找找",
+        "在筆記中", "在vault中", "在Vault中",
+        "筆記內", "筆記裡", "筆記中",
+        "vault內", "vault裡", "Vault內", "Vault裡",
+        "裡面有", "裡頭有",
+    ];
+    // 後綴雜訊詞
+    const SUFFIXES: &[&str] = &[
+        "的筆記", "的資料", "的記錄", "的內容", "的相關筆記",
+        "相關的筆記", "相關的資料",
+    ];
+    // 常見助詞/連接詞（整詞清除）
+    const STOPWORDS: &[&str] = &["的", "之", "與", "和", "或", "及"];
+
+    let mut q = query.trim().to_string();
+
+    // 反覆剝除前綴，直到無法再匹配
+    loop {
+        let before = q.clone();
+        for &p in PREFIXES {
+            if q.starts_with(p) {
+                q = q[p.len()..].trim().to_string();
+                break;
+            }
+        }
+        if q == before {
+            break;
+        }
+    }
+
+    // 反覆剝除後綴
+    loop {
+        let before = q.clone();
+        for &s in SUFFIXES {
+            if q.ends_with(s) {
+                let end = q.len() - s.len();
+                q = q[..end].trim().to_string();
+                break;
+            }
+        }
+        if q == before {
+            break;
+        }
+    }
+
+    // 去除純助詞開頭（如「的奶茶」→「奶茶」）
+    for &w in STOPWORDS {
+        if q.starts_with(w) && q.len() > w.len() {
+            q = q[w.len()..].trim().to_string();
+        }
+    }
+
+    if q.is_empty() {
+        query.trim().to_string() // 若清洗後為空，退回原始 query
+    } else {
+        q
+    }
+}
+
+// ── 數值比較過濾 ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+enum Comparison {
+    LessThan(f64),
+    LessThanOrEqual(f64),
+    GreaterThan(f64),
+    GreaterThanOrEqual(f64),
+    Equal(f64),
+    About(f64), // ±15%
+}
+
+impl Comparison {
+    fn matches(&self, value: f64) -> bool {
+        match self {
+            Self::LessThan(v) => value < *v,
+            Self::LessThanOrEqual(v) => value <= *v,
+            Self::GreaterThan(v) => value > *v,
+            Self::GreaterThanOrEqual(v) => value >= *v,
+            Self::Equal(v) => (value - v).abs() < 0.01,
+            Self::About(v) => (value - v).abs() <= v * 0.15,
+        }
+    }
+    fn label(&self) -> String {
+        match self {
+            Self::LessThan(v) => format!("< {}", v),
+            Self::LessThanOrEqual(v) => format!("≤ {}", v),
+            Self::GreaterThan(v) => format!("> {}", v),
+            Self::GreaterThanOrEqual(v) => format!("≥ {}", v),
+            Self::Equal(v) => format!("= {}", v),
+            Self::About(v) => format!("≈ {}", v),
+        }
+    }
+}
+
+/// 從查詢字串中解析比較詞 + 數字，返回 (比較條件, 去掉比較部分後的搜索詞)
+fn parse_comparison(query: &str) -> (Option<Comparison>, String) {
+    // 有序列表：長詞優先（避免「不超過」被「超過」先匹配）
+    let keywords: &[(&str, &str)] = &[
+        ("不超過", "lte"), ("不高於", "lte"), ("不大於", "lte"), ("至多", "lte"), ("最多", "lte"),
+        ("不低於", "gte"), ("不小於", "gte"), ("至少", "gte"), ("最少", "gte"),
+        ("低於", "lt"),  ("小於", "lt"),  ("少於", "lt"),  ("未達", "lt"),  ("不足", "lt"),
+        ("高於", "gt"),  ("大於", "gt"),  ("多於", "gt"),  ("超過", "gt"),
+        ("等於", "eq"),  ("剛好", "eq"),  ("恰好", "eq"),  ("正好", "eq"),
+        ("大約", "about"), ("約為", "about"), ("大概", "about"),
+        ("差不多", "about"), ("接近", "about"), ("約莫", "about"), ("左右", "about"),
+        ("約", "about"),
+    ];
+    let units = ["元", "塊", "分", "度", "克", "公克", "公斤", "公升", "毫升",
+                 "ml", "ML", "kg", "KG", "g", "G", "L", "km", "KM", "m", "M"];
+
+    for &(word, kind) in keywords {
+        if let Some(pos) = query.find(word) {
+            let after = query[pos + word.len()..].trim_start();
+            // 提取數字（整數或小數）
+            let num_end = after
+                .find(|c: char| !c.is_ascii_digit() && c != '.')
+                .unwrap_or(after.len());
+            if num_end == 0 {
+                continue;
+            }
+            if let Ok(val) = after[..num_end].parse::<f64>() {
+                let cmp = match kind {
+                    "lt"    => Comparison::LessThan(val),
+                    "lte"   => Comparison::LessThanOrEqual(val),
+                    "gt"    => Comparison::GreaterThan(val),
+                    "gte"   => Comparison::GreaterThanOrEqual(val),
+                    "eq"    => Comparison::Equal(val),
+                    _       => Comparison::About(val),
+                };
+                let before = query[..pos].trim();
+                let rest = &after[num_end..];
+                // 跳過單位
+                let unit_skip = units
+                    .iter()
+                    .find(|&&u| rest.starts_with(u))
+                    .map(|u| u.len())
+                    .unwrap_or(0);
+                // 去除助詞「的」「之」
+                let after_unit = rest[unit_skip..]
+                    .trim_start_matches('的')
+                    .trim_start_matches('之')
+                    .trim();
+                let remaining = match (before.is_empty(), after_unit.is_empty()) {
+                    (true,  true)  => String::new(),
+                    (true,  false) => after_unit.to_string(),
+                    (false, true)  => before.to_string(),
+                    (false, false) => format!("{} {}", before, after_unit),
+                };
+                return (Some(cmp), remaining);
+            }
+        }
+    }
+    (None, query.to_string())
+}
+
+/// 從文字內容中找出含有數字且符合比較條件的行
+fn filter_lines_by_comparison(content: &str, cmp: &Comparison) -> Vec<String> {
+    let mut matched = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // 掃描行內所有數字（含小數點）
+        let bytes = trimmed.as_bytes();
+        let mut i = 0;
+        let mut found = false;
+        while i < bytes.len() && !found {
+            if bytes[i].is_ascii_digit() {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                    i += 1;
+                }
+                if let Ok(s) = std::str::from_utf8(&bytes[start..i]) {
+                    if let Ok(val) = s.parse::<f64>() {
+                        if cmp.matches(val) {
+                            matched.push(trimmed.to_string());
+                            found = true;
+                        }
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    matched
+}
+
+/// 全文搜索 Vault（使用 SQLite FTS5），支援比較條件過濾
+async fn tool_search_vault(query: &str, state: &AppState, app: &AppHandle) -> String {
     if query.trim().is_empty() {
         return "請提供搜索關鍵字".to_string();
     }
-    // FTS5：多字詞用雙引號包圍
-    let fts_query = if query.contains(' ') {
-        format!("\"{}\"", query.replace('"', ""))
-    } else {
-        query.to_string()
+
+    // 1. 先清洗口語指令詞
+    let cleaned = clean_fts_query(query);
+    // 2. 再解析比較條件，提取核心搜索詞
+    let (cmp, search_query) = parse_comparison(&cleaned);
+    let fts_query = {
+        let q = if search_query.trim().is_empty() {
+            cleaned.clone()
+        } else {
+            search_query.trim().to_string()
+        };
+        // 再次清洗（比較詞剝除後可能遺留助詞）
+        clean_fts_query(&q)
     };
+
+    // Debug：顯示搜索細節
+    let _ = app.emit(
+        "llm:stderr",
+        format!(
+            "[search] 原始 query: {:?}　→　清洗後: {:?}　→　FTS: {:?}　比較條件: {}",
+            query,
+            cleaned,
+            fts_query,
+            cmp.as_ref().map(|c| c.label()).unwrap_or_else(|| "無".to_string())
+        ),
+    );
+
     let rows = sqlx::query(
-        "SELECT n.path, n.title, n.content
+        "SELECT path, title
          FROM search_fts
-         JOIN notes n ON search_fts.rowid = n.id
          WHERE search_fts MATCH ?1
          ORDER BY bm25(search_fts)
-         LIMIT 10",
+         LIMIT 15",
     )
     .bind(&fts_query)
     .fetch_all(&state.db)
     .await;
 
     match rows {
-        Ok(rows) if rows.is_empty() => format!("未找到包含「{}」的筆記", query),
+        Ok(rows) if rows.is_empty() => {
+            format!("未找到包含「{}」的筆記", fts_query)
+        }
         Ok(rows) => {
-            let lines: Vec<String> = rows
-                .iter()
-                .map(|r| {
-                    let path: String = r.get("path");
-                    let title: String = r.get("title");
-                    let content: Option<String> = r.get("content");
-                    let snippet: String = content
-                        .as_deref()
-                        .unwrap_or("")
-                        .chars()
-                        .take(100)
-                        .collect();
-                    format!("- **{}** ({})\n  {}", title, path, snippet.trim())
-                })
-                .collect();
-            format!("找到 {} 篇相關筆記：\n{}", lines.len(), lines.join("\n"))
+            let mut result_lines = Vec::new();
+            for r in &rows {
+                let path: String = r.get("path");
+                let title: String = r.get("title");
+                let content: Option<String> = sqlx::query_scalar(
+                    "SELECT content FROM notes WHERE path = ?",
+                )
+                .bind(&path)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten();
+
+                let snippet = if let Some(ref c) = content {
+                    if let Some(ref cmp_ref) = cmp {
+                        // 有比較條件：只列出符合數值的行
+                        let matched = filter_lines_by_comparison(c, cmp_ref);
+                        if matched.is_empty() {
+                            continue; // 此筆記無符合條件的行，略過
+                        }
+                        format!("（符合條件的行）\n{}", matched.join("\n"))
+                    } else {
+                        // 一般 snippet：找關鍵字前後文
+                        let q = fts_query.to_lowercase();
+                        let cl = c.to_lowercase();
+                        if let Some(pos) = cl.find(&q) {
+                            let start = pos.saturating_sub(60);
+                            let end = (pos + q.len() + 100).min(c.len());
+                            format!("...{}...", c[start..end].trim())
+                        } else {
+                            c.chars().take(120).collect::<String>() + "..."
+                        }
+                    }
+                } else {
+                    String::new()
+                };
+
+                result_lines.push(format!("- **{}** ({})\n  {}", title, path, snippet));
+            }
+
+            if result_lines.is_empty() {
+                format!(
+                    "在「{}」相關筆記中，未找到數值{}的項目",
+                    fts_query,
+                    cmp.as_ref().map(|c| c.label()).unwrap_or_default()
+                )
+            } else {
+                let header = if let Some(ref c) = cmp {
+                    format!(
+                        "搜索「{}」，篩選數值{}，找到 {} 筆：",
+                        fts_query,
+                        c.label(),
+                        result_lines.len()
+                    )
+                } else {
+                    format!("找到 {} 篇相關筆記：", result_lines.len())
+                };
+                format!("{}\n{}", header, result_lines.join("\n"))
+            }
         }
         Err(e) => format!("搜索失敗：{}", e),
     }
@@ -590,6 +855,7 @@ async fn execute_vault_tool(
     args: &serde_json::Value,
     state: &AppState,
     vault_path: &str,
+    app: &AppHandle,
 ) -> String {
     if vault_path.is_empty() {
         return "Vault 未設定，無法執行 Vault 操作".to_string();
@@ -597,7 +863,7 @@ async fn execute_vault_tool(
     match name {
         "search_vault" => {
             let query = args["query"].as_str().unwrap_or("");
-            tool_search_vault(query, state).await
+            tool_search_vault(query, state, app).await
         }
         "list_structure" => {
             let path = args["path"].as_str().unwrap_or("");
@@ -623,6 +889,33 @@ async fn execute_vault_tool(
         }
         _ => format!("未知工具：{}", name),
     }
+}
+
+/// 解析 LLM 以文字格式輸出的工具調用
+/// 支援格式：<tool_call>{"name":"func","arguments":{...}}</tool_call>
+fn parse_text_tool_calls(content: &str) -> Vec<serde_json::Value> {
+    let mut calls = Vec::new();
+    let mut remaining = content;
+    while let Some(start) = remaining.find("<tool_call>") {
+        let after_open = &remaining[start + "<tool_call>".len()..];
+        if let Some(end) = after_open.find("</tool_call>") {
+            let json_str = after_open[..end].trim();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                let name = v["name"].as_str().unwrap_or("").to_string();
+                let args_str = serde_json::to_string(&v["arguments"])
+                    .unwrap_or_else(|_| "{}".to_string());
+                calls.push(serde_json::json!({
+                    "id": format!("call_{}", name),
+                    "type": "function",
+                    "function": { "name": name, "arguments": args_str }
+                }));
+            }
+            remaining = &after_open[end + "</tool_call>".len()..];
+        } else {
+            break;
+        }
+    }
+    calls
 }
 
 /// 工具調用的可讀摘要（發送給前端的 agent:tool_call 事件內容）
@@ -656,16 +949,22 @@ pub async fn agent_chat(
 
     // Agent 系統 prompt：說明工具能力，附上可選的筆記上下文
     let agent_system = format!(
-        "你是一個能操作 Vault 筆記庫的智慧助手。\
-Vault 中的筆記為 Markdown 格式（.md 副檔名），以資料夾階層組織，路徑使用 / 分隔。\
-你有以下工具可以使用，請在需要時主動調用：\n\
-- search_vault：全文搜索 Vault 中的筆記\n\
-- list_structure：列出指定資料夾的子資料夾和筆記，path 傳空字串表示根目錄\n\
-- read_note：讀取指定筆記的完整內容\n\
-- create_note：在 Vault 中建立新筆記\n\
-- update_note：更新現有筆記的完整內容\n\
-- create_folder：建立新資料夾\n\
-搜索或查詢後，請綜合結果給出清晰的繁體中文回答。{}",
+        "你是一個能操作 Vault 筆記庫的智慧助手，使用繁體中文回答。\
+Vault 中的筆記為 Markdown 格式（.md 副檔名），以資料夾階層組織，路徑使用 / 分隔。\n\
+\n\
+【工具說明】\n\
+- search_vault(query)：對筆記標題和內容做全文搜索，query 只能是關鍵字，不支援數字比較運算。\n\
+- list_structure(path)：列出資料夾內容，path 傳空字串表示根目錄。\n\
+- read_note(path)：讀取指定筆記的完整內容。\n\
+- create_note(path, content)：建立新筆記。\n\
+- update_note(path, content)：更新現有筆記。\n\
+- create_folder(path)：建立新資料夾。\n\
+\n\
+【搜索策略】\n\
+1. search_vault 支援比較條件關鍵字（低於/高於/小於/大於/等於/大約/至少/至多/不超過 + 數字 + 單位），可直接帶入完整條件搜索，例如「奶茶 低於65元」、「飲料 高於100元」。\n\
+2. 搜索時帶上核心名詞 + 比較條件，系統會自動過濾筆記中符合數值的行。\n\
+3. 若第一次搜索無結果，改用更簡短的同義詞再試一次（例如「飲料」→「奶茶」），不要直接向用戶求助。\n\
+4. 整合所有工具結果後給出清晰完整的繁體中文回答，不要要求用戶自己去查。{}",
         system
             .as_deref()
             .map(|s| format!("\n\n---\n目前開啟的筆記內容（供參考）：\n{}", s))
@@ -718,55 +1017,181 @@ Vault 中的筆記為 Markdown 格式（.md 副檔名），以資料夾階層組
         let finish_reason = choice["finish_reason"].as_str().unwrap_or("stop");
         let message = &choice["message"];
 
-        // 把 assistant 訊息（含 tool_calls 欄位）加入歷史
-        llm_messages.push(message.clone());
-
+        let content_str = message["content"].as_str().unwrap_or("").to_string();
         let tool_calls_arr = message["tool_calls"].as_array();
-        let has_tool_calls =
-            tool_calls_arr.map(|arr| !arr.is_empty()).unwrap_or(false);
+        let has_native_tool_calls = tool_calls_arr.map(|arr| !arr.is_empty()).unwrap_or(false);
 
-        if finish_reason == "tool_calls" || has_tool_calls {
-            // 執行每個工具，把結果送回 LLM
+        if finish_reason == "tool_calls" || has_native_tool_calls {
+            // === 標準 OpenAI tool_calls 格式 ===
+            llm_messages.push(message.clone());
             let calls = tool_calls_arr.cloned().unwrap_or_default();
             for call in &calls {
                 let tool_id = call["id"].as_str().unwrap_or("").to_string();
-                let tool_name = call["function"]["name"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
+                let tool_name = call["function"]["name"].as_str().unwrap_or("").to_string();
                 let args_str = call["function"]["arguments"].as_str().unwrap_or("{}");
                 let args: serde_json::Value =
                     serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
-
-                // 通知前端正在調用哪個工具
                 let display = tool_call_display(&tool_name, &args);
                 let _ = app.emit("agent:tool_call", &display);
-
-                // 執行工具
                 let result =
-                    execute_vault_tool(&tool_name, &args, state.inner(), &vault_path).await;
-
-                // 把工具結果加入歷史
+                    execute_vault_tool(&tool_name, &args, state.inner(), &vault_path, &app).await;
                 llm_messages.push(serde_json::json!({
                     "role": "tool",
                     "tool_call_id": tool_id,
                     "content": result,
                 }));
             }
-            // 繼續下一輪，把工具結果送回 LLM
         } else {
-            // 最終回覆（無更多工具調用）
-            let text = message["content"]
-                .as_str()
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let _ = app.emit("llm:done", &text);
-            return Ok(text);
+            // === 嘗試解析文字格式工具調用 <tool_call>...</tool_call> ===
+            let text_calls = parse_text_tool_calls(&content_str);
+            if !text_calls.is_empty() {
+                // 取 <tool_call> 之前的思考前言作為 assistant 內容
+                let preamble = content_str
+                    .find("<tool_call>")
+                    .map(|p| content_str[..p].trim().to_string())
+                    .unwrap_or_default();
+                llm_messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": preamble
+                }));
+                let mut results_text = Vec::new();
+                for call in &text_calls {
+                    let tool_name =
+                        call["function"]["name"].as_str().unwrap_or("").to_string();
+                    let args_str = call["function"]["arguments"].as_str().unwrap_or("{}");
+                    let args: serde_json::Value =
+                        serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
+                    let display = tool_call_display(&tool_name, &args);
+                    let _ = app.emit("agent:tool_call", &display);
+                    let result =
+                        execute_vault_tool(&tool_name, &args, state.inner(), &vault_path, &app).await;
+                    results_text.push(format!("[工具: {}]\n{}", tool_name, result));
+                }
+                // 文字格式模型不支援 role:tool，改用 user 訊息傳回結果
+                llm_messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!(
+                        "以下是工具執行結果，請根據結果回答用戶：\n\n{}",
+                        results_text.join("\n\n")
+                    )
+                }));
+            } else {
+                // 最終回覆（無更多工具調用）
+                let text = content_str.trim().to_string();
+                let _ = app.emit("llm:done", &text);
+                return Ok(text);
+            }
         }
     }
 
     Err(AppError::AI(
         "Agent 工具調用超過最大輪次（8），請簡化您的請求。".to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_comparison_basic() {
+        let (cmp, q) = parse_comparison("低於65元的飲料");
+        assert!(matches!(cmp, Some(Comparison::LessThan(v)) if (v - 65.0).abs() < 0.01));
+        assert_eq!(q, "飲料");
+
+        let (cmp, q) = parse_comparison("高於100元的咖啡");
+        assert!(matches!(cmp, Some(Comparison::GreaterThan(v)) if (v - 100.0).abs() < 0.01));
+        assert_eq!(q, "咖啡");
+
+        let (cmp, q) = parse_comparison("不超過50元的奶茶");
+        assert!(matches!(cmp, Some(Comparison::LessThanOrEqual(v)) if (v - 50.0).abs() < 0.01));
+        assert_eq!(q, "奶茶");
+
+        let (cmp, q) = parse_comparison("大約30元的紅茶");
+        assert!(matches!(cmp, Some(Comparison::About(v)) if (v - 30.0).abs() < 0.01));
+        assert_eq!(q, "紅茶");
+
+        let (cmp, q) = parse_comparison("至少80元的果汁");
+        assert!(matches!(cmp, Some(Comparison::GreaterThanOrEqual(v)) if (v - 80.0).abs() < 0.01));
+        assert_eq!(q, "果汁");
+    }
+
+    #[test]
+    fn test_parse_comparison_llm_style() {
+        // LLM 通常會把比較詞放前面
+        let (cmp, q) = parse_comparison("飲料 低於65元");
+        assert!(matches!(cmp, Some(Comparison::LessThan(v)) if (v - 65.0).abs() < 0.01));
+        assert_eq!(q, "飲料");
+
+        // 無比較詞時原樣返回
+        let (cmp, q) = parse_comparison("奶茶");
+        assert!(cmp.is_none());
+        assert_eq!(q, "奶茶");
+    }
+
+    #[test]
+    fn test_clean_fts_query() {
+        // 完整口語句子 → 核心詞
+        assert_eq!(clean_fts_query("幫我找筆記內低於65元的飲料"), "低於65元的飲料");
+        assert_eq!(clean_fts_query("搜尋奶茶"), "奶茶");
+        assert_eq!(clean_fts_query("請幫我找咖啡的筆記"), "咖啡");
+        assert_eq!(clean_fts_query("在筆記中高於100元的果汁"), "高於100元的果汁");
+        assert_eq!(clean_fts_query("找一下紅茶"), "紅茶");
+        // 無指令詞時原樣
+        assert_eq!(clean_fts_query("飲料"), "飲料");
+    }
+
+    #[test]
+    fn test_full_pipeline() {
+        // 模擬完整流程：口語句 → 清洗 → 解析比較 → 最終 FTS 詞
+        let simulate = |raw: &str| -> (bool, String) {
+            let cleaned = clean_fts_query(raw);
+            let (cmp, search_query) = parse_comparison(&cleaned);
+            let fts = {
+                let q = if search_query.trim().is_empty() { cleaned.clone() } else { search_query.trim().to_string() };
+                clean_fts_query(&q)
+            };
+            (cmp.is_some(), fts)
+        };
+
+        let (has_cmp, fts) = simulate("幫我找筆記內低於65元的飲料");
+        assert!(has_cmp, "應解析出比較條件");
+        assert_eq!(fts, "飲料");
+
+        let (has_cmp, fts) = simulate("搜尋高於100元的咖啡");
+        assert!(has_cmp);
+        assert_eq!(fts, "咖啡");
+
+        let (has_cmp, fts) = simulate("找一下奶茶");
+        assert!(!has_cmp);
+        assert_eq!(fts, "奶茶");
+    }
+
+    #[test]
+    fn test_filter_lines_by_comparison() {
+        let content = "\
+珍珠奶茶 60元
+抹茶拿鐵 75元
+草莓奶昔 55元
+黑糖鮮奶茶 65元
+焦糖瑪奇朵 80元";
+
+        let cmp = Comparison::LessThan(65.0);
+        let matched = filter_lines_by_comparison(content, &cmp);
+        // 60 < 65 ✓, 75 ✗, 55 < 65 ✓, 65 not < 65 ✗, 80 ✗
+        assert_eq!(matched.len(), 2);
+        assert!(matched[0].contains("60"));
+        assert!(matched[1].contains("55"));
+
+        let cmp = Comparison::LessThanOrEqual(65.0);
+        let matched = filter_lines_by_comparison(content, &cmp);
+        // 60 ✓, 55 ✓, 65 ≤ 65 ✓
+        assert_eq!(matched.len(), 3);
+
+        let cmp = Comparison::About(65.0); // ±15% → 55.25~74.75
+        let matched = filter_lines_by_comparison(content, &cmp);
+        // 60 ✓, 75 ✓, 55 ✗（54.25邊緣，55.25以上才算）, 65 ✓
+        assert!(matched.iter().any(|l| l.contains("60")));
+        assert!(matched.iter().any(|l| l.contains("65")));
+    }
 }
