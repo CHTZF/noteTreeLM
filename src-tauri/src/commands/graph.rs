@@ -29,6 +29,7 @@ pub struct GraphData {
 
 #[tauri::command]
 pub async fn get_graph(state: State<'_, AppState>) -> Result<GraphData, AppError> {
+    let db = state.get_vault_db().await?;
     let nodes = sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>)>(
         "SELECT n.id, n.node_type, n.label, n.url, n.file_path
          FROM graph_nodes n
@@ -36,7 +37,7 @@ pub async fn get_graph(state: State<'_, AppState>) -> Result<GraphData, AppError
             OR EXISTS (SELECT 1 FROM notes WHERE path = n.id)
          ORDER BY n.node_type, n.label"
     )
-    .fetch_all(&state.db)
+    .fetch_all(&db)
     .await?;
 
     // 計算每個節點的連結數量
@@ -47,7 +48,7 @@ pub async fn get_graph(state: State<'_, AppState>) -> Result<GraphData, AppError
         )
         .bind(&id)
         .bind(&id)
-        .fetch_one(&state.db)
+        .fetch_one(&db)
         .await
         .unwrap_or(0);
 
@@ -64,7 +65,7 @@ pub async fn get_graph(state: State<'_, AppState>) -> Result<GraphData, AppError
     let edges = sqlx::query_as::<_, (i64, String, String, String, f64)>(
         "SELECT id, source_id, target_id, edge_type, weight FROM graph_edges"
     )
-    .fetch_all(&state.db)
+    .fetch_all(&db)
     .await?;
 
     let graph_edges = edges

@@ -4,8 +4,10 @@ import { open } from '@tauri-apps/plugin-dialog'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useVaultStore } from '../../stores/vaultStore'
 import { useGraphStore } from '../../stores/graphStore'
+import { useEditorStore } from '../../stores/editorStore'
 import { Settings, DEFAULT_SETTINGS } from '../../types/settings'
 import ModelDownloader, { WHISPER_MODELS, LLM_MODELS } from './ModelDownloader'
+import { toast } from '../common/Toast'
 
 interface SettingsModalProps {
   onClose: () => void
@@ -19,7 +21,7 @@ interface MemoryRuleEntry {
   created_at: number
 }
 
-type Tab = 'general' | 'ai' | 'voice' | 'server' | 'advanced' | 'raw'
+type Tab = 'general' | 'ai' | 'voice' | 'local' | 'advanced' | 'raw'
 type ServerStatus = 'unknown' | 'running' | 'loading' | 'stopped'
 
 // Provider → 預設模型清單
@@ -48,6 +50,7 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   const { settings, save, getApiKey, setApiKey } = useSettingsStore()
   const { scanVault } = useVaultStore()
   const { load: loadGraph } = useGraphStore()
+  const { setCurrentPath } = useEditorStore()
 
   const [tab, setTab] = useState<Tab>('general')
   const [draft, setDraft] = useState<Settings>({ ...settings })
@@ -82,7 +85,7 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   }, [draft.ai_provider])
 
   useEffect(() => {
-    if (tab !== 'server') return
+    if (tab !== 'voice' && tab !== 'local') return
     const refresh = async () => {
       const ws = await invoke<string>('get_whisper_server_status').catch(() => 'stopped')
       setWhisperStatus(ws as ServerStatus)
@@ -141,8 +144,15 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
       )
       document.documentElement.style.setProperty('--font-size-editor', `${draft.editor_font_size || 14}px`)
       document.documentElement.style.zoom = String((draft.ui_font_size || 14) / 14)
-      if (vaultChanged) { await scanVault(); await loadGraph() }
+      if (vaultChanged) {
+        setCurrentPath('')  // 關閉目前開啟的筆記，避免對新 vault 執行舊路徑操作
+        await scanVault()
+        await loadGraph()
+      }
       onClose()
+    } catch (err: any) {
+      const msg = err?.Settings ?? err?.message ?? (typeof err === 'string' ? err : '未知錯誤')
+      toast.error('設定儲存失敗：' + msg)
     } finally {
       setIsSaving(false)
     }
@@ -168,17 +178,19 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
 
   // ── Sub-components ──────────────────────────────────────────────
 
-  const PathPicker = ({ value, onChange, isDir = false }: { value: string; onChange: (v: string) => void; isDir?: boolean }) => (
+  const PathPicker = ({ value, onChange, isDir = false, disabled = false }: { value: string; onChange: (v: string) => void; isDir?: boolean; disabled?: boolean }) => (
     <div style={{ display: 'flex', gap: '8px' }}>
       <input value={value} onChange={(e) => onChange(e.target.value)}
         placeholder={isDir ? '選擇資料夾…' : '選擇檔案…'}
-        style={{ ...inputStyle, flex: 1 }} />
+        disabled={disabled}
+        style={{ ...(disabled ? disabledStyle : inputStyle), flex: 1 }} />
       <button
+        disabled={disabled}
         onClick={async () => {
           const r = await open({ directory: isDir, multiple: false })
           if (r) onChange(typeof r === 'string' ? r : String(r))
         }}
-        style={{ height: '32px', padding: '0 12px', borderRadius: '6px', background: 'var(--color-bg-overlay)', color: 'var(--color-text-primary)', fontSize: '13px', border: '1px solid var(--color-border)', flexShrink: 0, whiteSpace: 'nowrap' }}
+        style={{ height: '32px', padding: '0 12px', borderRadius: '6px', background: 'var(--color-bg-overlay)', color: disabled ? 'var(--color-text-muted)' : 'var(--color-text-primary)', fontSize: '13px', border: '1px solid var(--color-border)', flexShrink: 0, whiteSpace: 'nowrap', opacity: disabled ? 0.4 : 1, cursor: disabled ? 'not-allowed' : 'pointer' }}
       >瀏覽</button>
     </div>
   )
@@ -249,7 +261,7 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   const modelIsCustom = hasProvider && !modelOptions.includes(draft.ai_model) && draft.ai_model
 
   const tabs: [Tab, string][] = [
-    ['general', '一般'], ['ai', 'AI'], ['voice', '語音'], ['server', '伺服器'], ['advanced', '進階'], ['raw', '設定檔'],
+    ['general', '一般'], ['ai', 'AI'], ['voice', 'Whisper'], ['local', 'Local LLM'], ['advanced', '進階'], ['raw', '設定檔'],
   ]
 
   const numInputStyle: React.CSSProperties = {
@@ -312,10 +324,6 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
           <div style={{ flex: 1, overflowY: 'auto', padding: '20px 24px' }}>
 
             {tab === 'general' && <>
-              <div style={fieldStyle}>
-                <label style={labelStyle}>Vault 資料夾</label>
-                <PathPicker value={draft.vault_path} onChange={(v) => up({ vault_path: v })} isDir />
-              </div>
               <div style={fieldStyle}>
                 <label style={labelStyle}>佈景主題</label>
                 <select value={draft.theme} onChange={(e) => up({ theme: e.target.value as any })} style={inputStyle}>
@@ -465,57 +473,56 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                 </div>
               </>}
 
-              {/* 本地 LLM 欄位：選擇 local 時顯示 */}
-              {draft.ai_provider === 'local' && <>
-                <div style={fieldStyle}>
-                  <label style={labelStyle}>llama-server 路徑</label>
-                  <PathPicker value={draft.llama_cli_path} onChange={(v) => up({ llama_cli_path: v })} />
-                  <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '5px 0 0', lineHeight: 1.5 }}>
-                    請指向 <code>llama-server</code> 二進位檔（非 llama-cli）
-                  </p>
-                </div>
-                <div style={fieldStyle}>
-                  <label style={labelStyle}>llama-server 埠號</label>
-                  <input
-                    type="number" min={1024} max={65535}
-                    value={draft.llama_server_port}
-                    onChange={(e) => up({ llama_server_port: Number(e.target.value) })}
-                    style={{ ...inputStyle, width: '120px' }}
-                  />
-                  <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '5px 0 0', lineHeight: 1.5 }}>
-                    預設 8080。App 啟動後第一次對話時會自動啟動 llama-server，關閉 App 時自動停止。
-                  </p>
-                </div>
-                <ModelDownloader
-                  models={LLM_MODELS}
-                  title="本地語言模型"
-                  kind="llm"
-                  value={draft.llm_model_path}
-                  onChange={(v) => up({ llm_model_path: v })}
-                />
-              </>}
+              {draft.ai_provider === 'local' && (
+                <p style={{ fontSize: '12px', color: 'var(--color-text-muted)', margin: '4px 0 8px', lineHeight: 1.6 }}>
+                  本地 LLM 路徑、埠號與模型設定請至「Local LLM Server」頁面。
+                </p>
+              )}
 
-              <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px' }}>
-                <ToggleRow label="啟用主題分析" value={draft.ai_enable_topics} onChange={(v) => up({ ai_enable_topics: v })} />
+              <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px', marginTop: '8px' }}>
                 <ToggleRow label="啟用智慧摘要" value={draft.ai_enable_summary} onChange={(v) => up({ ai_enable_summary: v })} />
-                <ToggleRow label="啟用圖片辨識" value={draft.ai_enable_vision} onChange={(v) => up({ ai_enable_vision: v })} />
               </div>
             </>}
 
             {tab === 'voice' && <>
+              <ServerCard
+                name="Whisper Server（語音辨識）"
+                status={whisperStatus}
+                busy={whisperBusy}
+                onStart={() => {
+                  setWhisperBusy(true)
+                  invoke('start_whisper_server').finally(() => setWhisperBusy(false))
+                }}
+                onStop={async () => {
+                  setWhisperBusy(true)
+                  await invoke('stop_whisper_server').catch(() => {})
+                  setWhisperStatus('stopped')
+                  setWhisperBusy(false)
+                }}
+                onRestart={() => {
+                  setWhisperBusy(true)
+                  invoke('restart_whisper_server').finally(() => setWhisperBusy(false))
+                }}
+              />
+              {whisperStatus === 'running' && (
+                <p style={{ fontSize: '11px', color: 'var(--color-warning, #f59e0b)', margin: '-8px 0 16px', lineHeight: 1.5 }}>
+                  ⚠ 伺服器執行中，路徑、埠號與模型設定已鎖定。請先停止伺服器再修改。
+                </p>
+              )}
               <ModelDownloader
                 models={WHISPER_MODELS}
                 title="語音辨識模型"
                 kind="whisper"
                 value={draft.whisper_model_path}
                 onChange={(v) => up({ whisper_model_path: v })}
+                disabled={whisperStatus === 'running'}
               />
 
               <div style={{ borderTop: '1px solid var(--color-border)', margin: '18px 0' }} />
 
               <div style={fieldStyle}>
                 <label style={labelStyle}>whisper-server 路徑</label>
-                <PathPicker value={draft.whisper_cli_path} onChange={(v) => up({ whisper_cli_path: v })} />
+                <PathPicker value={draft.whisper_cli_path} onChange={(v) => up({ whisper_cli_path: v })} disabled={whisperStatus === 'running'} />
                 <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '4px 0 0', lineHeight: 1.5 }}>
                   請指向 <code>whisper-server</code> 二進位檔。第一次錄音時自動啟動，App 關閉時自動停止。
                 </p>
@@ -527,8 +534,9 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                   min={1024}
                   max={65535}
                   value={draft.whisper_server_port}
+                  disabled={whisperStatus === 'running'}
                   onChange={(e) => up({ whisper_server_port: Number(e.target.value) })}
-                  style={{ ...inputStyle, width: '100px' }}
+                  style={{ ...(whisperStatus === 'running' ? disabledStyle : inputStyle), width: '100px' }}
                 />
                 <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '4px 0 0', lineHeight: 1.5 }}>
                   預設 8081。請確保不與 llama-server（預設 8080）衝突。
@@ -562,7 +570,7 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                   </select>
                   {draft.voice_process_mode !== 'none' && !draft.llama_cli_path && (
                     <p style={{ fontSize: '11px', color: 'var(--color-warning, #f59e0b)', margin: '6px 0 0', lineHeight: 1.5 }}>
-                      ⚠ 請先到 AI 頁面設定 llama CLI 路徑與本地模型。
+                      ⚠ 請先到「Local LLM Server」頁面設定 llama 路徑與本地模型。
                     </p>
                   )}
                   {draft.voice_process_mode !== 'none' && (
@@ -576,29 +584,7 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
               </div>
             </>}
 
-            {tab === 'server' && <>
-              <p style={{ fontSize: '12px', color: 'var(--color-text-muted)', marginBottom: '20px', lineHeight: 1.6 }}>
-                管理 Whisper（語音辨識）與 LLaMA（本地 AI）伺服器的啟動狀態。App 關閉時兩個伺服器均會自動停止。
-              </p>
-              <ServerCard
-                name="Whisper Server（語音辨識）"
-                status={whisperStatus}
-                busy={whisperBusy}
-                onStart={() => {
-                  setWhisperBusy(true)
-                  invoke('start_whisper_server').finally(() => setWhisperBusy(false))
-                }}
-                onStop={async () => {
-                  setWhisperBusy(true)
-                  await invoke('stop_whisper_server').catch(() => {})
-                  setWhisperStatus('stopped')
-                  setWhisperBusy(false)
-                }}
-                onRestart={() => {
-                  setWhisperBusy(true)
-                  invoke('restart_whisper_server').finally(() => setWhisperBusy(false))
-                }}
-              />
+            {tab === 'local' && <>
               <ServerCard
                 name="LLaMA Server（本地 AI）"
                 status={llamaStatus}
@@ -618,9 +604,43 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                   invoke('restart_llama_server').finally(() => setLlamaBusy(false))
                 }}
               />
-              <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', lineHeight: 1.6 }}>
-                「載入中」表示伺服器進程已啟動，模型尚未就緒（依模型大小，可能需數十秒至數分鐘）。
-              </p>
+              {llamaStatus === 'running' && (
+                <p style={{ fontSize: '11px', color: 'var(--color-warning, #f59e0b)', margin: '-8px 0 16px', lineHeight: 1.5 }}>
+                  ⚠ 伺服器執行中，路徑、埠號與模型設定已鎖定。請先停止伺服器再修改。
+                </p>
+              )}
+              <div style={fieldStyle}>
+                <label style={labelStyle}>llama-server 路徑</label>
+                <PathPicker value={draft.llama_cli_path} onChange={(v) => up({ llama_cli_path: v })} disabled={llamaStatus === 'running'} />
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '5px 0 0', lineHeight: 1.5 }}>
+                  請指向 <code>llama-server</code> 二進位檔（非 llama-cli）
+                </p>
+              </div>
+              <div style={fieldStyle}>
+                <label style={labelStyle}>llama-server 埠號</label>
+                <input
+                  type="number" min={1024} max={65535}
+                  value={draft.llama_server_port}
+                  disabled={llamaStatus === 'running'}
+                  onChange={(e) => up({ llama_server_port: Number(e.target.value) })}
+                  style={{ ...(llamaStatus === 'running' ? disabledStyle : inputStyle), width: '120px' }}
+                />
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '5px 0 0', lineHeight: 1.5 }}>
+                  預設 8080。App 啟動後第一次對話時會自動啟動 llama-server，關閉 App 時自動停止。
+                </p>
+              </div>
+              <ModelDownloader
+                models={LLM_MODELS}
+                title="本地語言模型"
+                kind="llm"
+                value={draft.llm_model_path}
+                onChange={(v) => up({ llm_model_path: v })}
+                disabled={llamaStatus === 'running'}
+              />
+              <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px', marginTop: '8px' }}>
+                <ToggleRow label="啟用主題分析" value={draft.ai_enable_topics} onChange={(v) => up({ ai_enable_topics: v })} />
+                <ToggleRow label="啟用圖片辨識" value={draft.ai_enable_vision} onChange={(v) => up({ ai_enable_vision: v })} />
+              </div>
             </>}
 
             {tab === 'advanced' && <>

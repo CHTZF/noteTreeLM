@@ -1,6 +1,6 @@
-use crate::{db::queries, error::AppError, state::AppState};
+use crate::{db::queries, error::AppError, state::AppState, vault};
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, State};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Settings {
@@ -44,7 +44,7 @@ pub struct Settings {
 
 #[tauri::command]
 pub async fn get_settings(state: State<'_, AppState>) -> Result<Settings, AppError> {
-    let pool = &state.db;
+    let pool = &state.settings_db;
 
     macro_rules! get {
         ($key:expr, $default:expr) => {
@@ -100,14 +100,15 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<Settings, AppErr
 
 #[tauri::command]
 pub async fn save_settings(
+    app: AppHandle,
     state: State<'_, AppState>,
     settings: Settings,
 ) -> Result<(), AppError> {
-    let pool = &state.db;
+    let pool = state.settings_db.clone();
 
     macro_rules! save {
         ($key:expr, $value:expr) => {
-            queries::set_setting(pool, $key, &$value.to_string()).await?
+            queries::set_setting(&pool, $key, &$value.to_string()).await?
         };
     }
 
@@ -149,14 +150,62 @@ pub async fn save_settings(
 
     let recent_json = serde_json::to_string(&settings.recent_vaults)
         .map_err(|e| AppError::Settings(e.to_string()))?;
-    queries::set_setting(pool, "recent_vaults", &recent_json).await?;
+    queries::set_setting(&pool, "recent_vaults", &recent_json).await?;
 
-    // 更新記憶體中的 vault_path
+    // 更新記憶體中的 vault_path，並在切換 vault 時重啟 FileWatcher
     if !settings.vault_path.is_empty() {
-        state.set_vault_path(settings.vault_path).await;
+        let app_state = state.inner().clone();
+        let new_path = settings.vault_path;
+        handle_vault_switch(app, app_state, new_path).await;
     }
 
     Ok(())
+}
+
+/// 處理 vault 切換：關閉舊 DB、初始化新 DB、重啟 FileWatcher
+/// 獨立函式讓 AppState 以 clone（Arc-cheap）方式傳入，避免 `State<'_, AppState>` 的 HRTB Send 問題
+async fn handle_vault_switch(app: AppHandle, state: AppState, new_path: String) {
+    let old_path = state.get_vault_path().await;
+
+    if old_path != new_path {
+        // 停止舊 watcher（drop sender 即停止 thread）
+        {
+            let mut guard = state.watcher_stop.lock().await;
+            drop(guard.take());
+        }
+        // 關閉舊 vault DB
+        state.set_vault_db(None).await;
+        // 更新 vault_path
+        state.set_vault_path(new_path.clone()).await;
+        // 初始化新 vault DB 並啟動新 watcher（若路徑有效）
+        let path = std::path::PathBuf::from(&new_path);
+        if path.exists() {
+            if let Ok(vault_pool) = crate::db::init_vault_db(&path).await {
+                state.set_vault_db(Some(vault_pool)).await;
+            }
+            let stop_tx = vault::watcher::start_watcher(app, path);
+            *state.watcher_stop.lock().await = Some(stop_tx);
+        }
+    } else {
+        state.set_vault_path(new_path).await;
+    }
+}
+
+#[tauri::command]
+pub async fn get_vault_last_note(
+    state: State<'_, AppState>,
+    vault_path: String,
+) -> Result<Option<String>, AppError> {
+    queries::get_vault_last_note(&state.settings_db, &vault_path).await
+}
+
+#[tauri::command]
+pub async fn set_vault_last_note(
+    state: State<'_, AppState>,
+    vault_path: String,
+    note_path: String,
+) -> Result<(), AppError> {
+    queries::set_vault_last_note(&state.settings_db, &vault_path, &note_path).await
 }
 
 #[tauri::command]

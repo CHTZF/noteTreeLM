@@ -21,6 +21,7 @@ pub async fn search(
     }
 
     let limit = limit.unwrap_or(20);
+    let db = state.get_vault_db().await?;
 
     // FTS5 搜尋（標題權重較高）
     let rows = sqlx::query_as::<_, (String, String, f64)>(
@@ -32,7 +33,7 @@ pub async fn search(
     )
     .bind(&query)
     .bind(limit)
-    .fetch_all(&state.db)
+    .fetch_all(&db)
     .await
     .unwrap_or_default();
 
@@ -43,7 +44,7 @@ pub async fn search(
             "SELECT content FROM notes WHERE path = ?"
         )
         .bind(&path)
-        .fetch_optional(&state.db)
+        .fetch_optional(&db)
         .await?
         .unwrap_or_default();
 

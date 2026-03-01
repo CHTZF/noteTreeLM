@@ -2,23 +2,32 @@ use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
+use crate::error::AppError;
+
 #[derive(Clone)]
 pub struct AppState {
-    pub db: SqlitePool,
+    /// 帳號層級設定 DB（app_data_dir/settings.db）
+    pub settings_db: SqlitePool,
+    /// 目前 Vault 的資料 DB（vault_path/.notetreelm.db）；未設定 vault 時為 None
+    vault_db: Arc<RwLock<Option<SqlitePool>>>,
     pub vault_path: Arc<RwLock<String>>,
     /// 持有 llama-server 子進程；App 結束時 kill
     pub llama_server: Arc<Mutex<Option<tokio::process::Child>>>,
     /// 持有 whisper-server 子進程；App 結束時 kill
     pub whisper_server: Arc<Mutex<Option<tokio::process::Child>>>,
+    /// FileWatcher 停止信號（drop sender 即可停止舊 watcher thread）
+    pub watcher_stop: Arc<Mutex<Option<std::sync::mpsc::SyncSender<()>>>>,
 }
 
 impl AppState {
-    pub fn new(db: SqlitePool) -> Self {
+    pub fn new(settings_db: SqlitePool) -> Self {
         Self {
-            db,
+            settings_db,
+            vault_db: Arc::new(RwLock::new(None)),
             vault_path: Arc::new(RwLock::new(String::new())),
             llama_server: Arc::new(Mutex::new(None)),
             whisper_server: Arc::new(Mutex::new(None)),
+            watcher_stop: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -28,5 +37,19 @@ impl AppState {
 
     pub async fn set_vault_path(&self, path: String) {
         *self.vault_path.write().await = path;
+    }
+
+    /// 取得 vault DB pool；Vault 未設定時回傳錯誤
+    pub async fn get_vault_db(&self) -> Result<SqlitePool, AppError> {
+        self.vault_db
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| AppError::Vault("尚未設定 Vault 路徑".to_string()))
+    }
+
+    /// 設定（或清除）vault DB pool
+    pub async fn set_vault_db(&self, pool: Option<SqlitePool>) {
+        *self.vault_db.write().await = pool;
     }
 }

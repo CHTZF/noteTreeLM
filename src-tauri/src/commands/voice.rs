@@ -15,7 +15,7 @@ pub struct TranscribeResult {
 async fn resolve_whisper_server_config(
     state: &AppState,
 ) -> Result<(PathBuf, String, u16), AppError> {
-    let pool = &state.db;
+    let pool = &state.settings_db;
 
     let server_path = queries::get_setting(pool, "whisper_cli_path")
         .await?
@@ -225,7 +225,7 @@ pub async fn transcribe_audio(
     pcm_data: Vec<f32>,
     sample_rate: u32,
 ) -> Result<TranscribeResult, AppError> {
-    let pool = &state.db;
+    let pool = &state.settings_db;
 
     let model_path = queries::get_setting(pool, "whisper_model_path")
         .await?
@@ -300,7 +300,7 @@ pub async fn transcribe_audio(
 /// 不阻塞啟動流程；設定錯誤（路徑不存在等）會透過 whisper:stderr 事件通知前端
 pub async fn warmup_whisper_server(state: &AppState, app: &AppHandle) {
     let configured = matches!(
-        queries::get_setting(&state.db, "whisper_cli_path").await,
+        queries::get_setting(&state.settings_db, "whisper_cli_path").await,
         Ok(Some(ref p)) if !p.is_empty()
     );
     if !configured {
@@ -385,7 +385,7 @@ pub async fn stop_whisper_server(state: State<'_, AppState>) -> Result<(), AppEr
 /// 查詢 whisper-server 狀態："running" | "loading" | "stopped"
 #[tauri::command]
 pub async fn get_whisper_server_status(state: State<'_, AppState>) -> Result<String, AppError> {
-    let port = queries::get_setting(&state.db, "whisper_server_port")
+    let port = queries::get_setting(&state.settings_db, "whisper_server_port")
         .await
         .unwrap_or_default()
         .unwrap_or_else(|| "8081".to_string())

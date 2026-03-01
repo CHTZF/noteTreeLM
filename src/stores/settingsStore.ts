@@ -46,6 +46,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       await invoke('save_settings', { settings: rustSettings })
     } catch (err) {
       console.error('儲存設定失敗：', err)
+      throw err
     }
   },
 

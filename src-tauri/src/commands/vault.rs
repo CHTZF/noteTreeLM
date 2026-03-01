@@ -6,6 +6,7 @@ use crate::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sqlx::SqlitePool;
 use std::path::PathBuf;
 use tauri::State;
 
@@ -61,6 +62,7 @@ pub async fn create_note(
     if vault_path.is_empty() {
         return Err(AppError::Vault("尚未設定 Vault 路徑".to_string()));
     }
+    let db = state.get_vault_db().await?;
 
     let content = content.unwrap_or_default();
     let folder = folder.unwrap_or_default();
@@ -83,7 +85,7 @@ pub async fn create_note(
         "SELECT path FROM notes WHERE title = ?"
     )
     .bind(&title)
-    .fetch_optional(&state.db)
+    .fetch_optional(&db)
     .await?;
 
     if existing.is_some() {
@@ -115,7 +117,7 @@ pub async fn create_note(
     .bind(now)
     .bind(now)
     .bind(&checksum)
-    .execute(&state.db)
+    .execute(&db)
     .await?;
 
     // 同步 graph_nodes
@@ -126,7 +128,7 @@ pub async fn create_note(
     .bind(&rel_path)
     .bind(&title)
     .bind(now / 1000)
-    .execute(&state.db)
+    .execute(&db)
     .await?;
 
     Ok(Note {
@@ -145,12 +147,13 @@ pub async fn read_note(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<Note, AppError> {
+    let db = state.get_vault_db().await?;
     let row = sqlx::query_as::<_, (String, String, String, Option<String>, i64, i64, i64)>(
         "SELECT path, title, content, frontmatter, word_count, created_at, modified_at
          FROM notes WHERE path = ?"
     )
     .bind(&path)
-    .fetch_optional(&state.db)
+    .fetch_optional(&db)
     .await?
     .ok_or_else(|| AppError::Vault(format!("找不到筆記：{}", path)))?;
 
@@ -172,6 +175,7 @@ pub async fn update_note(
     content: String,
 ) -> Result<(), AppError> {
     let vault_path = state.get_vault_path().await;
+    let db = state.get_vault_db().await?;
     let abs_path = PathBuf::from(&vault_path).join(&path);
 
     tokio::fs::write(&abs_path, &content).await?;
@@ -191,31 +195,31 @@ pub async fn update_note(
     .bind(now)
     .bind(&checksum)
     .bind(&path)
-    .execute(&state.db)
+    .execute(&db)
     .await?;
 
     // 更新 links
-    sync_links(&state, &path, &content).await?;
+    sync_links(&db, &path, &content).await?;
 
     // 更新 graph node label
     sqlx::query("UPDATE graph_nodes SET label = ? WHERE id = ?")
         .bind(&title)
         .bind(&path)
-        .execute(&state.db)
+        .execute(&db)
         .await?;
 
     Ok(())
 }
 
 async fn sync_links(
-    state: &AppState,
+    db: &SqlitePool,
     source_path: &str,
     content: &str,
 ) -> Result<(), AppError> {
     // 刪除舊的 links（wikilink 和 image_embed）
     sqlx::query("DELETE FROM links WHERE source_path = ?")
         .bind(source_path)
-        .execute(&state.db)
+        .execute(db)
         .await?;
 
     // 解析並插入新 links
@@ -226,7 +230,7 @@ async fn sync_links(
             "SELECT path FROM notes WHERE title = ? LIMIT 1"
         )
         .bind(&link.target_title)
-        .fetch_optional(&state.db)
+        .fetch_optional(db)
         .await?;
 
         sqlx::query(
@@ -241,7 +245,7 @@ async fn sync_links(
         .bind(&link.alias)
         .bind(&link.heading)
         .bind(link.line_number)
-        .execute(&state.db)
+        .execute(db)
         .await?;
 
         // 更新 graph edge（僅 wikilink）
@@ -253,7 +257,7 @@ async fn sync_links(
                 )
                 .bind(source_path)
                 .bind(tp)
-                .execute(&state.db)
+                .execute(db)
                 .await?;
             }
         }
@@ -268,13 +272,14 @@ pub async fn delete_note(
     path: String,
 ) -> Result<DeleteResult, AppError> {
     let vault_path = state.get_vault_path().await;
+    let db = state.get_vault_db().await?;
 
     // 計算反向連結數量
     let affected_links: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM links WHERE target_path = ?"
     )
     .bind(&path)
-    .fetch_one(&state.db)
+    .fetch_one(&db)
     .await?;
 
     // 刪除實體檔案
@@ -284,11 +289,11 @@ pub async fn delete_note(
     // DB 刪除（CASCADE 自動清除 links、tags、graph_nodes、graph_edges）
     sqlx::query("DELETE FROM notes WHERE path = ?")
         .bind(&path)
-        .execute(&state.db)
+        .execute(&db)
         .await?;
     sqlx::query("DELETE FROM graph_nodes WHERE id = ?")
         .bind(&path)
-        .execute(&state.db)
+        .execute(&db)
         .await?;
 
     Ok(DeleteResult { affected_links })
@@ -301,6 +306,7 @@ pub async fn rename_note(
     new_title: String,
 ) -> Result<RenameResult, AppError> {
     let vault_path = state.get_vault_path().await;
+    let db = state.get_vault_db().await?;
 
     // 建立新路徑（保持原資料夾）
     let old_pathbuf = PathBuf::from(&path);
@@ -319,14 +325,14 @@ pub async fn rename_note(
     // 找出所有引用舊標題的筆記
     let old_title: String = sqlx::query_scalar("SELECT title FROM notes WHERE path = ?")
         .bind(&path)
-        .fetch_one(&state.db)
+        .fetch_one(&db)
         .await?;
 
     let backlinks: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT source_path FROM links WHERE target_title = ?"
     )
     .bind(&old_title)
-    .fetch_all(&state.db)
+    .fetch_all(&db)
     .await?;
 
     // 更新每個反向連結的檔案內容
@@ -359,13 +365,13 @@ pub async fn rename_note(
         .bind(&new_path)
         .bind(&new_title)
         .bind(&path)
-        .execute(&state.db)
+        .execute(&db)
         .await?;
     sqlx::query("UPDATE graph_nodes SET id = ?, label = ? WHERE id = ?")
         .bind(&new_path)
         .bind(&new_title)
         .bind(&path)
-        .execute(&state.db)
+        .execute(&db)
         .await?;
 
     Ok(RenameResult { new_path, updated_files })
@@ -376,6 +382,7 @@ pub async fn list_notes(
     state: State<'_, AppState>,
     folder: Option<String>,
 ) -> Result<Vec<Note>, AppError> {
+    let db = state.get_vault_db().await?;
     let rows = if let Some(f) = folder {
         let prefix = format!("{}/", f.trim_end_matches('/'));
         sqlx::query_as::<_, (String, String, String, Option<String>, i64, i64, i64)>(
@@ -383,14 +390,14 @@ pub async fn list_notes(
              FROM notes WHERE path LIKE ? ORDER BY modified_at DESC"
         )
         .bind(format!("{}%", prefix))
-        .fetch_all(&state.db)
+        .fetch_all(&db)
         .await?
     } else {
         sqlx::query_as::<_, (String, String, String, Option<String>, i64, i64, i64)>(
             "SELECT path, title, content, frontmatter, word_count, created_at, modified_at
              FROM notes ORDER BY modified_at DESC"
         )
-        .fetch_all(&state.db)
+        .fetch_all(&db)
         .await?
     };
 
@@ -413,12 +420,13 @@ pub async fn get_backlinks(
     state: State<'_, AppState>,
     title: String,
 ) -> Result<Vec<Link>, AppError> {
+    let db = state.get_vault_db().await?;
     let rows = sqlx::query_as::<_, (i64, String, String, Option<String>, String, String, Option<String>, Option<String>, i64)>(
         "SELECT id, source_path, target_title, target_path, link_type, raw_text, alias, heading, line_number
          FROM links WHERE target_title = ? ORDER BY source_path"
     )
     .bind(&title)
-    .fetch_all(&state.db)
+    .fetch_all(&db)
     .await?;
 
     Ok(rows
@@ -444,24 +452,25 @@ pub async fn scan_vault(state: State<'_, AppState>) -> Result<usize, AppError> {
     if vault_path.is_empty() {
         return Err(AppError::Vault("尚未設定 Vault 路徑".to_string()));
     }
+    let db = state.get_vault_db().await?;
 
     let mut count = 0;
-    scan_dir(&state, &vault_path, &vault_path, &mut count).await?;
+    scan_dir(&db, &vault_path, &vault_path, &mut count).await?;
 
     // 清除 DB 中已不存在於磁碟的幽靈條目
     let all_db_paths: Vec<String> = sqlx::query_scalar("SELECT path FROM notes")
-        .fetch_all(&state.db)
+        .fetch_all(&db)
         .await?;
     for path in all_db_paths {
         let abs = PathBuf::from(&vault_path).join(&path);
         if !abs.exists() {
             sqlx::query("DELETE FROM notes WHERE path = ?")
                 .bind(&path)
-                .execute(&state.db)
+                .execute(&db)
                 .await?;
             sqlx::query("DELETE FROM graph_nodes WHERE id = ?")
                 .bind(&path)
-                .execute(&state.db)
+                .execute(&db)
                 .await?;
         }
     }
@@ -469,7 +478,7 @@ pub async fn scan_vault(state: State<'_, AppState>) -> Result<usize, AppError> {
     sqlx::query(
         "DELETE FROM graph_nodes WHERE node_type = 'note' AND id NOT IN (SELECT path FROM notes)"
     )
-    .execute(&state.db)
+    .execute(&db)
     .await?;
 
     Ok(count)
@@ -483,6 +492,7 @@ pub async fn move_note(
     new_folder: String,
 ) -> Result<String, AppError> {
     let vault_path = state.get_vault_path().await;
+    let db = state.get_vault_db().await?;
 
     let filename = PathBuf::from(&old_path)
         .file_name()
@@ -510,15 +520,15 @@ pub async fn move_note(
 
     // notes.path 更新（links 有 ON UPDATE CASCADE 自動跟著更新）
     sqlx::query("UPDATE notes SET path = ? WHERE path = ?")
-        .bind(&new_path).bind(&old_path).execute(&state.db).await?;
+        .bind(&new_path).bind(&old_path).execute(&db).await?;
 
     // graph_nodes / graph_edges 手動更新
     sqlx::query("UPDATE graph_nodes SET id = ? WHERE id = ?")
-        .bind(&new_path).bind(&old_path).execute(&state.db).await?;
+        .bind(&new_path).bind(&old_path).execute(&db).await?;
     sqlx::query("UPDATE graph_edges SET source_id = ? WHERE source_id = ?")
-        .bind(&new_path).bind(&old_path).execute(&state.db).await?;
+        .bind(&new_path).bind(&old_path).execute(&db).await?;
     sqlx::query("UPDATE graph_edges SET target_id = ? WHERE target_id = ?")
-        .bind(&new_path).bind(&old_path).execute(&state.db).await?;
+        .bind(&new_path).bind(&old_path).execute(&db).await?;
 
     Ok(new_path)
 }
@@ -532,6 +542,7 @@ pub async fn move_folder(
     new_parent: String,    // 新父資料夾相對路徑（空 = 根目錄），e.g. "archive"
 ) -> Result<String, AppError> {
     let vault_path = state.get_vault_path().await;
+    let db = state.get_vault_db().await?;
     if folder_path.is_empty() || folder_path.contains("..") {
         return Err(AppError::Vault("無效的資料夾路徑".to_string()));
     }
@@ -575,7 +586,7 @@ pub async fn move_folder(
     let note_paths: Vec<String> =
         sqlx::query_scalar("SELECT path FROM notes WHERE path LIKE ?")
             .bind(format!("{}%", old_prefix))
-            .fetch_all(&state.db)
+            .fetch_all(&db)
             .await?;
 
     for old_note_path in &note_paths {
@@ -587,22 +598,22 @@ pub async fn move_folder(
         sqlx::query("UPDATE notes SET path = ? WHERE path = ?")
             .bind(&new_note_path)
             .bind(old_note_path)
-            .execute(&state.db)
+            .execute(&db)
             .await?;
         sqlx::query("UPDATE graph_nodes SET id = ? WHERE id = ?")
             .bind(&new_note_path)
             .bind(old_note_path)
-            .execute(&state.db)
+            .execute(&db)
             .await?;
         sqlx::query("UPDATE graph_edges SET source_id = ? WHERE source_id = ?")
             .bind(&new_note_path)
             .bind(old_note_path)
-            .execute(&state.db)
+            .execute(&db)
             .await?;
         sqlx::query("UPDATE graph_edges SET target_id = ? WHERE target_id = ?")
             .bind(&new_note_path)
             .bind(old_note_path)
-            .execute(&state.db)
+            .execute(&db)
             .await?;
     }
 
@@ -617,6 +628,7 @@ pub async fn rename_folder(
     new_name: String,    // 新目錄名稱，e.g. "new-name"
 ) -> Result<String, AppError> {
     let vault_path = state.get_vault_path().await;
+    let db = state.get_vault_db().await?;
     let new_name = new_name.trim().to_string();
     if folder_path.is_empty() || folder_path.contains("..") || new_name.is_empty() || new_name.contains('/') || new_name.contains("..") {
         return Err(AppError::Vault("無效的資料夾路徑或名稱".to_string()));
@@ -652,7 +664,7 @@ pub async fn rename_folder(
     let note_paths: Vec<String> =
         sqlx::query_scalar("SELECT path FROM notes WHERE path LIKE ?")
             .bind(format!("{}%", old_prefix))
-            .fetch_all(&state.db)
+            .fetch_all(&db)
             .await?;
 
     for old_note_path in &note_paths {
@@ -660,22 +672,22 @@ pub async fn rename_folder(
         sqlx::query("UPDATE notes SET path = ? WHERE path = ?")
             .bind(&new_note_path)
             .bind(old_note_path)
-            .execute(&state.db)
+            .execute(&db)
             .await?;
         sqlx::query("UPDATE graph_nodes SET id = ? WHERE id = ?")
             .bind(&new_note_path)
             .bind(old_note_path)
-            .execute(&state.db)
+            .execute(&db)
             .await?;
         sqlx::query("UPDATE graph_edges SET source_id = ? WHERE source_id = ?")
             .bind(&new_note_path)
             .bind(old_note_path)
-            .execute(&state.db)
+            .execute(&db)
             .await?;
         sqlx::query("UPDATE graph_edges SET target_id = ? WHERE target_id = ?")
             .bind(&new_note_path)
             .bind(old_note_path)
-            .execute(&state.db)
+            .execute(&db)
             .await?;
     }
 
@@ -754,6 +766,7 @@ pub async fn delete_folder(
     folder_path: String,
 ) -> Result<u32, AppError> {
     let vault_path = state.get_vault_path().await;
+    let db = state.get_vault_db().await?;
     if folder_path.contains("..") || folder_path.is_empty() {
         return Err(AppError::Vault("無效的資料夾路徑".to_string()));
     }
@@ -764,15 +777,15 @@ pub async fn delete_folder(
         "SELECT path FROM notes WHERE path LIKE ?"
     )
     .bind(format!("{}%", prefix))
-    .fetch_all(&state.db)
+    .fetch_all(&db)
     .await?;
 
     // 從 DB 刪除所有筆記（CASCADE 自動清除 links）
     for path in &note_paths {
         sqlx::query("DELETE FROM notes WHERE path = ?")
-            .bind(path).execute(&state.db).await?;
+            .bind(path).execute(&db).await?;
         sqlx::query("DELETE FROM graph_nodes WHERE id = ?")
-            .bind(path).execute(&state.db).await?;
+            .bind(path).execute(&db).await?;
     }
 
     // 刪除實體目錄（遞迴）
@@ -887,13 +900,13 @@ pub struct TrashItem {
 
 /// 將單一筆記移入 .trash/ 目錄（內部輔助函式）
 async fn trash_single_note(
-    state: &AppState,
+    db: &SqlitePool,
     vault_path: &str,
     note_path: &str,
 ) -> Result<(), AppError> {
     let title: String = sqlx::query_scalar("SELECT title FROM notes WHERE path = ?")
         .bind(note_path)
-        .fetch_optional(&state.db)
+        .fetch_optional(db)
         .await?
         .unwrap_or_default();
 
@@ -929,11 +942,11 @@ async fn trash_single_note(
     // 從 DB 刪除（CASCADE 自動清除 links、tags）
     sqlx::query("DELETE FROM notes WHERE path = ?")
         .bind(note_path)
-        .execute(&state.db)
+        .execute(db)
         .await?;
     sqlx::query("DELETE FROM graph_nodes WHERE id = ?")
         .bind(note_path)
-        .execute(&state.db)
+        .execute(db)
         .await?;
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -948,7 +961,7 @@ async fn trash_single_note(
     .bind(&title)
     .bind(&trash_filename)
     .bind(now)
-    .execute(&state.db)
+    .execute(db)
     .await?;
 
     Ok(())
@@ -967,7 +980,8 @@ pub async fn trash_note(
     if path.contains("..") {
         return Err(AppError::Vault("無效的路徑".to_string()));
     }
-    trash_single_note(&state, &vault_path, &path).await
+    let db = state.get_vault_db().await?;
+    trash_single_note(&db, &vault_path, &path).await
 }
 
 /// 將資料夾中所有筆記移至垃圾桶，然後刪除實體資料夾
@@ -977,6 +991,7 @@ pub async fn trash_folder(
     folder_path: String,
 ) -> Result<u32, AppError> {
     let vault_path = state.get_vault_path().await;
+    let db = state.get_vault_db().await?;
     if folder_path.contains("..") || folder_path.is_empty() {
         return Err(AppError::Vault("無效的資料夾路徑".to_string()));
     }
@@ -985,12 +1000,12 @@ pub async fn trash_folder(
     let note_paths: Vec<String> =
         sqlx::query_scalar("SELECT path FROM notes WHERE path LIKE ?")
             .bind(format!("{}%", prefix))
-            .fetch_all(&state.db)
+            .fetch_all(&db)
             .await?;
 
     let count = note_paths.len() as u32;
     for note_path in &note_paths {
-        trash_single_note(&state, &vault_path, note_path).await?;
+        trash_single_note(&db, &vault_path, note_path).await?;
     }
 
     let abs_path = PathBuf::from(&vault_path).join(&folder_path);
@@ -1008,11 +1023,12 @@ pub async fn trash_folder(
 pub async fn list_trash(
     state: State<'_, AppState>,
 ) -> Result<Vec<TrashItem>, AppError> {
+    let db = state.get_vault_db().await?;
     let items: Vec<TrashItem> = sqlx::query_as(
         "SELECT id, original_path, name, title, trash_filename, deleted_at
          FROM trash_items ORDER BY deleted_at DESC",
     )
-    .fetch_all(&state.db)
+    .fetch_all(&db)
     .await?;
     Ok(items)
 }
@@ -1028,13 +1044,14 @@ pub async fn restore_trash_item(
     if vault_path.is_empty() {
         return Err(AppError::Vault("尚未設定 Vault 路徑".to_string()));
     }
+    let db = state.get_vault_db().await?;
 
     let item: Option<TrashItem> = sqlx::query_as(
         "SELECT id, original_path, name, title, trash_filename, deleted_at
          FROM trash_items WHERE id = ?",
     )
     .bind(&id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&db)
     .await?;
     let item = item.ok_or_else(|| AppError::Vault("找不到垃圾桶項目".to_string()))?;
 
@@ -1094,23 +1111,23 @@ pub async fn restore_trash_item(
     )
     .bind(&new_path).bind(&title).bind(&content)
     .bind(word_count).bind(now).bind(now).bind(&checksum)
-    .execute(&state.db).await?;
+    .execute(&db).await?;
 
     sqlx::query(
         "INSERT OR REPLACE INTO graph_nodes(id, node_type, label, created_at)
          VALUES (?, 'note', ?, ?)",
     )
     .bind(&new_path).bind(&title).bind(now / 1000)
-    .execute(&state.db).await?;
+    .execute(&db).await?;
 
     sqlx::query("DELETE FROM links WHERE source_path = ?")
-        .bind(&new_path).execute(&state.db).await?;
+        .bind(&new_path).execute(&db).await?;
     let parsed_links = indexer::parse_links(&content);
     for link in parsed_links {
         let target_path: Option<String> =
             sqlx::query_scalar("SELECT path FROM notes WHERE title = ? LIMIT 1")
                 .bind(&link.target_title)
-                .fetch_optional(&state.db)
+                .fetch_optional(&db)
                 .await?;
         sqlx::query(
             "INSERT OR IGNORE INTO links(source_path, target_title, target_path, link_type, raw_text, alias, heading, line_number)
@@ -1119,11 +1136,11 @@ pub async fn restore_trash_item(
         .bind(&new_path).bind(&link.target_title).bind(&target_path)
         .bind(link.link_type.as_str()).bind(&link.raw_text)
         .bind(&link.alias).bind(&link.heading).bind(link.line_number)
-        .execute(&state.db).await?;
+        .execute(&db).await?;
     }
 
     sqlx::query("DELETE FROM trash_items WHERE id = ?")
-        .bind(&id).execute(&state.db).await?;
+        .bind(&id).execute(&db).await?;
 
     Ok(new_path)
 }
@@ -1135,13 +1152,14 @@ pub async fn delete_trash_items(
     ids: Vec<String>,
 ) -> Result<(), AppError> {
     let vault_path = state.get_vault_path().await;
+    let db = state.get_vault_db().await?;
     let trash_dir = PathBuf::from(&vault_path).join(".trash");
 
     for id in &ids {
         let trash_filename: Option<String> =
             sqlx::query_scalar("SELECT trash_filename FROM trash_items WHERE id = ?")
                 .bind(id)
-                .fetch_optional(&state.db)
+                .fetch_optional(&db)
                 .await?;
 
         if let Some(filename) = trash_filename {
@@ -1151,14 +1169,14 @@ pub async fn delete_trash_items(
             }
         }
         sqlx::query("DELETE FROM trash_items WHERE id = ?")
-            .bind(id).execute(&state.db).await?;
+            .bind(id).execute(&db).await?;
     }
 
     Ok(())
 }
 
 async fn scan_dir(
-    state: &AppState,
+    db: &SqlitePool,
     vault_root: &str,
     dir: &str,
     count: &mut usize,
@@ -1174,7 +1192,7 @@ async fn scan_dir(
         }
 
         if path.is_dir() {
-            Box::pin(scan_dir(state, vault_root, &path.to_string_lossy(), count)).await?;
+            Box::pin(scan_dir(db, vault_root, &path.to_string_lossy(), count)).await?;
         } else if path.extension().map(|e| e == "md").unwrap_or(false) {
             let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
             let rel_path = crate::vault::to_relative_path(vault_root, &path)
@@ -1192,7 +1210,7 @@ async fn scan_dir(
                 "SELECT checksum FROM notes WHERE path = ?"
             )
             .bind(&rel_path)
-            .fetch_optional(&state.db)
+            .fetch_optional(db)
             .await?;
 
             if existing_checksum.as_deref() == Some(&checksum) {
@@ -1219,7 +1237,7 @@ async fn scan_dir(
             .bind(now)
             .bind(now)
             .bind(&checksum)
-            .execute(&state.db)
+            .execute(db)
             .await?;
 
             // 更新 graph node
@@ -1230,14 +1248,13 @@ async fn scan_dir(
             .bind(&rel_path)
             .bind(&title)
             .bind(now / 1000)
-            .execute(&state.db)
+            .execute(db)
             .await?;
 
             // 重新解析 links
-            // (簡化：使用 AppState 的 db 直接操作)
             sqlx::query("DELETE FROM links WHERE source_path = ?")
                 .bind(&rel_path)
-                .execute(&state.db)
+                .execute(db)
                 .await?;
 
             let parsed_links = crate::vault::indexer::parse_links(&content);
@@ -1246,7 +1263,7 @@ async fn scan_dir(
                     "SELECT path FROM notes WHERE title = ? LIMIT 1"
                 )
                 .bind(&link.target_title)
-                .fetch_optional(&state.db)
+                .fetch_optional(db)
                 .await?;
 
                 sqlx::query(
@@ -1261,7 +1278,7 @@ async fn scan_dir(
                 .bind(&link.alias)
                 .bind(&link.heading)
                 .bind(link.line_number)
-                .execute(&state.db)
+                .execute(db)
                 .await?;
             }
 

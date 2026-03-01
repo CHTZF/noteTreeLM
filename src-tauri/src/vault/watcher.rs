@@ -4,7 +4,11 @@ use std::sync::mpsc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-pub fn start_watcher(app: AppHandle, vault_path: PathBuf) {
+/// 啟動 FileWatcher，回傳停止 sender。
+/// Drop 該 sender（或呼叫 stop_watcher）即可停止舊的 watcher thread。
+pub fn start_watcher(app: AppHandle, vault_path: PathBuf) -> mpsc::SyncSender<()> {
+    let (stop_tx, stop_rx) = mpsc::sync_channel::<()>(1);
+
     std::thread::spawn(move || {
         let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
 
@@ -26,17 +30,22 @@ pub fn start_watcher(app: AppHandle, vault_path: PathBuf) {
             return;
         }
 
-        for result in rx {
-            match result {
-                Ok(event) => {
-                    handle_event(&app, event);
-                }
-                Err(e) => {
-                    eprintln!("FileWatcher 事件錯誤：{}", e);
-                }
+        loop {
+            // 優先檢查停止信號（非阻塞）
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+            // 等待 notify 事件（最多 200ms，避免阻塞停止檢查）
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(Ok(event)) => handle_event(&app, event),
+                Ok(Err(e)) => eprintln!("FileWatcher 事件錯誤：{}", e),
+                Err(mpsc::RecvTimeoutError::Timeout) => {} // 繼續 loop
+                Err(mpsc::RecvTimeoutError::Disconnected) => break, // sender dropped
             }
         }
     });
+
+    stop_tx
 }
 
 fn handle_event(app: &AppHandle, event: Event) {

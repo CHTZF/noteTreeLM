@@ -66,18 +66,20 @@ export default function ChatPanel() {
     if (!vaultConfigured) setUseVaultTools(false)
   }, [vaultConfigured])
 
-  // 啟動時偵測是否有已儲存的記憶存檔，有的話恢復 lastMemoryPath
-  // 讓重啟 app 後仍能查詢過去記憶（不需用戶先壓縮一次）
+  // vault_path 變化時（包含首次設定、切換 vault）重置 lastMemoryPath 並重新查詢
+  // 確保切換 vault 後不會帶入舊 vault 的記憶路徑
   useEffect(() => {
-    if (!vaultConfigured) return
+    if (!vaultConfigured) {
+      setLastMemoryPath(null)
+      return
+    }
+    setLastMemoryPath(null) // 先清除，避免短暫帶入舊路徑
     invoke<Array<{ path: string }>>('query_memory', { keywords: [], limit: 1 })
       .then((results) => {
-        if (results.length > 0) {
-          setLastMemoryPath(results[0].path)
-        }
+        if (results.length > 0) setLastMemoryPath(results[0].path)
       })
       .catch(() => {})
-  }, [vaultConfigured])
+  }, [settings.vault_path])
 
   const send = useCallback(async () => {
     const text = input.trim()

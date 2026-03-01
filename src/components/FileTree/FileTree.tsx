@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { useVaultStore } from '../../stores/vaultStore'
 import { useEditorStore } from '../../stores/editorStore'
 import { useSettingsStore } from '../../stores/settingsStore'
+import { useGraphStore } from '../../stores/graphStore'
 import { FileTreeNode } from '../../types/models'
 import { toast } from '../common/Toast'
 import { ask } from '@tauri-apps/plugin-dialog'
@@ -201,9 +202,10 @@ interface FileTreeProps {
 }
 
 export default function FileTree({ onOpenNote }: FileTreeProps) {
-  const { fileTree, createNote, createFolder, importImage } = useVaultStore()
-  const { currentPath } = useEditorStore()
-  const { settings } = useSettingsStore()
+  const { fileTree, createNote, createFolder, importImage, scanVault } = useVaultStore()
+  const { currentPath, setCurrentPath } = useEditorStore()
+  const { settings, save } = useSettingsStore()
+  const { load: loadGraph } = useGraphStore()
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false)
   const [showNoteInput, setShowNoteInput] = useState(false)
   const [noteInputTitle, setNoteInputTitle] = useState('')
@@ -249,6 +251,22 @@ export default function FileTree({ onOpenNote }: FileTreeProps) {
     setShowFolderInput(true); setFolderInputName('')
     setTimeout(() => folderInputRef.current?.focus(), 30)
   }
+  const handleSwitchVault = async () => {
+    setHeaderMenuOpen(false)
+    try {
+      const result = await openDialog({ directory: true, multiple: false })
+      if (!result) return
+      const newPath = typeof result === 'string' ? result : String(result)
+      await save({ vault_path: newPath })
+      setCurrentPath(null)
+      await scanVault()
+      await loadGraph()
+    } catch (e: any) {
+      const msg = e?.Settings ?? e?.message ?? '未知錯誤'
+      toast.error('切換 Vault 失敗：' + msg)
+    }
+  }
+
   const handleImportImage = async () => {
     setHeaderMenuOpen(false)
     try {
@@ -292,6 +310,8 @@ export default function FileTree({ onOpenNote }: FileTreeProps) {
               <MenuItem icon="📁" label="新增資料夾" onClick={handleNewFolder} />
               <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
               <MenuItem icon="🖼" label="匯入圖片" onClick={handleImportImage} />
+              <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
+              <MenuItem icon="🔀" label="切換 Vault 資料夾" onClick={handleSwitchVault} />
             </div>
           )}
         </div>

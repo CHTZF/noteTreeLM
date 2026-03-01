@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import { listen } from '@tauri-apps/api/event'
+import { invoke } from '@tauri-apps/api/core'
 import { useSettingsStore } from './stores/settingsStore'
 import { useVaultStore } from './stores/vaultStore'
 import { useGraphStore } from './stores/graphStore'
@@ -24,7 +25,7 @@ export default function App() {
   const { load: loadSettings, settings } = useSettingsStore()
   const { scanVault, setupWatchers } = useVaultStore()
   const { load: loadGraph } = useGraphStore()
-  const { setCurrentPath } = useEditorStore()
+  const { currentPath, setCurrentPath } = useEditorStore()
   const { push: navPush, back: navBack, forward: navForward, canGoBack, canGoForward } = useNavigationStore()
 
   const [appReady, setAppReady] = useState(false)
@@ -66,11 +67,23 @@ export default function App() {
         setRightPanelWidth(settings.graph_panel_width)
         await scanVault()
         await loadGraph()
+        // 恢復此 Vault 上次開啟的筆記
+        const lastNote = await invoke<string | null>('get_vault_last_note', { vaultPath: settings.vault_path }).catch(() => null)
+        if (lastNote) {
+          navPush(lastNote)
+          setCurrentPath(lastNote)
+        }
       }
       setAppReady(true)
     }
     init()
   }, [])
+
+  // 每次切換筆記時，記錄此 Vault 的 last_open_note
+  useEffect(() => {
+    if (!currentPath || !settings.vault_path) return
+    invoke('set_vault_last_note', { vaultPath: settings.vault_path, notePath: currentPath }).catch(() => {})
+  }, [currentPath, settings.vault_path])
 
   // Debug mode 關閉時，若當前在 debug tab 則切回 graph
   useEffect(() => {

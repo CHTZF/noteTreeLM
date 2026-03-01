@@ -17,7 +17,7 @@ pub struct ChatMessage {
 
 /// 從 DB 讀取 llama-server 路徑、模型路徑、埠號
 async fn resolve_server_config(state: &AppState) -> Result<(PathBuf, String, u16), AppError> {
-    let pool = &state.db;
+    let pool = &state.settings_db;
 
     let server_path = queries::get_setting(pool, "llama_cli_path")
         .await?
@@ -311,10 +311,10 @@ pub async fn process_with_llm(
 /// App 啟動時呼叫：若已設定路徑則背景預熱 llama-server
 pub async fn warmup_llama_server(state: &AppState, app: &AppHandle) {
     let configured = matches!(
-        queries::get_setting(&state.db, "llama_cli_path").await,
+        queries::get_setting(&state.settings_db, "llama_cli_path").await,
         Ok(Some(ref p)) if !p.is_empty()
     ) && matches!(
-        queries::get_setting(&state.db, "llm_model_path").await,
+        queries::get_setting(&state.settings_db, "llm_model_path").await,
         Ok(Some(ref p)) if !p.is_empty()
     );
     if configured {
@@ -338,7 +338,7 @@ pub async fn stop_llama_server(state: State<'_, AppState>) -> Result<(), AppErro
 /// 查詢 llama-server 狀態："running" | "loading" | "stopped"
 #[tauri::command]
 pub async fn get_llama_server_status(state: State<'_, AppState>) -> Result<String, AppError> {
-    let port = queries::get_setting(&state.db, "llama_server_port")
+    let port = queries::get_setting(&state.settings_db, "llama_server_port")
         .await
         .unwrap_or_default()
         .unwrap_or_else(|| "8080".to_string())
@@ -787,7 +787,7 @@ fn filter_lines_by_comparison(content: &str, cmp: &Comparison) -> Vec<String> {
 }
 
 /// 全文搜索 Vault（使用 SQLite FTS5），支援比較條件過濾
-async fn tool_search_vault(query: &str, state: &AppState, app: &AppHandle) -> String {
+async fn tool_search_vault(query: &str, vault_db: &sqlx::SqlitePool, app: &AppHandle) -> String {
     if query.trim().is_empty() {
         return "請提供搜索關鍵字".to_string();
     }
@@ -826,7 +826,7 @@ async fn tool_search_vault(query: &str, state: &AppState, app: &AppHandle) -> St
          LIMIT 15",
     )
     .bind(&fts_query)
-    .fetch_all(&state.db)
+    .fetch_all(vault_db)
     .await;
 
     match rows {
@@ -842,7 +842,7 @@ async fn tool_search_vault(query: &str, state: &AppState, app: &AppHandle) -> St
                     "SELECT content FROM notes WHERE path = ?",
                 )
                 .bind(&path)
-                .fetch_optional(&state.db)
+                .fetch_optional(vault_db)
                 .await
                 .ok()
                 .flatten();
@@ -941,7 +941,7 @@ async fn tool_create_folder(rel_path: &str, vault_path: &str) -> String {
 async fn execute_vault_tool(
     name: &str,
     args: &serde_json::Value,
-    state: &AppState,
+    vault_db: &sqlx::SqlitePool,
     vault_path: &str,
     app: &AppHandle,
 ) -> String {
@@ -951,7 +951,7 @@ async fn execute_vault_tool(
     match name {
         "search_vault" => {
             let query = args["query"].as_str().unwrap_or("");
-            tool_search_vault(query, state, app).await
+            tool_search_vault(query, vault_db, app).await
         }
         "list_structure" => {
             let path = args["path"].as_str().unwrap_or("");
@@ -982,7 +982,7 @@ async fn execute_vault_tool(
                 .unwrap_or_default();
             let since = args["since"].as_str().map(String::from);
             let limit = args["limit"].as_u64().map(|v| v as usize);
-            tool_query_memory(keywords, since, limit, state).await
+            tool_query_memory(keywords, since, limit, vault_db).await
         }
         _ => format!("未知工具：{}", name),
     }
@@ -1042,6 +1042,7 @@ pub async fn agent_chat(
 ) -> Result<String, AppError> {
     let base_url = ensure_server_running(state.inner(), &app).await?;
     let vault_path = state.get_vault_path().await;
+    let vault_db = state.get_vault_db().await?;
     let client = reqwest::Client::new();
 
     // Agent 系統 prompt：說明工具能力，附上可選的筆記上下文
@@ -1131,7 +1132,7 @@ Vault 中的筆記為 Markdown 格式（.md 副檔名），以資料夾階層組
                 let display = tool_call_display(&tool_name, &args);
                 let _ = app.emit("agent:tool_call", &display);
                 let result =
-                    execute_vault_tool(&tool_name, &args, state.inner(), &vault_path, &app).await;
+                    execute_vault_tool(&tool_name, &args, &vault_db, &vault_path, &app).await;
                 llm_messages.push(serde_json::json!({
                     "role": "tool",
                     "tool_call_id": tool_id,
@@ -1161,7 +1162,7 @@ Vault 中的筆記為 Markdown 格式（.md 副檔名），以資料夾階層組
                     let display = tool_call_display(&tool_name, &args);
                     let _ = app.emit("agent:tool_call", &display);
                     let result =
-                        execute_vault_tool(&tool_name, &args, state.inner(), &vault_path, &app).await;
+                        execute_vault_tool(&tool_name, &args, &vault_db, &vault_path, &app).await;
                     results_text.push(format!("[工具: {}]\n{}", tool_name, result));
                 }
                 // 文字格式模型不支援 role:tool，改用 user 訊息傳回結果
@@ -1283,7 +1284,7 @@ async fn add_memory_rule_to_db(db: &sqlx::SqlitePool, pattern_type: &str, patter
 /// 工具：
 ///   query_memory    — 搜尋記憶筆記
 ///   add_memory_rule — 寫入新規則，讓 resolve_memory_context 下次直接處理（自我學習）
-async fn run_memory_agent(state: &AppState, query: &str, port: u16) -> Result<String, AppError> {
+async fn run_memory_agent(vault_db: &sqlx::SqlitePool, query: &str, port: u16) -> Result<String, AppError> {
     let base_url = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
 
@@ -1397,7 +1398,7 @@ async fn run_memory_agent(state: &AppState, query: &str, port: u16) -> Result<St
                 let tool_name = call["function"]["name"].as_str().unwrap_or("");
                 let args: serde_json::Value = serde_json::from_str(
                     call["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or_default();
-                let r = dispatch_memory_tool(tool_name, &args, state).await;
+                let r = dispatch_memory_tool(tool_name, &args, vault_db).await;
                 results.push(r);
             }
             messages.push(serde_json::json!({
@@ -1414,7 +1415,7 @@ async fn run_memory_agent(state: &AppState, query: &str, port: u16) -> Result<St
             let tool_name = call["function"]["name"].as_str().unwrap_or("");
             let args: serde_json::Value = serde_json::from_str(
                 call["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or_default();
-            let result = dispatch_memory_tool(tool_name, &args, state).await;
+            let result = dispatch_memory_tool(tool_name, &args, vault_db).await;
             messages.push(serde_json::json!({
                 "role": "tool", "tool_call_id": tool_id, "content": result
             }));
@@ -1425,7 +1426,7 @@ async fn run_memory_agent(state: &AppState, query: &str, port: u16) -> Result<St
 }
 
 /// memory_agent / resolve_memory_context 共用工具分派
-async fn dispatch_memory_tool(tool_name: &str, args: &serde_json::Value, state: &AppState) -> String {
+async fn dispatch_memory_tool(tool_name: &str, args: &serde_json::Value, vault_db: &sqlx::SqlitePool) -> String {
     match tool_name {
         "query_memory" => {
             let keywords: Vec<String> = args["keywords"].as_array()
@@ -1433,13 +1434,13 @@ async fn dispatch_memory_tool(tool_name: &str, args: &serde_json::Value, state: 
                 .unwrap_or_default();
             let since = args["since"].as_str().map(String::from);
             let limit = args["limit"].as_u64().map(|v| v as usize);
-            tool_query_memory(keywords, since, limit, state).await
+            tool_query_memory(keywords, since, limit, vault_db).await
         }
         "add_memory_rule" => {
             let ptype   = args["pattern_type"].as_str().unwrap_or("");
             let pattern = args["pattern"].as_str().unwrap_or("");
             let value   = args["value"].as_str().unwrap_or("");
-            add_memory_rule_to_db(&state.db, ptype, pattern, value).await
+            add_memory_rule_to_db(vault_db, ptype, pattern, value).await
         }
         other => format!("未知工具：{}", other),
     }
@@ -1447,10 +1448,11 @@ async fn dispatch_memory_tool(tool_name: &str, args: &serde_json::Value, state: 
 
 #[tauri::command]
 pub async fn memory_agent(state: State<'_, AppState>, query: String) -> Result<String, AppError> {
-    let port = queries::get_setting(&state.db, "llama_server_port")
+    let port = queries::get_setting(&state.settings_db, "llama_server_port")
         .await.unwrap_or_default().unwrap_or_else(|| "8080".to_string())
         .parse::<u16>().unwrap_or(8080);
-    run_memory_agent(state.inner(), &query, port).await
+    let vault_db = state.get_vault_db().await?;
+    run_memory_agent(&vault_db, &query, port).await
 }
 
 /// 讓前端或其他命令可以直接向資料庫新增記憶規則
@@ -1461,11 +1463,12 @@ pub async fn add_memory_rule(
     pattern: String,
     value: String,
 ) -> Result<(), AppError> {
+    let db = state.get_vault_db().await?;
     sqlx::query(
         "INSERT OR REPLACE INTO memory_rules(pattern_type, pattern, value) VALUES (?, ?, ?)"
     )
     .bind(&pattern_type).bind(&pattern).bind(&value)
-    .execute(&state.db).await?;
+    .execute(&db).await?;
     Ok(())
 }
 
@@ -1481,10 +1484,11 @@ pub struct MemoryRuleEntry {
 /// 取得所有記憶查詢規則（供設定頁面顯示）
 #[tauri::command]
 pub async fn get_memory_rules(state: State<'_, AppState>) -> Result<Vec<MemoryRuleEntry>, AppError> {
+    let db = state.get_vault_db().await?;
     let rows = sqlx::query_as::<_, (i64, String, String, String, i64)>(
         "SELECT id, pattern_type, pattern, value, created_at FROM memory_rules ORDER BY id"
     )
-    .fetch_all(&state.db).await?;
+    .fetch_all(&db).await?;
     Ok(rows.into_iter().map(|(id, pattern_type, pattern, value, created_at)| {
         MemoryRuleEntry { id, pattern_type, pattern, value, created_at }
     }).collect())
@@ -1493,8 +1497,9 @@ pub async fn get_memory_rules(state: State<'_, AppState>) -> Result<Vec<MemoryRu
 /// 刪除指定 id 的記憶規則
 #[tauri::command]
 pub async fn delete_memory_rule(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
+    let db = state.get_vault_db().await?;
     sqlx::query("DELETE FROM memory_rules WHERE id = ?")
-        .bind(id).execute(&state.db).await?;
+        .bind(id).execute(&db).await?;
     Ok(())
 }
 
@@ -1505,7 +1510,7 @@ async fn tool_query_memory(
     keywords: Vec<String>,
     since: Option<String>,
     limit: Option<usize>,
-    state: &AppState,
+    vault_db: &sqlx::SqlitePool,
 ) -> String {
     let limit = limit.unwrap_or(3).min(10) as i64;
 
@@ -1529,7 +1534,7 @@ async fn tool_query_memory(
              LIMIT ?"
         )
         .bind(limit)
-        .fetch_all(&state.db)
+        .fetch_all(vault_db)
         .await
         .unwrap_or_default();
 
@@ -1556,7 +1561,7 @@ async fn tool_query_memory(
         )
         .bind(&fts_query)
         .bind(limit)
-        .fetch_all(&state.db)
+        .fetch_all(vault_db)
         .await
         .unwrap_or_default();
 
@@ -1577,7 +1582,7 @@ async fn tool_query_memory(
              ORDER BY created_at DESC
              LIMIT 1"
         )
-        .fetch_optional(&state.db)
+        .fetch_optional(vault_db)
         .await
         .unwrap_or_default();
 
@@ -1586,13 +1591,13 @@ async fn tool_query_memory(
         }
         // 用最新一筆繼續往下格式化
         let rows_fallback = fallback.into_iter().collect::<Vec<_>>();
-        return format_memory_rows(&rows_fallback, &format!("（關鍵字「{}」無精確匹配，以下為最新記憶）", keywords.join("、")), state).await;
+        return format_memory_rows(&rows_fallback, &format!("（關鍵字「{}」無精確匹配，以下為最新記憶）", keywords.join("、")), vault_db).await;
     }
 
-    format_memory_rows(&rows, "", state).await
+    format_memory_rows(&rows, "", vault_db).await
 }
 
-async fn format_memory_rows(rows: &[(String, String, i64)], prefix: &str, state: &AppState) -> String {
+async fn format_memory_rows(rows: &[(String, String, i64)], prefix: &str, vault_db: &sqlx::SqlitePool) -> String {
     let mut output = if prefix.is_empty() {
         format!("找到 {} 筆記憶筆記：\n\n", rows.len())
     } else {
@@ -1607,7 +1612,7 @@ async fn format_memory_rows(rows: &[(String, String, i64)], prefix: &str, state:
         // 取前 600 字元的摘要（跳過 frontmatter 分隔符）
         let snippet: String = sqlx::query_scalar::<_, String>("SELECT content FROM notes WHERE path = ?")
             .bind(path)
-            .fetch_optional(&state.db)
+            .fetch_optional(vault_db)
             .await
             .unwrap_or_default()
             .unwrap_or_default()
@@ -1638,6 +1643,8 @@ pub async fn save_memory_session(
     let display_time = now.format("%Y-%m-%d %H:%M:%S").to_string();
     let title = format!("AI 對話記憶 — {}", display_time);
     let rel_path = format!("memories/ai_memory_{}.md", timestamp);
+
+    let db = state.get_vault_db().await?;
 
     // 確保 memories/ 資料夾存在
     let memories_dir = PathBuf::from(&vault_path).join("memories");
@@ -1682,7 +1689,7 @@ pub async fn save_memory_session(
     .bind(now_ms)
     .bind(now_ms)
     .bind(&checksum)
-    .execute(&state.db)
+    .execute(&db)
     .await?;
 
     sqlx::query(
@@ -1692,7 +1699,7 @@ pub async fn save_memory_session(
     .bind(&rel_path)
     .bind(&title)
     .bind(now_ms / 1000)
-    .execute(&state.db)
+    .execute(&db)
     .await?;
 
     Ok(rel_path)
@@ -1715,6 +1722,7 @@ pub async fn query_memory(
     limit: Option<usize>,
 ) -> Result<Vec<MemoryResult>, AppError> {
     let limit = limit.unwrap_or(10).min(50) as i64;
+    let db = state.get_vault_db().await?;
     if keywords.is_empty() {
         // 無關鍵字時回傳最新的記憶筆記
         let rows = sqlx::query_as::<_, (String, String, i64, String)>(
@@ -1724,7 +1732,7 @@ pub async fn query_memory(
              LIMIT ?"
         )
         .bind(limit)
-        .fetch_all(&state.db)
+        .fetch_all(&db)
         .await?;
 
         return Ok(rows.into_iter().map(|(path, title, created_at, content)| {
@@ -1745,7 +1753,7 @@ pub async fn query_memory(
     )
     .bind(&fts_query)
     .bind(limit)
-    .fetch_all(&state.db)
+    .fetch_all(&db)
     .await
     .unwrap_or_default();
 
@@ -1860,9 +1868,10 @@ pub async fn resolve_memory_context(
     query: String,
 ) -> Result<String, AppError> {
     let now = Local::now();
+    let db = state.get_vault_db().await?;
 
     // 1. 載入自訂規則（來自 memory_rules 表，由 memory_agent 自動學習新增）
-    let rules = load_memory_rules(&state.db).await;
+    let rules = load_memory_rules(&db).await;
     let extra_stops: Vec<char> = rules.iter()
         .filter(|(pt, _, _)| pt == "stopword")
         .filter_map(|(_, pattern, _)| pattern.chars().next())
@@ -1879,7 +1888,7 @@ pub async fn resolve_memory_context(
              WHERE path LIKE 'memories/ai_memory_%'
              ORDER BY created_at DESC LIMIT ?"
         )
-        .bind(limit).fetch_all(&state.db).await.unwrap_or_default()
+        .bind(limit).fetch_all(&db).await.unwrap_or_default()
         .into_iter().filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min))
         .collect()
     } else {
@@ -1894,7 +1903,7 @@ pub async fn resolve_memory_context(
             conditions, limit
         );
         let mut rows = sqlx::query_as::<_, (String, String, i64)>(&sql)
-            .fetch_all(&state.db).await.unwrap_or_default()
+            .fetch_all(&db).await.unwrap_or_default()
             .into_iter().filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min))
             .collect::<Vec<_>>();
 
@@ -1905,7 +1914,7 @@ pub async fn resolve_memory_context(
                  WHERE path LIKE 'memories/ai_memory_%'
                  ORDER BY created_at DESC LIMIT 1"
             )
-            .fetch_all(&state.db).await.unwrap_or_default()
+            .fetch_all(&db).await.unwrap_or_default()
             .into_iter().filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min))
             .collect();
         }
@@ -1914,15 +1923,15 @@ pub async fn resolve_memory_context(
 
     // 3. Rust 找到結果 → 直接回傳（快速路徑）
     if !rows.is_empty() {
-        return Ok(format_memory_rows(&rows, "", state.inner()).await);
+        return Ok(format_memory_rows(&rows, "", &db).await);
     }
 
     // 4. Rust 完全找不到（since 過濾後也空） → fallback 到 memory_agent（LLM）
     //    memory_agent 可辨識新時間表達式並呼叫 add_memory_rule 自我學習
-    let port = queries::get_setting(&state.db, "llama_server_port")
+    let port = queries::get_setting(&state.settings_db, "llama_server_port")
         .await.unwrap_or_default().unwrap_or_else(|| "8080".to_string())
         .parse::<u16>().unwrap_or(8080);
-    run_memory_agent(state.inner(), &query, port).await
+    run_memory_agent(&db, &query, port).await
 }
 
 #[cfg(test)]

@@ -55,12 +55,14 @@ pub async fn import_url(
         return Err(AppError::Vault("尚未設定 Vault 路徑".to_string()));
     }
 
+    let db = state.get_vault_db().await?;
+
     // 檢查是否已匯入過
     let existing: Option<String> = sqlx::query_scalar(
         "SELECT note_path FROM imports WHERE source_url = ?"
     )
     .bind(&url)
-    .fetch_optional(&state.db)
+    .fetch_optional(&db)
     .await?;
 
     if let Some(existing_path) = existing {
@@ -102,7 +104,7 @@ pub async fn import_url(
     )
     .bind(&url)
     .bind(&note.path)
-    .execute(&state.db)
+    .execute(&db)
     .await?;
 
     Ok(ImportResult {

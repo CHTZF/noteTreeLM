@@ -9,7 +9,10 @@ use commands::{
          get_llama_server_status, start_llama_server, restart_llama_server,
          save_memory_session, query_memory, memory_agent, add_memory_rule,
          get_memory_rules, delete_memory_rule, resolve_memory_context},
-    download::*, graph::*, import::*, search::*, settings::*, vault::*,
+    download::*, graph::*, import::*, search::*,
+    settings::{get_settings, save_settings, get_api_key, set_api_key,
+               get_vault_last_note, set_vault_last_note},
+    vault::*,
     voice::{transcribe_audio, stop_whisper_server, warmup_whisper_server,
             get_whisper_server_status, start_whisper_server, restart_whisper_server},
 };
@@ -47,20 +50,25 @@ pub fn run() {
                     .app_data_dir()
                     .expect("無法取得 app data 目錄");
 
-                let pool = db::init_db(&app_data_dir)
+                let settings_pool = db::init_settings_db(&app_data_dir)
                     .await
-                    .expect("資料庫初始化失敗");
+                    .expect("設定資料庫初始化失敗");
 
-                let state = AppState::new(pool);
+                let state = AppState::new(settings_pool);
 
-                // 載入已設定的 vault_path
-                if let Ok(Some(vp)) = db::queries::get_setting(&state.db, "vault_path").await {
+                // 載入已設定的 vault_path，並初始化 vault DB
+                if let Ok(Some(vp)) = db::queries::get_setting(&state.settings_db, "vault_path").await {
                     if !vp.is_empty() {
                         state.set_vault_path(vp.clone()).await;
-                        // 啟動 FileWatcher
                         let path = std::path::PathBuf::from(&vp);
                         if path.exists() {
-                            vault::watcher::start_watcher(app_handle.clone(), path);
+                            // 初始化 vault DB
+                            if let Ok(vault_pool) = db::init_vault_db(&path).await {
+                                state.set_vault_db(Some(vault_pool)).await;
+                            }
+                            // 啟動 FileWatcher
+                            let stop_tx = vault::watcher::start_watcher(app_handle.clone(), path);
+                            *state.watcher_stop.lock().await = Some(stop_tx);
                         }
                     }
                 }
@@ -94,6 +102,8 @@ pub fn run() {
             save_settings,
             get_api_key,
             set_api_key,
+            get_vault_last_note,
+            set_vault_last_note,
             // Vault
             create_note,
             read_note,

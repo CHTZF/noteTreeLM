@@ -151,9 +151,11 @@ interface Props {
   value: string
   /** Called when the user selects a model or imports one */
   onChange: (path: string) => void
+  /** When true, locks model selection and import (server is running) */
+  disabled?: boolean
 }
 
-export default function ModelDownloader({ models, title, kind, value, onChange }: Props) {
+export default function ModelDownloader({ models, title, kind, value, onChange, disabled = false }: Props) {
   const [dirInfos, setDirInfos] = useState<ModelFileInfo[]>([])
   const [externalPaths, setExternalPaths] = useState<string[]>([])
   const [progress, setProgress] = useState<Record<string, DownloadProgress>>({})
@@ -309,7 +311,7 @@ export default function ModelDownloader({ models, title, kind, value, onChange }
       {/* ─── 已下載模型 ─────────────────────────────────────────────────────── */}
       <div style={sectionLabel}>
         <span style={{ fontWeight: 500 }}>{title} — 已下載模型</span>
-        <button onClick={handleImport} style={smallBtn()}>+ 匯入模型</button>
+        <button onClick={handleImport} disabled={disabled} style={{ ...smallBtn(), ...(disabled ? { opacity: 0.4, cursor: 'not-allowed' } : {}) }}>+ 匯入模型</button>
       </div>
 
       <div style={{
@@ -376,11 +378,13 @@ export default function ModelDownloader({ models, title, kind, value, onChange }
         ) : (
           <select
             value={value}
+            disabled={disabled}
             onChange={e => onChange(e.target.value)}
             style={{
               width: '100%', height: '32px', padding: '0 10px', boxSizing: 'border-box',
               background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)',
               borderRadius: '6px', color: 'var(--color-text-primary)', fontSize: '13px', outline: 'none',
+              opacity: disabled ? 0.4 : 1, cursor: disabled ? 'not-allowed' : 'default',
             }}
           >
             <option value="">請選擇模型…</option>
