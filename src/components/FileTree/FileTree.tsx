@@ -349,7 +349,12 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
   const menuRef = useRef<HTMLDivElement>(null)
   const subInputRef = useRef<HTMLInputElement>(null)
   const folderWrapperRef = useRef<HTMLDivElement>(null)
-  const { deleteNote, createFolder, deleteFolder, importImage, deleteAsset } = useVaultStore()
+  const renameInputRef = useRef<HTMLInputElement>(null)
+  const [isRenaming, setIsRenaming] = useState(false)
+  const [renameValue, setRenameValue] = useState('')
+  const [menuX, setMenuX] = useState(0)
+  const [menuY, setMenuY] = useState(0)
+  const { deleteNote, createFolder, renameFolder, deleteFolder, importImage, deleteAsset, renameNote } = useVaultStore()
   const { currentPath: editorPath, setCurrentPath, setContent } = useEditorStore()
 
   // 點選選單外部時關閉
@@ -373,7 +378,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
   }, [node.isFolder, node.path])
 
   const handleDeleteNote = async (e: React.MouseEvent) => {
-    e.stopPropagation()
+    e.stopPropagation(); setMenuOpen(false)
     const confirmed = await ask(`確定要刪除「${node.name}」嗎？此操作無法復原。`, { title: '刪除筆記', kind: 'warning' })
     if (!confirmed) return
     try {
@@ -381,6 +386,21 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
       if (editorPath === node.path) { setContent(''); setCurrentPath(null) }
       toast.success(`已刪除「${node.name}」`)
     } catch (e: any) { toast.error(e.message || '刪除失敗') }
+  }
+
+  const handleRenameNote = (e: React.MouseEvent) => {
+    e.stopPropagation(); setMenuOpen(false)
+    setRenameValue(node.name); setIsRenaming(true)
+    setTimeout(() => renameInputRef.current?.focus(), 30)
+  }
+  const handleRenameNoteSubmit = async () => {
+    setIsRenaming(false)
+    const name = renameValue.trim()
+    if (!name || name === node.name) return
+    try {
+      await renameNote(node.path, name)
+      toast.success(`已重新命名為「${name}」`)
+    } catch (e: any) { toast.error(e.message || '重新命名失敗') }
   }
 
   const handleDeleteAsset = async (e: React.MouseEvent) => {
@@ -399,16 +419,16 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
         data-item-path={node.path}
         data-item-parent={parentEncoded}
         onClick={async () => { try { await shellOpen(`${vaultPath}/${node.path}`) } catch { toast.error('無法開啟圖片') } }}
+        onContextMenu={(e) => { if (isRenaming) return; e.preventDefault(); e.stopPropagation(); window.getSelection()?.removeAllRanges(); setMenuX(e.clientX); setMenuY(e.clientY); setMenuOpen(true) }}
         onMouseEnter={() => setIsHovered(true)}
         onMouseLeave={() => setIsHovered(false)}
         style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '3px 8px 3px ' + (8 + depth * 16) + 'px', cursor: 'pointer', fontSize: '13px', color: 'var(--color-text-secondary)', background: isHovered ? 'var(--color-bg-hover)' : 'transparent', borderRadius: '4px', margin: '0 4px', transition: 'background 0.1s', userSelect: 'none' }}>
         <span style={{ fontSize: '12px' }}>🖼</span>
         <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{node.name}</span>
-        {isHovered && (
-          <button onClick={handleDeleteAsset} title="刪除圖片"
-            style={{ flexShrink: 0, padding: '1px 5px', borderRadius: '3px', fontSize: '12px', lineHeight: 1, color: 'var(--color-text-muted)', background: 'transparent', opacity: 0.7 }}
-            onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.color = 'var(--color-danger, #e06c75)'; (e.currentTarget as HTMLElement).style.opacity = '1' }}
-            onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.color = 'var(--color-text-muted)'; (e.currentTarget as HTMLElement).style.opacity = '0.7' }}>✕</button>
+        {menuOpen && (
+          <div ref={menuRef} style={{ position: 'fixed', left: menuX, top: menuY - 15, background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)', borderRadius: '6px', boxShadow: '0 4px 16px rgba(0,0,0,0.35)', zIndex: 200, minWidth: '120px', overflow: 'hidden', padding: '4px 0' }}>
+            <MenuItem icon="🗑" label="刪除圖片" danger onClick={handleDeleteAsset} />
+          </div>
         )}
       </div>
     )
@@ -420,7 +440,8 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
     const srcParent = node.path.includes('/') ? node.path.split('/').slice(0, -1).join('/') : ''
 
     const handleFolderMouseDown = (e: React.MouseEvent) => {
-      if (e.button !== 0) return
+      if (isRenaming) return
+      if (e.button !== 0) { if (e.button === 2) e.preventDefault(); return }
       e.stopPropagation()
       const startX = e.clientX
       const startY = e.clientY
@@ -434,7 +455,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
           if (dx * dx + dy * dy > 25) {
             document.body.style.userSelect = 'none'
             document.body.style.webkitUserSelect = 'none'
-            document.body.style.cursor = 'grabbing'
+            document.body.style.cursor = 'default'
 
             const ghost = document.createElement('div')
             ghost.textContent = `📁 ${srcName}`
@@ -559,6 +580,21 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
         toast.success(`已刪除資料夾「${node.name}」`)
       } catch (e: any) { toast.error(e.message || '刪除資料夾失敗') }
     }
+    const handleRenameFolder = (e: React.MouseEvent) => {
+      e.stopPropagation(); setMenuOpen(false)
+      setRenameValue(node.name); setIsRenaming(true)
+      setTimeout(() => renameInputRef.current?.focus(), 30)
+    }
+    const handleRenameFolderSubmit = async () => {
+      setIsRenaming(false)
+      const name = renameValue.trim()
+      if (!name || name === node.name) return
+      try {
+        await renameFolder(node.path, name)
+        toast.success(`已重新命名為「${name}」`)
+      } catch (e: any) { toast.error(e.message || '重新命名失敗') }
+    }
+
     const handleSubInputSubmit = async () => {
       const name = subInputName.trim(); setShowSubInput(false); setSubInputName('')
       if (!name) return
@@ -581,31 +617,38 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
           data-item-path={node.path}
           data-item-parent={parentEncoded}
           onMouseDown={handleFolderMouseDown}
-          onClick={() => { if (dragJustEnded) return; setIsExpanded(!isExpanded) }}
+          onClick={() => { if (dragJustEnded || isRenaming) return; setIsExpanded(!isExpanded) }}
+          onContextMenu={(e) => { if (isRenaming) return; e.preventDefault(); e.stopPropagation(); window.getSelection()?.removeAllRanges(); setMenuX(e.clientX); setMenuY(e.clientY); setMenuOpen(true) }}
           onMouseEnter={() => setIsHovered(true)}
           onMouseLeave={() => setIsHovered(false)}
-          style={{ display: 'flex', alignItems: 'center', gap: '4px', padding: '3px 8px 3px ' + (8 + depth * 16) + 'px', cursor: 'grab', fontSize: '13px', color: 'var(--color-text-secondary)', userSelect: 'none', position: 'relative' }}>
+          style={{ display: 'flex', alignItems: 'center', gap: '4px', padding: '3px 8px 3px ' + (8 + depth * 16) + 'px', cursor: 'pointer', fontSize: '13px', color: 'var(--color-text-secondary)', userSelect: 'none', position: 'relative' }}>
           <span style={{ fontSize: '10px' }}>{isExpanded ? '▼' : '▶'}</span>
-          <span style={{ flex: 1 }}>📁 {node.name}</span>
-          <div ref={menuRef} style={{ position: 'relative', flexShrink: 0 }}>
-            <button onClick={(e) => { e.stopPropagation(); setMenuOpen((v) => !v) }} title="更多操作"
+          {isRenaming ? (
+            <input
+              ref={renameInputRef}
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleRenameFolderSubmit() } if (e.key === 'Escape') { e.stopPropagation(); setIsRenaming(false) } }}
+              onBlur={handleRenameFolderSubmit}
+              onClick={(e) => e.stopPropagation()}
               onMouseDown={(e) => e.stopPropagation()}
-              style={{ padding: '1px 6px', borderRadius: '3px', fontSize: '11px', letterSpacing: '0.05em', color: 'var(--color-text-muted)', background: 'transparent', opacity: 0.6 }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.opacity = '1' }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = '0.6' }}>•••</button>
-            {menuOpen && (
-              <div style={{ position: 'absolute', top: '100%', right: 0, background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)', borderRadius: '6px', boxShadow: '0 4px 16px rgba(0,0,0,0.35)', zIndex: 200, minWidth: '148px', overflow: 'hidden', padding: '4px 0' }}>
-                <MenuItem icon="📝" label="新增筆記" onClick={(e) => openSubInput('note', e)} />
-                <MenuItem icon="📁" label="新增子資料夾" onClick={(e) => openSubInput('folder', e)} />
-                <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
-                <MenuItem icon="🖼" label="匯入圖片" onClick={handleImportImageToFolder} />
-                <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
-                <MenuItem icon="🗑" label="刪除資料夾" danger onClick={handleDeleteFolder} />
-              </div>
-            )}
-          </div>
+              style={{ flex: 1, padding: '1px 4px', background: 'var(--color-bg-base)', border: '1px solid var(--color-accent)', borderRadius: '3px', color: 'var(--color-text-primary)', fontSize: '13px', outline: 'none' }}
+            />
+          ) : (
+            <span style={{ flex: 1 }}>📁 {node.name}</span>
+          )}
         </div>
-
+        {menuOpen && (
+          <div ref={menuRef} style={{ position: 'fixed', left: menuX, top: menuY - 15, background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)', borderRadius: '6px', boxShadow: '0 4px 16px rgba(0,0,0,0.35)', zIndex: 200, minWidth: '148px', overflow: 'hidden', padding: '4px 0' }}>
+            <MenuItem icon="📝" label="新增筆記" onClick={(e) => openSubInput('note', e)} />
+            <MenuItem icon="📁" label="新增子資料夾" onClick={(e) => openSubInput('folder', e)} />
+            <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
+            <MenuItem icon="🖼" label="匯入圖片" onClick={handleImportImageToFolder} />
+            <MenuItem icon="✏️" label="重新命名" onClick={handleRenameFolder} />
+            <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
+            <MenuItem icon="🗑" label="刪除資料夾" danger onClick={handleDeleteFolder} />
+          </div>
+        )}
         {isExpanded && (
           <>
             {showSubInput && (
@@ -631,7 +674,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
   const parentEncoded = parentFolder === '' ? '__root__' : parentFolder
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
-    if (e.button !== 0) return
+    if (e.button !== 0) { if (e.button === 2) e.preventDefault(); return }
     e.stopPropagation()
 
     const startX = e.clientX
@@ -648,7 +691,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
           // 鎖定文字選取 + 游標
           document.body.style.userSelect = 'none'
           document.body.style.webkitUserSelect = 'none'
-          document.body.style.cursor = 'grabbing'
+          document.body.style.cursor = 'default'
 
           const ghost = document.createElement('div')
           ghost.textContent = `📝 ${srcName}`
@@ -750,29 +793,42 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
       data-item-path={node.path}
       data-item-parent={parentEncoded}
       onMouseDown={handleMouseDown}
-      onClick={() => { if (dragJustEnded) return; onOpenNote(node.path) }}
+      onClick={() => { if (dragJustEnded || isRenaming) return; onOpenNote(node.path) }}
+      onContextMenu={(e) => { if (isRenaming) return; e.preventDefault(); e.stopPropagation(); window.getSelection()?.removeAllRanges(); setMenuX(e.clientX); setMenuY(e.clientY); setMenuOpen(true) }}
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
       style={{
         display: 'flex', alignItems: 'center', gap: '6px',
         padding: '3px 8px 3px ' + (8 + depth * 16) + 'px',
-        cursor: 'grab', fontSize: '13px',
+        cursor: 'pointer', fontSize: '13px',
         color: isActive ? 'var(--color-text-primary)' : 'var(--color-text-secondary)',
         background: isActive ? 'var(--color-accent-dim)' : isHovered ? 'var(--color-bg-hover)' : 'transparent',
         borderRadius: '4px', margin: '0 4px',
         transition: 'background 0.1s', userSelect: 'none',
       }}>
       <span style={{ fontSize: '12px' }}>📝</span>
-      <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: isActive ? 'var(--color-text-primary)' : 'var(--color-text-secondary)' }}>
-        {node.name}
-      </span>
-      {isHovered && (
-        <button onClick={handleDeleteNote}
+      {isRenaming ? (
+        <input
+          ref={renameInputRef}
+          value={renameValue}
+          onChange={(e) => setRenameValue(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleRenameNoteSubmit() } if (e.key === 'Escape') { e.stopPropagation(); setIsRenaming(false) } }}
+          onBlur={handleRenameNoteSubmit}
+          onClick={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
-          title="刪除筆記"
-          style={{ flexShrink: 0, padding: '1px 5px', borderRadius: '3px', fontSize: '12px', lineHeight: 1, color: 'var(--color-text-muted)', background: 'transparent', opacity: 0.7 }}
-          onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.color = 'var(--color-danger, #e06c75)'; (e.currentTarget as HTMLElement).style.opacity = '1' }}
-          onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.color = 'var(--color-text-muted)'; (e.currentTarget as HTMLElement).style.opacity = '0.7' }}>✕</button>
+          style={{ flex: 1, padding: '1px 4px', background: 'var(--color-bg-base)', border: '1px solid var(--color-accent)', borderRadius: '3px', color: 'var(--color-text-primary)', fontSize: '13px', outline: 'none' }}
+        />
+      ) : (
+        <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: isActive ? 'var(--color-text-primary)' : 'var(--color-text-secondary)' }}>
+          {node.name}
+        </span>
+      )}
+      {menuOpen && (
+        <div ref={menuRef} style={{ position: 'fixed', left: menuX, top: menuY - 15, background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)', borderRadius: '6px', boxShadow: '0 4px 16px rgba(0,0,0,0.35)', zIndex: 200, minWidth: '130px', overflow: 'hidden', padding: '4px 0' }}>
+          <MenuItem icon="✏️" label="重新命名" onClick={handleRenameNote} />
+          <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
+          <MenuItem icon="🗑" label="刪除筆記" danger onClick={handleDeleteNote} />
+        </div>
       )}
     </div>
   )

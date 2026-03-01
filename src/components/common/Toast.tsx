@@ -8,7 +8,7 @@ interface ToastItem {
 
 interface ToastStore {
   toasts: ToastItem[]
-  show: (message: string, type?: ToastItem['type']) => void
+  show: (message: string, type?: ToastItem['type'], duration?: number) => number
   dismiss: (id: number) => void
 }
 
@@ -16,21 +16,27 @@ let toastId = 0
 
 export const useToastStore = create<ToastStore>((set) => ({
   toasts: [],
-  show: (message, type = 'info') => {
+  show: (message, type = 'info', duration = 3000) => {
     const id = ++toastId
     set((s) => ({ toasts: [...s.toasts, { id, message, type }] }))
-    setTimeout(() => {
-      set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }))
-    }, 3000)
+    if (duration > 0) {
+      setTimeout(() => {
+        set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }))
+      }, duration)
+    }
+    return id
   },
   dismiss: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
 }))
 
 export const toast = {
   success: (msg: string) => useToastStore.getState().show(msg, 'success'),
-  error: (msg: string) => useToastStore.getState().show(msg, 'error'),
+  error: (msg: string, opts?: { duration?: number }) =>
+    useToastStore.getState().show(msg, 'error', opts?.duration ?? 3000),
   warning: (msg: string) => useToastStore.getState().show(msg, 'warning'),
-  info: (msg: string) => useToastStore.getState().show(msg, 'info'),
+  info: (msg: string, opts?: { duration?: number }) =>
+    useToastStore.getState().show(msg, 'info', opts?.duration ?? 3000),
+  dismiss: (id: number) => useToastStore.getState().dismiss(id),
 }
 
 export default function Toast() {

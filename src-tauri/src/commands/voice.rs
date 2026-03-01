@@ -43,8 +43,17 @@ async fn resolve_whisper_server_config(
     let bin = PathBuf::from(&server_path);
     if !bin.exists() {
         return Err(AppError::Voice(format!(
-            "找不到 whisper-server：{}",
+            "找不到 whisper-server：{}，請到 Settings > Voice 更新路徑。",
             bin.display()
+        )));
+    }
+
+    // 在嘗試啟動伺服器前先確認模型檔案存在，避免 server spawn 後立刻因載入失敗退出
+    let model_file = PathBuf::from(&model_path);
+    if !model_file.exists() {
+        return Err(AppError::Voice(format!(
+            "找不到 Whisper 模型檔案：{}，請到 Settings > Voice 更新路徑。",
+            model_file.display()
         )));
     }
 
@@ -63,61 +72,124 @@ async fn ensure_whisper_server_running(
     let base_url = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
 
-    // 若 state 有子進程，先 ping 確認還活著
-    // 任何 HTTP 回應（包含 404）都視為活著；只有連線被拒才代表進程已死
-    {
-        let guard = state.whisper_server.lock().await;
-        if guard.is_some() {
-            let alive = client
-                .get(format!("{}/health", base_url))
-                .timeout(Duration::from_secs(2))
-                .send()
-                .await
-                .is_ok(); // 任何 HTTP 回應 = 伺服器仍在運行
-            if alive {
-                return Ok(base_url);
+    // ── Phase 1：判斷是否需要 spawn ──────────────────────────────────────
+    // 三種情況：
+    //   A) 無子進程 → 直接 spawn
+    //   B) 有子進程且 health OK → 直接回傳
+    //   C) 有子進程且 health 失敗 → 檢查進程是否仍在執行
+    //      C1) 仍在執行（只是還在載入） → 跳過 spawn，直接進入等待迴圈
+    //      C2) 已結束（crash） → 清除 state，重新 spawn
+    enum Action { Spawn, WaitExisting, Ready }
+
+    let action = {
+        let mut guard = state.whisper_server.lock().await;
+        match guard.as_mut() {
+            None => {
+                // 無子進程記錄，但 port 上可能有孤立進程（上次 crash / force-quit 殘留）
+                // 先快速 ping 一次：若已有回應就直接使用，避免重複 spawn 造成 port 衝突
+                let orphan_alive = client
+                    .get(format!("{}/health", base_url))
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await
+                    .is_ok();
+                if orphan_alive {
+                    let _ = app.emit("whisper:stderr", "[server] 偵測到既有 whisper-server，重新使用");
+                    Action::Ready
+                } else {
+                    Action::Spawn
+                }
             }
-            let _ = app.emit("whisper:stderr", "[server] 伺服器意外退出，重新啟動…");
+            Some(child) => {
+                let alive = client
+                    .get(format!("{}/health", base_url))
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await
+                    .is_ok();
+                if alive {
+                    Action::Ready
+                } else {
+                    // try_wait() 不阻塞：Ok(None) = 仍在執行，Ok(Some(_)) = 已結束
+                    match child.try_wait() {
+                        Ok(None) => {
+                            // 進程仍在，只是模型尚未載入完畢（warmup 逾時後常見）
+                            Action::WaitExisting
+                        }
+                        _ => {
+                            // 進程已結束或狀態無法取得 → 清除並重新 spawn
+                            let _ = app.emit("whisper:stderr", "[server] 伺服器意外退出，重新啟動…");
+                            *guard = None;
+                            Action::Spawn
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    match action {
+        Action::Ready => return Ok(base_url),
+        Action::WaitExisting => {
+            let _ = app.emit("whisper:stderr", "[server] 模型載入中，請稍候…");
+            // 直接進入等待迴圈，不重新 spawn
+        }
+        Action::Spawn => {
+            let _ = app.emit(
+                "whisper:stderr",
+                &format!("[server] 啟動 whisper-server（port {}）…", port),
+            );
+
+            let mut child = tokio::process::Command::new(&bin)
+                .args([
+                    "--model", &model_path,
+                    "--port", &port.to_string(),
+                    "--host", "127.0.0.1",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(false)
+                .spawn()
+                .map_err(|e| AppError::Voice(format!("無法啟動 whisper-server：{}", e)))?;
+
+            // 轉發 stderr 到 whisper:stderr 事件
+            if let Some(stderr) = child.stderr.take() {
+                let app2 = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    use tokio::io::{AsyncBufReadExt, BufReader};
+                    let mut reader = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        let _ = app2.emit("whisper:stderr", &line);
+                    }
+                });
+            }
+
+            *state.whisper_server.lock().await = Some(child);
         }
     }
 
-    // 啟動 whisper-server
-    let _ = app.emit(
-        "whisper:stderr",
-        &format!("[server] 啟動 whisper-server（port {}）…", port),
-    );
-
-    let mut child = tokio::process::Command::new(&bin)
-        .args([
-            "--model", &model_path,
-            "--port", &port.to_string(),
-            "--host", "127.0.0.1",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(false)
-        .spawn()
-        .map_err(|e| AppError::Voice(format!("無法啟動 whisper-server：{}", e)))?;
-
-    // 轉發 stderr 到 whisper:stderr 事件
-    if let Some(stderr) = child.stderr.take() {
-        let app2 = app.clone();
-        tauri::async_runtime::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            let mut reader = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                let _ = app2.emit("whisper:stderr", &line);
-            }
-        });
-    }
-
-    *state.whisper_server.lock().await = Some(child);
-
-    // 等待伺服器接受連線（最多 60s）
-    // 任何 HTTP 回應（包含 404）代表進程已啟動；connection refused 代表尚未就緒
+    // ── Phase 2：等待伺服器就緒（最多 180s，支援大型模型）────────────────
+    // 每秒：先確認進程是否仍在執行，再 ping health endpoint
+    // 若進程提早退出（模型路徑錯誤等）立即回報錯誤，不等滿 180s
     let _ = app.emit("whisper:stderr", "[server] 等待模型載入…");
-    for i in 0..60 {
+    for i in 0..180 {
         tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // 先檢查進程是否已退出
+        {
+            let mut guard = state.whisper_server.lock().await;
+            if let Some(child) = guard.as_mut() {
+                if let Ok(Some(status)) = child.try_wait() {
+                    // 進程已退出（模型路徑錯誤、二進位不相容等）
+                    *guard = None;
+                    return Err(AppError::Voice(format!(
+                        "whisper-server 意外退出（code: {:?}），請確認模型路徑與二進位設定。",
+                        status.code()
+                    )));
+                }
+            }
+        }
+
         let result = client
             .get(format!("{}/health", base_url))
             .timeout(Duration::from_secs(2))
@@ -139,7 +211,7 @@ async fn ensure_whisper_server_running(
     }
 
     Err(AppError::Voice(
-        "whisper-server 啟動逾時（60s），請確認路徑與模型設定。".to_string(),
+        "whisper-server 啟動逾時（180s），請確認路徑與模型設定。".to_string(),
     ))
 }
 
@@ -225,18 +297,25 @@ pub async fn transcribe_audio(
 }
 
 /// App 啟動時呼叫：若已設定路徑則背景預熱 whisper-server 並送出靜音推論
-/// 不阻塞啟動流程；錯誤直接忽略（使用者未設定時是正常情況）
+/// 不阻塞啟動流程；設定錯誤（路徑不存在等）會透過 whisper:stderr 事件通知前端
 pub async fn warmup_whisper_server(state: &AppState, app: &AppHandle) {
     let configured = matches!(
         queries::get_setting(&state.db, "whisper_cli_path").await,
         Ok(Some(ref p)) if !p.is_empty()
     );
-    if configured {
-        if let Ok(base_url) = ensure_whisper_server_running(state, app).await {
+    if !configured {
+        return; // 未設定是正常情況，靜默跳過
+    }
+    match ensure_whisper_server_running(state, app).await {
+        Ok(base_url) => {
             // 送一段靜音給 whisper 做推論預熱，觸發 Metal shader 編譯 / 內部緩衝區分配
             // 這樣使用者第一次錄音時推論速度就會與後續段落相同
             let _ = warmup_whisper_inference(&base_url).await;
             let _ = app.emit("whisper:stderr", "[server] 推論引擎預熱完成");
+        }
+        Err(e) => {
+            // 設定錯誤（檔案不存在、路徑錯誤等）→ 透過事件通知前端顯示 toast
+            let _ = app.emit("whisper:stderr", &format!("[server:error] {}", e));
         }
     }
 }
@@ -300,6 +379,65 @@ pub async fn stop_whisper_server(state: State<'_, AppState>) -> Result<(), AppEr
     if let Some(mut child) = guard.take() {
         child.kill().await.ok();
     }
+    Ok(())
+}
+
+/// 查詢 whisper-server 狀態："running" | "loading" | "stopped"
+#[tauri::command]
+pub async fn get_whisper_server_status(state: State<'_, AppState>) -> Result<String, AppError> {
+    let port = queries::get_setting(&state.db, "whisper_server_port")
+        .await
+        .unwrap_or_default()
+        .unwrap_or_else(|| "8081".to_string())
+        .parse::<u16>()
+        .unwrap_or(8081);
+    let base_url = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+    let healthy = client
+        .get(format!("{}/health", base_url))
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .is_ok();
+    if healthy {
+        return Ok("running".to_string());
+    }
+    let mut guard = state.whisper_server.lock().await;
+    match guard.as_mut() {
+        None => Ok("stopped".to_string()),
+        Some(child) => match child.try_wait() {
+            Ok(None) => Ok("loading".to_string()),
+            _ => {
+                *guard = None;
+                Ok("stopped".to_string())
+            }
+        },
+    }
+}
+
+/// 手動啟動 whisper-server
+#[tauri::command]
+pub async fn start_whisper_server(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), AppError> {
+    ensure_whisper_server_running(state.inner(), &app).await?;
+    Ok(())
+}
+
+/// 重啟 whisper-server（先強制關閉再重新啟動）
+#[tauri::command]
+pub async fn restart_whisper_server(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), AppError> {
+    {
+        let mut guard = state.whisper_server.lock().await;
+        if let Some(mut child) = guard.take() {
+            child.kill().await.ok();
+        }
+    }
+    ensure_whisper_server_running(state.inner(), &app).await?;
     Ok(())
 }
 

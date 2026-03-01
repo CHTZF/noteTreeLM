@@ -173,7 +173,7 @@ export default function Editor({ canGoBack, canGoForward, onBack, onForward }: E
       // 分開傳讓模型知道這是任務而非對話，避免模型回應「請提供文字」
       const system = mode === 'format'
         ? '你是文字整理助手。你的唯一任務是將輸入的口語錄音文字整理成通順的書面文字，保留原意，不要增加任何新內容。直接輸出整理後的文字，不要問問題、不要說明、不要對話。'
-        : '你是筆記助手。你的唯一任務是為輸入的內容用繁體中文生成 YAML frontmatter，包含 title、tags（陣列）、summary 三個欄位。只輸出 frontmatter，用 --- 包圍，不要問問題、不要說明、不要對話。'
+        : '你是筆記助手。你的唯一任務是分析輸入文字中的關鍵主題或概念，並將原始文字中出現的這些主題以 Obsidian wikilink 格式包圍（例如 [[主題]]）。直接輸出替換後的原始文字，不要增加任何新內容，不要問問題、不要說明、不要對話。'
       toast.info('llama 處理中…')
       try {
         const result = await invoke<string>('process_with_llm', { system, userContent: text })

@@ -5,11 +5,14 @@ mod state;
 mod vault;
 
 use commands::{
-    ai::{stream_chat, process_with_llm, stop_llama_server, warmup_llama_server, agent_chat},
+    ai::{stream_chat, process_with_llm, stop_llama_server, warmup_llama_server, agent_chat,
+         get_llama_server_status, start_llama_server, restart_llama_server},
     download::*, graph::*, import::*, search::*, settings::*, vault::*,
-    voice::{transcribe_audio, stop_whisper_server, warmup_whisper_server},
+    voice::{transcribe_audio, stop_whisper_server, warmup_whisper_server,
+            get_whisper_server_status, start_whisper_server, restart_whisper_server},
 };
 use state::AppState;
+use std::time::Duration;
 use tauri::{
     generate_handler,
     Manager,
@@ -63,8 +66,11 @@ pub fn run() {
                 app_handle.manage(state);
 
                 // 背景預熱 whisper-server 與 llama-server（若已設定路徑）
+                // 延遲 2 秒讓前端 React app 完成掛載並 register 事件監聽器，
+                // 確保 whisper:stderr / llm:stderr 事件能被捕獲
                 let warmup_app = app_handle.clone();
                 tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                     if let Some(state) = warmup_app.try_state::<AppState>() {
                         // 並行預熱兩個 server，互不阻塞
                         tokio::join!(
@@ -92,6 +98,7 @@ pub fn run() {
             update_note,
             delete_note,
             rename_note,
+            rename_folder,
             list_notes,
             get_backlinks,
             scan_vault,
@@ -119,11 +126,17 @@ pub fn run() {
             // Voice
             transcribe_audio,
             stop_whisper_server,
+            get_whisper_server_status,
+            start_whisper_server,
+            restart_whisper_server,
             // AI / LLM
             stream_chat,
             process_with_llm,
             agent_chat,
             stop_llama_server,
+            get_llama_server_status,
+            start_llama_server,
+            restart_llama_server,
             // Download
             get_models_dir,
             get_downloaded_models,

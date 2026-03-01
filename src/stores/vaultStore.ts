@@ -18,6 +18,7 @@ interface VaultStore {
   deleteNote: (path: string) => Promise<void>
   renameNote: (path: string, newTitle: string) => Promise<RenameResult>
   createFolder: (folderPath: string) => Promise<void>
+  renameFolder: (folderPath: string, newName: string) => Promise<string>
   deleteFolder: (folderPath: string) => Promise<number>
   importImage: (sourcePath: string, folder?: string) => Promise<string>
   deleteAsset: (path: string) => Promise<void>
@@ -91,6 +92,12 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
   createFolder: async (folderPath) => {
     await invoke('create_folder', { folderPath })
     await get().loadNotes()
+  },
+
+  renameFolder: async (folderPath, newName) => {
+    const newPath = await invoke<string>('rename_folder', { folderPath, newName })
+    await get().loadNotes()
+    return newPath
   },
 
   // 軟刪除資料夾：所有筆記移至垃圾桶，實體目錄刪除

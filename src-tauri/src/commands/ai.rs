@@ -333,6 +333,66 @@ pub async fn stop_llama_server(state: State<'_, AppState>) -> Result<(), AppErro
     Ok(())
 }
 
+/// 查詢 llama-server 狀態："running" | "loading" | "stopped"
+#[tauri::command]
+pub async fn get_llama_server_status(state: State<'_, AppState>) -> Result<String, AppError> {
+    let port = queries::get_setting(&state.db, "llama_server_port")
+        .await
+        .unwrap_or_default()
+        .unwrap_or_else(|| "8080".to_string())
+        .parse::<u16>()
+        .unwrap_or(8080);
+    let base_url = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+    let healthy = client
+        .get(format!("{}/health", base_url))
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+    if healthy {
+        return Ok("running".to_string());
+    }
+    let mut guard = state.llama_server.lock().await;
+    match guard.as_mut() {
+        None => Ok("stopped".to_string()),
+        Some(child) => match child.try_wait() {
+            Ok(None) => Ok("loading".to_string()),
+            _ => {
+                *guard = None;
+                Ok("stopped".to_string())
+            }
+        },
+    }
+}
+
+/// 手動啟動 llama-server
+#[tauri::command]
+pub async fn start_llama_server(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), AppError> {
+    ensure_server_running(state.inner(), &app).await?;
+    Ok(())
+}
+
+/// 重啟 llama-server（先強制關閉再重新啟動）
+#[tauri::command]
+pub async fn restart_llama_server(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), AppError> {
+    {
+        let mut guard = state.llama_server.lock().await;
+        if let Some(mut child) = guard.take() {
+            child.kill().await.ok();
+        }
+    }
+    ensure_server_running(state.inner(), &app).await?;
+    Ok(())
+}
+
 // ─── Vault Agent ──────────────────────────────────────────────────────────────
 
 /// 工具定義（OpenAI function calling 格式）

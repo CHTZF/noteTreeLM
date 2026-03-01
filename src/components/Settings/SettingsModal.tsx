@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useVaultStore } from '../../stores/vaultStore'
@@ -10,7 +11,8 @@ interface SettingsModalProps {
   onClose: () => void
 }
 
-type Tab = 'general' | 'ai' | 'voice' | 'advanced' | 'raw'
+type Tab = 'general' | 'ai' | 'voice' | 'server' | 'advanced' | 'raw'
+type ServerStatus = 'unknown' | 'running' | 'loading' | 'stopped'
 
 // Provider → 預設模型清單
 const MODEL_OPTIONS: Record<string, string[]> = {
@@ -45,6 +47,11 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   const [apiKeySaved, setApiKeySaved] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
 
+  const [whisperStatus, setWhisperStatus] = useState<ServerStatus>('unknown')
+  const [llamaStatus, setLlamaStatus] = useState<ServerStatus>('unknown')
+  const [whisperBusy, setWhisperBusy] = useState(false)
+  const [llamaBusy, setLlamaBusy] = useState(false)
+
   const colorScheme = draft.theme === 'dark' ? 'dark' : 'light'
   const inputStyle: React.CSSProperties = {
     width: '100%', height: '32px', padding: '0 10px', boxSizing: 'border-box',
@@ -62,6 +69,19 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
     else
       setApiKeyLocal('')
   }, [draft.ai_provider])
+
+  useEffect(() => {
+    if (tab !== 'server') return
+    const refresh = async () => {
+      const ws = await invoke<string>('get_whisper_server_status').catch(() => 'stopped')
+      setWhisperStatus(ws as ServerStatus)
+      const ls = await invoke<string>('get_llama_server_status').catch(() => 'stopped')
+      setLlamaStatus(ls as ServerStatus)
+    }
+    refresh()
+    const id = setInterval(refresh, 3000)
+    return () => clearInterval(id)
+  }, [tab])
 
   const up = (partial: Partial<Settings>) => setDraft((d) => ({ ...d, ...partial }))
 
@@ -152,6 +172,44 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
     </div>
   )
 
+  const ServerCard = ({
+    name, status, busy, onStart, onStop, onRestart,
+  }: {
+    name: string; status: ServerStatus; busy: boolean
+    onStart: () => void; onStop: () => void; onRestart: () => void
+  }) => {
+    const dotColor = status === 'running' ? '#4ec9b0' : status === 'loading' ? '#d19a66' : status === 'stopped' ? '#e06c75' : '#666'
+    const statusLabel = status === 'running' ? '已啟動' : status === 'loading' ? '載入中…' : status === 'stopped' ? '已停止' : '偵測中'
+    const actionBtn = (label: string, color: string, onClick: () => void) => (
+      <button onClick={onClick} style={{
+        padding: '5px 14px', borderRadius: '6px', fontSize: '12px', cursor: 'pointer',
+        background: `${color}22`, border: `1px solid ${color}`, color,
+      }}>{label}</button>
+    )
+    return (
+      <div style={{ border: '1px solid var(--color-border)', borderRadius: '8px', padding: '16px', marginBottom: '16px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: '50%', background: dotColor, flexShrink: 0 }} />
+            <div>
+              <div style={{ fontSize: '13px', fontWeight: 500, color: 'var(--color-text-primary)' }}>{name}</div>
+              <div style={{ fontSize: '11px', color: 'var(--color-text-muted)', marginTop: 2 }}>
+                {busy ? '操作中…' : statusLabel}
+              </div>
+            </div>
+          </div>
+          {!busy && (
+            <div style={{ display: 'flex', gap: '8px' }}>
+              {status === 'running' && <>{actionBtn('停止', '#e06c75', onStop)}{actionBtn('重啟', '#d19a66', onRestart)}</>}
+              {status === 'loading' && actionBtn('強制停止', '#e06c75', onStop)}
+              {status === 'stopped' && actionBtn('啟動', '#4ec9b0', onStart)}
+            </div>
+          )}
+        </div>
+      </div>
+    )
+  }
+
   // ── Render ───────────────────────────────────────────────────────
 
   const hasProvider = !!draft.ai_provider
@@ -159,7 +217,7 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   const modelIsCustom = hasProvider && !modelOptions.includes(draft.ai_model) && draft.ai_model
 
   const tabs: [Tab, string][] = [
-    ['general', '一般'], ['ai', 'AI'], ['voice', '語音'], ['advanced', '進階'], ['raw', '設定檔'],
+    ['general', '一般'], ['ai', 'AI'], ['voice', '語音'], ['server', '伺服器'], ['advanced', '進階'], ['raw', '設定檔'],
   ]
 
   const numInputStyle: React.CSSProperties = {
@@ -468,7 +526,7 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                   >
                     <option value="none">無（直接插入原始文字）</option>
                     <option value="format">自動整理（llama 潤稿）</option>
-                    <option value="summary">產生摘要 / 標籤（llama 生成 frontmatter）</option>
+                    <option value="summary">標記 Wikilink（llama 分析關鍵詞）</option>
                   </select>
                   {draft.voice_process_mode !== 'none' && !draft.llama_cli_path && (
                     <p style={{ fontSize: '11px', color: 'var(--color-warning, #f59e0b)', margin: '6px 0 0', lineHeight: 1.5 }}>
@@ -479,11 +537,58 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                     <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '6px 0 0', lineHeight: 1.5 }}>
                       {draft.voice_process_mode === 'format'
                         ? '辨識完成後，llama 會將口語文字潤飾成書面語後再插入。'
-                        : '辨識完成後，llama 會根據內容生成 YAML frontmatter（title、tags、summary）並插入。'}
+                        : '辨識完成後，llama 會分析口語文字中的關鍵主題，並將其替換為 [[wikilink]] 格式後插入。'}
                     </p>
                   )}
                 </div>
               </div>
+            </>}
+
+            {tab === 'server' && <>
+              <p style={{ fontSize: '12px', color: 'var(--color-text-muted)', marginBottom: '20px', lineHeight: 1.6 }}>
+                管理 Whisper（語音辨識）與 LLaMA（本地 AI）伺服器的啟動狀態。App 關閉時兩個伺服器均會自動停止。
+              </p>
+              <ServerCard
+                name="Whisper Server（語音辨識）"
+                status={whisperStatus}
+                busy={whisperBusy}
+                onStart={() => {
+                  setWhisperBusy(true)
+                  invoke('start_whisper_server').finally(() => setWhisperBusy(false))
+                }}
+                onStop={async () => {
+                  setWhisperBusy(true)
+                  await invoke('stop_whisper_server').catch(() => {})
+                  setWhisperStatus('stopped')
+                  setWhisperBusy(false)
+                }}
+                onRestart={() => {
+                  setWhisperBusy(true)
+                  invoke('restart_whisper_server').finally(() => setWhisperBusy(false))
+                }}
+              />
+              <ServerCard
+                name="LLaMA Server（本地 AI）"
+                status={llamaStatus}
+                busy={llamaBusy}
+                onStart={() => {
+                  setLlamaBusy(true)
+                  invoke('start_llama_server').finally(() => setLlamaBusy(false))
+                }}
+                onStop={async () => {
+                  setLlamaBusy(true)
+                  await invoke('stop_llama_server').catch(() => {})
+                  setLlamaStatus('stopped')
+                  setLlamaBusy(false)
+                }}
+                onRestart={() => {
+                  setLlamaBusy(true)
+                  invoke('restart_llama_server').finally(() => setLlamaBusy(false))
+                }}
+              />
+              <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', lineHeight: 1.6 }}>
+                「載入中」表示伺服器進程已啟動，模型尚未就緒（依模型大小，可能需數十秒至數分鐘）。
+              </p>
             </>}
 
             {tab === 'advanced' && <>

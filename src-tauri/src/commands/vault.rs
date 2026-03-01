@@ -609,6 +609,79 @@ pub async fn move_folder(
     Ok(new_folder_path)
 }
 
+/// 重新命名資料夾（保留在原父資料夾，只改目錄名稱）
+#[tauri::command]
+pub async fn rename_folder(
+    state: State<'_, AppState>,
+    folder_path: String, // 舊相對路徑，e.g. "projects/old-name"
+    new_name: String,    // 新目錄名稱，e.g. "new-name"
+) -> Result<String, AppError> {
+    let vault_path = state.get_vault_path().await;
+    let new_name = new_name.trim().to_string();
+    if folder_path.is_empty() || folder_path.contains("..") || new_name.is_empty() || new_name.contains('/') || new_name.contains("..") {
+        return Err(AppError::Vault("無效的資料夾路徑或名稱".to_string()));
+    }
+
+    let parent = PathBuf::from(&folder_path)
+        .parent()
+        .and_then(|p| {
+            let s = p.to_string_lossy().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        });
+
+    let new_folder_path = if let Some(p) = parent {
+        format!("{}/{}", p, new_name)
+    } else {
+        new_name.clone()
+    };
+
+    if new_folder_path == folder_path {
+        return Ok(folder_path);
+    }
+
+    let abs_old = PathBuf::from(&vault_path).join(&folder_path);
+    let abs_new = PathBuf::from(&vault_path).join(&new_folder_path);
+
+    tokio::fs::rename(&abs_old, &abs_new)
+        .await
+        .map_err(|e| AppError::Vault(format!("重新命名資料夾失敗：{}", e)))?;
+
+    // 更新 DB 中所有路徑前綴符合的筆記
+    let old_prefix = format!("{}/", folder_path);
+    let new_prefix = format!("{}/", new_folder_path);
+    let note_paths: Vec<String> =
+        sqlx::query_scalar("SELECT path FROM notes WHERE path LIKE ?")
+            .bind(format!("{}%", old_prefix))
+            .fetch_all(&state.db)
+            .await?;
+
+    for old_note_path in &note_paths {
+        let new_note_path = format!("{}{}", new_prefix, &old_note_path[old_prefix.len()..]);
+        sqlx::query("UPDATE notes SET path = ? WHERE path = ?")
+            .bind(&new_note_path)
+            .bind(old_note_path)
+            .execute(&state.db)
+            .await?;
+        sqlx::query("UPDATE graph_nodes SET id = ? WHERE id = ?")
+            .bind(&new_note_path)
+            .bind(old_note_path)
+            .execute(&state.db)
+            .await?;
+        sqlx::query("UPDATE graph_edges SET source_id = ? WHERE source_id = ?")
+            .bind(&new_note_path)
+            .bind(old_note_path)
+            .execute(&state.db)
+            .await?;
+        sqlx::query("UPDATE graph_edges SET target_id = ? WHERE target_id = ?")
+            .bind(&new_note_path)
+            .bind(old_note_path)
+            .execute(&state.db)
+            .await?;
+    }
+
+    Ok(new_folder_path)
+}
+
 /// 相對路徑由前端以 vault_path 補完後傳入
 #[tauri::command]
 pub async fn read_file_base64(path: String) -> Result<String, AppError> {
