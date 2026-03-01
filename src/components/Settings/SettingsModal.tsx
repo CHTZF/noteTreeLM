@@ -627,6 +627,35 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                     開啟後右側面板會新增 Chat 分頁，可與本地 llama LLM 進行對話。需先在 AI 頁面設定 llama CLI。
                   </p>
                 )}
+                <div style={{ height: '1px', background: 'var(--color-border)', margin: '8px 0' }} />
+                <ToggleRow
+                  label="自動記憶整理"
+                  value={draft.enable_auto_memory}
+                  onChange={(v) => up({ enable_auto_memory: v })}
+                />
+                {draft.enable_auto_memory && (
+                  <>
+                    <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 4px 0', lineHeight: 1.5 }}>
+                      對話達到閾值時自動將原始訊息存為記憶筆記（memories/ai_memory_*.md），並提供 query_memory 工具查詢。
+                    </p>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                      <label style={{ fontSize: '13px', color: 'var(--color-text-secondary)', whiteSpace: 'nowrap' }}>訊息閾值</label>
+                      <input
+                        type="number"
+                        min={5}
+                        max={200}
+                        value={draft.memory_threshold}
+                        onChange={(e) => up({ memory_threshold: Math.max(5, Math.min(200, Number(e.target.value))) })}
+                        style={{
+                          width: '72px', padding: '4px 8px',
+                          background: 'var(--color-bg-base)', border: '1px solid var(--color-border)',
+                          borderRadius: '4px', color: 'var(--color-text-primary)', fontSize: '13px',
+                        }}
+                      />
+                      <span style={{ fontSize: '12px', color: 'var(--color-text-muted)' }}>則訊息後壓縮</span>
+                    </div>
+                  </>
+                )}
               </div>
             </>}
 

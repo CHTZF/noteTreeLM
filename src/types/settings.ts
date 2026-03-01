@@ -33,6 +33,8 @@ export interface Settings {
   enable_chat: boolean
   llama_server_port: number
   whisper_server_port: number
+  enable_auto_memory: boolean
+  memory_threshold: number
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -70,4 +72,6 @@ export const DEFAULT_SETTINGS: Settings = {
   enable_chat: false,
   llama_server_port: 8080,
   whisper_server_port: 8081,
+  enable_auto_memory: false,
+  memory_threshold: 20,
 }

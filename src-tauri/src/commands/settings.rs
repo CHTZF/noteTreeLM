@@ -38,6 +38,8 @@ pub struct Settings {
     pub enable_chat: bool,
     pub llama_server_port: u32,
     pub whisper_server_port: u32,
+    pub enable_auto_memory: bool,
+    pub memory_threshold: u32,
 }
 
 #[tauri::command]
@@ -91,6 +93,8 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<Settings, AppErr
         enable_chat: get!("enable_chat", "false") == "true",
         llama_server_port: get!("llama_server_port", "8080").parse().unwrap_or(8080),
         whisper_server_port: get!("whisper_server_port", "8081").parse().unwrap_or(8081),
+        enable_auto_memory: get!("enable_auto_memory", "false") == "true",
+        memory_threshold: get!("memory_threshold", "20").parse().unwrap_or(20),
     })
 }
 
@@ -140,6 +144,8 @@ pub async fn save_settings(
     save!("enable_chat", settings.enable_chat);
     save!("llama_server_port", settings.llama_server_port);
     save!("whisper_server_port", settings.whisper_server_port);
+    save!("enable_auto_memory", settings.enable_auto_memory);
+    save!("memory_threshold", settings.memory_threshold);
 
     let recent_json = serde_json::to_string(&settings.recent_vaults)
         .map_err(|e| AppError::Settings(e.to_string()))?;

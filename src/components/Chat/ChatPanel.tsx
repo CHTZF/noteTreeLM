@@ -4,6 +4,7 @@ import { listen } from '@tauri-apps/api/event'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useEditorStore } from '../../stores/editorStore'
 import { useDebugStore } from '../../stores/debugStore'
+import { toast } from '../common/Toast'
 
 interface Message {
   role: 'user' | 'assistant' | 'tool'
@@ -22,11 +23,14 @@ export default function ChatPanel() {
   const [useNoteContext, setUseNoteContext] = useState(false)
   const [useVaultTools, setUseVaultTools] = useState(false)
   const [error, setError] = useState('')
+  const [isCompressing, setIsCompressing] = useState(false)
+  const [lastMemoryPath, setLastMemoryPath] = useState<string | null>(null)
 
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const streamingRef = useRef('')
   const tokenCountRef = useRef(0)
+  const justCompressedRef = useRef(false)
 
   const log = useCallback((msg: string) => addLog('chat', 'info', msg), [addLog])
   const err = useCallback((msg: string) => addLog('chat', 'error', msg), [addLog])
@@ -113,12 +117,26 @@ export default function ChatPanel() {
         setMessages((prev) => [...prev, { role: 'assistant', content: finalContent }])
       } else {
         // ── 一般串流模式 ─────────────────────────────────────────────────────
-        const system =
+        const notePart =
           useNoteContext && currentPath && noteContent
             ? `你是一個筆記助手。以下是使用者目前開啟的筆記內容，請根據此內容協助回答問題：\n\n${noteContent.slice(0, 4000)}`
-            : undefined
+            : null
 
-        if (system) log(`  帶入筆記上下文（${system.length} 字元）`)
+        // 若記憶已壓縮，由 memory_agent 查詢相關記憶片段並注入 system
+        // memory_agent 為無狀態單次 agent，LLM 自行決定搜尋策略
+        let memoryPart: string | null = null
+        if (lastMemoryPath) {
+          try {
+            const memorySummary = await invoke<string>('memory_agent', { query: text })
+            if (memorySummary && memorySummary !== '未找到相關記憶') {
+              memoryPart = `以下是相關的過去對話記憶（供參考）：\n\n${memorySummary}`
+              log(`  帶入記憶摘要（memory_agent）`)
+            }
+          } catch { /* 查詢失敗時靜默略過，不影響主對話 */ }
+        }
+
+        const system = [notePart, memoryPart].filter(Boolean).join('\n\n') || undefined
+        if (system) log(`  帶入 system 上下文（${system.length} 字元）`)
 
         unlistenToken = await listen<string>('llm:token', (event) => {
           streamingRef.current += event.payload
@@ -173,7 +191,45 @@ export default function ChatPanel() {
     setError('')
     setStreamingText('')
     streamingRef.current = ''
+    setLastMemoryPath(null)
   }
+
+  // 壓縮記憶：把目前對話原文存成 memories/ai_memory_[timestamp].md
+  const compressToMemory = useCallback(async () => {
+    const toCompress = messages.filter(m => m.role !== 'tool')
+    if (toCompress.length === 0 || isCompressing) return
+    setIsCompressing(true)
+    try {
+      const path = await invoke<string>('save_memory_session', { messages: toCompress })
+      setLastMemoryPath(path)
+      const filename = path.split('/').pop() ?? path
+      setMessages([{
+        role: 'assistant',
+        content: `記憶已整理並儲存至 \`${path}\`。\n\n繼續對話時，Agent 模式可透過 query_memory 工具查詢過去的記憶；一般模式會自動依你的問題帶入相關記憶片段。`,
+      }])
+      toast.success(`記憶已儲存：${filename}`)
+      log(`記憶已儲存：${path}`)
+    } catch (e: unknown) {
+      const msg = typeof e === 'string' ? e : e instanceof Error ? e.message : String(e)
+      toast.error('記憶儲存失敗')
+      err('save_memory_session 失敗：' + msg)
+    } finally {
+      setIsCompressing(false)
+    }
+  }, [messages, isCompressing, log, err])
+
+  // 自動觸發：當訊息數量達到閾值時壓縮記憶
+  useEffect(() => {
+    const threshold = settings.memory_threshold ?? 20
+    if (!settings.enable_auto_memory) return
+    if (isStreaming || isCompressing) return
+    if (justCompressedRef.current) { justCompressedRef.current = false; return }
+    const meaningful = messages.filter(m => m.role === 'user' || m.role === 'assistant').length
+    if (meaningful >= threshold) {
+      justCompressedRef.current = true
+      compressToMemory()
+    }
+  }, [messages.length, settings.enable_auto_memory, settings.memory_threshold, isStreaming, isCompressing, compressToMemory])
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', background: 'var(--color-bg-base)' }}>
@@ -218,14 +274,28 @@ export default function ChatPanel() {
             帶入筆記
           </label>
           {messages.length > 0 && (
-            <button
-              onClick={clearChat}
-              style={{
-                fontSize: '11px', padding: '2px 8px', borderRadius: '4px',
-                background: 'var(--color-bg-overlay)', border: '1px solid var(--color-border)',
-                color: 'var(--color-text-secondary)', cursor: 'pointer',
-              }}
-            >清除</button>
+            <>
+              <button
+                onClick={compressToMemory}
+                disabled={isCompressing || isStreaming}
+                title="將目前對話儲存為記憶筆記並清空對話"
+                style={{
+                  fontSize: '11px', padding: '2px 8px', borderRadius: '4px',
+                  background: 'var(--color-bg-overlay)', border: '1px solid var(--color-border)',
+                  color: isCompressing ? 'var(--color-text-muted)' : 'var(--color-accent)',
+                  cursor: isCompressing || isStreaming ? 'not-allowed' : 'pointer',
+                  opacity: isCompressing || isStreaming ? 0.5 : 1,
+                }}
+              >{isCompressing ? '儲存中…' : '壓縮記憶'}</button>
+              <button
+                onClick={clearChat}
+                style={{
+                  fontSize: '11px', padding: '2px 8px', borderRadius: '4px',
+                  background: 'var(--color-bg-overlay)', border: '1px solid var(--color-border)',
+                  color: 'var(--color-text-secondary)', cursor: 'pointer',
+                }}
+              >清除</button>
+            </>
           )}
         </div>
       </div>
@@ -240,6 +310,32 @@ export default function ChatPanel() {
           ⚠ 請先到 <strong>Settings &gt; AI</strong> 設定 llama CLI 路徑與本地模型。
         </div>
       )}
+
+      {/* 接近閾值警告（未開啟自動記憶時顯示） */}
+      {(() => {
+        const threshold = settings.memory_threshold ?? 20
+        const meaningful = messages.filter(m => m.role === 'user' || m.role === 'assistant').length
+        const nearLimit = meaningful >= Math.max(threshold - 4, 1) && meaningful < threshold
+        return !settings.enable_auto_memory && nearLimit ? (
+          <div style={{
+            margin: '4px 12px 0', padding: '6px 10px', borderRadius: '6px',
+            background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)',
+            fontSize: '11px', color: 'var(--color-warning, #f59e0b)', lineHeight: 1.5,
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          }}>
+            <span>對話已達 {meaningful} 則，接近閾值 {threshold}，建議壓縮記憶。</span>
+            <button
+              onClick={compressToMemory}
+              disabled={isCompressing}
+              style={{
+                marginLeft: '8px', fontSize: '11px', padding: '2px 8px', borderRadius: '4px',
+                background: 'rgba(245,158,11,0.15)', border: '1px solid rgba(245,158,11,0.4)',
+                color: 'var(--color-warning, #f59e0b)', cursor: 'pointer', flexShrink: 0,
+              }}
+            >立即壓縮</button>
+          </div>
+        ) : null
+      })()}
 
       {/* 訊息列表 */}
       <div style={{ flex: 1, overflowY: 'auto', padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: '6px' }}>

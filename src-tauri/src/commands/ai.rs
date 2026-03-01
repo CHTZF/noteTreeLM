@@ -1,6 +1,8 @@
 use crate::{db::queries, error::AppError, state::AppState};
+use chrono::Local;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -483,6 +485,32 @@ fn vault_tools() -> serde_json::Value {
                     "required": ["path"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "query_memory",
+                "description": "查詢過去整理的對話記憶筆記。當使用者提到之前討論過的話題、或需要參考過去對話內容時使用。回傳符合的記憶筆記清單（含時間與摘要片段）。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "keywords": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "搜尋關鍵字列表，例如 [\"Rust\", \"async\", \"Tauri\"]"
+                        },
+                        "since": {
+                            "type": "string",
+                            "description": "可選，只查詢此日期之後的記憶，格式 YYYY-MM-DD"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "回傳最多幾筆，預設 3"
+                        }
+                    },
+                    "required": ["keywords"]
+                }
+            }
         }
     ])
 }
@@ -947,6 +975,15 @@ async fn execute_vault_tool(
             let path = args["path"].as_str().unwrap_or("");
             tool_create_folder(path, vault_path).await
         }
+        "query_memory" => {
+            let keywords: Vec<String> = args["keywords"]
+                .as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let since = args["since"].as_str().map(String::from);
+            let limit = args["limit"].as_u64().map(|v| v as usize);
+            tool_query_memory(keywords, since, limit, state).await
+        }
         _ => format!("未知工具：{}", name),
     }
 }
@@ -1147,6 +1184,386 @@ Vault 中的筆記為 Markdown 格式（.md 副檔名），以資料夾階層組
     Err(AppError::AI(
         "Agent 工具調用超過最大輪次（8），請簡化您的請求。".to_string(),
     ))
+}
+
+// ─── Memory Agent ─────────────────────────────────────────────────────────────
+
+/// 無狀態單次記憶查詢 agent
+///
+/// 設計原則：
+/// - 無對話歷史，每次呼叫獨立（不累積 context）
+/// - 只有 query_memory 一個工具
+/// - LLM 自行決定搜尋關鍵字，支援多次工具呼叫（最多 3 輪）
+/// - 回傳整理後的純文字摘要，供 stream_chat system prompt 注入
+#[tauri::command]
+pub async fn memory_agent(
+    state: State<'_, AppState>,
+    query: String,
+) -> Result<String, AppError> {
+    // memory_agent 假設 llama-server 已在運行（chat 進行中時理應已啟動）
+    // 直接取 port 嘗試連線，不重新 spawn server
+    let port = queries::get_setting(&state.db, "llama_server_port")
+        .await
+        .unwrap_or_default()
+        .unwrap_or_else(|| "8080".to_string())
+        .parse::<u16>()
+        .unwrap_or(8080);
+    let base_url = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+
+    let system = "你是一個記憶查詢助手。\
+根據使用者的問題，使用 query_memory 工具搜尋相關的過去對話記憶，\
+整理成簡潔摘要後直接輸出。\
+不要進行多餘對話，不要提問，只輸出查詢到的相關記憶內容。\
+如果找不到任何相關記憶，只回覆「未找到相關記憶」。";
+
+    let memory_tool = serde_json::json!([{
+        "type": "function",
+        "function": {
+            "name": "query_memory",
+            "description": "搜尋過去的對話記憶筆記，返回相關摘要",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keywords": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "搜尋關鍵字列表"
+                    },
+                    "since": {
+                        "type": "string",
+                        "description": "可選，只查詢此日期後的記憶，格式 YYYY-MM-DD"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "最多回傳幾筆，預設 3"
+                    }
+                },
+                "required": ["keywords"]
+            }
+        }
+    }]);
+
+    let mut messages: Vec<serde_json::Value> = vec![
+        serde_json::json!({"role": "user", "content": query}),
+    ];
+
+    // 最多 3 輪（通常 1 次工具呼叫就足夠）
+    for _ in 0..3 {
+        let mut api_messages = vec![
+            serde_json::json!({"role": "system", "content": system}),
+        ];
+        api_messages.extend(messages.iter().cloned());
+
+        let body = serde_json::json!({
+            "model": "local",
+            "messages": api_messages,
+            "tools": memory_tool,
+            "tool_choice": "auto",
+            "max_tokens": 1024,
+            "stream": false,
+        });
+
+        let resp = client
+            .post(format!("{}/v1/chat/completions", base_url))
+            .json(&body)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(|e| AppError::AI(format!("memory_agent 請求失敗：{}", e)))?;
+
+        let json: serde_json::Value = resp.json().await
+            .map_err(|e| AppError::AI(format!("memory_agent 回應解析失敗：{}", e)))?;
+
+        let message = &json["choices"][0]["message"];
+        let content_str = message["content"].as_str().unwrap_or("").to_string();
+        let finish_reason = json["choices"][0]["finish_reason"].as_str().unwrap_or("");
+        let tool_calls_arr = message["tool_calls"].as_array();
+        let has_native_calls = tool_calls_arr.map(|a| !a.is_empty()).unwrap_or(false);
+
+        if finish_reason != "tool_calls" && !has_native_calls {
+            // 嘗試解析文字格式工具呼叫 <tool_call>...</tool_call>
+            let text_calls = parse_text_tool_calls(&content_str);
+            if text_calls.is_empty() {
+                // 沒有工具呼叫，直接回傳 LLM 的文字輸出
+                return Ok(content_str);
+            }
+            // 文字格式工具呼叫
+            messages.push(serde_json::json!({"role": "assistant", "content": content_str}));
+            let mut results = Vec::new();
+            for call in &text_calls {
+                let tool_name = call["function"]["name"].as_str().unwrap_or("");
+                let args: serde_json::Value = serde_json::from_str(
+                    call["function"]["arguments"].as_str().unwrap_or("{}")
+                ).unwrap_or_default();
+                if tool_name == "query_memory" {
+                    let keywords: Vec<String> = args["keywords"].as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    let since = args["since"].as_str().map(String::from);
+                    let limit = args["limit"].as_u64().map(|v| v as usize);
+                    results.push(tool_query_memory(keywords, since, limit, state.inner()).await);
+                }
+            }
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": format!("以下是查詢結果，請整理後回答：\n\n{}", results.join("\n\n"))
+            }));
+            continue;
+        }
+
+        // 標準 OpenAI tool_calls 格式
+        messages.push(message.clone());
+        let calls = tool_calls_arr.cloned().unwrap_or_default();
+        for call in &calls {
+            let tool_id = call["id"].as_str().unwrap_or("").to_string();
+            let tool_name = call["function"]["name"].as_str().unwrap_or("");
+            let args: serde_json::Value = serde_json::from_str(
+                call["function"]["arguments"].as_str().unwrap_or("{}")
+            ).unwrap_or_default();
+
+            let result = if tool_name == "query_memory" {
+                let keywords: Vec<String> = args["keywords"].as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                let since = args["since"].as_str().map(String::from);
+                let limit = args["limit"].as_u64().map(|v| v as usize);
+                tool_query_memory(keywords, since, limit, state.inner()).await
+            } else {
+                format!("未知工具：{}", tool_name)
+            };
+
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": tool_id,
+                "content": result
+            }));
+        }
+    }
+
+    Ok("未找到相關記憶".to_string())
+}
+
+// ─── Memory ───────────────────────────────────────────────────────────────────
+
+/// Agent 工具：查詢記憶筆記（回傳格式化純文字，供 LLM 直接使用）
+async fn tool_query_memory(
+    keywords: Vec<String>,
+    since: Option<String>,
+    limit: Option<usize>,
+    state: &AppState,
+) -> String {
+    let limit = limit.unwrap_or(3).min(10) as i64;
+    if keywords.is_empty() {
+        return "請提供至少一個關鍵字".to_string();
+    }
+
+    // 把關鍵字組成 FTS5 MATCH 查詢（用 OR 連接）
+    let fts_query = keywords.join(" OR ");
+
+    let rows = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT s.path, s.title, n.created_at
+         FROM search_fts s
+         JOIN notes n ON n.path = s.path
+         WHERE s.path LIKE 'memories/ai_memory_%'
+           AND search_fts MATCH ?
+         ORDER BY bm25(search_fts)
+         LIMIT ?"
+    )
+    .bind(&fts_query)
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    // 可選：時間篩選（since 格式 YYYY-MM-DD）
+    let since_ts: Option<i64> = since.and_then(|s| {
+        chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok().map(|d| {
+            d.and_hms_opt(0, 0, 0)
+                .and_then(|dt| dt.and_local_timezone(Local).earliest())
+                .map(|dt| dt.timestamp_millis())
+                .unwrap_or(0)
+        })
+    });
+
+    let rows: Vec<(String, String, i64)> = rows.into_iter()
+        .filter(|(_, _, ts)| since_ts.map_or(true, |min_ts| *ts >= min_ts))
+        .collect();
+
+    if rows.is_empty() {
+        return format!("未找到關鍵字「{}」相關的記憶筆記", keywords.join("、"));
+    }
+
+    let mut output = format!("找到 {} 筆記憶筆記：\n\n", rows.len());
+    for (path, title, created_ms) in &rows {
+        let dt = chrono::DateTime::from_timestamp_millis(*created_ms)
+            .map(|dt| dt.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "未知時間".to_string());
+
+        // 取片段（讀取 notes 內容前 400 字元）
+        let snippet: String = sqlx::query_scalar::<_, String>("SELECT content FROM notes WHERE path = ?")
+            .bind(path)
+            .fetch_optional(&state.db)
+            .await
+            .unwrap_or_default()
+            .unwrap_or_default()
+            .chars()
+            .skip_while(|c| *c == '-' || *c == '\n')
+            .take(400)
+            .collect();
+
+        output.push_str(&format!("【{}】{}\n路徑：{}\n摘要：{}…\n\n", dt, title, path, snippet.trim()));
+    }
+    output.push_str("如需完整內容請使用 read_note 工具。");
+    output
+}
+
+/// 將當前對話原文儲存為記憶筆記（memories/ai_memory_[timestamp].md）
+/// 返回建立的筆記相對路徑
+#[tauri::command]
+pub async fn save_memory_session(
+    state: State<'_, AppState>,
+    messages: Vec<ChatMessage>,
+) -> Result<String, AppError> {
+    let vault_path = state.get_vault_path().await;
+    if vault_path.is_empty() {
+        return Err(AppError::Vault("未設定 Vault 路徑".to_string()));
+    }
+
+    let now = Local::now();
+    let timestamp = now.format("%Y%m%d_%H%M%S").to_string();
+    let display_time = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    let title = format!("AI 對話記憶 — {}", display_time);
+    let rel_path = format!("memories/ai_memory_{}.md", timestamp);
+
+    // 確保 memories/ 資料夾存在
+    let memories_dir = PathBuf::from(&vault_path).join("memories");
+    tokio::fs::create_dir_all(&memories_dir).await
+        .map_err(|e| AppError::Vault(format!("建立 memories 資料夾失敗：{}", e)))?;
+
+    // 組裝 Markdown 內容（儲存原始對話）
+    let mut content = format!(
+        "---\ncreated: {}\nmessage_count: {}\n---\n\n# {}\n\n",
+        now.to_rfc3339(),
+        messages.iter().filter(|m| m.role != "tool").count(),
+        title
+    );
+    for msg in &messages {
+        match msg.role.as_str() {
+            "user"      => content.push_str(&format!("**使用者**\n\n{}\n\n---\n\n", msg.content)),
+            "assistant" => content.push_str(&format!("**助手**\n\n{}\n\n---\n\n", msg.content)),
+            _ => {} // 略過 tool 訊息
+        }
+    }
+
+    // 寫入磁碟
+    let abs_path = PathBuf::from(&vault_path).join(&rel_path);
+    tokio::fs::write(&abs_path, &content).await
+        .map_err(|e| AppError::Vault(format!("寫入記憶筆記失敗：{}", e)))?;
+
+    // 插入 DB（FTS trigger 會自動同步 search_fts）
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    let checksum = format!("{:x}", hasher.finalize());
+    let word_count = content.split_whitespace().count() as i64;
+
+    sqlx::query(
+        "INSERT OR REPLACE INTO notes(path, title, content, word_count, created_at, modified_at, checksum)
+         VALUES (?, ?, ?, ?, ?, ?, ?)"
+    )
+    .bind(&rel_path)
+    .bind(&title)
+    .bind(&content)
+    .bind(word_count)
+    .bind(now_ms)
+    .bind(now_ms)
+    .bind(&checksum)
+    .execute(&state.db)
+    .await?;
+
+    sqlx::query(
+        "INSERT OR REPLACE INTO graph_nodes(id, node_type, label, created_at)
+         VALUES (?, 'note', ?, ?)"
+    )
+    .bind(&rel_path)
+    .bind(&title)
+    .bind(now_ms / 1000)
+    .execute(&state.db)
+    .await?;
+
+    Ok(rel_path)
+}
+
+/// 查詢記憶筆記（供前端直接呼叫，非 agent 工具版）
+#[derive(Debug, Serialize)]
+pub struct MemoryResult {
+    pub path: String,
+    pub title: String,
+    pub created_at: i64,
+    pub snippet: String,
+}
+
+#[tauri::command]
+pub async fn query_memory(
+    state: State<'_, AppState>,
+    keywords: Vec<String>,
+    since: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<MemoryResult>, AppError> {
+    let limit = limit.unwrap_or(10).min(50) as i64;
+    if keywords.is_empty() {
+        // 無關鍵字時回傳最新的記憶筆記
+        let rows = sqlx::query_as::<_, (String, String, i64, String)>(
+            "SELECT path, title, created_at, content FROM notes
+             WHERE path LIKE 'memories/ai_memory_%'
+             ORDER BY created_at DESC
+             LIMIT ?"
+        )
+        .bind(limit)
+        .fetch_all(&state.db)
+        .await?;
+
+        return Ok(rows.into_iter().map(|(path, title, created_at, content)| {
+            let snippet = content.chars().skip_while(|c| *c == '-' || *c == '\n').take(200).collect();
+            MemoryResult { path, title, created_at, snippet }
+        }).collect());
+    }
+
+    let fts_query = keywords.join(" OR ");
+    let rows = sqlx::query_as::<_, (String, String, i64, String)>(
+        "SELECT s.path, s.title, n.created_at, n.content
+         FROM search_fts s
+         JOIN notes n ON n.path = s.path
+         WHERE s.path LIKE 'memories/ai_memory_%'
+           AND search_fts MATCH ?
+         ORDER BY bm25(search_fts)
+         LIMIT ?"
+    )
+    .bind(&fts_query)
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let since_ts: Option<i64> = since.and_then(|s| {
+        chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok().map(|d| {
+            d.and_hms_opt(0, 0, 0)
+                .and_then(|dt| dt.and_local_timezone(Local).earliest())
+                .map(|dt| dt.timestamp_millis())
+                .unwrap_or(0)
+        })
+    });
+
+    let results = rows.into_iter()
+        .filter(|(_, _, ts, _)| since_ts.map_or(true, |min_ts| *ts >= min_ts))
+        .map(|(path, title, created_at, content)| {
+            let snippet = content.chars().skip_while(|c| *c == '-' || *c == '\n').take(200).collect();
+            MemoryResult { path, title, created_at, snippet }
+        })
+        .collect();
+
+    Ok(results)
 }
 
 #[cfg(test)]
