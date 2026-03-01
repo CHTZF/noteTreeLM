@@ -240,3 +240,16 @@ INSERT OR IGNORE INTO settings(key, value) VALUES
   ('editor_font_size',   '14'),
   ('ui_font_size',       '14'),
   ('graph_font_size',    '11');
+
+-- 動態記憶查詢規則（由 memory_agent 自動新增，resolve_memory_context 執行時載入）
+-- pattern_type:
+--   temporal_exact_days : pattern 完全匹配 → value 為天數偏移（負數=過去），e.g. "大前天"="-3"
+--   temporal_unit       : pattern 為後綴，e.g. "小時前"/"分鐘前"/"週前" → value 為單位 "hours"/"minutes"/"weeks"
+--   stopword            : pattern 為單一 CJK 字元，加入停用詞過濾，value 為空
+CREATE TABLE IF NOT EXISTS memory_rules (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  pattern_type TEXT    NOT NULL CHECK(pattern_type IN ('temporal_exact_days','temporal_unit','stopword')),
+  pattern      TEXT    NOT NULL UNIQUE,
+  value        TEXT    NOT NULL DEFAULT '',
+  created_at   INTEGER DEFAULT (strftime('%s','now') * 1000)
+);

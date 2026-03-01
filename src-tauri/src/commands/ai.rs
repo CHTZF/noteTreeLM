@@ -1,5 +1,5 @@
 use crate::{db::queries, error::AppError, state::AppState};
-use chrono::Local;
+use chrono::{Datelike, Local};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1188,88 +1188,194 @@ Vault 中的筆記為 Markdown 格式（.md 副檔名），以資料夾階層組
 
 // ─── Memory Agent ─────────────────────────────────────────────────────────────
 
-/// 無狀態單次記憶查詢 agent
+/// 從查詢字串中提取模式前方的數字（阿拉伯或中文，供 temporal_unit 規則使用）
+fn extract_number_before(query: &str, suffix: &str) -> Option<i64> {
+    let pos = query.find(suffix)?;
+    let before: Vec<char> = query[..pos].chars().collect();
+    // 阿拉伯數字（從尾端往前取連續數字）
+    let digits: String = before.iter().rev().take_while(|c| c.is_ascii_digit())
+        .collect::<String>().chars().rev().collect();
+    if !digits.is_empty() { return digits.parse().ok(); }
+    // 中文數字（單字）
+    let last = before.last()?;
+    [('一',1i64),('二',2),('三',3),('四',4),('五',5),
+     ('六',6),('七',7),('八',8),('九',9),('十',10)]
+        .iter().find(|&&(c,_)| c == *last).map(|&(_,v)| v)
+}
+
+/// 載入 memory_rules 表中的規則
+async fn load_memory_rules(db: &sqlx::SqlitePool) -> Vec<(String, String, String)> {
+    sqlx::query_as::<_, (String, String, String)>(
+        "SELECT pattern_type, pattern, value FROM memory_rules ORDER BY id"
+    )
+    .fetch_all(db).await.unwrap_or_default()
+}
+
+/// 與 parse_query_since 相同，但先套用資料庫中的自訂規則
+fn parse_query_since_with_rules(
+    query: &str,
+    now: &chrono::DateTime<Local>,
+    rules: &[(String, String, String)],
+) -> Option<i64> {
+    let day_start = |d: chrono::NaiveDate| -> Option<i64> {
+        d.and_hms_opt(0, 0, 0)?.and_local_timezone(Local).earliest()
+            .map(|dt| dt.timestamp_millis())
+    };
+    // 先套用自訂規則
+    for (ptype, pattern, value) in rules {
+        match ptype.as_str() {
+            "temporal_exact_days" if query.contains(pattern.as_str()) => {
+                let days: i64 = value.parse().unwrap_or(0);
+                return day_start(now.date_naive() + chrono::TimeDelta::days(days));
+            }
+            "temporal_unit" if query.contains(pattern.as_str()) => {
+                if let Some(n) = extract_number_before(query, pattern) {
+                    return Some(match value.as_str() {
+                        "hours"   => (now.clone() - chrono::TimeDelta::hours(n)).timestamp_millis(),
+                        "minutes" => (now.clone() - chrono::TimeDelta::minutes(n)).timestamp_millis(),
+                        "weeks"   => return day_start(now.date_naive() - chrono::TimeDelta::weeks(n)),
+                        _         => return None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    // 回退到內建規則
+    parse_query_since(query, now)
+}
+
+/// 與 extract_cjk_bigrams 相同，但合併來自 memory_rules 的額外停用詞
+fn extract_cjk_bigrams_with_extra_stops(query: &str, extra_stops: &[char]) -> Vec<String> {
+    const STOPS: &[char] = &[
+        '你','我','他','她','它','的','了','嗎','啊','哦','嗯','是','有','在',
+        '說','知','道','記','得','什','麼','怎','樣','那','這','就','都','也',
+        '還','不','沒','要','會','可','以','和','與','或','但','如','果','因',
+        '為','所','而','且','雖','然','呢','嘛','吧','喔','囉','啦','呀','嘿',
+        '哈','去','來','到','對','把','被','讓','幫','請','謝','好','很',
+    ];
+    let cjk: Vec<char> = query.chars().filter(|c| is_cjk(*c)).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for pair in cjk.windows(2) {
+        let in_stops = |c: char| STOPS.contains(&c) || extra_stops.contains(&c);
+        if in_stops(pair[0]) && in_stops(pair[1]) { continue; }
+        let bigram: String = pair.iter().collect();
+        if seen.insert(bigram.clone()) { out.push(bigram); }
+    }
+    out
+}
+
+/// 將規則寫入 memory_rules 表（供 run_memory_agent 工具呼叫與 add_memory_rule command 共用）
+async fn add_memory_rule_to_db(db: &sqlx::SqlitePool, pattern_type: &str, pattern: &str, value: &str) -> String {
+    match sqlx::query(
+        "INSERT OR REPLACE INTO memory_rules(pattern_type, pattern, value) VALUES (?, ?, ?)"
+    )
+    .bind(pattern_type).bind(pattern).bind(value)
+    .execute(db).await {
+        Ok(_)  => format!("規則已儲存：[{}] {} → {}", pattern_type, pattern, value),
+        Err(e) => format!("規則儲存失敗：{}", e),
+    }
+}
+
+/// memory_agent 核心邏輯（取 &AppState，供 Tauri command 與 resolve_memory_context fallback 共用）
 ///
-/// 設計原則：
-/// - 無對話歷史，每次呼叫獨立（不累積 context）
-/// - 只有 query_memory 一個工具
-/// - LLM 自行決定搜尋關鍵字，支援多次工具呼叫（最多 3 輪）
-/// - 回傳整理後的純文字摘要，供 stream_chat system prompt 注入
-#[tauri::command]
-pub async fn memory_agent(
-    state: State<'_, AppState>,
-    query: String,
-) -> Result<String, AppError> {
-    // memory_agent 假設 llama-server 已在運行（chat 進行中時理應已啟動）
-    // 直接取 port 嘗試連線，不重新 spawn server
-    let port = queries::get_setting(&state.db, "llama_server_port")
-        .await
-        .unwrap_or_default()
-        .unwrap_or_else(|| "8080".to_string())
-        .parse::<u16>()
-        .unwrap_or(8080);
+/// 工具：
+///   query_memory    — 搜尋記憶筆記
+///   add_memory_rule — 寫入新規則，讓 resolve_memory_context 下次直接處理（自我學習）
+async fn run_memory_agent(state: &AppState, query: &str, port: u16) -> Result<String, AppError> {
     let base_url = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
 
-    let system = "你是一個記憶查詢助手。\
-根據使用者的問題，使用 query_memory 工具搜尋相關的過去對話記憶，\
-整理成簡潔摘要後直接輸出。\
-不要進行多餘對話，不要提問，只輸出查詢到的相關記憶內容。\
-如果找不到任何相關記憶，只回覆「未找到相關記憶」。";
+    let now = Local::now();
+    let today_str      = now.format("%Y-%m-%d").to_string();
+    let yesterday_str  = (now - chrono::TimeDelta::days(1)).format("%Y-%m-%d").to_string();
+    let day_before_str = (now - chrono::TimeDelta::days(2)).format("%Y-%m-%d").to_string();
+    let this_month_str = now.format("%Y-%m-01").to_string();
+    let last_month_str = {
+        let (y, m) = (now.year(), now.month());
+        if m == 1 { format!("{}-12-01", y - 1) } else { format!("{}-{:02}-01", y, m - 1) }
+    };
 
-    let memory_tool = serde_json::json!([{
-        "type": "function",
-        "function": {
-            "name": "query_memory",
-            "description": "搜尋過去的對話記憶筆記，返回相關摘要",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "keywords": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "搜尋關鍵字列表"
+    let system = format!(
+        "你是一個記憶查詢助手。今天是 {today}。\
+根據使用者的問題，搜尋相關的過去對話記憶，整理成簡潔摘要後直接輸出。\n\
+【時間表達式轉換規則】\n\
+- 剛剛／剛才／最近 → keywords=[], 不帶 since\n\
+- 今天 → since=\"{today}\"  昨天 → since=\"{yesterday}\"  前天 → since=\"{day_before}\"\n\
+- N天前（N≥3）→ since 自行計算  本月 → since=\"{this_month}\"  上月 → since=\"{last_month}\"\n\
+- 本週 → since 為本週一（今天是週{weekday}）  X月 → since=\"{{year}}-{{X:02}}-01\"\n\
+- 遇到 Rust 不認識的時間表達式（如「3小時前」「大前天」「上上週」）→ 先呼叫 add_memory_rule 儲存規則，再呼叫 query_memory\n\
+【add_memory_rule 規則】\n\
+  temporal_exact_days: 固定天數，value 為負整數（如「大前天」\"-3\"）\n\
+  temporal_unit: 數字+後綴，value 為 hours/minutes/weeks（如「小時前」\"hours\"）\n\
+  stopword: 應過濾的停用字，value 為空字串\n\
+【輸出規則】只輸出記憶摘要，不對話，不提問。找不到記憶只回覆「未找到相關記憶」。",
+        today = today_str, yesterday = yesterday_str, day_before = day_before_str,
+        this_month = this_month_str, last_month = last_month_str,
+        weekday = now.weekday().number_from_monday(),
+    );
+
+    let tools = serde_json::json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "query_memory",
+                "description": "搜尋過去對話記憶。keywords 空陣列=取最新記憶；有關鍵字=FTS 搜尋。since 為時間下限 YYYY-MM-DD。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "keywords": { "type": "array", "items": { "type": "string" },
+                            "description": "搜尋關鍵字，空陣列=最新記憶" },
+                        "since":    { "type": "string",  "description": "時間下限 YYYY-MM-DD" },
+                        "limit":    { "type": "integer", "description": "最多筆數，預設 3" }
                     },
-                    "since": {
-                        "type": "string",
-                        "description": "可選，只查詢此日期後的記憶，格式 YYYY-MM-DD"
+                    "required": []
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "add_memory_rule",
+                "description": "發現 Rust 不認識的時間表達式時，儲存規則讓系統下次直接處理（不再需要 LLM）",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern_type": { "type": "string",
+                            "enum": ["temporal_exact_days","temporal_unit","stopword"],
+                            "description": "規則類型" },
+                        "pattern": { "type": "string",
+                            "description": "觸發字串，如「大前天」「小時前」" },
+                        "value": { "type": "string",
+                            "description": "temporal_exact_days: 負整數如\"-3\"；temporal_unit: hours/minutes/weeks；stopword: 空字串" }
                     },
-                    "limit": {
-                        "type": "integer",
-                        "description": "最多回傳幾筆，預設 3"
-                    }
-                },
-                "required": ["keywords"]
+                    "required": ["pattern_type","pattern","value"]
+                }
             }
         }
-    }]);
+    ]);
 
     let mut messages: Vec<serde_json::Value> = vec![
         serde_json::json!({"role": "user", "content": query}),
     ];
 
-    // 最多 3 輪（通常 1 次工具呼叫就足夠）
-    for _ in 0..3 {
-        let mut api_messages = vec![
-            serde_json::json!({"role": "system", "content": system}),
-        ];
+    // 最多 4 輪（考慮 add_memory_rule + query_memory 共兩次工具）
+    for _ in 0..4 {
+        let mut api_messages = vec![serde_json::json!({"role": "system", "content": system})];
         api_messages.extend(messages.iter().cloned());
 
         let body = serde_json::json!({
             "model": "local",
             "messages": api_messages,
-            "tools": memory_tool,
+            "tools": tools,
             "tool_choice": "auto",
             "max_tokens": 1024,
             "stream": false,
         });
 
-        let resp = client
-            .post(format!("{}/v1/chat/completions", base_url))
-            .json(&body)
-            .timeout(Duration::from_secs(60))
-            .send()
-            .await
+        let resp = client.post(format!("{}/v1/chat/completions", base_url))
+            .json(&body).timeout(Duration::from_secs(60)).send().await
             .map_err(|e| AppError::AI(format!("memory_agent 請求失敗：{}", e)))?;
 
         let json: serde_json::Value = resp.json().await
@@ -1282,66 +1388,114 @@ pub async fn memory_agent(
         let has_native_calls = tool_calls_arr.map(|a| !a.is_empty()).unwrap_or(false);
 
         if finish_reason != "tool_calls" && !has_native_calls {
-            // 嘗試解析文字格式工具呼叫 <tool_call>...</tool_call>
             let text_calls = parse_text_tool_calls(&content_str);
-            if text_calls.is_empty() {
-                // 沒有工具呼叫，直接回傳 LLM 的文字輸出
-                return Ok(content_str);
-            }
-            // 文字格式工具呼叫
+            if text_calls.is_empty() { return Ok(content_str); }
+
             messages.push(serde_json::json!({"role": "assistant", "content": content_str}));
             let mut results = Vec::new();
             for call in &text_calls {
                 let tool_name = call["function"]["name"].as_str().unwrap_or("");
                 let args: serde_json::Value = serde_json::from_str(
-                    call["function"]["arguments"].as_str().unwrap_or("{}")
-                ).unwrap_or_default();
-                if tool_name == "query_memory" {
-                    let keywords: Vec<String> = args["keywords"].as_array()
-                        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                        .unwrap_or_default();
-                    let since = args["since"].as_str().map(String::from);
-                    let limit = args["limit"].as_u64().map(|v| v as usize);
-                    results.push(tool_query_memory(keywords, since, limit, state.inner()).await);
-                }
+                    call["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or_default();
+                let r = dispatch_memory_tool(tool_name, &args, state).await;
+                results.push(r);
             }
             messages.push(serde_json::json!({
                 "role": "user",
-                "content": format!("以下是查詢結果，請整理後回答：\n\n{}", results.join("\n\n"))
+                "content": format!("以下是工具結果，請整理後回答：\n\n{}", results.join("\n\n"))
             }));
             continue;
         }
 
-        // 標準 OpenAI tool_calls 格式
+        // 標準 tool_calls 格式
         messages.push(message.clone());
-        let calls = tool_calls_arr.cloned().unwrap_or_default();
-        for call in &calls {
+        for call in tool_calls_arr.cloned().unwrap_or_default() {
             let tool_id = call["id"].as_str().unwrap_or("").to_string();
             let tool_name = call["function"]["name"].as_str().unwrap_or("");
             let args: serde_json::Value = serde_json::from_str(
-                call["function"]["arguments"].as_str().unwrap_or("{}")
-            ).unwrap_or_default();
-
-            let result = if tool_name == "query_memory" {
-                let keywords: Vec<String> = args["keywords"].as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
-                let since = args["since"].as_str().map(String::from);
-                let limit = args["limit"].as_u64().map(|v| v as usize);
-                tool_query_memory(keywords, since, limit, state.inner()).await
-            } else {
-                format!("未知工具：{}", tool_name)
-            };
-
+                call["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or_default();
+            let result = dispatch_memory_tool(tool_name, &args, state).await;
             messages.push(serde_json::json!({
-                "role": "tool",
-                "tool_call_id": tool_id,
-                "content": result
+                "role": "tool", "tool_call_id": tool_id, "content": result
             }));
         }
     }
 
     Ok("未找到相關記憶".to_string())
+}
+
+/// memory_agent / resolve_memory_context 共用工具分派
+async fn dispatch_memory_tool(tool_name: &str, args: &serde_json::Value, state: &AppState) -> String {
+    match tool_name {
+        "query_memory" => {
+            let keywords: Vec<String> = args["keywords"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let since = args["since"].as_str().map(String::from);
+            let limit = args["limit"].as_u64().map(|v| v as usize);
+            tool_query_memory(keywords, since, limit, state).await
+        }
+        "add_memory_rule" => {
+            let ptype   = args["pattern_type"].as_str().unwrap_or("");
+            let pattern = args["pattern"].as_str().unwrap_or("");
+            let value   = args["value"].as_str().unwrap_or("");
+            add_memory_rule_to_db(&state.db, ptype, pattern, value).await
+        }
+        other => format!("未知工具：{}", other),
+    }
+}
+
+#[tauri::command]
+pub async fn memory_agent(state: State<'_, AppState>, query: String) -> Result<String, AppError> {
+    let port = queries::get_setting(&state.db, "llama_server_port")
+        .await.unwrap_or_default().unwrap_or_else(|| "8080".to_string())
+        .parse::<u16>().unwrap_or(8080);
+    run_memory_agent(state.inner(), &query, port).await
+}
+
+/// 讓前端或其他命令可以直接向資料庫新增記憶規則
+#[tauri::command]
+pub async fn add_memory_rule(
+    state: State<'_, AppState>,
+    pattern_type: String,
+    pattern: String,
+    value: String,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT OR REPLACE INTO memory_rules(pattern_type, pattern, value) VALUES (?, ?, ?)"
+    )
+    .bind(&pattern_type).bind(&pattern).bind(&value)
+    .execute(&state.db).await?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+pub struct MemoryRuleEntry {
+    pub id: i64,
+    pub pattern_type: String,
+    pub pattern: String,
+    pub value: String,
+    pub created_at: i64,
+}
+
+/// 取得所有記憶查詢規則（供設定頁面顯示）
+#[tauri::command]
+pub async fn get_memory_rules(state: State<'_, AppState>) -> Result<Vec<MemoryRuleEntry>, AppError> {
+    let rows = sqlx::query_as::<_, (i64, String, String, String, i64)>(
+        "SELECT id, pattern_type, pattern, value, created_at FROM memory_rules ORDER BY id"
+    )
+    .fetch_all(&state.db).await?;
+    Ok(rows.into_iter().map(|(id, pattern_type, pattern, value, created_at)| {
+        MemoryRuleEntry { id, pattern_type, pattern, value, created_at }
+    }).collect())
+}
+
+/// 刪除指定 id 的記憶規則
+#[tauri::command]
+pub async fn delete_memory_rule(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
+    sqlx::query("DELETE FROM memory_rules WHERE id = ?")
+        .bind(id).execute(&state.db).await?;
+    Ok(())
 }
 
 // ─── Memory ───────────────────────────────────────────────────────────────────
@@ -1354,27 +1508,6 @@ async fn tool_query_memory(
     state: &AppState,
 ) -> String {
     let limit = limit.unwrap_or(3).min(10) as i64;
-    if keywords.is_empty() {
-        return "請提供至少一個關鍵字".to_string();
-    }
-
-    // 把關鍵字組成 FTS5 MATCH 查詢（用 OR 連接）
-    let fts_query = keywords.join(" OR ");
-
-    let rows = sqlx::query_as::<_, (String, String, i64)>(
-        "SELECT s.path, s.title, n.created_at
-         FROM search_fts s
-         JOIN notes n ON n.path = s.path
-         WHERE s.path LIKE 'memories/ai_memory_%'
-           AND search_fts MATCH ?
-         ORDER BY bm25(search_fts)
-         LIMIT ?"
-    )
-    .bind(&fts_query)
-    .bind(limit)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
 
     // 可選：時間篩選（since 格式 YYYY-MM-DD）
     let since_ts: Option<i64> = since.and_then(|s| {
@@ -1386,21 +1519,92 @@ async fn tool_query_memory(
         })
     });
 
-    let rows: Vec<(String, String, i64)> = rows.into_iter()
-        .filter(|(_, _, ts)| since_ts.map_or(true, |min_ts| *ts >= min_ts))
-        .collect();
+    let rows: Vec<(String, String, i64)> = if keywords.is_empty() {
+        // 無關鍵字：按時間降序回傳最新記憶（不走 FTS，適合「你還記得什麼嗎」類型的問題）
+        let mut q = sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT path, title, created_at
+             FROM notes
+             WHERE path LIKE 'memories/ai_memory_%'
+             ORDER BY created_at DESC
+             LIMIT ?"
+        )
+        .bind(limit)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+
+        if let Some(min_ts) = since_ts {
+            q.retain(|(_, _, ts)| *ts >= min_ts);
+        }
+        q
+    } else {
+        // 有關鍵字：用 FTS5 MATCH 搜尋（OR 連接）
+        // 注意：FTS5 unicode61 對連續漢字以空格分詞，若關鍵字為多字詞需用引號括起
+        let fts_terms: Vec<String> = keywords.iter()
+            .map(|k| format!("\"{}\"", k.replace('"', "")))
+            .collect();
+        let fts_query = fts_terms.join(" OR ");
+
+        let rows = sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT s.path, s.title, n.created_at
+             FROM search_fts s
+             JOIN notes n ON n.path = s.path
+             WHERE s.path LIKE 'memories/ai_memory_%'
+               AND search_fts MATCH ?
+             ORDER BY bm25(search_fts)
+             LIMIT ?"
+        )
+        .bind(&fts_query)
+        .bind(limit)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+
+        rows.into_iter()
+            .filter(|(_, _, ts)| since_ts.map_or(true, |min_ts| *ts >= min_ts))
+            .collect()
+    };
 
     if rows.is_empty() {
-        return format!("未找到關鍵字「{}」相關的記憶筆記", keywords.join("、"));
+        if keywords.is_empty() {
+            return "目前沒有任何已儲存的記憶筆記".to_string();
+        }
+        // FTS 找不到時，降級到最新 1 筆，避免空手而回
+        let fallback = sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT path, title, created_at
+             FROM notes
+             WHERE path LIKE 'memories/ai_memory_%'
+             ORDER BY created_at DESC
+             LIMIT 1"
+        )
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or_default();
+
+        if fallback.is_none() {
+            return format!("未找到關鍵字「{}」相關的記憶筆記，且目前無任何記憶存檔", keywords.join("、"));
+        }
+        // 用最新一筆繼續往下格式化
+        let rows_fallback = fallback.into_iter().collect::<Vec<_>>();
+        return format_memory_rows(&rows_fallback, &format!("（關鍵字「{}」無精確匹配，以下為最新記憶）", keywords.join("、")), state).await;
     }
 
-    let mut output = format!("找到 {} 筆記憶筆記：\n\n", rows.len());
-    for (path, title, created_ms) in &rows {
+    format_memory_rows(&rows, "", state).await
+}
+
+async fn format_memory_rows(rows: &[(String, String, i64)], prefix: &str, state: &AppState) -> String {
+    let mut output = if prefix.is_empty() {
+        format!("找到 {} 筆記憶筆記：\n\n", rows.len())
+    } else {
+        format!("{}\n找到 {} 筆記憶筆記：\n\n", prefix, rows.len())
+    };
+
+    for (path, title, created_ms) in rows {
         let dt = chrono::DateTime::from_timestamp_millis(*created_ms)
             .map(|dt| dt.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_else(|| "未知時間".to_string());
 
-        // 取片段（讀取 notes 內容前 400 字元）
+        // 取前 600 字元的摘要（跳過 frontmatter 分隔符）
         let snippet: String = sqlx::query_scalar::<_, String>("SELECT content FROM notes WHERE path = ?")
             .bind(path)
             .fetch_optional(&state.db)
@@ -1409,12 +1613,11 @@ async fn tool_query_memory(
             .unwrap_or_default()
             .chars()
             .skip_while(|c| *c == '-' || *c == '\n')
-            .take(400)
+            .take(600)
             .collect();
 
-        output.push_str(&format!("【{}】{}\n路徑：{}\n摘要：{}…\n\n", dt, title, path, snippet.trim()));
+        output.push_str(&format!("【{}】{}\n路徑：{}\n內容：\n{}…\n\n", dt, title, path, snippet.trim()));
     }
-    output.push_str("如需完整內容請使用 read_note 工具。");
     output
 }
 
@@ -1564,6 +1767,162 @@ pub async fn query_memory(
         .collect();
 
     Ok(results)
+}
+
+// ─── resolve_memory_context（純 Rust，取代 memory_agent）─────────────────────
+//
+// 延遲 < 100ms（無 LLM 呼叫）：
+//   1. 解析查詢中的時間表達式 → since_ts
+//   2. 提取 CJK 雙字元 n-gram → LIKE 條件（繞過 FTS CJK 斷詞問題）
+//   3. 降級策略：LIKE 找不到 → 取最新一筆
+//   4. 回傳格式化純文字，供 stream_chat system 注入
+
+/// 判斷是否為 CJK 漢字
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x4E00..=0x9FFF | 0x3400..=0x4DBF |
+        0x20000..=0x2A6DF | 0xF900..=0xFAFF | 0x2F800..=0x2FA1F
+    )
+}
+
+/// 從查詢字串解析時間表達式，回傳 since 毫秒時間戳（None = 不限時間）
+fn parse_query_since(query: &str, now: &chrono::DateTime<Local>) -> Option<i64> {
+    use chrono::Datelike;
+
+    let day_start = |d: chrono::NaiveDate| -> Option<i64> {
+        d.and_hms_opt(0, 0, 0)?
+            .and_local_timezone(Local).earliest()
+            .map(|dt| dt.timestamp_millis())
+    };
+
+    if query.contains("今天") {
+        return day_start(now.date_naive());
+    }
+    if query.contains("昨天") {
+        return day_start(now.date_naive() - chrono::TimeDelta::days(1));
+    }
+    if query.contains("前天") {
+        return day_start(now.date_naive() - chrono::TimeDelta::days(2));
+    }
+
+    // "3天前" / "三天前"
+    let chars: Vec<char> = query.chars().collect();
+    for w in chars.windows(3) {
+        if w[1] == '天' && w[2] == '前' {
+            let days: Option<i64> = if let Some(d) = w[0].to_digit(10) {
+                Some(d as i64)
+            } else {
+                [('一',1i64),('二',2),('三',3),('四',4),('五',5),
+                 ('六',6),('七',7),('八',8),('九',9)]
+                    .iter().find(|&&(c, _)| c == w[0]).map(|&(_, v)| v)
+            };
+            if let Some(d) = days {
+                return day_start(now.date_naive() - chrono::TimeDelta::days(d));
+            }
+        }
+    }
+
+    if query.contains("本週") || query.contains("這週") || query.contains("本周") || query.contains("這周") {
+        use chrono::Datelike;
+        let offset = now.weekday().num_days_from_monday() as i64;
+        return day_start(now.date_naive() - chrono::TimeDelta::days(offset));
+    }
+    if query.contains("本月") || query.contains("這個月") || query.contains("這月") {
+        return day_start(chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)?);
+    }
+    if query.contains("上個月") || query.contains("上月") {
+        let (y, m) = if now.month() == 1 { (now.year() - 1, 12u32) } else { (now.year(), now.month() - 1) };
+        return day_start(chrono::NaiveDate::from_ymd_opt(y, m, 1)?);
+    }
+
+    // 中文月份 "一月".."十二月" / 阿拉伯 "1月".."12月"
+    let cn_months = [("一月",1u32),("二月",2),("三月",3),("四月",4),
+                     ("五月",5),("六月",6),("七月",7),("八月",8),
+                     ("九月",9),("十月",10),("十一月",11),("十二月",12)];
+    for &(name, m) in &cn_months {
+        if query.contains(name) {
+            return day_start(chrono::NaiveDate::from_ymd_opt(now.year(), m, 1)?);
+        }
+    }
+    for m in 1u32..=12 {
+        if query.contains(&format!("{}月", m)) {
+            return day_start(chrono::NaiveDate::from_ymd_opt(now.year(), m, 1)?);
+        }
+    }
+
+    None // 剛剛/剛才/最近/不限時間
+}
+
+
+#[tauri::command]
+pub async fn resolve_memory_context(
+    state: State<'_, AppState>,
+    query: String,
+) -> Result<String, AppError> {
+    let now = Local::now();
+
+    // 1. 載入自訂規則（來自 memory_rules 表，由 memory_agent 自動學習新增）
+    let rules = load_memory_rules(&state.db).await;
+    let extra_stops: Vec<char> = rules.iter()
+        .filter(|(pt, _, _)| pt == "stopword")
+        .filter_map(|(_, pattern, _)| pattern.chars().next())
+        .collect();
+
+    // 2. 套用規則解析時間表達式 + 提取搜尋詞
+    let since_ts = parse_query_since_with_rules(&query, &now, &rules);
+    let terms = extract_cjk_bigrams_with_extra_stops(&query, &extra_stops);
+
+    let limit = 3i64;
+    let rows: Vec<(String, String, i64)> = if terms.is_empty() {
+        sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT path, title, created_at FROM notes
+             WHERE path LIKE 'memories/ai_memory_%'
+             ORDER BY created_at DESC LIMIT ?"
+        )
+        .bind(limit).fetch_all(&state.db).await.unwrap_or_default()
+        .into_iter().filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min))
+        .collect()
+    } else {
+        // CJK bigrams → LIKE 搜尋（terms 只含 CJK 字元，無 SQL injection 風險）
+        let conditions: String = terms.iter()
+            .map(|t| format!("content LIKE '%{}%'", t))
+            .collect::<Vec<_>>().join(" OR ");
+        let sql = format!(
+            "SELECT path, title, created_at FROM notes
+             WHERE path LIKE 'memories/ai_memory_%' AND ({})
+             ORDER BY created_at DESC LIMIT {}",
+            conditions, limit
+        );
+        let mut rows = sqlx::query_as::<_, (String, String, i64)>(&sql)
+            .fetch_all(&state.db).await.unwrap_or_default()
+            .into_iter().filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min))
+            .collect::<Vec<_>>();
+
+        // LIKE 無結果 → 降級取最新 1 筆（仍受 since 篩選）
+        if rows.is_empty() {
+            rows = sqlx::query_as::<_, (String, String, i64)>(
+                "SELECT path, title, created_at FROM notes
+                 WHERE path LIKE 'memories/ai_memory_%'
+                 ORDER BY created_at DESC LIMIT 1"
+            )
+            .fetch_all(&state.db).await.unwrap_or_default()
+            .into_iter().filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min))
+            .collect();
+        }
+        rows
+    };
+
+    // 3. Rust 找到結果 → 直接回傳（快速路徑）
+    if !rows.is_empty() {
+        return Ok(format_memory_rows(&rows, "", state.inner()).await);
+    }
+
+    // 4. Rust 完全找不到（since 過濾後也空） → fallback 到 memory_agent（LLM）
+    //    memory_agent 可辨識新時間表達式並呼叫 add_memory_rule 自我學習
+    let port = queries::get_setting(&state.db, "llama_server_port")
+        .await.unwrap_or_default().unwrap_or_else(|| "8080".to_string())
+        .parse::<u16>().unwrap_or(8080);
+    run_memory_agent(state.inner(), &query, port).await
 }
 
 #[cfg(test)]

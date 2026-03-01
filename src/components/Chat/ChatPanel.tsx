@@ -7,7 +7,7 @@ import { useDebugStore } from '../../stores/debugStore'
 import { toast } from '../common/Toast'
 
 interface Message {
-  role: 'user' | 'assistant' | 'tool'
+  role: 'user' | 'assistant' | 'tool' | 'notice'
   content: string
 }
 
@@ -66,6 +66,19 @@ export default function ChatPanel() {
     if (!vaultConfigured) setUseVaultTools(false)
   }, [vaultConfigured])
 
+  // 啟動時偵測是否有已儲存的記憶存檔，有的話恢復 lastMemoryPath
+  // 讓重啟 app 後仍能查詢過去記憶（不需用戶先壓縮一次）
+  useEffect(() => {
+    if (!vaultConfigured) return
+    invoke<Array<{ path: string }>>('query_memory', { keywords: [], limit: 1 })
+      .then((results) => {
+        if (results.length > 0) {
+          setLastMemoryPath(results[0].path)
+        }
+      })
+      .catch(() => {})
+  }, [vaultConfigured])
+
   const send = useCallback(async () => {
     const text = input.trim()
     if (!text || isStreaming) return
@@ -80,9 +93,9 @@ export default function ChatPanel() {
     streamingRef.current = ''
     tokenCountRef.current = 0
 
-    // 只把 user/assistant 訊息送給 LLM（tool 是顯示用的）
+    // 只把 user/assistant 訊息送給 LLM（tool/notice 只做 UI 顯示，不進入 context）
     const llmMessages = allMessages
-      .filter((m) => m.role !== 'tool')
+      .filter((m) => m.role === 'user' || m.role === 'assistant')
       .map((m) => ({ role: m.role, content: m.content }))
 
     log(`▶ 傳送訊息（${text.length} 字），模式: ${useVaultTools ? 'agent' : 'chat'}`)
@@ -122,17 +135,21 @@ export default function ChatPanel() {
             ? `你是一個筆記助手。以下是使用者目前開啟的筆記內容，請根據此內容協助回答問題：\n\n${noteContent.slice(0, 4000)}`
             : null
 
-        // 若記憶已壓縮，由 memory_agent 查詢相關記憶片段並注入 system
-        // memory_agent 為無狀態單次 agent，LLM 自行決定搜尋策略
+        // 若有記憶存檔，由 resolve_memory_context 查詢（純 Rust，< 100ms）
         let memoryPart: string | null = null
         if (lastMemoryPath) {
           try {
-            const memorySummary = await invoke<string>('memory_agent', { query: text })
-            if (memorySummary && memorySummary !== '未找到相關記憶') {
+            const memorySummary = await invoke<string>('resolve_memory_context', { query: text })
+            if (memorySummary) {
               memoryPart = `以下是相關的過去對話記憶（供參考）：\n\n${memorySummary}`
-              log(`  帶入記憶摘要（memory_agent）`)
+              log(`  帶入記憶摘要（${memorySummary.length} 字元）`)
+            } else {
+              log('  resolve_memory_context：無相關記憶，略過注入')
             }
-          } catch { /* 查詢失敗時靜默略過，不影響主對話 */ }
+          } catch (e) {
+            const msg = typeof e === 'string' ? e : e instanceof Error ? e.message : String(e)
+            err('resolve_memory_context 查詢失敗：' + msg)
+          }
         }
 
         const system = [notePart, memoryPart].filter(Boolean).join('\n\n') || undefined
@@ -177,7 +194,7 @@ export default function ChatPanel() {
       setStreamingText('')
       streamingRef.current = ''
     }
-  }, [input, isStreaming, messages, useNoteContext, useVaultTools, currentPath, noteContent, log, err])
+  }, [input, isStreaming, messages, useNoteContext, useVaultTools, currentPath, noteContent, lastMemoryPath, log, err])
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -204,8 +221,8 @@ export default function ChatPanel() {
       setLastMemoryPath(path)
       const filename = path.split('/').pop() ?? path
       setMessages([{
-        role: 'assistant',
-        content: `記憶已整理並儲存至 \`${path}\`。\n\n繼續對話時，Agent 模式可透過 query_memory 工具查詢過去的記憶；一般模式會自動依你的問題帶入相關記憶片段。`,
+        role: 'notice',
+        content: `已儲存記憶：${filename}`,
       }])
       toast.success(`記憶已儲存：${filename}`)
       log(`記憶已儲存：${path}`)
@@ -436,6 +453,18 @@ function MessageBubble({
 }) {
   const isUser = message.role === 'user'
   const isTool = message.role === 'tool'
+  const isNotice = message.role === 'notice'
+
+  if (isNotice) {
+    return (
+      <div style={{
+        textAlign: 'center', fontSize: '11px', color: 'var(--color-text-muted)',
+        padding: '4px 0', opacity: 0.7,
+      }}>
+        ── {message.content} ──
+      </div>
+    )
+  }
 
   if (isTool) {
     return (

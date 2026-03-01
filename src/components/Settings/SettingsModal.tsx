@@ -11,6 +11,14 @@ interface SettingsModalProps {
   onClose: () => void
 }
 
+interface MemoryRuleEntry {
+  id: number
+  pattern_type: string
+  pattern: string
+  value: string
+  created_at: number
+}
+
 type Tab = 'general' | 'ai' | 'voice' | 'server' | 'advanced' | 'raw'
 type ServerStatus = 'unknown' | 'running' | 'loading' | 'stopped'
 
@@ -52,6 +60,9 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   const [whisperBusy, setWhisperBusy] = useState(false)
   const [llamaBusy, setLlamaBusy] = useState(false)
 
+  const [memoryRules, setMemoryRules] = useState<MemoryRuleEntry[]>([])
+  const [memoryRulesLoading, setMemoryRulesLoading] = useState(false)
+
   const colorScheme = draft.theme === 'dark' ? 'dark' : 'light'
   const inputStyle: React.CSSProperties = {
     width: '100%', height: '32px', padding: '0 10px', boxSizing: 'border-box',
@@ -82,6 +93,27 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
     const id = setInterval(refresh, 3000)
     return () => clearInterval(id)
   }, [tab])
+
+  useEffect(() => {
+    if (tab !== 'advanced') return
+    setMemoryRulesLoading(true)
+    invoke<MemoryRuleEntry[]>('get_memory_rules')
+      .then(setMemoryRules)
+      .catch(() => setMemoryRules([]))
+      .finally(() => setMemoryRulesLoading(false))
+  }, [tab])
+
+  const handleDeleteMemoryRule = async (id: number) => {
+    await invoke('delete_memory_rule', { id }).catch(() => {})
+    setMemoryRules((prev) => prev.filter((r) => r.id !== id))
+  }
+
+  const patternTypeLabel = (pt: string) => {
+    if (pt === 'temporal_exact_days') return '固定天數'
+    if (pt === 'temporal_unit') return '時間單位'
+    if (pt === 'stopword') return '停用詞'
+    return pt
+  }
 
   const up = (partial: Partial<Settings>) => setDraft((d) => ({ ...d, ...partial }))
 
@@ -655,6 +687,74 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                       <span style={{ fontSize: '12px', color: 'var(--color-text-muted)' }}>則訊息後壓縮</span>
                     </div>
                   </>
+                )}
+              </div>
+
+              {/* 查詢規則 */}
+              <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px', marginTop: '8px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' }}>
+                  <span style={{ fontSize: '13px', fontWeight: 500, color: 'var(--color-text-primary)' }}>查詢規則</span>
+                  {memoryRulesLoading && (
+                    <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>載入中…</span>
+                  )}
+                </div>
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '0 0 12px', lineHeight: 1.5 }}>
+                  由 AI 自動學習並寫入的時間詞與停用詞規則，用於加速記憶查詢。可刪除不需要的規則。
+                </p>
+                {!memoryRulesLoading && memoryRules.length === 0 ? (
+                  <p style={{ fontSize: '12px', color: 'var(--color-text-muted)', fontStyle: 'italic' }}>尚無自訂規則</p>
+                ) : (
+                  <div style={{ border: '1px solid var(--color-border)', borderRadius: '6px', overflow: 'hidden' }}>
+                    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px' }}>
+                      <thead>
+                        <tr style={{ background: 'var(--color-bg-elevated)' }}>
+                          {['類型', '觸發詞', '值', '建立日期', ''].map((h) => (
+                            <th key={h} style={{
+                              textAlign: 'left', padding: '6px 10px',
+                              color: 'var(--color-text-secondary)', fontWeight: 500,
+                              borderBottom: '1px solid var(--color-border)',
+                            }}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {memoryRules.map((rule, i) => (
+                          <tr key={rule.id} style={{ background: i % 2 === 0 ? 'transparent' : 'var(--color-bg-elevated)' }}>
+                            <td style={{ padding: '6px 10px', color: 'var(--color-text-secondary)' }}>
+                              {patternTypeLabel(rule.pattern_type)}
+                            </td>
+                            <td style={{ padding: '6px 10px', color: 'var(--color-text-primary)', fontFamily: 'monospace' }}>
+                              {rule.pattern}
+                            </td>
+                            <td style={{ padding: '6px 10px', color: 'var(--color-text-secondary)', fontFamily: 'monospace' }}>
+                              {rule.value || '—'}
+                            </td>
+                            <td style={{ padding: '6px 10px', color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }}>
+                              {new Date(rule.created_at).toLocaleDateString('zh-TW')}
+                            </td>
+                            <td style={{ padding: '6px 8px', textAlign: 'right' }}>
+                              <button
+                                onClick={() => handleDeleteMemoryRule(rule.id)}
+                                style={{
+                                  padding: '2px 8px', borderRadius: '4px', fontSize: '11px',
+                                  background: 'transparent', border: '1px solid var(--color-border)',
+                                  color: 'var(--color-text-muted)', cursor: 'pointer',
+                                }}
+                                onMouseEnter={(e) => {
+                                  e.currentTarget.style.borderColor = '#e06c75'
+                                  e.currentTarget.style.color = '#e06c75'
+                                }}
+                                onMouseLeave={(e) => {
+                                  e.currentTarget.style.borderColor = 'var(--color-border)'
+                                  e.currentTarget.style.color = 'var(--color-text-muted)'
+                                }}
+                              >刪除</button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
                 )}
               </div>
             </>}

@@ -7,7 +7,8 @@ mod vault;
 use commands::{
     ai::{stream_chat, process_with_llm, stop_llama_server, warmup_llama_server, agent_chat,
          get_llama_server_status, start_llama_server, restart_llama_server,
-         save_memory_session, query_memory, memory_agent},
+         save_memory_session, query_memory, memory_agent, add_memory_rule,
+         get_memory_rules, delete_memory_rule, resolve_memory_context},
     download::*, graph::*, import::*, search::*, settings::*, vault::*,
     voice::{transcribe_audio, stop_whisper_server, warmup_whisper_server,
             get_whisper_server_status, start_whisper_server, restart_whisper_server},
@@ -141,6 +142,10 @@ pub fn run() {
             save_memory_session,
             query_memory,
             memory_agent,
+            add_memory_rule,
+            get_memory_rules,
+            delete_memory_rule,
+            resolve_memory_context,
             // Download
             get_models_dir,
             get_downloaded_models,
