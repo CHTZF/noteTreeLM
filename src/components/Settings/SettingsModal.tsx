@@ -29,16 +29,14 @@ const MODEL_OPTIONS: Record<string, string[]> = {
   openai:    ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-4', 'gpt-3.5-turbo'],
   anthropic: ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'],
   ollama:    ['llama3.2', 'llama3.1', 'mistral', 'codestral', 'gemma2', 'phi3'],
-  local:     [],
 }
 const DEFAULT_MODEL: Record<string, string> = {
-  openai: 'gpt-4o', anthropic: 'claude-sonnet-4-6', ollama: 'llama3.2', local: '',
+  openai: 'gpt-4o', anthropic: 'claude-sonnet-4-6', ollama: 'llama3.2',
 }
 const DEFAULT_BASE_URL: Record<string, string> = {
   openai: 'https://api.openai.com/v1',
   anthropic: 'https://api.anthropic.com/v1',
   ollama: 'http://localhost:11434/v1',
-  local: '',
 }
 
 const labelStyle: React.CSSProperties = {
@@ -98,7 +96,7 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   }, [tab])
 
   useEffect(() => {
-    if (tab !== 'advanced') return
+    if (tab !== 'local') return
     setMemoryRulesLoading(true)
     invoke<MemoryRuleEntry[]>('get_memory_rules')
       .then(setMemoryRules)
@@ -216,6 +214,26 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
     </div>
   )
 
+  const SectionHeader = ({ label, locked }: { label: string; locked?: boolean }) => (
+    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
+      <span style={{
+        fontSize: '10.5px', fontWeight: 600, letterSpacing: '0.07em',
+        color: 'var(--color-text-secondary)', textTransform: 'uppercase' as const,
+      }}>{label}</span>
+      {locked && (
+        <span style={{
+          fontSize: '10px', color: 'var(--color-warning, #f59e0b)',
+          background: 'rgba(245,158,11,0.1)', border: '1px solid rgba(245,158,11,0.25)',
+          padding: '1px 7px', borderRadius: '4px', fontWeight: 500,
+        }}>執行中・已鎖定</span>
+      )}
+    </div>
+  )
+
+  const SectionDivider = () => (
+    <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0 20px' }} />
+  )
+
   const ServerCard = ({
     name, status, busy, onStart, onStop, onRestart,
   }: {
@@ -261,7 +279,7 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   const modelIsCustom = hasProvider && !modelOptions.includes(draft.ai_model) && draft.ai_model
 
   const tabs: [Tab, string][] = [
-    ['general', '一般'], ['ai', 'AI'], ['voice', 'Whisper'], ['local', 'Local LLM'], ['advanced', '進階'], ['raw', '設定檔'],
+    ['general', '一般'], ['ai', '外部資源'], ['voice', 'Whisper'], ['local', 'Local LLM'], ['advanced', '進階'], ['raw', '設定檔'],
   ]
 
   const numInputStyle: React.CSSProperties = {
@@ -406,18 +424,20 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
 
             {tab === 'ai' && <>
               <div style={fieldStyle}>
-                <label style={labelStyle}>AI 提供商</label>
+                <label style={labelStyle}>外部 AI 提供商</label>
                 <select value={draft.ai_provider} onChange={(e) => handleProviderChange(e.target.value)} style={inputStyle}>
                   <option value="">未設定</option>
                   <option value="openai">OpenAI</option>
                   <option value="anthropic">Anthropic</option>
                   <option value="ollama">Ollama（本地 API）</option>
-                  <option value="local">本地 LLM（llama.cpp）</option>
                 </select>
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '5px 0 0', lineHeight: 1.5 }}>
+                  當本地工具（記憶查詢、主題分析等）無法回答時，Chat 會透過此提供商發送請求作為外部輔助。本地 LLM 路徑與模型請至「Local LLM」頁面設定。
+                </p>
               </div>
 
-              {/* 雲端提供商欄位：未選擇或 local 模式時隱藏 */}
-              {draft.ai_provider && draft.ai_provider !== 'local' && <>
+              {/* 提供商欄位：未選擇時隱藏 */}
+              {draft.ai_provider && <>
                 {/* 模型 — 下拉選單（依提供商），Ollama 用文字輸入 */}
                 <div style={fieldStyle}>
                   <label style={labelStyle}>模型</label>
@@ -473,18 +493,10 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                 </div>
               </>}
 
-              {draft.ai_provider === 'local' && (
-                <p style={{ fontSize: '12px', color: 'var(--color-text-muted)', margin: '4px 0 8px', lineHeight: 1.6 }}>
-                  本地 LLM 路徑、埠號與模型設定請至「Local LLM Server」頁面。
-                </p>
-              )}
-
-              <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px', marginTop: '8px' }}>
-                <ToggleRow label="啟用智慧摘要" value={draft.ai_enable_summary} onChange={(v) => up({ ai_enable_summary: v })} />
-              </div>
             </>}
 
             {tab === 'voice' && <>
+              {/* ── Server Status ──────────────────────────────────────────── */}
               <ServerCard
                 name="Whisper Server（語音辨識）"
                 status={whisperStatus}
@@ -504,44 +516,36 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                   invoke('restart_whisper_server').finally(() => setWhisperBusy(false))
                 }}
               />
-              {whisperStatus === 'running' && (
-                <p style={{ fontSize: '11px', color: 'var(--color-warning, #f59e0b)', margin: '-8px 0 16px', lineHeight: 1.5 }}>
-                  ⚠ 伺服器執行中，路徑、埠號與模型設定已鎖定。請先停止伺服器再修改。
-                </p>
-              )}
-              <ModelDownloader
-                models={WHISPER_MODELS}
-                title="語音辨識模型"
-                kind="whisper"
-                value={draft.whisper_model_path}
-                onChange={(v) => up({ whisper_model_path: v })}
-                disabled={whisperStatus === 'running'}
-              />
 
-              <div style={{ borderTop: '1px solid var(--color-border)', margin: '18px 0' }} />
-
+              {/* ── Server Configuration ───────────────────────────────────── */}
+              <SectionDivider />
+              <SectionHeader label="伺服器設定" locked={whisperStatus === 'running'} />
               <div style={fieldStyle}>
-                <label style={labelStyle}>whisper-server 路徑</label>
+                <label style={labelStyle}>執行檔路徑</label>
                 <PathPicker value={draft.whisper_cli_path} onChange={(v) => up({ whisper_cli_path: v })} disabled={whisperStatus === 'running'} />
                 <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '4px 0 0', lineHeight: 1.5 }}>
-                  請指向 <code>whisper-server</code> 二進位檔。第一次錄音時自動啟動，App 關閉時自動停止。
+                  請指向 <code>whisper-server</code> 二進位檔（第一次錄音時自動啟動）
                 </p>
               </div>
-              <div style={fieldStyle}>
-                <label style={labelStyle}>whisper-server 埠號</label>
-                <input
-                  type="number"
-                  min={1024}
-                  max={65535}
-                  value={draft.whisper_server_port}
-                  disabled={whisperStatus === 'running'}
-                  onChange={(e) => up({ whisper_server_port: Number(e.target.value) })}
-                  style={{ ...(whisperStatus === 'running' ? disabledStyle : inputStyle), width: '100px' }}
-                />
-                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '4px 0 0', lineHeight: 1.5 }}>
-                  預設 8081。請確保不與 llama-server（預設 8080）衝突。
+              <div style={{ display: 'flex', alignItems: 'flex-end', gap: '16px', marginBottom: '18px' }}>
+                <div>
+                  <label style={labelStyle}>埠號</label>
+                  <input
+                    type="number" min={1024} max={65535}
+                    value={draft.whisper_server_port}
+                    disabled={whisperStatus === 'running'}
+                    onChange={(e) => up({ whisper_server_port: Number(e.target.value) })}
+                    style={{ ...(whisperStatus === 'running' ? disabledStyle : inputStyle), width: '100px' }}
+                  />
+                </div>
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '0 0 6px', lineHeight: 1.5 }}>
+                  預設 8081，勿與 llama-server（8080）衝突
                 </p>
               </div>
+
+              {/* ── Recognition Settings ───────────────────────────────────── */}
+              <SectionDivider />
+              <SectionHeader label="辨識設定" />
               <div style={fieldStyle}>
                 <label style={labelStyle}>辨識語言</label>
                 <select value={draft.whisper_language} onChange={(e) => up({ whisper_language: e.target.value })} style={inputStyle}>
@@ -555,36 +559,46 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                 </select>
               </div>
               <ToggleRow label="辨識完成後自動插入編輯器" value={draft.whisper_auto_insert} onChange={(v) => up({ whisper_auto_insert: v })} />
-
-              <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px', marginTop: '8px' }}>
-                <div style={fieldStyle}>
-                  <label style={labelStyle}>語音後處理模式</label>
-                  <select
-                    value={draft.voice_process_mode}
-                    onChange={(e) => up({ voice_process_mode: e.target.value as any })}
-                    style={inputStyle}
-                  >
-                    <option value="none">無（直接插入原始文字）</option>
-                    <option value="format">自動整理（llama 潤稿）</option>
-                    <option value="summary">標記 Wikilink（llama 分析關鍵詞）</option>
-                  </select>
-                  {draft.voice_process_mode !== 'none' && !draft.llama_cli_path && (
-                    <p style={{ fontSize: '11px', color: 'var(--color-warning, #f59e0b)', margin: '6px 0 0', lineHeight: 1.5 }}>
-                      ⚠ 請先到「Local LLM Server」頁面設定 llama 路徑與本地模型。
-                    </p>
-                  )}
-                  {draft.voice_process_mode !== 'none' && (
-                    <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '6px 0 0', lineHeight: 1.5 }}>
-                      {draft.voice_process_mode === 'format'
-                        ? '辨識完成後，llama 會將口語文字潤飾成書面語後再插入。'
-                        : '辨識完成後，llama 會分析口語文字中的關鍵主題，並將其替換為 [[wikilink]] 格式後插入。'}
-                    </p>
-                  )}
-                </div>
+              <div style={fieldStyle}>
+                <label style={labelStyle}>語音後處理模式</label>
+                <select
+                  value={draft.voice_process_mode}
+                  onChange={(e) => up({ voice_process_mode: e.target.value as any })}
+                  style={inputStyle}
+                >
+                  <option value="none">無（直接插入原始文字）</option>
+                  <option value="format">自動整理（llama 潤稿）</option>
+                  <option value="summary">標記 Wikilink（llama 分析關鍵詞）</option>
+                </select>
+                {draft.voice_process_mode !== 'none' && !draft.llama_cli_path && (
+                  <p style={{ fontSize: '11px', color: 'var(--color-warning, #f59e0b)', margin: '6px 0 0', lineHeight: 1.5 }}>
+                    ⚠ 請先到「Local LLM Server」頁面設定 llama 路徑與本地模型。
+                  </p>
+                )}
+                {draft.voice_process_mode !== 'none' && (
+                  <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '6px 0 0', lineHeight: 1.5 }}>
+                    {draft.voice_process_mode === 'format'
+                      ? '辨識完成後，llama 會將口語文字潤飾成書面語後再插入。'
+                      : '辨識完成後，llama 會分析口語文字中的關鍵主題，並將其替換為 [[wikilink]] 格式後插入。'}
+                  </p>
+                )}
               </div>
+
+              {/* ── Model Management ───────────────────────────────────────── */}
+              <SectionDivider />
+              <SectionHeader label="模型管理" locked={whisperStatus === 'running'} />
+              <ModelDownloader
+                models={WHISPER_MODELS}
+                title="語音辨識模型"
+                kind="whisper"
+                value={draft.whisper_model_path}
+                onChange={(v) => up({ whisper_model_path: v })}
+                disabled={whisperStatus === 'running'}
+              />
             </>}
 
             {tab === 'local' && <>
+              {/* ── Server Status ──────────────────────────────────────────── */}
               <ServerCard
                 name="LLaMA Server（本地 AI）"
                 status={llamaStatus}
@@ -604,114 +618,73 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                   invoke('restart_llama_server').finally(() => setLlamaBusy(false))
                 }}
               />
-              {llamaStatus === 'running' && (
-                <p style={{ fontSize: '11px', color: 'var(--color-warning, #f59e0b)', margin: '-8px 0 16px', lineHeight: 1.5 }}>
-                  ⚠ 伺服器執行中，路徑、埠號與模型設定已鎖定。請先停止伺服器再修改。
-                </p>
-              )}
+
+              {/* ── Server Configuration ───────────────────────────────────── */}
+              <SectionDivider />
+              <SectionHeader label="伺服器設定" locked={llamaStatus === 'running'} />
               <div style={fieldStyle}>
-                <label style={labelStyle}>llama-server 路徑</label>
+                <label style={labelStyle}>執行檔路徑</label>
                 <PathPicker value={draft.llama_cli_path} onChange={(v) => up({ llama_cli_path: v })} disabled={llamaStatus === 'running'} />
-                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '5px 0 0', lineHeight: 1.5 }}>
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '4px 0 0', lineHeight: 1.5 }}>
                   請指向 <code>llama-server</code> 二進位檔（非 llama-cli）
                 </p>
               </div>
-              <div style={fieldStyle}>
-                <label style={labelStyle}>llama-server 埠號</label>
-                <input
-                  type="number" min={1024} max={65535}
-                  value={draft.llama_server_port}
-                  disabled={llamaStatus === 'running'}
-                  onChange={(e) => up({ llama_server_port: Number(e.target.value) })}
-                  style={{ ...(llamaStatus === 'running' ? disabledStyle : inputStyle), width: '120px' }}
-                />
-                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '5px 0 0', lineHeight: 1.5 }}>
-                  預設 8080。App 啟動後第一次對話時會自動啟動 llama-server，關閉 App 時自動停止。
+              <div style={{ display: 'flex', alignItems: 'flex-end', gap: '16px', marginBottom: '18px' }}>
+                <div>
+                  <label style={labelStyle}>埠號</label>
+                  <input
+                    type="number" min={1024} max={65535}
+                    value={draft.llama_server_port}
+                    disabled={llamaStatus === 'running'}
+                    onChange={(e) => up({ llama_server_port: Number(e.target.value) })}
+                    style={{ ...(llamaStatus === 'running' ? disabledStyle : inputStyle), width: '100px' }}
+                  />
+                </div>
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '0 0 6px', lineHeight: 1.5 }}>
+                  預設 8080（第一次對話時自動啟動）
                 </p>
               </div>
-              <ModelDownloader
-                models={LLM_MODELS}
-                title="本地語言模型"
-                kind="llm"
-                value={draft.llm_model_path}
-                onChange={(v) => up({ llm_model_path: v })}
-                disabled={llamaStatus === 'running'}
-              />
-              <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px', marginTop: '8px' }}>
-                <ToggleRow label="啟用主題分析" value={draft.ai_enable_topics} onChange={(v) => up({ ai_enable_topics: v })} />
-                <ToggleRow label="啟用圖片辨識" value={draft.ai_enable_vision} onChange={(v) => up({ ai_enable_vision: v })} />
-              </div>
-            </>}
 
-            {tab === 'advanced' && <>
-              <div style={fieldStyle}>
-                <label style={labelStyle}>匯入最大深度</label>
-                <input type="number" min={1} max={10}
-                  value={draft.import_max_depth}
-                  onChange={(e) => up({ import_max_depth: Number(e.target.value) })}
-                  style={numInputStyle} />
-              </div>
-              <div style={fieldStyle}>
-                <label style={labelStyle}>匯入最大頁數</label>
-                <input type="number" min={1} max={200}
-                  value={draft.import_max_pages}
-                  onChange={(e) => up({ import_max_pages: Number(e.target.value) })}
-                  style={numInputStyle} />
-              </div>
-              <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px', marginTop: '8px' }}>
-                <ToggleRow
-                  label="Debug 模式"
-                  value={draft.debug_mode}
-                  onChange={(v) => up({ debug_mode: v })}
-                />
-                {draft.debug_mode && (
-                  <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 16px 0', lineHeight: 1.5 }}>
-                    開啟後右側面板會新增 Debug 分頁，顯示語音錄音的詳細事件日誌。
-                  </p>
-                )}
-                <ToggleRow
-                  label="啟用 Chat 功能"
-                  value={draft.enable_chat}
-                  onChange={(v) => up({ enable_chat: v })}
-                />
-                {draft.enable_chat && (
-                  <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 0 0', lineHeight: 1.5 }}>
-                    開啟後右側面板會新增 Chat 分頁，可與本地 llama LLM 進行對話。需先在 AI 頁面設定 llama CLI。
-                  </p>
-                )}
-                <div style={{ height: '1px', background: 'var(--color-border)', margin: '8px 0' }} />
-                <ToggleRow
-                  label="自動記憶整理"
-                  value={draft.enable_auto_memory}
-                  onChange={(v) => up({ enable_auto_memory: v })}
-                />
-                {draft.enable_auto_memory && (
-                  <>
-                    <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 4px 0', lineHeight: 1.5 }}>
-                      對話達到閾值時自動將原始訊息存為記憶筆記（memories/ai_memory_*.md），並提供 query_memory 工具查詢。
-                    </p>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                      <label style={{ fontSize: '13px', color: 'var(--color-text-secondary)', whiteSpace: 'nowrap' }}>訊息閾值</label>
-                      <input
-                        type="number"
-                        min={5}
-                        max={200}
-                        value={draft.memory_threshold}
-                        onChange={(e) => up({ memory_threshold: Math.max(5, Math.min(200, Number(e.target.value))) })}
-                        style={{
-                          width: '72px', padding: '4px 8px',
-                          background: 'var(--color-bg-base)', border: '1px solid var(--color-border)',
-                          borderRadius: '4px', color: 'var(--color-text-primary)', fontSize: '13px',
-                        }}
-                      />
-                      <span style={{ fontSize: '12px', color: 'var(--color-text-muted)' }}>則訊息後壓縮</span>
-                    </div>
-                  </>
-                )}
-              </div>
+              {/* ── AI Features ────────────────────────────────────────────── */}
+              <SectionDivider />
+              <SectionHeader label="AI 功能" />
+              <ToggleRow label="啟用智慧摘要" value={draft.ai_enable_summary} onChange={(v) => up({ ai_enable_summary: v })} />
+              <ToggleRow label="啟用主題分析" value={draft.ai_enable_topics} onChange={(v) => up({ ai_enable_topics: v })} />
+              <ToggleRow label="啟用圖片辨識" value={draft.ai_enable_vision} onChange={(v) => up({ ai_enable_vision: v })} />
+              <ToggleRow label="啟用 Chat 功能" value={draft.enable_chat} onChange={(v) => up({ enable_chat: v })} />
+              {draft.enable_chat && (
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 16px 0', lineHeight: 1.5 }}>
+                  開啟後右側面板會新增 Chat 分頁，可與本地 llama LLM 進行對話。需先設定上方的 llama CLI 路徑。
+                </p>
+              )}
 
+              {/* ── Chat & Memory ──────────────────────────────────────────── */}
+              <SectionDivider />
+              <SectionHeader label="Chat 與記憶" />
+              <ToggleRow label="自動記憶整理" value={draft.enable_auto_memory} onChange={(v) => up({ enable_auto_memory: v })} />
+              {draft.enable_auto_memory && (
+                <>
+                  <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 4px 0', lineHeight: 1.5 }}>
+                    對話達到閾值時自動將原始訊息存為記憶筆記（memories/ai_memory_*.md），並提供 query_memory 工具查詢。
+                  </p>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
+                    <label style={{ fontSize: '13px', color: 'var(--color-text-secondary)', whiteSpace: 'nowrap' }}>訊息閾值</label>
+                    <input
+                      type="number" min={5} max={200}
+                      value={draft.memory_threshold}
+                      onChange={(e) => up({ memory_threshold: Math.max(5, Math.min(200, Number(e.target.value))) })}
+                      style={{
+                        width: '72px', padding: '4px 8px',
+                        background: 'var(--color-bg-base)', border: '1px solid var(--color-border)',
+                        borderRadius: '4px', color: 'var(--color-text-primary)', fontSize: '13px',
+                      }}
+                    />
+                    <span style={{ fontSize: '12px', color: 'var(--color-text-muted)' }}>則訊息後壓縮</span>
+                  </div>
+                </>
+              )}
               {/* 查詢規則 */}
-              <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px', marginTop: '8px' }}>
+              <div style={{ marginBottom: '16px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' }}>
                   <span style={{ fontSize: '13px', fontWeight: 500, color: 'var(--color-text-primary)' }}>查詢規則</span>
                   {memoryRulesLoading && (
@@ -775,6 +748,47 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                       </tbody>
                     </table>
                   </div>
+                )}
+              </div>
+
+              {/* ── Model Management ───────────────────────────────────────── */}
+              <SectionDivider />
+              <SectionHeader label="模型管理" locked={llamaStatus === 'running'} />
+              <ModelDownloader
+                models={LLM_MODELS}
+                title="本地語言模型"
+                kind="llm"
+                value={draft.llm_model_path}
+                onChange={(v) => up({ llm_model_path: v })}
+                disabled={llamaStatus === 'running'}
+              />
+            </>}
+
+            {tab === 'advanced' && <>
+              <div style={fieldStyle}>
+                <label style={labelStyle}>匯入最大深度</label>
+                <input type="number" min={1} max={10}
+                  value={draft.import_max_depth}
+                  onChange={(e) => up({ import_max_depth: Number(e.target.value) })}
+                  style={numInputStyle} />
+              </div>
+              <div style={fieldStyle}>
+                <label style={labelStyle}>匯入最大頁數</label>
+                <input type="number" min={1} max={200}
+                  value={draft.import_max_pages}
+                  onChange={(e) => up({ import_max_pages: Number(e.target.value) })}
+                  style={numInputStyle} />
+              </div>
+              <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px', marginTop: '8px' }}>
+                <ToggleRow
+                  label="Debug 模式"
+                  value={draft.debug_mode}
+                  onChange={(v) => up({ debug_mode: v })}
+                />
+                {draft.debug_mode && (
+                  <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 16px 0', lineHeight: 1.5 }}>
+                    開啟後右側面板會新增 Debug 分頁，顯示語音錄音的詳細事件日誌。
+                  </p>
                 )}
               </div>
             </>}

@@ -168,34 +168,14 @@ async fn ensure_server_running(
     ))
 }
 
-/// 串流聊天：透過 llama-server /v1/chat/completions (stream=true)
-/// tokens 以 "llm:token" 事件即時推送前端，完成後發送 "llm:done"
-#[tauri::command]
-pub async fn stream_chat(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    messages: Vec<ChatMessage>,
-    system: Option<String>,
-) -> Result<String, AppError> {
-    let base_url = ensure_server_running(state.inner(), &app).await?;
-    let client = reqwest::Client::new();
-
-    // 組裝 OpenAI-compatible messages 陣列
-    let mut api_messages: Vec<serde_json::Value> = Vec::new();
-    if let Some(sys) = &system {
-        api_messages.push(serde_json::json!({"role": "system", "content": sys}));
-    }
-    for msg in &messages {
-        api_messages.push(serde_json::json!({"role": msg.role, "content": msg.content}));
-    }
-
-    let body = serde_json::json!({
-        "messages": api_messages,
-        "max_tokens": 2048,
-        "temperature": 0.7,
-        "stream": true,
-    });
-
+/// 封裝 OpenAI-compatible SSE 串流請求，返回 StreamResult
+/// 同時處理文字 token（emit llm:token）和 tool call fragments 的累積
+async fn send_streaming_request(
+    client: &reqwest::Client,
+    base_url: &str,
+    body: serde_json::Value,
+    app: &AppHandle,
+) -> Result<StreamResult, AppError> {
     let response = client
         .post(format!("{}/v1/chat/completions", base_url))
         .json(&body)
@@ -213,7 +193,323 @@ pub async fn stream_chat(
         )));
     }
 
-    // 解析 SSE 串流：每個 event 以 \n\n 分隔
+    let mut stream = response.bytes_stream();
+    let mut sse_buf = String::new();
+    let mut full_text = String::new();
+    let mut finish_reason = String::from("stop");
+    let mut tool_call_chunks: Vec<ToolCallAccumulator> = Vec::new();
+
+    while let Some(item) = stream.next().await {
+        let bytes = item.map_err(|e| AppError::AI(format!("串流讀取失敗：{}", e)))?;
+        sse_buf.push_str(&String::from_utf8_lossy(&bytes));
+
+        while let Some(event_end) = sse_buf.find("\n\n") {
+            let event = sse_buf[..event_end].to_string();
+            sse_buf = sse_buf[event_end + 2..].to_string();
+
+            for line in event.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if data.trim() == "[DONE]" {
+                        continue;
+                    }
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                        let choice = &json["choices"][0];
+
+                        // 記錄 finish_reason
+                        if let Some(fr) = choice["finish_reason"].as_str() {
+                            if !fr.is_empty() {
+                                finish_reason = fr.to_string();
+                            }
+                        }
+
+                        let delta = &choice["delta"];
+
+                        // 一般文字 token
+                        if let Some(content) = delta["content"].as_str() {
+                            if !content.is_empty() {
+                                let _ = app.emit("llm:token", content);
+                                full_text.push_str(content);
+                            }
+                        }
+
+                        // Tool call fragments 累積
+                        if let Some(tc_arr) = delta["tool_calls"].as_array() {
+                            for tc_chunk in tc_arr {
+                                let idx =
+                                    tc_chunk["index"].as_u64().unwrap_or(0) as usize;
+                                while tool_call_chunks.len() <= idx {
+                                    tool_call_chunks.push(ToolCallAccumulator {
+                                        id: String::new(),
+                                        name: String::new(),
+                                        arguments: String::new(),
+                                    });
+                                }
+                                let acc = &mut tool_call_chunks[idx];
+                                if let Some(id) = tc_chunk["id"].as_str() {
+                                    if !id.is_empty() {
+                                        acc.id = id.to_string();
+                                    }
+                                }
+                                if let Some(name) = tc_chunk["function"]["name"].as_str() {
+                                    if !name.is_empty() {
+                                        acc.name = name.to_string();
+                                    }
+                                }
+                                if let Some(args_frag) =
+                                    tc_chunk["function"]["arguments"].as_str()
+                                {
+                                    acc.arguments.push_str(args_frag);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(StreamResult {
+        full_text,
+        finish_reason,
+        tool_call_chunks,
+    })
+}
+
+/// 回傳只包含 call_external_ai 的工具定義陣列（用於 stream_chat）
+fn external_ai_tool_definition() -> serde_json::Value {
+    serde_json::json!([{
+        "type": "function",
+        "function": {
+            "name": "call_external_ai",
+            "description": "呼叫外部 AI 服務獲取即時資訊或當前事件。\
+僅在需要本地模型不具備的最新外部資料時使用（如今日新聞、即時排行、最新活動）。\
+不用於查詢 Vault 筆記或歷史對話記憶。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "發送給外部 AI 的完整問題或指令"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    }])
+}
+
+/// 串流聊天：透過 llama-server /v1/chat/completions (stream=true)
+/// tokens 以 "llm:token" 事件即時推送前端，完成後發送 "llm:done"
+#[tauri::command]
+pub async fn stream_chat(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    messages: Vec<ChatMessage>,
+    system: Option<String>,
+) -> Result<String, AppError> {
+    let base_url = ensure_server_running(state.inner(), &app).await?;
+    let client = reqwest::Client::new();
+
+    // 讀取外部 AI 設定
+    let settings_db = &state.settings_db;
+    let ext_provider = queries::get_setting(settings_db, "ai_provider")
+        .await?
+        .unwrap_or_default();
+    let ext_config = if !ext_provider.is_empty() {
+        let base = queries::get_setting(settings_db, "ai_base_url")
+            .await?
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        let model = queries::get_setting(settings_db, "ai_model")
+            .await?
+            .unwrap_or_else(|| "gpt-4o".to_string());
+        let api_key = read_api_key_sync(&ext_provider);
+        ExtAiConfig { provider: ext_provider, base_url: base, model, api_key }
+    } else {
+        ExtAiConfig {
+            provider: String::new(),
+            base_url: String::new(),
+            model: String::new(),
+            api_key: String::new(),
+        }
+    };
+
+    // 取得 vault 資訊（Vault 未設定時 vault_db_opt 為 None，vault_path 為空字串）
+    let vault_path = state.get_vault_path().await;
+    let vault_db_opt = state.get_vault_db().await.ok();
+
+    // 組裝初始 messages 陣列
+    let mut messages_json: Vec<serde_json::Value> = Vec::new();
+    if let Some(sys) = &system {
+        messages_json.push(serde_json::json!({"role": "system", "content": sys}));
+    }
+    for msg in &messages {
+        messages_json.push(serde_json::json!({"role": msg.role, "content": msg.content}));
+    }
+
+    let tools = vault_tools(); // 所有 8 個工具
+    let mut final_text = String::new();
+
+    // 多輪迴圈（最多 5 輪工具調用）
+    for _round in 0..5 {
+        let body = serde_json::json!({
+            "messages": messages_json,
+            "tools": tools,
+            "tool_choice": "auto",
+            "max_tokens": 2048,
+            "temperature": 0.7,
+            "stream": true,
+        });
+
+        let result = send_streaming_request(&client, &base_url, body, &app).await?;
+
+        // 無 tool call → 完成
+        let Some((tool_id, tool_name, tool_args)) = detect_tool_call(&result) else {
+            final_text = result.full_text;
+            break;
+        };
+
+        // 顯示工具呼叫進度給前端
+        let display = tool_call_display(&tool_name, &tool_args);
+        let _ = app.emit("agent:tool_call", &display);
+
+        // 寫入工具：等待前端確認（存入 oneshot sender，等候 confirm_write_tool 命令）
+        let approved = if is_write_tool(&tool_name) {
+            let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+            *state.write_confirm_tx.lock().await = Some(tx);
+            let _ = app.emit("agent:write_request", &display);
+            tokio::time::timeout(Duration::from_secs(60), rx)
+                .await
+                .unwrap_or(Ok(false))
+                .unwrap_or(false)
+        } else {
+            true
+        };
+
+        let tool_result = if approved {
+            execute_vault_tool(
+                &tool_name,
+                &tool_args,
+                vault_db_opt.as_ref(),
+                &vault_path,
+                &app,
+                &ext_config,
+            )
+            .await
+        } else {
+            "用戶拒絕了此寫入操作。".to_string()
+        };
+
+        // 注入工具結果到 messages（native / text-fallback 兩種格式）
+        if !tool_id.is_empty() {
+            // Native OpenAI tool_calls 格式
+            messages_json.push(serde_json::json!({
+                "role": "assistant",
+                "content": serde_json::Value::Null,
+                "tool_calls": [{
+                    "id": tool_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": serde_json::to_string(&tool_args).unwrap_or_default()
+                    }
+                }]
+            }));
+            messages_json.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": tool_id,
+                "content": tool_result
+            }));
+        } else {
+            // 文字格式 fallback：保留前言，以 user 訊息注入結果
+            let preamble = result
+                .full_text
+                .find("<tool_call>")
+                .map(|p| result.full_text[..p].trim().to_string())
+                .unwrap_or_default();
+            if !preamble.is_empty() {
+                messages_json
+                    .push(serde_json::json!({"role": "assistant", "content": preamble}));
+            }
+            messages_json.push(serde_json::json!({
+                "role": "user",
+                "content": format!(
+                    "工具執行結果：\n\n[{}]\n{}",
+                    tool_name, tool_result
+                )
+            }));
+        }
+    }
+
+    let _ = app.emit(
+        "llm:stderr",
+        format!("[chat] 完成，回應 {} 字元", final_text.len()),
+    );
+    let _ = app.emit("llm:done", &final_text);
+    Ok(final_text)
+}
+
+/// 串流聊天（外部 AI 提供商）：OpenAI / Anthropic / Ollama
+/// tokens 以 "llm:token" 事件推送，完成後發送 "llm:done"
+#[tauri::command]
+pub async fn stream_chat_external(
+    app: AppHandle,
+    messages: Vec<ChatMessage>,
+    system: Option<String>,
+    provider: String,
+    base_url: String,
+    model: String,
+    api_key: String,
+) -> Result<String, AppError> {
+    match provider.as_str() {
+        "anthropic" => stream_external_anthropic(messages, system, model, api_key, app).await,
+        _ => stream_external_openai_compat(messages, system, model, base_url, api_key, app).await,
+    }
+}
+
+/// OpenAI-compatible SSE 串流（openai、ollama 等）
+async fn stream_external_openai_compat(
+    messages: Vec<ChatMessage>,
+    system: Option<String>,
+    model: String,
+    base_url: String,
+    api_key: String,
+    app: AppHandle,
+) -> Result<String, AppError> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+
+    let mut api_messages: Vec<serde_json::Value> = Vec::new();
+    if let Some(sys) = &system {
+        api_messages.push(serde_json::json!({"role": "system", "content": sys}));
+    }
+    for msg in &messages {
+        api_messages.push(serde_json::json!({"role": msg.role, "content": msg.content}));
+    }
+
+    let body = serde_json::json!({
+        "model": model,
+        "messages": api_messages,
+        "max_tokens": 2048,
+        "temperature": 0.7,
+        "stream": true,
+    });
+
+    let mut req = client.post(&url).json(&body).timeout(Duration::from_secs(120));
+    if !api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", api_key));
+    }
+
+    let response = req
+        .send()
+        .await
+        .map_err(|e| AppError::AI(format!("外部 AI 請求失敗：{}", e)))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(AppError::AI(format!("外部 AI 回應錯誤 {}：{}", status, text)));
+    }
+
     let mut stream = response.bytes_stream();
     let mut sse_buf = String::new();
     let mut full_text = String::new();
@@ -232,9 +528,7 @@ pub async fn stream_chat(
                         continue;
                     }
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(content) =
-                            json["choices"][0]["delta"]["content"].as_str()
-                        {
+                        if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
                             if !content.is_empty() {
                                 let _ = app.emit("llm:token", content);
                                 full_text.push_str(content);
@@ -246,12 +540,83 @@ pub async fn stream_chat(
         }
     }
 
-    let _ = app.emit(
-        "llm:stderr",
-        format!("[chat] 完成，回應 {} 字元", full_text.len()),
-    );
+    let _ = app.emit("llm:stderr", format!("[外部 AI] 完成，回應 {} 字元", full_text.len()));
     let _ = app.emit("llm:done", &full_text);
+    Ok(full_text)
+}
 
+/// Anthropic Messages API SSE 串流
+async fn stream_external_anthropic(
+    messages: Vec<ChatMessage>,
+    system: Option<String>,
+    model: String,
+    api_key: String,
+    app: AppHandle,
+) -> Result<String, AppError> {
+    let client = reqwest::Client::new();
+    let url = "https://api.anthropic.com/v1/messages";
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "max_tokens": 2048,
+        "stream": true,
+        "messages": messages.iter().map(|m| serde_json::json!({
+            "role": m.role,
+            "content": m.content,
+        })).collect::<Vec<_>>(),
+    });
+    if let Some(sys) = system {
+        body["system"] = serde_json::json!(sys);
+    }
+
+    let response = client
+        .post(url)
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .timeout(Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| AppError::AI(format!("Anthropic 請求失敗：{}", e)))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(AppError::AI(format!("Anthropic 回應錯誤 {}：{}", status, text)));
+    }
+
+    // Anthropic SSE: data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
+    let mut stream = response.bytes_stream();
+    let mut sse_buf = String::new();
+    let mut full_text = String::new();
+
+    while let Some(item) = stream.next().await {
+        let bytes = item.map_err(|e| AppError::AI(format!("串流讀取失敗：{}", e)))?;
+        sse_buf.push_str(&String::from_utf8_lossy(&bytes));
+
+        while let Some(event_end) = sse_buf.find("\n\n") {
+            let event = sse_buf[..event_end].to_string();
+            sse_buf = sse_buf[event_end + 2..].to_string();
+
+            for line in event.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                        if json["type"] == "content_block_delta" {
+                            if let Some(text) = json["delta"]["text"].as_str() {
+                                if !text.is_empty() {
+                                    let _ = app.emit("llm:token", text);
+                                    full_text.push_str(text);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = app.emit("llm:stderr", format!("[Anthropic] 完成，回應 {} 字元", full_text.len()));
+    let _ = app.emit("llm:done", &full_text);
     Ok(full_text)
 }
 
@@ -397,6 +762,123 @@ pub async fn restart_llama_server(
 
 // ─── Vault Agent ──────────────────────────────────────────────────────────────
 
+/// 外部 AI 提供商設定（供 agent 工具使用）
+struct ExtAiConfig {
+    provider: String,
+    base_url: String,
+    model: String,
+    api_key: String,
+}
+
+/// 串流過程中累積的單一 tool call 資料
+struct ToolCallAccumulator {
+    id: String,
+    name: String,
+    arguments: String, // 累積的 JSON fragment 字串
+}
+
+/// send_streaming_request 的回傳結果
+struct StreamResult {
+    full_text: String,
+    finish_reason: String,
+    tool_call_chunks: Vec<ToolCallAccumulator>,
+}
+
+/// 從系統 keyring 讀取 API 金鑰（同步）
+fn read_api_key_sync(provider: &str) -> String {
+    if provider.is_empty() {
+        return String::new();
+    }
+    keyring::Entry::new("com.notetreelm.app", provider)
+        .ok()
+        .and_then(|e| e.get_password().ok())
+        .unwrap_or_default()
+}
+
+/// Tool：呼叫外部 AI（非串流），返回回應文字作為工具結果
+async fn call_external_ai_tool(query: &str, config: &ExtAiConfig, app: &AppHandle) -> String {
+    if config.provider.is_empty() {
+        return "外部 AI 未設定，請至「設定 > 外部資源」頁面設定提供商與 API 金鑰後再試。".to_string();
+    }
+
+    let _ = app.emit(
+        "llm:stderr",
+        format!("[外部 AI] 查詢：{}", &query[..query.len().min(80)]),
+    );
+
+    let client = reqwest::Client::new();
+    let messages = vec![serde_json::json!({"role": "user", "content": query})];
+
+    let response_text = match config.provider.as_str() {
+        "anthropic" => {
+            let body = serde_json::json!({
+                "model": config.model,
+                "max_tokens": 2048,
+                "messages": messages,
+            });
+            match client
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", &config.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&body)
+                .timeout(Duration::from_secs(60))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => r
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|j| j["content"][0]["text"].as_str().map(String::from))
+                    .unwrap_or_else(|| "外部 AI 回應解析失敗".to_string()),
+                Ok(r) => format!(
+                    "外部 AI 錯誤 {}：{}",
+                    r.status(),
+                    r.text().await.unwrap_or_default()
+                ),
+                Err(e) => format!("外部 AI 請求失敗：{}", e),
+            }
+        }
+        _ => {
+            // OpenAI-compatible（openai、ollama 等）
+            let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
+            let body = serde_json::json!({
+                "model": config.model,
+                "messages": messages,
+                "max_tokens": 2048,
+            });
+            let mut req = client.post(&url).json(&body).timeout(Duration::from_secs(60));
+            if !config.api_key.is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", config.api_key));
+            }
+            match req.send().await {
+                Ok(r) if r.status().is_success() => r
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|j| {
+                        j["choices"][0]["message"]["content"]
+                            .as_str()
+                            .map(String::from)
+                    })
+                    .unwrap_or_else(|| "外部 AI 回應解析失敗".to_string()),
+                Ok(r) => format!(
+                    "外部 AI 錯誤 {}：{}",
+                    r.status(),
+                    r.text().await.unwrap_or_default()
+                ),
+                Err(e) => format!("外部 AI 請求失敗：{}", e),
+            }
+        }
+    };
+
+    let _ = app.emit(
+        "llm:stderr",
+        format!("[外部 AI] 完成，{} 字元", response_text.len()),
+    );
+    response_text
+}
+
 /// 工具定義（OpenAI function calling 格式）
 fn vault_tools() -> serde_json::Value {
     serde_json::json!([
@@ -509,6 +991,25 @@ fn vault_tools() -> serde_json::Value {
                         }
                     },
                     "required": ["keywords"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "call_external_ai",
+                "description": "呼叫外部 AI 服務（如 OpenAI / Anthropic）獲取即時資訊或當前事件。\
+僅在問題需要本地模型不具備的最新外部資料時使用（例如今日新聞、即時排行、最新活動等）。\
+不用於查詢 Vault 筆記或歷史對話記憶（那些請用 search_vault / query_memory）。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "發送給外部 AI 的完整問題或指令"
+                        }
+                    },
+                    "required": ["query"]
                 }
             }
         }
@@ -937,21 +1438,61 @@ async fn tool_create_folder(rel_path: &str, vault_path: &str) -> String {
     }
 }
 
+/// 判斷工具是否為寫入操作（需要使用者確認）
+fn is_write_tool(name: &str) -> bool {
+    matches!(name, "create_note" | "update_note" | "create_folder")
+}
+
+/// 從 StreamResult 提取 tool call（native 格式優先，fallback 文字格式）
+/// 回傳 (tool_id, tool_name, tool_args)
+fn detect_tool_call(
+    result: &StreamResult,
+) -> Option<(String, String, serde_json::Value)> {
+    // Native OpenAI tool_calls 格式
+    if result.finish_reason == "tool_calls" && !result.tool_call_chunks.is_empty() {
+        let acc = &result.tool_call_chunks[0];
+        let args: serde_json::Value =
+            serde_json::from_str(&acc.arguments).unwrap_or(serde_json::json!({}));
+        return Some((acc.id.clone(), acc.name.clone(), args));
+    }
+    // 文字格式 fallback <tool_call>...</tool_call>
+    if result.full_text.contains("<tool_call>") {
+        if let Some(call) = parse_text_tool_calls(&result.full_text).into_iter().next() {
+            let name = call["function"]["name"].as_str().unwrap_or("").to_string();
+            let args_str = call["function"]["arguments"].as_str().unwrap_or("{}");
+            let args: serde_json::Value =
+                serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
+            return Some((String::new(), name, args));
+        }
+    }
+    None
+}
+
 /// 分派工具調用到對應的實作函式
 async fn execute_vault_tool(
     name: &str,
     args: &serde_json::Value,
-    vault_db: &sqlx::SqlitePool,
+    vault_db: Option<&sqlx::SqlitePool>,
     vault_path: &str,
     app: &AppHandle,
+    ext_config: &ExtAiConfig,
 ) -> String {
+    // call_external_ai 不依賴 vault，可在 vault 未設定時使用
+    if name == "call_external_ai" {
+        let query = args["query"].as_str().unwrap_or("");
+        return call_external_ai_tool(query, ext_config, app).await;
+    }
+
     if vault_path.is_empty() {
         return "Vault 未設定，無法執行 Vault 操作".to_string();
     }
     match name {
         "search_vault" => {
             let query = args["query"].as_str().unwrap_or("");
-            tool_search_vault(query, vault_db, app).await
+            match vault_db {
+                Some(db) => tool_search_vault(query, db, app).await,
+                None => "Vault 資料庫未就緒".to_string(),
+            }
         }
         "list_structure" => {
             let path = args["path"].as_str().unwrap_or("");
@@ -982,7 +1523,10 @@ async fn execute_vault_tool(
                 .unwrap_or_default();
             let since = args["since"].as_str().map(String::from);
             let limit = args["limit"].as_u64().map(|v| v as usize);
-            tool_query_memory(keywords, since, limit, vault_db).await
+            match vault_db {
+                Some(db) => tool_query_memory(keywords, since, limit, db).await,
+                None => "Vault 資料庫未就緒".to_string(),
+            }
         }
         _ => format!("未知工具：{}", name),
     }
@@ -1027,12 +1571,31 @@ fn tool_call_display(name: &str, args: &serde_json::Value) -> String {
         "create_note" => format!("✏️  建立筆記: {}", args["path"].as_str().unwrap_or("")),
         "update_note" => format!("✏️  更新筆記: {}", args["path"].as_str().unwrap_or("")),
         "create_folder" => format!("📁 建立資料夾: {}", args["path"].as_str().unwrap_or("")),
+        "call_external_ai" => {
+            let q = args["query"].as_str().unwrap_or("");
+            let preview = &q[..q.len().min(50)];
+            format!("🌐 外部 AI：\"{}\"", preview)
+        }
         _ => format!("執行工具: {}", name),
     }
 }
 
+/// 前端確認/拒絕寫入工具（stream_chat 等待此命令後繼續執行）
+#[tauri::command]
+pub async fn confirm_write_tool(
+    state: State<'_, AppState>,
+    approved: bool,
+) -> Result<(), AppError> {
+    let tx = state.write_confirm_tx.lock().await.take();
+    if let Some(tx) = tx {
+        let _ = tx.send(approved);
+    }
+    Ok(())
+}
+
 /// Vault Agent 聊天：內建工具調用迴圈，可搜索/讀取/新增/編輯 Vault 中的筆記與資料夾
 /// 每次工具調用會發送 "agent:tool_call" 事件讓前端即時顯示進度
+/// 工具清單包含 call_external_ai，LLM 可自動決定何時呼叫外部資源
 #[tauri::command]
 pub async fn agent_chat(
     app: AppHandle,
@@ -1044,6 +1607,22 @@ pub async fn agent_chat(
     let vault_path = state.get_vault_path().await;
     let vault_db = state.get_vault_db().await?;
     let client = reqwest::Client::new();
+
+    // 讀取外部 AI 設定（provider/model/base_url 存在 settings_db，api_key 存在 keyring）
+    let settings_db = &state.settings_db;
+    let ext_provider = queries::get_setting(settings_db, "ai_provider")
+        .await?.unwrap_or_default();
+    let ext_base_url = queries::get_setting(settings_db, "ai_base_url")
+        .await?.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    let ext_model = queries::get_setting(settings_db, "ai_model")
+        .await?.unwrap_or_else(|| "gpt-4o".to_string());
+    let ext_api_key = read_api_key_sync(&ext_provider);
+    let ext_config = ExtAiConfig {
+        provider: ext_provider,
+        base_url: ext_base_url,
+        model: ext_model,
+        api_key: ext_api_key,
+    };
 
     // Agent 系統 prompt：說明工具能力，附上可選的筆記上下文
     let agent_system = format!(
@@ -1132,7 +1711,7 @@ Vault 中的筆記為 Markdown 格式（.md 副檔名），以資料夾階層組
                 let display = tool_call_display(&tool_name, &args);
                 let _ = app.emit("agent:tool_call", &display);
                 let result =
-                    execute_vault_tool(&tool_name, &args, &vault_db, &vault_path, &app).await;
+                    execute_vault_tool(&tool_name, &args, Some(&vault_db), &vault_path, &app, &ext_config).await;
                 llm_messages.push(serde_json::json!({
                     "role": "tool",
                     "tool_call_id": tool_id,
@@ -1162,7 +1741,7 @@ Vault 中的筆記為 Markdown 格式（.md 副檔名），以資料夾階層組
                     let display = tool_call_display(&tool_name, &args);
                     let _ = app.emit("agent:tool_call", &display);
                     let result =
-                        execute_vault_tool(&tool_name, &args, &vault_db, &vault_path, &app).await;
+                        execute_vault_tool(&tool_name, &args, Some(&vault_db), &vault_path, &app, &ext_config).await;
                     results_text.push(format!("[工具: {}]\n{}", tool_name, result));
                 }
                 // 文字格式模型不支援 role:tool，改用 user 訊息傳回結果

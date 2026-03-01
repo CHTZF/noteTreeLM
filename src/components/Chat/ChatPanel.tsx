@@ -21,7 +21,8 @@ export default function ChatPanel() {
   const [isStreaming, setIsStreaming] = useState(false)
   const [streamingText, setStreamingText] = useState('')
   const [useNoteContext, setUseNoteContext] = useState(false)
-  const [useVaultTools, setUseVaultTools] = useState(false)
+  const [writeConfirmMode, setWriteConfirmMode] = useState<'always' | 'once' | 'never'>('always')
+  const [pendingWriteDisplay, setPendingWriteDisplay] = useState<string | null>(null)
   const [error, setError] = useState('')
   const [isCompressing, setIsCompressing] = useState(false)
   const [lastMemoryPath, setLastMemoryPath] = useState<string | null>(null)
@@ -31,6 +32,7 @@ export default function ChatPanel() {
   const streamingRef = useRef('')
   const tokenCountRef = useRef(0)
   const justCompressedRef = useRef(false)
+  const sessionWriteApprovedRef = useRef(false)
 
   const log = useCallback((msg: string) => addLog('chat', 'info', msg), [addLog])
   const err = useCallback((msg: string) => addLog('chat', 'error', msg), [addLog])
@@ -61,11 +63,6 @@ export default function ChatPanel() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages.length, streamingText])
 
-  // Vault 未設定時關閉 vault tools
-  useEffect(() => {
-    if (!vaultConfigured) setUseVaultTools(false)
-  }, [vaultConfigured])
-
   // vault_path 變化時（包含首次設定、切換 vault）重置 lastMemoryPath 並重新查詢
   // 確保切換 vault 後不會帶入舊 vault 的記憶路徑
   useEffect(() => {
@@ -80,6 +77,14 @@ export default function ChatPanel() {
       })
       .catch(() => {})
   }, [settings.vault_path])
+
+  const handleWriteConfirm = useCallback(async (approved: boolean) => {
+    if (approved && writeConfirmMode === 'once') {
+      sessionWriteApprovedRef.current = true
+    }
+    setPendingWriteDisplay(null)
+    await invoke('confirm_write_tool', { approved })
+  }, [writeConfirmMode])
 
   const send = useCallback(async () => {
     const text = input.trim()
@@ -100,85 +105,80 @@ export default function ChatPanel() {
       .filter((m) => m.role === 'user' || m.role === 'assistant')
       .map((m) => ({ role: m.role, content: m.content }))
 
-    log(`▶ 傳送訊息（${text.length} 字），模式: ${useVaultTools ? 'agent' : 'chat'}`)
+    log(`▶ 傳送訊息（${text.length} 字）`)
 
     let unlistenToken: (() => void) | undefined
     let unlistenDone: (() => void) | undefined
     let unlistenToolCall: (() => void) | undefined
+    let unlistenWriteReq: (() => void) | undefined
 
     try {
-      if (useVaultTools) {
-        // ── Agent 模式 ──────────────────────────────────────────────────────
-        // 監聽工具調用事件，即時顯示在對話中
-        unlistenToolCall = await listen<string>('agent:tool_call', (event) => {
-          setMessages((prev) => [...prev, { role: 'tool', content: event.payload }])
-        })
+      const notePart =
+        useNoteContext && currentPath && noteContent
+          ? `你是一個筆記助手。以下是使用者目前開啟的筆記內容，請根據此內容協助回答問題：\n\n${noteContent.slice(0, 4000)}`
+          : null
 
-        const noteContext =
-          useNoteContext && currentPath && noteContent
-            ? noteContent.slice(0, 4000)
-            : undefined
-
-        if (noteContext) log(`  帶入筆記上下文（${noteContext.length} 字元）`)
-        log('  呼叫 invoke("agent_chat")')
-
-        const responseText = await invoke<string>('agent_chat', {
-          messages: llmMessages,
-          system: noteContext,
-        })
-
-        const finalContent = responseText || ''
-        log(`✓ agent_chat 完成，回覆 ${finalContent.length} 字元`)
-        setMessages((prev) => [...prev, { role: 'assistant', content: finalContent }])
-      } else {
-        // ── 一般串流模式 ─────────────────────────────────────────────────────
-        const notePart =
-          useNoteContext && currentPath && noteContent
-            ? `你是一個筆記助手。以下是使用者目前開啟的筆記內容，請根據此內容協助回答問題：\n\n${noteContent.slice(0, 4000)}`
-            : null
-
-        // 若有記憶存檔，由 resolve_memory_context 查詢（純 Rust，< 100ms）
-        let memoryPart: string | null = null
-        if (lastMemoryPath) {
-          try {
-            const memorySummary = await invoke<string>('resolve_memory_context', { query: text })
-            if (memorySummary) {
-              memoryPart = `以下是相關的過去對話記憶（供參考）：\n\n${memorySummary}`
-              log(`  帶入記憶摘要（${memorySummary.length} 字元）`)
-            } else {
-              log('  resolve_memory_context：無相關記憶，略過注入')
-            }
-          } catch (e) {
-            const msg = typeof e === 'string' ? e : e instanceof Error ? e.message : String(e)
-            err('resolve_memory_context 查詢失敗：' + msg)
+      // 若有記憶存檔，由 resolve_memory_context 查詢（純 Rust，< 100ms）
+      let memoryPart: string | null = null
+      if (lastMemoryPath) {
+        try {
+          const memorySummary = await invoke<string>('resolve_memory_context', { query: text })
+          if (memorySummary) {
+            memoryPart = `以下是相關的過去對話記憶（供參考）：\n\n${memorySummary}`
+            log(`  帶入記憶摘要（${memorySummary.length} 字元）`)
+          } else {
+            log('  resolve_memory_context：無相關記憶，略過注入')
           }
+        } catch (e) {
+          const msg = typeof e === 'string' ? e : e instanceof Error ? e.message : String(e)
+          err('resolve_memory_context 查詢失敗：' + msg)
         }
-
-        const system = [notePart, memoryPart].filter(Boolean).join('\n\n') || undefined
-        if (system) log(`  帶入 system 上下文（${system.length} 字元）`)
-
-        unlistenToken = await listen<string>('llm:token', (event) => {
-          streamingRef.current += event.payload
-          tokenCountRef.current += event.payload.length
-          setStreamingText(streamingRef.current)
-          if (tokenCountRef.current === event.payload.length) {
-            log('✓ 開始收到 llm:token 串流')
-          }
-        })
-        unlistenDone = await listen('llm:done', () => {
-          log(`⏹ llm:done 事件收到，共 ${tokenCountRef.current} 字元`)
-        })
-
-        log('  呼叫 invoke("stream_chat")')
-        const responseText = await invoke<string>('stream_chat', {
-          messages: llmMessages,
-          system,
-        })
-
-        const finalContent = responseText || streamingRef.current
-        log(`✓ stream_chat 完成，回覆 ${finalContent.length} 字元`)
-        setMessages((prev) => [...prev, { role: 'assistant', content: finalContent }])
       }
+
+      const system = [notePart, memoryPart].filter(Boolean).join('\n\n') || undefined
+      if (system) log(`  帶入 system 上下文（${system.length} 字元）`)
+
+      // 監聽工具調用顯示
+      unlistenToolCall = await listen<string>('agent:tool_call', (event) => {
+        setMessages((prev) => [...prev, { role: 'tool', content: event.payload }])
+      })
+
+      // 監聽寫入確認請求
+      unlistenWriteReq = await listen<string>('agent:write_request', async (event) => {
+        const display = event.payload
+        if (writeConfirmMode === 'never') {
+          await invoke('confirm_write_tool', { approved: true })
+          return
+        }
+        if (writeConfirmMode === 'once' && sessionWriteApprovedRef.current) {
+          await invoke('confirm_write_tool', { approved: true })
+          return
+        }
+        // 'always' 或 'once' 首次：顯示確認 UI
+        setPendingWriteDisplay(display)
+      })
+
+      unlistenToken = await listen<string>('llm:token', (event) => {
+        streamingRef.current += event.payload
+        tokenCountRef.current += event.payload.length
+        setStreamingText(streamingRef.current)
+        if (tokenCountRef.current === event.payload.length) {
+          log('✓ 開始收到 llm:token 串流')
+        }
+      })
+      unlistenDone = await listen('llm:done', () => {
+        log(`⏹ llm:done 事件收到，共 ${tokenCountRef.current} 字元`)
+      })
+
+      log('  呼叫 invoke("stream_chat")')
+      const responseText = await invoke<string>('stream_chat', {
+        messages: llmMessages,
+        system,
+      })
+
+      const finalContent = responseText || streamingRef.current
+      log(`✓ stream_chat 完成，回覆 ${finalContent.length} 字元`)
+      setMessages((prev) => [...prev, { role: 'assistant', content: finalContent }])
     } catch (e: unknown) {
       const msg =
         typeof e === 'string'
@@ -192,11 +192,13 @@ export default function ChatPanel() {
       unlistenToken?.()
       unlistenDone?.()
       unlistenToolCall?.()
+      unlistenWriteReq?.()
+      setPendingWriteDisplay(null)
       setIsStreaming(false)
       setStreamingText('')
       streamingRef.current = ''
     }
-  }, [input, isStreaming, messages, useNoteContext, useVaultTools, currentPath, noteContent, lastMemoryPath, log, err])
+  }, [input, isStreaming, messages, useNoteContext, writeConfirmMode, currentPath, noteContent, lastMemoryPath, log, err])
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -261,22 +263,25 @@ export default function ChatPanel() {
           CHAT
         </span>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          {/* Vault 工具 toggle */}
-          <label style={{
-            display: 'flex', alignItems: 'center', gap: '5px', fontSize: '11px',
-            cursor: vaultConfigured ? 'pointer' : 'not-allowed',
-            color: useVaultTools ? 'var(--color-accent)' : 'var(--color-text-muted)',
-            opacity: vaultConfigured ? 1 : 0.35,
-          }}>
-            <input
-              type="checkbox"
-              checked={useVaultTools}
-              onChange={(e) => setUseVaultTools(e.target.checked)}
-              disabled={!vaultConfigured}
-              style={{ cursor: 'pointer', accentColor: 'var(--color-accent)', width: '12px', height: '12px' }}
-            />
-            Vault 工具
-          </label>
+          {/* 寫入確認模式選擇器 */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '11px', color: 'var(--color-text-muted)' }}>
+            <span>寫入：</span>
+            {(['always', 'once', 'never'] as const).map((mode) => (
+              <button
+                key={mode}
+                onClick={() => { setWriteConfirmMode(mode); sessionWriteApprovedRef.current = false }}
+                style={{
+                  padding: '1px 6px', borderRadius: '4px', fontSize: '11px',
+                  border: '1px solid var(--color-border)',
+                  background: writeConfirmMode === mode ? 'var(--color-accent)' : 'transparent',
+                  color: writeConfirmMode === mode ? '#fff' : 'var(--color-text-muted)',
+                  cursor: 'pointer',
+                }}
+              >
+                {mode === 'always' ? '每次' : mode === 'once' ? '本次' : '關閉'}
+              </button>
+            ))}
+          </div>
           {/* 帶入筆記 toggle */}
           <label style={{
             display: 'flex', alignItems: 'center', gap: '5px', fontSize: '11px',
@@ -364,9 +369,7 @@ export default function ChatPanel() {
             height: '100%', color: 'var(--color-text-muted)', fontSize: '12px',
             textAlign: 'center', lineHeight: 1.6,
           }}>
-            {useVaultTools
-              ? '與 Vault 助手對話\n可搜索、新增、編輯 Vault 中的筆記與資料夾'
-              : '與本地 LLM 對話'}
+            {'與本地 LLM 對話（自動使用工具）'}
             <br />
             <span style={{ fontSize: '11px', opacity: 0.7 }}>按 Enter 送出，Shift+Enter 換行</span>
           </div>
@@ -398,6 +401,32 @@ export default function ChatPanel() {
         <div ref={bottomRef} />
       </div>
 
+      {/* 寫入確認 Bubble */}
+      {pendingWriteDisplay && (
+        <div style={{
+          margin: '0 8px 8px', padding: '10px 14px', borderRadius: '8px',
+          background: 'var(--color-bg-elevated)', border: '1px solid var(--color-accent)',
+          fontSize: '13px', flexShrink: 0,
+        }}>
+          <div style={{ marginBottom: '8px', color: 'var(--color-text-primary)', whiteSpace: 'pre-wrap', fontFamily: 'var(--font-mono, monospace)', fontSize: '12px' }}>
+            {pendingWriteDisplay}
+          </div>
+          <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '8px' }}>
+            LLM 想執行此寫入操作，是否允許？
+          </div>
+          <div style={{ display: 'flex', gap: '6px' }}>
+            <button
+              onClick={() => handleWriteConfirm(true)}
+              style={{ padding: '4px 12px', borderRadius: '4px', background: 'var(--color-accent)', color: '#fff', border: 'none', cursor: 'pointer', fontSize: '12px' }}
+            >允許</button>
+            <button
+              onClick={() => handleWriteConfirm(false)}
+              style={{ padding: '4px 12px', borderRadius: '4px', background: 'transparent', color: 'var(--color-text-secondary)', border: '1px solid var(--color-border)', cursor: 'pointer', fontSize: '12px' }}
+            >拒絕</button>
+          </div>
+        </div>
+      )}
+
       {/* 輸入區 */}
       <div style={{
         padding: '8px 12px', borderTop: '1px solid var(--color-border)', flexShrink: 0,
@@ -409,9 +438,7 @@ export default function ChatPanel() {
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
           disabled={isStreaming || !isConfigured}
-          placeholder={isConfigured
-            ? (useVaultTools ? '搜索筆記、新增/編輯筆記或資料夾…' : '輸入訊息…')
-            : '請先設定 llama CLI'}
+          placeholder={isConfigured ? '輸入訊息…' : '請先設定 llama CLI'}
           rows={1}
           style={{
             flex: 1, resize: 'none', padding: '7px 10px',
@@ -445,6 +472,7 @@ export default function ChatPanel() {
     </div>
   )
 }
+
 
 function MessageBubble({
   message,

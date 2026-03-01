@@ -17,6 +17,8 @@ pub struct AppState {
     pub whisper_server: Arc<Mutex<Option<tokio::process::Child>>>,
     /// FileWatcher 停止信號（drop sender 即可停止舊 watcher thread）
     pub watcher_stop: Arc<Mutex<Option<std::sync::mpsc::SyncSender<()>>>>,
+    /// 寫入工具確認通道（stream_chat 等待前端確認時使用）
+    pub write_confirm_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<bool>>>>,
 }
 
 impl AppState {
@@ -28,6 +30,7 @@ impl AppState {
             llama_server: Arc::new(Mutex::new(None)),
             whisper_server: Arc::new(Mutex::new(None)),
             watcher_stop: Arc::new(Mutex::new(None)),
+            write_confirm_tx: Arc::new(Mutex::new(None)),
         }
     }
 
