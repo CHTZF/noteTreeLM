@@ -475,6 +475,219 @@ async fn download_single_binary(
 }
 
 
+// ── Binary (llama-server) download ───────────────────────────────────────────
+
+/// Returns the absolute path to the downloaded llama-server binary, or None if not installed.
+#[tauri::command]
+pub async fn get_llama_binary_path(app: AppHandle) -> Result<Option<String>, AppError> {
+    let name = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
+    let path = binaries_dir(&app)?.join(name);
+    if path.exists() {
+        Ok(Some(path.to_string_lossy().into_owned()))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Downloads the latest llama-server binary from ggerganov/llama.cpp GitHub Releases.
+/// Returns immediately; progress is pushed via "model-download-progress" events
+/// with model_id = "__llama_server__".
+#[tauri::command]
+pub async fn download_llama_server(
+    app: AppHandle,
+    dl_state: tauri::State<'_, DownloadState>,
+) -> Result<(), AppError> {
+    const MODEL_ID: &str = "__llama_server__";
+
+    {
+        let mut active = dl_state.active.lock().await;
+        if active.contains_key(MODEL_ID) {
+            return Ok(());
+        }
+        active.insert(MODEL_ID.to_string(), Arc::new(AtomicBool::new(false)));
+    }
+
+    let app2 = app.clone();
+    tokio::spawn(async move {
+        let result = run_llama_download(&app2, MODEL_ID).await;
+
+        if let Some(ds) = app2.try_state::<DownloadState>() {
+            ds.active.lock().await.remove(MODEL_ID);
+        }
+
+        match result {
+            Ok(path) => {
+                emit_progress(&app2, DownloadProgress {
+                    model_id: MODEL_ID.to_string(),
+                    downloaded_bytes: 0,
+                    total_bytes: 0,
+                    speed_bps: 0,
+                    status: "completed".to_string(),
+                    file_path: Some(path),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                emit_progress(&app2, DownloadProgress {
+                    model_id: MODEL_ID.to_string(),
+                    downloaded_bytes: 0,
+                    total_bytes: 0,
+                    speed_bps: 0,
+                    status: "error".to_string(),
+                    file_path: None,
+                    error: Some(e.to_string()),
+                });
+            }
+        }
+    });
+
+    Ok(())
+}
+
+/// 回傳當前平台對應的 llama.cpp asset 關鍵字與 zip 內 binary 名稱
+fn llama_platform_pattern() -> Result<(&'static str, &'static str), AppError> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos",   "aarch64") => Ok(("macos-arm64",   "llama-server")),
+        ("macos",   "x86_64")  => Ok(("macos-x86_64",  "llama-server")),
+        ("windows", "x86_64")  => Ok(("win-avx2-x64",  "llama-server.exe")),
+        (os, arch) => Err(AppError::Import(format!(
+            "此平台（{}/{}）尚不支援自動下載", os, arch
+        ))),
+    }
+}
+
+async fn run_llama_download(app: &AppHandle, model_id: &str) -> Result<String, AppError> {
+    let (asset_pattern, binary_name) = llama_platform_pattern()?;
+
+    let client = reqwest::Client::builder()
+        .user_agent("noteTreeLM/1.0")
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| AppError::Import(e.to_string()))?;
+
+    // 查詢 ggerganov/llama.cpp 最新 release
+    let release: serde_json::Value = client
+        .get("https://api.github.com/repos/ggerganov/llama.cpp/releases/latest")
+        .send().await
+        .map_err(|e| AppError::Import(format!("無法連接 GitHub API：{}", e)))?
+        .json().await
+        .map_err(|e| AppError::Import(e.to_string()))?;
+
+    let assets = release["assets"].as_array()
+        .ok_or_else(|| AppError::Import("GitHub release 格式異常".to_string()))?;
+
+    // 選出符合平台的 zip（例如 llama-b4639-bin-macos-arm64.zip）
+    let download_url = assets.iter()
+        .find_map(|a| {
+            let name = a["name"].as_str()?.to_lowercase();
+            let url  = a["browser_download_url"].as_str()?;
+            if name.contains(asset_pattern) && name.ends_with(".zip") {
+                Some(url.to_string())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| AppError::Import(format!(
+            "找不到 {} 平台的 llama-server 下載包。\n\
+             可至 https://github.com/ggerganov/llama.cpp/releases 手動下載。",
+            asset_pattern
+        )))?;
+
+    download_and_extract_llama(app, model_id, &client, &download_url, binary_name).await
+}
+
+/// 下載 zip，解壓出 llama-server binary，儲存到 bin_dir
+async fn download_and_extract_llama(
+    app: &AppHandle,
+    model_id: &str,
+    client: &reqwest::Client,
+    url: &str,
+    binary_name: &str,
+) -> Result<String, AppError> {
+    let resp = client.get(url).send().await
+        .map_err(|e| AppError::Import(e.to_string()))?;
+
+    if !resp.status().is_success() {
+        return Err(AppError::Import(format!("下載失敗 HTTP {}", resp.status())));
+    }
+
+    let total_bytes = resp.content_length().unwrap_or(0);
+    let bin_dir = binaries_dir(app)?;
+    let zip_part = bin_dir.join("llama-server.zip.part");
+
+    let mut file = std::fs::File::create(&zip_part)?;
+    let mut downloaded = 0u64;
+    let mut last_emit = std::time::Instant::now();
+    let mut last_emit_downloaded = 0u64;
+    let mut resp = resp;
+
+    loop {
+        match resp.chunk().await.map_err(|e| AppError::Import(e.to_string()))? {
+            None => break,
+            Some(chunk) => {
+                file.write_all(&chunk)?;
+                downloaded += chunk.len() as u64;
+                let elapsed = last_emit.elapsed();
+                if elapsed >= std::time::Duration::from_millis(300) {
+                    let speed_bps = if elapsed.as_secs_f64() > 0.0 {
+                        ((downloaded - last_emit_downloaded) as f64 / elapsed.as_secs_f64()) as u64
+                    } else { 0 };
+                    last_emit = std::time::Instant::now();
+                    last_emit_downloaded = downloaded;
+                    emit_progress(app, DownloadProgress {
+                        model_id: model_id.to_string(),
+                        downloaded_bytes: downloaded,
+                        total_bytes: total_bytes,
+                        speed_bps,
+                        status: "downloading".to_string(),
+                        file_path: None,
+                        error: None,
+                    });
+                }
+            }
+        }
+    }
+    file.flush()?;
+    drop(file);
+
+    // 解壓縮，找出 binary（可能在子目錄）
+    let zip_bytes = std::fs::read(&zip_part)
+        .map_err(|e| AppError::Import(e.to_string()))?;
+    let cursor = std::io::Cursor::new(zip_bytes);
+    let mut archive = zip::ZipArchive::new(cursor)
+        .map_err(|e| AppError::Import(format!("zip 解壓失敗：{}", e)))?;
+
+    let entry_name = (0..archive.len())
+        .find_map(|i| {
+            let e = archive.by_index(i).ok()?;
+            let name = e.name().to_string();
+            let file_part = name.rsplit('/').next().unwrap_or(&name).to_lowercase();
+            if file_part == binary_name.to_lowercase() {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| AppError::Import(format!("zip 中找不到 {}", binary_name)))?;
+
+    let dest = bin_dir.join(binary_name);
+    {
+        let mut entry = archive.by_name(&entry_name)
+            .map_err(|e| AppError::Import(e.to_string()))?;
+        let mut out = std::fs::File::create(&dest)?;
+        std::io::copy(&mut entry, &mut out)?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    let _ = std::fs::remove_file(&zip_part);
+    Ok(dest.to_string_lossy().into_owned())
+}
+
 // ── Core download logic ───────────────────────────────────────────────────────
 
 async fn run_download(

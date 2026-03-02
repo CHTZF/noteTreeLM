@@ -79,6 +79,12 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   const [binarySpeedBps, setBinarySpeedBps] = useState(0)
   const [binaryInstalled, setBinaryInstalled] = useState(false)
 
+  const [llamaBinaryDownloading, setLlamaBinaryDownloading] = useState(false)
+  const [llamaBinaryDownloadedBytes, setLlamaBinaryDownloadedBytes] = useState(0)
+  const [llamaBinaryTotalBytes, setLlamaBinaryTotalBytes] = useState(0)
+  const [llamaBinarySpeedBps, setLlamaBinarySpeedBps] = useState(0)
+  const [llamaBinaryInstalled, setLlamaBinaryInstalled] = useState(false)
+
   const [memoryRules, setMemoryRules] = useState<MemoryRuleEntry[]>([])
   const [memoryRulesLoading, setMemoryRulesLoading] = useState(false)
 
@@ -143,6 +149,42 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
         setBinaryDownloadedBytes(0)
         setBinaryTotalBytes(0)
         setBinarySpeedBps(0)
+        toast.error('下載失敗：' + p.error)
+      }
+    }).then(fn => { if (cancelled) fn(); else unlisten = fn })
+    return () => { cancelled = true; unlisten?.() }
+  }, [])
+
+  // 檢查 llama-server binary 是否已安裝
+  useEffect(() => {
+    if (tab !== 'local') return
+    invoke<string | null>('get_llama_binary_path').then(p => setLlamaBinaryInstalled(!!p))
+  }, [tab])
+
+  // 監聽 llama-server binary 下載進度
+  useEffect(() => {
+    let unlisten: (() => void) | null = null
+    let cancelled = false
+    listen<any>('model-download-progress', (e) => {
+      if (e.payload.model_id !== '__llama_server__') return
+      const p = e.payload
+      if (p.status === 'downloading') {
+        setLlamaBinaryDownloadedBytes(p.downloaded_bytes ?? 0)
+        setLlamaBinaryTotalBytes(p.total_bytes ?? 0)
+        setLlamaBinarySpeedBps(p.speed_bps ?? 0)
+      } else if (p.status === 'completed') {
+        setLlamaBinaryDownloading(false)
+        setLlamaBinaryDownloadedBytes(0)
+        setLlamaBinaryTotalBytes(0)
+        setLlamaBinarySpeedBps(0)
+        setLlamaBinaryInstalled(true)
+        if (p.file_path) up({ llama_cli_path: p.file_path })
+        toast.success('llama-server 下載完成，路徑已自動填入')
+      } else if (p.status === 'error') {
+        setLlamaBinaryDownloading(false)
+        setLlamaBinaryDownloadedBytes(0)
+        setLlamaBinaryTotalBytes(0)
+        setLlamaBinarySpeedBps(0)
         toast.error('下載失敗：' + p.error)
       }
     }).then(fn => { if (cancelled) fn(); else unlisten = fn })
@@ -724,6 +766,49 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                 <PathPicker value={draft.llama_cli_path} onChange={(v) => up({ llama_cli_path: v })} disabled={llamaStatus === 'running'} />
                 <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '4px 0 0', lineHeight: 1.5 }}>
                   請指向 <code>llama-server</code> 二進位檔（非 llama-cli）
+                </p>
+              </div>
+              <div style={fieldStyle}>
+                <label style={labelStyle}>自動下載</label>
+                <button
+                  onClick={() => {
+                    setLlamaBinaryDownloading(true)
+                    invoke('download_llama_server').catch((e: any) => {
+                      setLlamaBinaryDownloading(false)
+                      toast.error('下載失敗：' + (e?.Import ?? String(e)))
+                    })
+                  }}
+                  disabled={llamaBinaryDownloading || llamaStatus === 'running'}
+                  style={{ ...inputStyle, cursor: llamaBinaryDownloading || llamaStatus === 'running' ? 'not-allowed' : 'pointer', opacity: llamaBinaryDownloading || llamaStatus === 'running' ? 0.6 : 1 }}
+                >
+                  {llamaBinaryDownloading ? '下載中…' : llamaBinaryInstalled ? '重新安裝最新版' : '自動安裝最新版'}
+                </button>
+                {llamaBinaryDownloading && (
+                  <div style={{ marginTop: '8px' }}>
+                    <div style={{ height: '4px', borderRadius: '2px', background: 'var(--color-bg-overlay)', overflow: 'hidden' }}>
+                      <div style={{
+                        height: '100%',
+                        width: llamaBinaryTotalBytes > 0 ? `${Math.round(llamaBinaryDownloadedBytes / llamaBinaryTotalBytes * 100)}%` : '100%',
+                        background: 'var(--color-accent)',
+                        borderRadius: '2px',
+                        transition: llamaBinaryTotalBytes > 0 ? 'width 0.3s ease' : undefined,
+                        animation: llamaBinaryTotalBytes === 0 ? 'pulse 1.5s ease-in-out infinite' : undefined,
+                      }} />
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: 'var(--color-text-muted)', marginTop: '4px' }}>
+                      <span>
+                        {fmtBytes(llamaBinaryDownloadedBytes)}
+                        {llamaBinaryTotalBytes > 0 ? ` / ${fmtBytes(llamaBinaryTotalBytes)}` : ''}
+                      </span>
+                      <span>
+                        {llamaBinaryTotalBytes > 0 ? `${Math.round(llamaBinaryDownloadedBytes / llamaBinaryTotalBytes * 100)}%` : '連線中…'}
+                        {llamaBinarySpeedBps > 0 ? ` · ${fmtSpeed(llamaBinarySpeedBps)}` : ''}
+                      </span>
+                    </div>
+                  </div>
+                )}
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '4px 0 0', lineHeight: 1.5 }}>
+                  從 ggerganov/llama.cpp 官方 Releases 下載預建版本（macOS ARM / Windows AVX2）。下載後自動填入路徑。
                 </p>
               </div>
 
