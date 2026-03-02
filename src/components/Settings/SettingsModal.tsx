@@ -597,11 +597,17 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                 name="Whisper Server（語音辨識）"
                 status={whisperStatus}
                 busy={whisperBusy}
-                onStart={() => {
+                onStart={async () => {
                   setWhisperBusy(true)
-                  invoke('start_whisper_server')
-                    .catch((e: any) => toast.error(e?.Voice ?? String(e)))
-                    .finally(() => setWhisperBusy(false))
+                  try {
+                    await invoke('start_whisper_server')
+                  } catch (e: any) {
+                    console.error('[start_whisper_server]', e)
+                    const msg = typeof e === 'string' ? e : e?.Voice ?? e?.message ?? JSON.stringify(e)
+                    toast.error(msg)
+                  } finally {
+                    setWhisperBusy(false)
+                  }
                 }}
                 onStop={async () => {
                   setWhisperBusy(true)
@@ -609,11 +615,17 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                   setWhisperStatus('stopped')
                   setWhisperBusy(false)
                 }}
-                onRestart={() => {
+                onRestart={async () => {
                   setWhisperBusy(true)
-                  invoke('restart_whisper_server')
-                    .catch((e: any) => toast.error(e?.Voice ?? String(e)))
-                    .finally(() => setWhisperBusy(false))
+                  try {
+                    await invoke('restart_whisper_server')
+                  } catch (e: any) {
+                    console.error('[restart_whisper_server]', e)
+                    const msg = typeof e === 'string' ? e : e?.Voice ?? e?.message ?? JSON.stringify(e)
+                    toast.error(msg)
+                  } finally {
+                    setWhisperBusy(false)
+                  }
                 }}
               />
 
@@ -746,11 +758,17 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                 name="LLaMA Server（本地 AI）"
                 status={llamaStatus}
                 busy={llamaBusy}
-                onStart={() => {
+                onStart={async () => {
                   setLlamaBusy(true)
-                  invoke('start_llama_server')
-                    .catch((e: any) => toast.error(e?.AI ?? String(e)))
-                    .finally(() => setLlamaBusy(false))
+                  try {
+                    await invoke('start_llama_server')
+                  } catch (e: any) {
+                    console.error('[start_llama_server]', e)
+                    const msg = typeof e === 'string' ? e : e?.AI ?? e?.message ?? JSON.stringify(e)
+                    toast.error(msg)
+                  } finally {
+                    setLlamaBusy(false)
+                  }
                 }}
                 onStop={async () => {
                   setLlamaBusy(true)
@@ -758,11 +776,17 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                   setLlamaStatus('stopped')
                   setLlamaBusy(false)
                 }}
-                onRestart={() => {
+                onRestart={async () => {
                   setLlamaBusy(true)
-                  invoke('restart_llama_server')
-                    .catch((e: any) => toast.error(e?.AI ?? String(e)))
-                    .finally(() => setLlamaBusy(false))
+                  try {
+                    await invoke('restart_llama_server')
+                  } catch (e: any) {
+                    console.error('[restart_llama_server]', e)
+                    const msg = typeof e === 'string' ? e : e?.AI ?? e?.message ?? JSON.stringify(e)
+                    toast.error(msg)
+                  } finally {
+                    setLlamaBusy(false)
+                  }
                 }}
               />
 
