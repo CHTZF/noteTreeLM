@@ -21,9 +21,31 @@ env:
   RELEASES_REPO: CHTZF/noteTreeLM-releases
 
 jobs:
+  # GitHub 不允許對空 repo 建立 release，先確保 repo 有至少一個 commit
+  init-releases-repo:
+    name: Init releases repo
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create initial commit if repo is empty
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+        run: |
+          SIZE=$(gh api repos/$RELEASES_REPO --jq '.size')
+          if [ "$SIZE" = "0" ]; then
+            CONTENT=$(printf '# noteTreeLM Releases\n\nPre-built binaries for [noteTreeLM](https://github.com/CHTZF/noteTreeLM).\n' | base64 -w 0)
+            gh api repos/$RELEASES_REPO/contents/README.md \
+              --method PUT \
+              -f message="chore: initialize releases repository" \
+              -f content="$CONTENT"
+            echo "✅ Initialized $RELEASES_REPO"
+          else
+            echo "ℹ️ $RELEASES_REPO already has commits (size=$SIZE), skipping init"
+          fi
+
   build-macos-arm64:
     name: macOS ARM64 (Metal)
     runs-on: macos-15
+    needs: init-releases-repo
     steps:
       - name: Resolve whisper.cpp tag
         id: tag
@@ -116,6 +138,7 @@ jobs:
   build-windows-x64:
     name: Windows x64
     runs-on: windows-latest
+    needs: init-releases-repo
     steps:
       - name: Resolve whisper.cpp tag
         id: tag
