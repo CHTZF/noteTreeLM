@@ -724,8 +724,12 @@ pub async fn warmup_llama_server(state: &AppState, app: &AppHandle) {
         queries::get_setting(&state.settings_db, "llm_model_path").await,
         Ok(Some(ref p)) if !p.is_empty()
     );
-    if configured {
-        let _ = ensure_server_running(state, app).await;
+    if !configured {
+        return; // 未設定是正常情況，靜默跳過
+    }
+    if let Err(e) = ensure_server_running(state, app).await {
+        // 設定錯誤（執行檔不存在、路徑錯誤等）→ 透過事件通知前端顯示 toast
+        let _ = app.emit("llm:stderr", format!("[server:error] {}", e));
     }
 }
 

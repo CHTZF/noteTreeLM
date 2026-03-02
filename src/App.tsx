@@ -126,6 +126,37 @@ export default function App() {
     }
   }, [])
 
+  // llama-server 啟動進度通知（與 whisper 對稱）
+  useEffect(() => {
+    let loadingToastId: number | null = null
+    let cancelled = false
+    let unlisten: (() => void) | null = null
+    listen<string>('llm:stderr', (event) => {
+      const line = event.payload
+      if (line.startsWith('[server:error]')) {
+        const msg = line.replace('[server:error] ', '')
+        toast.error(msg, { duration: 0 })
+      } else if (line.includes('等待模型載入') || line.includes('模型載入中')) {
+        if (loadingToastId === null) {
+          loadingToastId = toast.info('llama-server 載入模型中，請稍候…', { duration: 0 })
+        }
+      } else if (line.includes('就緒')) {
+        if (loadingToastId !== null) {
+          toast.dismiss(loadingToastId)
+          loadingToastId = null
+        }
+        toast.info('llama-server 已就緒')
+      }
+    }).then((fn) => {
+      if (cancelled) fn()
+      else unlisten = fn
+    })
+    return () => {
+      cancelled = true
+      unlisten?.()
+    }
+  }, [])
+
   // FileWatcher + 圖譜同步
   useEffect(() => {
     if (!appReady || showOnboarding) return
