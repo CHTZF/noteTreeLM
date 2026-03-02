@@ -10,6 +10,18 @@ import { Settings, DEFAULT_SETTINGS } from '../../types/settings'
 import ModelDownloader, { WHISPER_MODELS, LLM_MODELS } from './ModelDownloader'
 import { toast } from '../common/Toast'
 
+function fmtBytes(bytes: number): string {
+  if (bytes === 0) return '0 B'
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
+}
+
+function fmtSpeed(bps: number): string {
+  if (bps < 1024 * 1024) return `${(bps / 1024).toFixed(0)} KB/s`
+  return `${(bps / 1024 / 1024).toFixed(1)} MB/s`
+}
+
 interface SettingsModalProps {
   onClose: () => void
 }
@@ -62,7 +74,9 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   const [whisperBusy, setWhisperBusy] = useState(false)
   const [llamaBusy, setLlamaBusy] = useState(false)
   const [binaryDownloading, setBinaryDownloading] = useState(false)
-  const [binaryDownloadPct, setBinaryDownloadPct] = useState<number | null>(null)
+  const [binaryDownloadedBytes, setBinaryDownloadedBytes] = useState(0)
+  const [binaryTotalBytes, setBinaryTotalBytes] = useState(0)
+  const [binarySpeedBps, setBinarySpeedBps] = useState(0)
   const [binaryInstalled, setBinaryInstalled] = useState(false)
 
   const [memoryRules, setMemoryRules] = useState<MemoryRuleEntry[]>([])
@@ -112,17 +126,23 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
     listen<any>('model-download-progress', (e) => {
       if (e.payload.model_id !== '__whisper_server__') return
       const p = e.payload
-      if (p.status === 'downloading' && p.total_bytes > 0) {
-        setBinaryDownloadPct(Math.round(p.downloaded_bytes / p.total_bytes * 100))
+      if (p.status === 'downloading') {
+        setBinaryDownloadedBytes(p.downloaded_bytes ?? 0)
+        setBinaryTotalBytes(p.total_bytes ?? 0)
+        setBinarySpeedBps(p.speed_bps ?? 0)
       } else if (p.status === 'completed') {
         setBinaryDownloading(false)
-        setBinaryDownloadPct(null)
+        setBinaryDownloadedBytes(0)
+        setBinaryTotalBytes(0)
+        setBinarySpeedBps(0)
         setBinaryInstalled(true)
         if (p.file_path) up({ whisper_cli_path: p.file_path })
         toast.success('whisper-server 下載完成，路徑已自動填入')
       } else if (p.status === 'error') {
         setBinaryDownloading(false)
-        setBinaryDownloadPct(null)
+        setBinaryDownloadedBytes(0)
+        setBinaryTotalBytes(0)
+        setBinarySpeedBps(0)
         toast.error('下載失敗：' + p.error)
       }
     }).then(fn => { if (cancelled) fn(); else unlisten = fn })
@@ -574,10 +594,32 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                   disabled={binaryDownloading || whisperStatus === 'running'}
                   style={{ ...inputStyle, cursor: binaryDownloading || whisperStatus === 'running' ? 'not-allowed' : 'pointer', opacity: binaryDownloading || whisperStatus === 'running' ? 0.6 : 1 }}
                 >
-                  {binaryDownloading
-                    ? `安裝中… ${binaryDownloadPct !== null ? binaryDownloadPct + '%' : ''}`
-                    : binaryInstalled ? '重新安裝最新版' : '自動安裝最新版（Metal）'}
+                  {binaryDownloading ? '下載中…' : binaryInstalled ? '重新安裝最新版' : '自動安裝最新版（Metal）'}
                 </button>
+                {binaryDownloading && (
+                  <div style={{ marginTop: '8px' }}>
+                    <div style={{ height: '4px', borderRadius: '2px', background: 'var(--color-bg-overlay)', overflow: 'hidden' }}>
+                      <div style={{
+                        height: '100%',
+                        width: binaryTotalBytes > 0 ? `${Math.round(binaryDownloadedBytes / binaryTotalBytes * 100)}%` : '100%',
+                        background: 'var(--color-accent)',
+                        borderRadius: '2px',
+                        transition: binaryTotalBytes > 0 ? 'width 0.3s ease' : undefined,
+                        animation: binaryTotalBytes === 0 ? 'pulse 1.5s ease-in-out infinite' : undefined,
+                      }} />
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: 'var(--color-text-muted)', marginTop: '4px' }}>
+                      <span>
+                        {fmtBytes(binaryDownloadedBytes)}
+                        {binaryTotalBytes > 0 ? ` / ${fmtBytes(binaryTotalBytes)}` : ''}
+                      </span>
+                      <span>
+                        {binaryTotalBytes > 0 ? `${Math.round(binaryDownloadedBytes / binaryTotalBytes * 100)}%` : '連線中…'}
+                        {binarySpeedBps > 0 ? ` · ${fmtSpeed(binarySpeedBps)}` : ''}
+                      </span>
+                    </div>
+                  </div>
+                )}
                 <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '4px 0 0', lineHeight: 1.5 }}>
                   從 noteTreeLM Releases 下載預建版本（macOS ARM 含 Metal 加速）。若遇到網路問題，可手動編譯：<code>cmake … -DWHISPER_BUILD_SERVER=ON -DGGML_METAL=ON</code>
                 </p>

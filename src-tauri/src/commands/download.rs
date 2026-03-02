@@ -430,6 +430,7 @@ async fn download_single_binary(
     let mut file = std::fs::File::create(&part)?;
     let mut downloaded = 0u64;
     let mut last_emit = std::time::Instant::now();
+    let mut last_emit_downloaded = 0u64;
     let mut resp = resp;
 
     loop {
@@ -438,13 +439,18 @@ async fn download_single_binary(
             Some(chunk) => {
                 file.write_all(&chunk)?;
                 downloaded += chunk.len() as u64;
-                if last_emit.elapsed() >= std::time::Duration::from_millis(300) {
+                let elapsed = last_emit.elapsed();
+                if elapsed >= std::time::Duration::from_millis(300) {
+                    let speed_bps = if elapsed.as_secs_f64() > 0.0 {
+                        ((downloaded - last_emit_downloaded) as f64 / elapsed.as_secs_f64()) as u64
+                    } else { 0 };
                     last_emit = std::time::Instant::now();
+                    last_emit_downloaded = downloaded;
                     emit_progress(app, DownloadProgress {
                         model_id: model_id.to_string(),
                         downloaded_bytes: downloaded,
                         total_bytes: total_bytes,
-                        speed_bps: 0,
+                        speed_bps,
                         status: "downloading".to_string(),
                         file_path: None,
                         error: None,
