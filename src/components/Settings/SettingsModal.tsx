@@ -599,7 +599,9 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                 busy={whisperBusy}
                 onStart={() => {
                   setWhisperBusy(true)
-                  invoke('start_whisper_server').finally(() => setWhisperBusy(false))
+                  invoke('start_whisper_server')
+                    .catch((e: any) => toast.error(e?.Voice ?? String(e)))
+                    .finally(() => setWhisperBusy(false))
                 }}
                 onStop={async () => {
                   setWhisperBusy(true)
@@ -609,7 +611,9 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                 }}
                 onRestart={() => {
                   setWhisperBusy(true)
-                  invoke('restart_whisper_server').finally(() => setWhisperBusy(false))
+                  invoke('restart_whisper_server')
+                    .catch((e: any) => toast.error(e?.Voice ?? String(e)))
+                    .finally(() => setWhisperBusy(false))
                 }}
               />
 
@@ -744,7 +748,9 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                 busy={llamaBusy}
                 onStart={() => {
                   setLlamaBusy(true)
-                  invoke('start_llama_server').finally(() => setLlamaBusy(false))
+                  invoke('start_llama_server')
+                    .catch((e: any) => toast.error(e?.AI ?? String(e)))
+                    .finally(() => setLlamaBusy(false))
                 }}
                 onStop={async () => {
                   setLlamaBusy(true)
@@ -754,7 +760,9 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                 }}
                 onRestart={() => {
                   setLlamaBusy(true)
-                  invoke('restart_llama_server').finally(() => setLlamaBusy(false))
+                  invoke('restart_llama_server')
+                    .catch((e: any) => toast.error(e?.AI ?? String(e)))
+                    .finally(() => setLlamaBusy(false))
                 }}
               />
 
