@@ -15,8 +15,19 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-/// 從 DB 讀取 llama-server 路徑、模型路徑、埠號
-async fn resolve_server_config(state: &AppState) -> Result<(PathBuf, String, u16), AppError> {
+/// 從可用 port 開始往上尋找第一個空閒的 localhost port
+fn find_free_port(preferred: u16) -> u16 {
+    use std::net::TcpListener;
+    for port in preferred..=65535 {
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    preferred
+}
+
+/// 從 DB 讀取 llama-server 路徑、模型路徑（port 由執行時自動分配）
+async fn resolve_server_config(state: &AppState) -> Result<(PathBuf, String), AppError> {
     let pool = &state.settings_db;
 
     let server_path = queries::get_setting(pool, "llama_cli_path")
@@ -25,11 +36,6 @@ async fn resolve_server_config(state: &AppState) -> Result<(PathBuf, String, u16
     let model_path = queries::get_setting(pool, "llm_model_path")
         .await?
         .unwrap_or_default();
-    let port = queries::get_setting(pool, "llama_server_port")
-        .await?
-        .unwrap_or_else(|| "8080".to_string())
-        .parse::<u16>()
-        .unwrap_or(8080);
 
     if server_path.is_empty() {
         return Err(AppError::AI(
@@ -50,7 +56,7 @@ async fn resolve_server_config(state: &AppState) -> Result<(PathBuf, String, u16
         )));
     }
 
-    Ok((bin, model_path, port))
+    Ok((bin, model_path))
 }
 
 /// 確保 llama-server 正在運行；若未啟動則自動 spawn
@@ -59,7 +65,23 @@ async fn ensure_server_running(
     state: &AppState,
     app: &AppHandle,
 ) -> Result<String, AppError> {
-    let (bin, model_path, port) = resolve_server_config(state).await?;
+    // 啟動鎖：確保同一時刻只有一個呼叫者在跑啟動 / 等待流程
+    let _start_lock = state.llama_start_lock.lock().await;
+
+    let (bin, model_path) = resolve_server_config(state).await?;
+
+    // 取得或自動分配 port（只分配一次，後續重用）
+    let port = {
+        let mut guard = state.llama_actual_port.lock().await;
+        if let Some(p) = *guard {
+            p
+        } else {
+            let p = find_free_port(8080);
+            *guard = Some(p);
+            p
+        }
+    };
+
     let base_url = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
 
@@ -703,12 +725,12 @@ pub async fn stop_llama_server(state: State<'_, AppState>) -> Result<(), AppErro
 /// 查詢 llama-server 狀態："running" | "loading" | "stopped"
 #[tauri::command]
 pub async fn get_llama_server_status(state: State<'_, AppState>) -> Result<String, AppError> {
-    let port = queries::get_setting(&state.settings_db, "llama_server_port")
-        .await
-        .unwrap_or_default()
-        .unwrap_or_else(|| "8080".to_string())
-        .parse::<u16>()
-        .unwrap_or(8080);
+    // llama_actual_port 為 None 代表本次 session 從未成功啟動過 server，
+    // 不應去 ping 預設 8080（避免誤判孤立進程為 running）
+    let port = match *state.llama_actual_port.lock().await {
+        Some(p) => p,
+        None => return Ok("stopped".to_string()),
+    };
     let base_url = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
     let healthy = client
@@ -754,6 +776,8 @@ pub async fn restart_llama_server(
         let mut guard = state.llama_server.lock().await;
         if let Some(mut child) = guard.take() {
             child.kill().await.ok();
+            // 等待 OS 釋放 port，避免重啟時 orphan check 誤判舊進程仍存活
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
     ensure_server_running(state.inner(), &app).await?;

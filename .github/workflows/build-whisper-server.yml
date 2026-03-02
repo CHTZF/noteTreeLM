@@ -1,0 +1,206 @@
+name: Build whisper-server
+
+# 把編譯好的 binary 推到 public repo（CHTZF/noteTreeLM-releases）的 Releases，
+# 讓 App 可以不需要 token 就能下載。
+# 使用前置作業：
+#   1. 建立 public repo: CHTZF/noteTreeLM-releases
+#   2. 建立 fine-grained PAT，給 noteTreeLM-releases 的 Contents: Read & write
+#   3. 將 PAT 存為 private repo 的 Secret: RELEASES_PAT
+
+on:
+  workflow_dispatch:
+    inputs:
+      whisper_tag:
+        description: "whisper.cpp tag (e.g. v1.8.3), leave empty for latest"
+        required: false
+        default: ""
+  schedule:
+    - cron: "0 2 * * 1"  # 每週一自動檢查
+
+env:
+  RELEASES_REPO: CHTZF/noteTreeLM-releases
+
+jobs:
+  build-macos-arm64:
+    name: macOS ARM64 (Metal)
+    runs-on: macos-15
+    steps:
+      - name: Resolve whisper.cpp tag
+        id: tag
+        run: |
+          INPUT_TAG="${{ github.event.inputs.whisper_tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+          else
+            TAG=$(curl -sf https://api.github.com/repos/ggerganov/whisper.cpp/releases/latest \
+                  | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if binary already exists in releases repo
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          EXISTS=$(gh release view "whisper-$TAG" --repo "$RELEASES_REPO" \
+                   --json assets -q ".assets[].name" 2>/dev/null \
+                   | grep -c "^whisper-server-macos-arm64$" || true)
+          echo "exists=$EXISTS" >> "$GITHUB_OUTPUT"
+
+      - name: Download whisper.cpp source
+        if: steps.check.outputs.exists == '0'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          curl -sL "https://github.com/ggerganov/whisper.cpp/archive/refs/tags/${TAG}.tar.gz" \
+               -o whisper-src.tar.gz
+          mkdir whisper-src
+          tar -xzf whisper-src.tar.gz -C whisper-src --strip-components=1
+
+      - name: Install cmake
+        if: steps.check.outputs.exists == '0'
+        run: brew install cmake
+
+      - name: Build whisper-server (Metal, static)
+        if: steps.check.outputs.exists == '0'
+        run: |
+          cmake -S whisper-src -B whisper-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DWHISPER_BUILD_SERVER=ON \
+            -DWHISPER_BUILD_EXAMPLES=OFF \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_METAL=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON
+
+          cmake --build whisper-build \
+            --target whisper-server \
+            --config Release \
+            --parallel
+
+          BINARY=$(find whisper-build -name "whisper-server" -type f | head -1)
+          if [ -z "$BINARY" ]; then
+            echo "ERROR: whisper-server binary not found"
+            find whisper-build -type f -name "*server*"
+            exit 1
+          fi
+
+          cp "$BINARY" whisper-server-macos-arm64
+          chmod +x whisper-server-macos-arm64
+          file whisper-server-macos-arm64
+          ls -lh whisper-server-macos-arm64
+
+      - name: Upload to public releases repo
+        if: steps.check.outputs.exists == '0'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          RELEASE_TAG="whisper-$TAG"
+
+          gh release view "$RELEASE_TAG" --repo "$RELEASES_REPO" > /dev/null 2>&1 || \
+          gh release create "$RELEASE_TAG" \
+            --repo "$RELEASES_REPO" \
+            --title "whisper-server $TAG" \
+            --notes "Pre-built whisper-server binaries from whisper.cpp $TAG." \
+            --prerelease
+
+          gh release upload "$RELEASE_TAG" \
+            --repo "$RELEASES_REPO" \
+            --clobber \
+            whisper-server-macos-arm64
+
+          echo "✅ Uploaded to $RELEASES_REPO @ $RELEASE_TAG"
+
+  build-windows-x64:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - name: Resolve whisper.cpp tag
+        id: tag
+        shell: bash
+        run: |
+          INPUT_TAG="${{ github.event.inputs.whisper_tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+          else
+            TAG=$(curl -sf https://api.github.com/repos/ggerganov/whisper.cpp/releases/latest \
+                  | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if binary already exists in releases repo
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          EXISTS=$(gh release view "whisper-$TAG" --repo "$RELEASES_REPO" \
+                   --json assets -q ".assets[].name" 2>/dev/null \
+                   | grep -c "^whisper-server-windows-x64.exe$" || true)
+          echo "exists=$EXISTS" >> "$GITHUB_OUTPUT"
+
+      - name: Download whisper.cpp source
+        if: steps.check.outputs.exists == '0'
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          curl -sL "https://github.com/ggerganov/whisper.cpp/archive/refs/tags/${TAG}.tar.gz" \
+               -o whisper-src.tar.gz
+          mkdir whisper-src
+          tar -xzf whisper-src.tar.gz -C whisper-src --strip-components=1
+
+      - name: Build whisper-server (Windows, static)
+        if: steps.check.outputs.exists == '0'
+        shell: cmd
+        run: |
+          cmake -S whisper-src -B whisper-build ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DWHISPER_BUILD_SERVER=ON ^
+            -DWHISPER_BUILD_EXAMPLES=OFF ^
+            -DWHISPER_BUILD_TESTS=OFF ^
+            -DBUILD_SHARED_LIBS=OFF
+
+          cmake --build whisper-build ^
+            --target whisper-server ^
+            --config Release ^
+            --parallel
+
+      - name: Collect binary
+        if: steps.check.outputs.exists == '0'
+        shell: bash
+        run: |
+          BINARY=$(find whisper-build -name "whisper-server.exe" -type f | head -1)
+          if [ -z "$BINARY" ]; then
+            echo "ERROR: whisper-server.exe not found"
+            find whisper-build -type f -name "*.exe"
+            exit 1
+          fi
+          cp "$BINARY" whisper-server-windows-x64.exe
+          ls -lh whisper-server-windows-x64.exe
+
+      - name: Upload to public releases repo
+        if: steps.check.outputs.exists == '0'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          RELEASE_TAG="whisper-$TAG"
+
+          gh release view "$RELEASE_TAG" --repo "$RELEASES_REPO" > /dev/null 2>&1 || \
+          gh release create "$RELEASE_TAG" \
+            --repo "$RELEASES_REPO" \
+            --title "whisper-server $TAG" \
+            --notes "Pre-built whisper-server binaries from whisper.cpp $TAG." \
+            --prerelease
+
+          gh release upload "$RELEASE_TAG" \
+            --repo "$RELEASES_REPO" \
+            --clobber \
+            whisper-server-windows-x64.exe
+
+          echo "✅ Uploaded to $RELEASES_REPO @ $RELEASE_TAG"

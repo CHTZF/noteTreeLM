@@ -16,7 +16,7 @@ import ChatPanel from './components/Chat/ChatPanel'
 import QuickOpen from './components/QuickOpen/QuickOpen'
 import SettingsModal from './components/Settings/SettingsModal'
 import TrashPanel from './components/Trash/TrashPanel'
-import Toast from './components/common/Toast'
+import Toast, { toast } from './components/common/Toast'
 import './styles/App.css'
 
 type RightPanelTab = 'graph' | 'search' | 'debug' | 'chat'
@@ -94,6 +94,37 @@ export default function App() {
   useEffect(() => {
     if (!settings.enable_chat && rightTab === 'chat') setRightTab('graph')
   }, [settings.enable_chat])
+
+  // whisper-server 啟動進度通知（全域唯一，避免多個 useVoiceRecorder 實例重複顯示）
+  useEffect(() => {
+    let loadingToastId: number | null = null
+    let cancelled = false
+    let unlisten: (() => void) | null = null
+    listen<string>('whisper:stderr', (event) => {
+      const line = event.payload
+      if (line.startsWith('[server:error]')) {
+        const msg = line.replace('[server:error] ', '')
+        toast.error(msg, { duration: 0 })
+      } else if (line.includes('等待模型載入') || line.includes('模型載入中')) {
+        if (loadingToastId === null) {
+          loadingToastId = toast.info('whisper-server 載入模型中，請稍候…', { duration: 0 })
+        }
+      } else if (line.includes('就緒')) {
+        if (loadingToastId !== null) {
+          toast.dismiss(loadingToastId)
+          loadingToastId = null
+        }
+        toast.info('whisper-server 已就緒')
+      }
+    }).then((fn) => {
+      if (cancelled) fn()
+      else unlisten = fn
+    })
+    return () => {
+      cancelled = true
+      unlisten?.()
+    }
+  }, [])
 
   // FileWatcher + 圖譜同步
   useEffect(() => {

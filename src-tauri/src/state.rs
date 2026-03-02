@@ -19,6 +19,14 @@ pub struct AppState {
     pub watcher_stop: Arc<Mutex<Option<std::sync::mpsc::SyncSender<()>>>>,
     /// 寫入工具確認通道（stream_chat 等待前端確認時使用）
     pub write_confirm_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<bool>>>>,
+    /// llama-server 實際執行的 port（執行時自動分配，不存 DB）
+    pub llama_actual_port: Arc<Mutex<Option<u16>>>,
+    /// whisper-server 實際執行的 port（執行時自動分配，不存 DB）
+    pub whisper_actual_port: Arc<Mutex<Option<u16>>>,
+    /// llama-server 啟動鎖：防止多個呼叫者同時跑啟動流程，導致重複 emit 就緒訊息
+    pub llama_start_lock: Arc<Mutex<()>>,
+    /// whisper-server 啟動鎖：同上
+    pub whisper_start_lock: Arc<Mutex<()>>,
 }
 
 impl AppState {
@@ -31,6 +39,10 @@ impl AppState {
             whisper_server: Arc::new(Mutex::new(None)),
             watcher_stop: Arc::new(Mutex::new(None)),
             write_confirm_tx: Arc::new(Mutex::new(None)),
+            llama_actual_port: Arc::new(Mutex::new(None)),
+            whisper_actual_port: Arc::new(Mutex::new(None)),
+            llama_start_lock: Arc::new(Mutex::new(())),
+            whisper_start_lock: Arc::new(Mutex::new(())),
         }
     }
 

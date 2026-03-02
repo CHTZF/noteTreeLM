@@ -11,6 +11,7 @@ pub struct Settings {
     pub whisper_cli_path: String,
     pub whisper_model_path: String,
     pub whisper_language: String,
+    pub whisper_threads: u32,
     pub whisper_auto_insert: bool,
     pub import_max_depth: u32,
     pub import_max_pages: u32,
@@ -36,10 +37,10 @@ pub struct Settings {
     pub debug_mode: bool,
     pub voice_process_mode: String,
     pub enable_chat: bool,
-    pub llama_server_port: u32,
-    pub whisper_server_port: u32,
     pub enable_auto_memory: bool,
     pub memory_threshold: u32,
+    pub write_confirm_mode: String,
+    pub chat_auto_include_note: bool,
 }
 
 #[tauri::command]
@@ -66,6 +67,7 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<Settings, AppErr
         whisper_cli_path: get!("whisper_cli_path", ""),
         whisper_model_path: get!("whisper_model_path", ""),
         whisper_language: get!("whisper_language", "auto"),
+        whisper_threads: get!("whisper_threads", "4").parse().unwrap_or(4),
         whisper_auto_insert: get!("whisper_auto_insert", "true") == "true",
         import_max_depth: get!("import_max_depth", "3").parse().unwrap_or(3),
         import_max_pages: get!("import_max_pages", "50").parse().unwrap_or(50),
@@ -91,10 +93,10 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<Settings, AppErr
         debug_mode: get!("debug_mode", "false") == "true",
         voice_process_mode: get!("voice_process_mode", "none"),
         enable_chat: get!("enable_chat", "false") == "true",
-        llama_server_port: get!("llama_server_port", "8080").parse().unwrap_or(8080),
-        whisper_server_port: get!("whisper_server_port", "8081").parse().unwrap_or(8081),
         enable_auto_memory: get!("enable_auto_memory", "false") == "true",
         memory_threshold: get!("memory_threshold", "20").parse().unwrap_or(20),
+        write_confirm_mode: get!("write_confirm_mode", "always"),
+        chat_auto_include_note: get!("chat_auto_include_note", "false") == "true",
     })
 }
 
@@ -119,6 +121,7 @@ pub async fn save_settings(
     save!("whisper_cli_path", settings.whisper_cli_path);
     save!("whisper_model_path", settings.whisper_model_path);
     save!("whisper_language", settings.whisper_language);
+    save!("whisper_threads", settings.whisper_threads);
     save!("whisper_auto_insert", settings.whisper_auto_insert);
     save!("import_max_depth", settings.import_max_depth);
     save!("import_max_pages", settings.import_max_pages);
@@ -143,10 +146,10 @@ pub async fn save_settings(
     save!("debug_mode", settings.debug_mode);
     save!("voice_process_mode", settings.voice_process_mode);
     save!("enable_chat", settings.enable_chat);
-    save!("llama_server_port", settings.llama_server_port);
-    save!("whisper_server_port", settings.whisper_server_port);
     save!("enable_auto_memory", settings.enable_auto_memory);
     save!("memory_threshold", settings.memory_threshold);
+    save!("write_confirm_mode", settings.write_confirm_mode);
+    save!("chat_auto_include_note", settings.chat_auto_include_note);
 
     let recent_json = serde_json::to_string(&settings.recent_vaults)
         .map_err(|e| AppError::Settings(e.to_string()))?;

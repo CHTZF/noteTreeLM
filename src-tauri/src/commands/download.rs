@@ -254,6 +254,221 @@ pub async fn set_external_model_paths(
     Ok(())
 }
 
+// ── Binary (whisper-server) download ─────────────────────────────────────────
+
+fn binaries_dir(app: &AppHandle) -> Result<std::path::PathBuf, AppError> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| AppError::Io(e.to_string()))?
+        .join("bin");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Returns the absolute path to the downloaded whisper-server binary, or None if not installed.
+#[tauri::command]
+pub async fn get_whisper_binary_path(app: AppHandle) -> Result<Option<String>, AppError> {
+    let path = binaries_dir(&app)?.join("whisper-server");
+    if path.exists() {
+        Ok(Some(path.to_string_lossy().into_owned()))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Downloads the latest whisper-server binary from GitHub Releases.
+/// Returns immediately; progress is pushed via "model-download-progress" events
+/// with model_id = "__whisper_server__".
+#[tauri::command]
+pub async fn download_whisper_server(
+    app: AppHandle,
+    dl_state: tauri::State<'_, DownloadState>,
+) -> Result<(), AppError> {
+    const MODEL_ID: &str = "__whisper_server__";
+
+    // Prevent duplicate downloads
+    {
+        let mut active = dl_state.active.lock().await;
+        if active.contains_key(MODEL_ID) {
+            return Ok(());
+        }
+        active.insert(MODEL_ID.to_string(), Arc::new(AtomicBool::new(false)));
+    }
+
+    let app2 = app.clone();
+    tokio::spawn(async move {
+        let result = run_binary_download(&app2, MODEL_ID).await;
+
+        if let Some(ds) = app2.try_state::<DownloadState>() {
+            ds.active.lock().await.remove(MODEL_ID);
+        }
+
+        match result {
+            Ok(path) => {
+                emit_progress(&app2, DownloadProgress {
+                    model_id: MODEL_ID.to_string(),
+                    downloaded_bytes: 0,
+                    total_bytes: 0,
+                    speed_bps: 0,
+                    status: "completed".to_string(),
+                    file_path: Some(path),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                emit_progress(&app2, DownloadProgress {
+                    model_id: MODEL_ID.to_string(),
+                    downloaded_bytes: 0,
+                    total_bytes: 0,
+                    speed_bps: 0,
+                    status: "error".to_string(),
+                    file_path: None,
+                    error: Some(e.to_string()),
+                });
+            }
+        }
+    });
+
+    Ok(())
+}
+
+/// noteTreeLM 自己維護的預建 binary 所在 public repo
+const OUR_REPO: &str = "CHTZF/noteTreeLM-releases";
+
+/// 回傳當前平台對應的 asset 檔名（在 CHTZF/noteTreeLM-releases 上）
+fn platform_asset_name() -> Result<&'static str, AppError> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos",   "aarch64") => Ok("whisper-server-macos-arm64"),
+        ("macos",   "x86_64")  => Ok("whisper-server-macos-x86_64"),
+        ("windows", "x86_64")  => Ok("whisper-server-windows-x64.exe"),
+        (os, arch) => Err(AppError::Import(format!(
+            "此平台（{}/{}）尚不支援自動下載",
+            os, arch
+        ))),
+    }
+}
+
+async fn run_binary_download(app: &AppHandle, model_id: &str) -> Result<String, AppError> {
+    let asset_name = platform_asset_name()?;
+
+    let client = reqwest::Client::builder()
+        .user_agent("noteTreeLM/1.0")
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| AppError::Import(e.to_string()))?;
+
+    match find_our_prebuilt(&client, asset_name).await {
+        Ok(download_url) => download_single_binary(app, model_id, &client, &download_url).await,
+        Err(_) => Err(AppError::Import(
+            "找不到預建版本。請確認網路連線，或至 GitHub → Actions → \
+             「Build whisper-server」手動執行 workflow 後再試。\n\
+             若有網路限制，可自行編譯：cmake … -DWHISPER_BUILD_SERVER=ON \
+             -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON"
+                .to_string(),
+        )),
+    }
+}
+
+/// 在 CHTZF/noteTreeLM-releases 中尋找最新含有目標 asset 的 whisper-* release
+async fn find_our_prebuilt(
+    client: &reqwest::Client,
+    asset_name: &str,
+) -> Result<String, AppError> {
+    let releases: Vec<serde_json::Value> = client
+        .get(format!(
+            "https://api.github.com/repos/{}/releases?per_page=20",
+            OUR_REPO
+        ))
+        .send()
+        .await
+        .map_err(|e| AppError::Import(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| AppError::Import(e.to_string()))?;
+
+    for release in &releases {
+        let tag = release["tag_name"].as_str().unwrap_or("");
+        if !tag.starts_with("whisper-") {
+            continue;
+        }
+        if let Some(assets) = release["assets"].as_array() {
+            for asset in assets {
+                if asset["name"].as_str() == Some(asset_name) {
+                    if let Some(url) = asset["browser_download_url"].as_str() {
+                        return Ok(url.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Err(AppError::Import("找不到預建版本".to_string()))
+}
+
+/// 直接下載單一 binary 檔案（非 zip），儲存到 bin_dir/whisper-server
+async fn download_single_binary(
+    app: &AppHandle,
+    model_id: &str,
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<String, AppError> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| AppError::Import(e.to_string()))?;
+
+    if !resp.status().is_success() {
+        return Err(AppError::Import(format!("下載失敗 HTTP {}", resp.status())));
+    }
+
+    let total_bytes = resp.content_length().unwrap_or(0);
+    let bin_dir = binaries_dir(app)?;
+    let dest = bin_dir.join("whisper-server");
+    let part = bin_dir.join("whisper-server.part");
+
+    let mut file = std::fs::File::create(&part)?;
+    let mut downloaded = 0u64;
+    let mut last_emit = std::time::Instant::now();
+    let mut resp = resp;
+
+    loop {
+        match resp.chunk().await.map_err(|e| AppError::Import(e.to_string()))? {
+            None => break,
+            Some(chunk) => {
+                file.write_all(&chunk)?;
+                downloaded += chunk.len() as u64;
+                if last_emit.elapsed() >= std::time::Duration::from_millis(300) {
+                    last_emit = std::time::Instant::now();
+                    emit_progress(app, DownloadProgress {
+                        model_id: model_id.to_string(),
+                        downloaded_bytes: downloaded,
+                        total_bytes: total_bytes,
+                        speed_bps: 0,
+                        status: "downloading".to_string(),
+                        file_path: None,
+                        error: None,
+                    });
+                }
+            }
+        }
+    }
+    file.flush()?;
+    drop(file);
+
+    std::fs::rename(&part, &dest)?;
+
+    // chmod +x (macOS / Linux)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    Ok(dest.to_string_lossy().into_owned())
+}
+
+
 // ── Core download logic ───────────────────────────────────────────────────────
 
 async fn run_download(

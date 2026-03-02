@@ -2,7 +2,6 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useDebugStore } from '../stores/debugStore'
-import { toast } from '../components/common/Toast'
 
 export type VoiceState = 'idle' | 'recording' | 'transcribing' | 'done' | 'error'
 
@@ -56,34 +55,14 @@ export function useVoiceRecorder(
   const err  = (msg: string) => useDebugStore.getState().addLog('voice',   'error', msg)
   const wlog = (msg: string) => useDebugStore.getState().addLog('whisper', 'info',  msg)
 
-  // 監聽 whisper-server 啟動進度，給使用者即時回饋
-  const loadingToastIdRef = useRef<number | null>(null)
-
+  // whisper:stderr → debug log only（toast 通知由 App.tsx 統一處理，避免多實例重複顯示）
   useEffect(() => {
     let cancelled = false
     let unlisten: (() => void) | null = null
     listen<string>('whisper:stderr', (event) => {
-      const line = event.payload
-      wlog(line)
-
-      if (line.startsWith('[server:error]')) {
-        // 設定錯誤（模型檔案不存在等）→ 永久顯示 error toast 直到使用者點擊關閉
-        const msg = line.replace('[server:error] ', '')
-        toast.error(msg, { duration: 0 })
-      } else if (line.includes('等待模型載入') || line.includes('模型載入中')) {
-        // 持續顯示直到手動 dismiss（duration: 0 = 不自動消失）
-        if (loadingToastIdRef.current === null) {
-          loadingToastIdRef.current = toast.info('whisper-server 載入模型中，請稍候…', { duration: 0 })
-        }
-      } else if (line.includes('就緒')) {
-        if (loadingToastIdRef.current !== null) {
-          toast.dismiss(loadingToastIdRef.current)
-          loadingToastIdRef.current = null
-        }
-        toast.info('whisper-server 已就緒')
-      }
+      wlog(event.payload)
     }).then((fn) => {
-      if (cancelled) fn() // cleanup 已執行，立即取消訂閱
+      if (cancelled) fn()
       else unlisten = fn
     })
 

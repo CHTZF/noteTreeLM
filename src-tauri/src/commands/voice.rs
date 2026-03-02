@@ -2,7 +2,7 @@ use crate::{db::queries, error::AppError, state::AppState};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TranscribeResult {
@@ -11,10 +11,21 @@ pub struct TranscribeResult {
 
 // ─── Server config ────────────────────────────────────────────────────────────
 
-/// 從 DB 讀取 whisper-server 路徑、模型路徑、埠號
+/// 從可用 port 開始往上尋找第一個空閒的 localhost port
+fn find_free_port(preferred: u16) -> u16 {
+    use std::net::TcpListener;
+    for port in preferred..=65535 {
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+    preferred
+}
+
+/// 從 DB 讀取 whisper-server 路徑、模型路徑、threads（port 由執行時自動分配）
 async fn resolve_whisper_server_config(
     state: &AppState,
-) -> Result<(PathBuf, String, u16), AppError> {
+) -> Result<(PathBuf, String, u32), AppError> {
     let pool = &state.settings_db;
 
     let server_path = queries::get_setting(pool, "whisper_cli_path")
@@ -23,11 +34,11 @@ async fn resolve_whisper_server_config(
     let model_path = queries::get_setting(pool, "whisper_model_path")
         .await?
         .unwrap_or_default();
-    let port = queries::get_setting(pool, "whisper_server_port")
+    let threads: u32 = queries::get_setting(pool, "whisper_threads")
         .await?
-        .unwrap_or_else(|| "8081".to_string())
-        .parse::<u16>()
-        .unwrap_or(8081);
+        .unwrap_or_default()
+        .parse()
+        .unwrap_or(4);
 
     if server_path.is_empty() {
         return Err(AppError::Voice(
@@ -57,7 +68,7 @@ async fn resolve_whisper_server_config(
         )));
     }
 
-    Ok((bin, model_path, port))
+    Ok((bin, model_path, threads))
 }
 
 // ─── Server lifecycle ─────────────────────────────────────────────────────────
@@ -68,7 +79,25 @@ async fn ensure_whisper_server_running(
     state: &AppState,
     app: &AppHandle,
 ) -> Result<String, AppError> {
-    let (bin, model_path, port) = resolve_whisper_server_config(state).await?;
+    // 啟動鎖：確保同一時刻只有一個呼叫者在跑啟動 / 等待流程
+    // 第二個呼叫者在此等待，直到第一個完成後再進入 Phase 1
+    // → 第二個呼叫者在 Phase 1 發現伺服器已就緒，直接回傳，不重複 emit
+    let _start_lock = state.whisper_start_lock.lock().await;
+
+    let (bin, model_path, threads) = resolve_whisper_server_config(state).await?;
+
+    // 取得或自動分配 port（只分配一次，後續重用）
+    let port = {
+        let mut guard = state.whisper_actual_port.lock().await;
+        if let Some(p) = *guard {
+            p
+        } else {
+            let p = find_free_port(8081);
+            *guard = Some(p);
+            p
+        }
+    };
+
     let base_url = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
 
@@ -145,6 +174,7 @@ async fn ensure_whisper_server_running(
                     "--model", &model_path,
                     "--port", &port.to_string(),
                     "--host", "127.0.0.1",
+                    "--threads", &threads.to_string(),
                 ])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped())
@@ -175,17 +205,25 @@ async fn ensure_whisper_server_running(
     for i in 0..180 {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        // 先檢查進程是否已退出
+        // 先檢查進程是否已退出或被手動停止
         {
             let mut guard = state.whisper_server.lock().await;
-            if let Some(child) = guard.as_mut() {
-                if let Ok(Some(status)) = child.try_wait() {
-                    // 進程已退出（模型路徑錯誤、二進位不相容等）
-                    *guard = None;
-                    return Err(AppError::Voice(format!(
-                        "whisper-server 意外退出（code: {:?}），請確認模型路徑與二進位設定。",
-                        status.code()
-                    )));
+            match guard.as_mut() {
+                None => {
+                    // state 被 stop_whisper_server 清空 → 使用者手動停止，立即放棄
+                    return Err(AppError::Voice(
+                        "whisper-server 已手動停止".to_string(),
+                    ));
+                }
+                Some(child) => {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        // 進程已退出（模型路徑錯誤、二進位不相容等）
+                        *guard = None;
+                        return Err(AppError::Voice(format!(
+                            "whisper-server 意外退出（code: {:?}），請確認模型路徑與二進位設定。",
+                            status.code()
+                        )));
+                    }
                 }
             }
         }
@@ -240,27 +278,15 @@ pub async fn transcribe_audio(
         .await?
         .unwrap_or_else(|| "auto".to_string());
 
-    // 寫入暫存 WAV 檔
-    let temp_dir = app
-        .path()
-        .app_cache_dir()
-        .map_err(|e| AppError::Voice(e.to_string()))?;
-    tokio::fs::create_dir_all(&temp_dir).await?;
-    let wav_path = temp_dir.join("recording.wav");
-    write_wav(&wav_path, &pcm_data, sample_rate, 1)?;
+    // 在記憶體中建構 WAV，避免磁碟 I/O 造成延遲
+    let wav_bytes = build_wav_bytes(&pcm_data, sample_rate);
 
     // 確保 whisper-server 正在運行
     let base_url = ensure_whisper_server_running(&state, &app).await?;
 
-    // 讀取 WAV bytes
-    let file_bytes = tokio::fs::read(&wav_path)
-        .await
-        .map_err(|e| AppError::Voice(format!("讀取 WAV 失敗：{}", e)))?;
-    tokio::fs::remove_file(&wav_path).await.ok();
-
     // POST multipart 到 whisper-server /inference
     let client = reqwest::Client::new();
-    let part = reqwest::multipart::Part::bytes(file_bytes)
+    let part = reqwest::multipart::Part::bytes(wav_bytes)
         .file_name("audio.wav")
         .mime_str("audio/wav")
         .map_err(|e| AppError::Voice(e.to_string()))?;
@@ -293,7 +319,42 @@ pub async fn transcribe_audio(
         .map_err(|e| AppError::Voice(format!("解析回應失敗：{}", e)))?;
 
     let text = json["text"].as_str().unwrap_or("").trim().to_string();
+    let text = if is_whisper_hallucination(&text) { String::new() } else { text };
     Ok(TranscribeResult { text })
+}
+
+/// Whisper 在靜音或雜訊片段上的已知幻覺短句過濾
+/// temperature=0 仍會出現這些輸出，需在應用層過濾
+fn is_whisper_hallucination(text: &str) -> bool {
+    let s = text.trim().to_lowercase();
+    // 去掉末尾標點再比對
+    let s = s.trim_end_matches(['.', '!', '?', ',', '。', '！', '？']).trim();
+    matches!(
+        s,
+        "thank you"
+            | "thanks"
+            | "thanks for watching"
+            | "thank you for watching"
+            | "thank you for listening"
+            | "please subscribe"
+            | "like and subscribe"
+            | "bye"
+            | "bye bye"
+            | "you"
+            | "subtitles by the amara.org community"
+            | "[silence]"
+            | "[ silence ]"
+            | "[blank_audio]"
+            | "[ blank_audio ]"
+            | "[music]"
+            | "[ music ]"
+            | "[applause]"
+            | "謝謝"
+            | "謝謝你"
+            | "謝謝大家"
+            | "謝謝觀看"
+            | "謝謝收看"
+    )
 }
 
 /// App 啟動時呼叫：若已設定路徑則背景預熱 whisper-server 並送出靜音推論
@@ -378,6 +439,10 @@ pub async fn stop_whisper_server(state: State<'_, AppState>) -> Result<(), AppEr
     let mut guard = state.whisper_server.lock().await;
     if let Some(mut child) = guard.take() {
         child.kill().await.ok();
+        // 等待進程真正退出，確保下一次 health ping 不會再回應
+        // （只送 SIGKILL 不 wait 的話，OS 需要數十 ms 才會清理進程，
+        //   這段空窗期輪詢會看到 "running" 而誤判為重新連線）
+        child.wait().await.ok();
     }
     Ok(())
 }
@@ -385,12 +450,17 @@ pub async fn stop_whisper_server(state: State<'_, AppState>) -> Result<(), AppEr
 /// 查詢 whisper-server 狀態："running" | "loading" | "stopped"
 #[tauri::command]
 pub async fn get_whisper_server_status(state: State<'_, AppState>) -> Result<String, AppError> {
-    let port = queries::get_setting(&state.settings_db, "whisper_server_port")
-        .await
-        .unwrap_or_default()
-        .unwrap_or_else(|| "8081".to_string())
-        .parse::<u16>()
-        .unwrap_or(8081);
+    // whisper_actual_port 為 None 代表本次 session 從未成功啟動過 server
+    // （二進位不存在時 ensure_whisper_server_running 在 resolve_config 階段就失敗，
+    //   不會設定 port）。這時不應去 ping 預設 8081 — 那會誤判孤立進程為 running。
+    let port = match *state.whisper_actual_port.lock().await {
+        Some(p) => p,
+        None => {
+            // 確認 child state 也是 None（一致性檢查），直接回傳 stopped
+            return Ok("stopped".to_string());
+        }
+    };
+
     let base_url = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::new();
     let healthy = client
@@ -435,6 +505,9 @@ pub async fn restart_whisper_server(
         let mut guard = state.whisper_server.lock().await;
         if let Some(mut child) = guard.take() {
             child.kill().await.ok();
+            // wait() 確保進程真正退出後 OS 才釋放 port，
+            // 避免重啟時 orphan check 誤判舊進程仍存活
+            child.wait().await.ok();
         }
     }
     ensure_whisper_server_running(state.inner(), &app).await?;
@@ -443,7 +516,9 @@ pub async fn restart_whisper_server(
 
 // ─── WAV helper ───────────────────────────────────────────────────────────────
 
-fn write_wav(path: &PathBuf, pcm: &[f32], sample_rate: u32, channels: u16) -> Result<(), AppError> {
+/// 將 PCM f32 建構成單聲道 16-bit WAV bytes（純記憶體，無磁碟 I/O）
+fn build_wav_bytes(pcm: &[f32], sample_rate: u32) -> Vec<u8> {
+    let channels: u16 = 1;
     let bits_per_sample: u16 = 16;
     let byte_rate = sample_rate * channels as u32 * bits_per_sample as u32 / 8;
     let block_align = channels * bits_per_sample / 8;
@@ -474,6 +549,5 @@ fn write_wav(path: &PathBuf, pcm: &[f32], sample_rate: u32, channels: u16) -> Re
         buf.extend_from_slice(&i16_sample.to_le_bytes());
     }
 
-    std::fs::write(path, buf).map_err(|e| AppError::Voice(e.to_string()))?;
-    Ok(())
+    buf
 }

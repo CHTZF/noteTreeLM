@@ -6,6 +6,7 @@ export interface Settings {
   whisper_cli_path: string
   whisper_model_path: string
   whisper_language: string
+  whisper_threads: number
   whisper_auto_insert: boolean
   import_max_depth: number
   import_max_pages: number
@@ -31,10 +32,10 @@ export interface Settings {
   debug_mode: boolean
   voice_process_mode: 'none' | 'format' | 'summary'
   enable_chat: boolean
-  llama_server_port: number
-  whisper_server_port: number
   enable_auto_memory: boolean
   memory_threshold: number
+  write_confirm_mode: 'always' | 'once' | 'never'
+  chat_auto_include_note: boolean
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -45,6 +46,7 @@ export const DEFAULT_SETTINGS: Settings = {
   whisper_cli_path: '',
   whisper_model_path: '',
   whisper_language: 'auto',
+  whisper_threads: 4,
   whisper_auto_insert: true,
   import_max_depth: 3,
   import_max_pages: 50,
@@ -70,8 +72,8 @@ export const DEFAULT_SETTINGS: Settings = {
   debug_mode: false,
   voice_process_mode: 'none',
   enable_chat: false,
-  llama_server_port: 8080,
-  whisper_server_port: 8081,
   enable_auto_memory: false,
   memory_threshold: 20,
+  write_confirm_mode: 'always',
+  chat_auto_include_note: false,
 }

@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useVaultStore } from '../../stores/vaultStore'
@@ -60,6 +61,9 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   const [llamaStatus, setLlamaStatus] = useState<ServerStatus>('unknown')
   const [whisperBusy, setWhisperBusy] = useState(false)
   const [llamaBusy, setLlamaBusy] = useState(false)
+  const [binaryDownloading, setBinaryDownloading] = useState(false)
+  const [binaryDownloadPct, setBinaryDownloadPct] = useState<number | null>(null)
+  const [binaryInstalled, setBinaryInstalled] = useState(false)
 
   const [memoryRules, setMemoryRules] = useState<MemoryRuleEntry[]>([])
   const [memoryRulesLoading, setMemoryRulesLoading] = useState(false)
@@ -94,6 +98,36 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
     const id = setInterval(refresh, 3000)
     return () => clearInterval(id)
   }, [tab])
+
+  // 檢查 whisper-server binary 是否已安裝
+  useEffect(() => {
+    if (tab !== 'voice') return
+    invoke<string | null>('get_whisper_binary_path').then(p => setBinaryInstalled(!!p))
+  }, [tab])
+
+  // 監聽 whisper-server binary 下載進度
+  useEffect(() => {
+    let unlisten: (() => void) | null = null
+    let cancelled = false
+    listen<any>('model-download-progress', (e) => {
+      if (e.payload.model_id !== '__whisper_server__') return
+      const p = e.payload
+      if (p.status === 'downloading' && p.total_bytes > 0) {
+        setBinaryDownloadPct(Math.round(p.downloaded_bytes / p.total_bytes * 100))
+      } else if (p.status === 'completed') {
+        setBinaryDownloading(false)
+        setBinaryDownloadPct(null)
+        setBinaryInstalled(true)
+        if (p.file_path) up({ whisper_cli_path: p.file_path })
+        toast.success('whisper-server 下載完成，路徑已自動填入')
+      } else if (p.status === 'error') {
+        setBinaryDownloading(false)
+        setBinaryDownloadPct(null)
+        toast.error('下載失敗：' + p.error)
+      }
+    }).then(fn => { if (cancelled) fn(); else unlisten = fn })
+    return () => { cancelled = true; unlisten?.() }
+  }, [])
 
   useEffect(() => {
     if (tab !== 'local') return
@@ -527,19 +561,40 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                   請指向 <code>whisper-server</code> 二進位檔（第一次錄音時自動啟動）
                 </p>
               </div>
-              <div style={{ display: 'flex', alignItems: 'flex-end', gap: '16px', marginBottom: '18px' }}>
-                <div>
-                  <label style={labelStyle}>埠號</label>
-                  <input
-                    type="number" min={1024} max={65535}
-                    value={draft.whisper_server_port}
-                    disabled={whisperStatus === 'running'}
-                    onChange={(e) => up({ whisper_server_port: Number(e.target.value) })}
-                    style={{ ...(whisperStatus === 'running' ? disabledStyle : inputStyle), width: '100px' }}
-                  />
-                </div>
-                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '0 0 6px', lineHeight: 1.5 }}>
-                  預設 8081，勿與 llama-server（8080）衝突
+              <div style={fieldStyle}>
+                <label style={labelStyle}>自動下載</label>
+                <button
+                  onClick={() => {
+                    setBinaryDownloading(true)
+                    invoke('download_whisper_server').catch((e: any) => {
+                      setBinaryDownloading(false)
+                      toast.error('下載失敗：' + (e?.Import ?? String(e)))
+                    })
+                  }}
+                  disabled={binaryDownloading || whisperStatus === 'running'}
+                  style={{ ...inputStyle, cursor: binaryDownloading || whisperStatus === 'running' ? 'not-allowed' : 'pointer', opacity: binaryDownloading || whisperStatus === 'running' ? 0.6 : 1 }}
+                >
+                  {binaryDownloading
+                    ? `安裝中… ${binaryDownloadPct !== null ? binaryDownloadPct + '%' : ''}`
+                    : binaryInstalled ? '重新安裝最新版' : '自動安裝最新版（Metal）'}
+                </button>
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '4px 0 0', lineHeight: 1.5 }}>
+                  從 noteTreeLM Releases 下載預建版本（macOS ARM 含 Metal 加速）。若遇到網路問題，可手動編譯：<code>cmake … -DWHISPER_BUILD_SERVER=ON -DGGML_METAL=ON</code>
+                </p>
+              </div>
+              <div style={fieldStyle}>
+                <label style={labelStyle}>CPU 執行緒數</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={32}
+                  value={draft.whisper_threads}
+                  onChange={(e) => up({ whisper_threads: Math.max(1, parseInt(e.target.value) || 4) })}
+                  style={{ ...inputStyle, width: '80px' }}
+                  disabled={whisperStatus === 'running'}
+                />
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '4px 0 0', lineHeight: 1.5 }}>
+                  建議設為實體核心數（預設 4）。修改後需重啟伺服器生效。
                 </p>
               </div>
 
@@ -629,21 +684,6 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                   請指向 <code>llama-server</code> 二進位檔（非 llama-cli）
                 </p>
               </div>
-              <div style={{ display: 'flex', alignItems: 'flex-end', gap: '16px', marginBottom: '18px' }}>
-                <div>
-                  <label style={labelStyle}>埠號</label>
-                  <input
-                    type="number" min={1024} max={65535}
-                    value={draft.llama_server_port}
-                    disabled={llamaStatus === 'running'}
-                    onChange={(e) => up({ llama_server_port: Number(e.target.value) })}
-                    style={{ ...(llamaStatus === 'running' ? disabledStyle : inputStyle), width: '100px' }}
-                  />
-                </div>
-                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '0 0 6px', lineHeight: 1.5 }}>
-                  預設 8080（第一次對話時自動啟動）
-                </p>
-              </div>
 
               {/* ── AI Features ────────────────────────────────────────────── */}
               <SectionDivider />
@@ -655,6 +695,12 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
               {draft.enable_chat && (
                 <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 16px 0', lineHeight: 1.5 }}>
                   開啟後右側面板會新增 Chat 分頁，可與本地 llama LLM 進行對話。需先設定上方的 llama CLI 路徑。
+                </p>
+              )}
+              <ToggleRow label="Chat 自動帶入當前筆記" value={draft.chat_auto_include_note} onChange={(v) => up({ chat_auto_include_note: v })} />
+              {draft.chat_auto_include_note && (
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 16px 0', lineHeight: 1.5 }}>
+                  開啟筆記時，Chat 會自動將目前編輯中的筆記內容注入為 system context，讓 LLM 可直接針對筆記回答。
                 </p>
               )}
 
@@ -683,6 +729,33 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                   </div>
                 </>
               )}
+              {/* 寫入確認模式 */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
+                <div>
+                  <span style={{ fontSize: '13px', color: 'var(--color-text-primary)' }}>Vault 寫入確認</span>
+                  <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '3px 0 0', lineHeight: 1.4 }}>
+                    LLM 呼叫寫入工具（新增/更新筆記、新增資料夾）時的確認方式
+                  </p>
+                </div>
+                <div style={{ display: 'flex', gap: '4px', flexShrink: 0, marginLeft: '12px' }}>
+                  {(['always', 'once', 'never'] as const).map((mode) => (
+                    <button
+                      key={mode}
+                      onClick={() => up({ write_confirm_mode: mode })}
+                      style={{
+                        padding: '3px 10px', borderRadius: '4px', fontSize: '12px',
+                        border: '1px solid var(--color-border)',
+                        background: draft.write_confirm_mode === mode ? 'var(--color-accent)' : 'transparent',
+                        color: draft.write_confirm_mode === mode ? '#fff' : 'var(--color-text-muted)',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      {mode === 'always' ? '每次' : mode === 'once' ? '本次' : '關閉'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               {/* 查詢規則 */}
               <div style={{ marginBottom: '16px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' }}>

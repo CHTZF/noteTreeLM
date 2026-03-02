@@ -166,6 +166,8 @@ pub fn run() {
             delete_model_file,
             get_external_model_paths,
             set_external_model_paths,
+            get_whisper_binary_path,
+            download_whisper_server,
         ])
         .build(tauri::generate_context!())
         .expect("noteTreeLM 構建失敗")

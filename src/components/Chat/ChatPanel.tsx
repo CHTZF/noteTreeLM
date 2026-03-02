@@ -5,6 +5,7 @@ import { useSettingsStore } from '../../stores/settingsStore'
 import { useEditorStore } from '../../stores/editorStore'
 import { useDebugStore } from '../../stores/debugStore'
 import { toast } from '../common/Toast'
+import { useVoiceRecorder } from '../../hooks/useVoiceRecorder'
 
 interface Message {
   role: 'user' | 'assistant' | 'tool' | 'notice'
@@ -20,8 +21,8 @@ export default function ChatPanel() {
   const [input, setInput] = useState('')
   const [isStreaming, setIsStreaming] = useState(false)
   const [streamingText, setStreamingText] = useState('')
-  const [useNoteContext, setUseNoteContext] = useState(false)
-  const [writeConfirmMode, setWriteConfirmMode] = useState<'always' | 'once' | 'never'>('always')
+  const useNoteContext = !!settings.chat_auto_include_note
+  const writeConfirmMode = (settings.write_confirm_mode ?? 'always') as 'always' | 'once' | 'never'
   const [pendingWriteDisplay, setPendingWriteDisplay] = useState<string | null>(null)
   const [error, setError] = useState('')
   const [isCompressing, setIsCompressing] = useState(false)
@@ -38,7 +39,23 @@ export default function ChatPanel() {
   const err = useCallback((msg: string) => addLog('chat', 'error', msg), [addLog])
 
   const isConfigured = !!settings.llama_cli_path && !!settings.llm_model_path
+  const whisperConfigured = !!settings.whisper_cli_path && !!settings.whisper_model_path
   const vaultConfigured = !!settings.vault_path
+
+  // 語音轉文字：每段結果直接 append 到輸入框
+  const handleTranscript = useCallback((text: string) => {
+    if (!text.trim()) return
+    setInput((prev) => prev ? prev + ' ' + text : text)
+  }, [])
+  const { state: voiceState, toggle: toggleVoice } = useVoiceRecorder(handleTranscript)
+
+  // 語音帶入時自動調整 textarea 高度
+  useEffect(() => {
+    const t = inputRef.current
+    if (!t) return
+    t.style.height = 'auto'
+    t.style.height = Math.min(t.scrollHeight, 120) + 'px'
+  }, [input])
 
   // 持續監聽 llm:stderr → 寫入 debug
   // 使用 cancelled flag 解決 React StrictMode 下 async listen() 的 race condition
@@ -263,40 +280,6 @@ export default function ChatPanel() {
           CHAT
         </span>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          {/* 寫入確認模式選擇器 */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '11px', color: 'var(--color-text-muted)' }}>
-            <span>寫入：</span>
-            {(['always', 'once', 'never'] as const).map((mode) => (
-              <button
-                key={mode}
-                onClick={() => { setWriteConfirmMode(mode); sessionWriteApprovedRef.current = false }}
-                style={{
-                  padding: '1px 6px', borderRadius: '4px', fontSize: '11px',
-                  border: '1px solid var(--color-border)',
-                  background: writeConfirmMode === mode ? 'var(--color-accent)' : 'transparent',
-                  color: writeConfirmMode === mode ? '#fff' : 'var(--color-text-muted)',
-                  cursor: 'pointer',
-                }}
-              >
-                {mode === 'always' ? '每次' : mode === 'once' ? '本次' : '關閉'}
-              </button>
-            ))}
-          </div>
-          {/* 帶入筆記 toggle */}
-          <label style={{
-            display: 'flex', alignItems: 'center', gap: '5px', fontSize: '11px',
-            cursor: currentPath ? 'pointer' : 'not-allowed',
-            color: useNoteContext ? 'var(--color-accent)' : 'var(--color-text-muted)',
-          }}>
-            <input
-              type="checkbox"
-              checked={useNoteContext}
-              onChange={(e) => setUseNoteContext(e.target.checked)}
-              disabled={!currentPath}
-              style={{ cursor: 'pointer', accentColor: 'var(--color-accent)', width: '12px', height: '12px' }}
-            />
-            帶入筆記
-          </label>
           {messages.length > 0 && (
             <>
               <button
@@ -454,19 +437,77 @@ export default function ChatPanel() {
             t.style.height = Math.min(t.scrollHeight, 120) + 'px'
           }}
         />
+        {/* 錄音按鈕 */}
+        <button
+          onClick={toggleVoice}
+          disabled={!whisperConfigured || voiceState === 'transcribing'}
+          title={!whisperConfigured ? '請先到設定頁設定 Whisper' : voiceState === 'recording' ? '停止錄音' : '語音輸入'}
+          style={{
+            width: '34px', height: '34px', borderRadius: '6px', flexShrink: 0,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            border: '1px solid var(--color-border)',
+            background: voiceState === 'recording'
+              ? 'rgba(239,68,68,0.15)'
+              : voiceState === 'done'
+                ? 'rgba(74,222,128,0.15)'
+                : 'var(--color-bg-elevated)',
+            color: voiceState === 'recording'
+              ? '#ef4444'
+              : voiceState === 'done'
+                ? '#4ade80'
+                : voiceState === 'error'
+                  ? '#f59e0b'
+                  : 'var(--color-text-muted)',
+            cursor: !whisperConfigured || voiceState === 'transcribing' ? 'not-allowed' : 'pointer',
+            opacity: !whisperConfigured || voiceState === 'transcribing' ? 0.4 : 1,
+            transition: 'background 0.2s, color 0.2s',
+          }}
+        >
+          {voiceState === 'recording' ? (
+            // 停止方塊
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+              <rect x="3" y="3" width="18" height="18" rx="2"/>
+            </svg>
+          ) : voiceState === 'transcribing' ? (
+            // 轉圈點點
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+              <circle cx="12" cy="12" r="9" strokeDasharray="28 56" strokeDashoffset="0">
+                <animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="0.8s" repeatCount="indefinite"/>
+              </circle>
+            </svg>
+          ) : (
+            // 麥克風
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+              <line x1="12" y1="19" x2="12" y2="23"/>
+              <line x1="8" y1="23" x2="16" y2="23"/>
+            </svg>
+          )}
+        </button>
+        {/* 送出按鈕（箭頭） */}
         <button
           onClick={send}
           disabled={isStreaming || !input.trim() || !isConfigured}
+          title="送出"
           style={{
-            padding: '0 14px', height: '34px', borderRadius: '6px', flexShrink: 0,
-            background: isStreaming ? 'var(--color-bg-overlay)' : 'var(--color-accent)',
-            color: isStreaming ? 'var(--color-text-muted)' : 'white',
-            border: 'none', fontSize: '13px',
+            width: '34px', height: '34px', borderRadius: '6px', flexShrink: 0,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            background: isStreaming || !input.trim() || !isConfigured ? 'var(--color-bg-overlay)' : 'var(--color-accent)',
+            color: isStreaming || !input.trim() || !isConfigured ? 'var(--color-text-muted)' : 'white',
+            border: 'none',
             cursor: isStreaming || !input.trim() || !isConfigured ? 'not-allowed' : 'pointer',
             opacity: isStreaming || !input.trim() || !isConfigured ? 0.5 : 1,
           }}
         >
-          {isStreaming ? '…' : '送出'}
+          {isStreaming ? (
+            <span style={{ fontSize: '16px', lineHeight: 1 }}>…</span>
+          ) : (
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="12" y1="19" x2="12" y2="5"/>
+              <polyline points="5 12 12 5 19 12"/>
+            </svg>
+          )}
         </button>
       </div>
     </div>
