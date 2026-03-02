@@ -161,6 +161,26 @@ async fn ensure_server_running(
     for i in 0..60u32 {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
+        // 先檢查進程是否已退出或被手動停止
+        {
+            let mut guard = state.llama_server.lock().await;
+            match guard.as_mut() {
+                None => {
+                    // state 被 stop_llama_server 清空 → 使用者手動停止，立即放棄
+                    return Err(AppError::AI("llama-server 已手動停止".to_string()));
+                }
+                Some(child) => {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        *guard = None;
+                        return Err(AppError::AI(format!(
+                            "llama-server 意外退出（code: {:?}），請確認模型路徑與二進位設定。",
+                            status.code()
+                        )));
+                    }
+                }
+            }
+        }
+
         let ready = client
             .get(format!("{}/health", base_url))
             .timeout(Duration::from_secs(2))
@@ -714,10 +734,9 @@ pub async fn warmup_llama_server(state: &AppState, app: &AppHandle) {
 pub async fn stop_llama_server(state: State<'_, AppState>) -> Result<(), AppError> {
     let mut guard = state.llama_server.lock().await;
     if let Some(mut child) = guard.take() {
-        child
-            .kill()
-            .await
-            .map_err(|e| AppError::AI(format!("停止 llama-server 失敗：{}", e)))?;
+        child.kill().await.ok();
+        // 等待進程真正退出，確保下一次 health ping 不會再回應
+        child.wait().await.ok();
     }
     Ok(())
 }
@@ -776,8 +795,9 @@ pub async fn restart_llama_server(
         let mut guard = state.llama_server.lock().await;
         if let Some(mut child) = guard.take() {
             child.kill().await.ok();
-            // 等待 OS 釋放 port，避免重啟時 orphan check 誤判舊進程仍存活
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            // wait() 確保進程真正退出後 OS 才釋放 port，
+            // 避免重啟時 orphan check 誤判舊進程仍存活
+            child.wait().await.ok();
         }
     }
     ensure_server_running(state.inner(), &app).await?;
