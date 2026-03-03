@@ -656,6 +656,7 @@ async fn download_and_extract_llama(
 
     if file_ext == ".tar.gz" {
         // macOS / Linux：tar.gz 解壓
+        // 解壓所有檔案（含 .dylib），讓 llama-server 能找到動態連結函式庫
         use flate2::read::GzDecoder;
         use tar::Archive;
         let gz = GzDecoder::new(std::io::Cursor::new(archive_bytes));
@@ -663,16 +664,31 @@ async fn download_and_extract_llama(
         let mut found = false;
         for entry in tar.entries().map_err(|e| AppError::Import(e.to_string()))? {
             let mut entry = entry.map_err(|e| AppError::Import(e.to_string()))?;
+            let entry_type = entry.header().entry_type();
+            // 只解壓一般檔案（跳過目錄、symlink 等）
+            if !entry_type.is_file() { continue; }
             let path = entry.path().map_err(|e| AppError::Import(e.to_string()))?.to_string_lossy().to_string();
-            let file_part = path.rsplit('/').next().unwrap_or(&path).to_lowercase();
-            if file_part == binary_name.to_lowercase() {
-                entry.unpack(&dest).map_err(|e| AppError::Import(format!("解壓失敗：{}", e)))?;
+            // 取最末一段作為檔名（不保留子目錄結構，平舖到 bin_dir）
+            let file_name = path.rsplit('/').next().unwrap_or(&path).to_string();
+            if file_name.is_empty() { continue; }
+            let out_path = bin_dir.join(&file_name);
+            let mut out = std::fs::File::create(&out_path)
+                .map_err(|e| AppError::Import(format!("建立 {} 失敗：{}", file_name, e)))?;
+            std::io::copy(&mut entry, &mut out)
+                .map_err(|e| AppError::Import(format!("解壓 {} 失敗：{}", file_name, e)))?;
+            // 對主 binary 標記 found
+            if file_name.to_lowercase() == binary_name.to_lowercase() {
                 found = true;
-                break;
             }
         }
         if !found {
             return Err(AppError::Import(format!("tar.gz 中找不到 {}", binary_name)));
+        }
+        // chmod +x 主 binary
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
         }
     } else {
         // Windows：zip 解壓
