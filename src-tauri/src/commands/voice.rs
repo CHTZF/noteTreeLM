@@ -181,6 +181,7 @@ async fn ensure_whisper_server_running(
                     "--port", &port.to_string(),
                     "--host", "127.0.0.1",
                     "--threads", &threads.to_string(),
+                    "--flash-attn",   // Metal flash attention：加速自注意力計算（~20-30%）
                 ])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped())

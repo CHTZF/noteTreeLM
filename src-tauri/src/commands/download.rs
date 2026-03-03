@@ -599,11 +599,30 @@ async fn download_single_binary(
 
 // ── CoreML model download (macOS only) ───────────────────────────────────────
 
-/// 從主模型路徑推導 CoreML encoder 套件的預期目錄路徑
+/// 移除量化後綴（如 -q5_0, -q4_K_M, -Q8_0），以對應 HuggingFace CoreML 命名規則。
+/// 範例：ggml-large-v3-turbo-q5_0 → ggml-large-v3-turbo
+///        ggml-base.en              → ggml-base.en（不變）
+fn strip_quantization_suffix(stem: &str) -> &str {
+    let bytes = stem.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'-'
+            && (bytes[i + 1] == b'q' || bytes[i + 1] == b'Q')
+            && bytes[i + 2].is_ascii_digit()
+        {
+            return &stem[..i];
+        }
+        i += 1;
+    }
+    stem
+}
+
+/// 從主模型路徑推導 whisper.cpp 預期的 CoreML encoder 目錄路徑（含量化後綴）
 fn derive_coreml_path(model_path: &str) -> Option<std::path::PathBuf> {
     let p = std::path::Path::new(model_path);
-    let stem = p.file_stem()?.to_str()?;          // "ggml-base.en"（去掉 .bin）
+    let stem = p.file_stem()?.to_str()?;   // e.g. "ggml-large-v3-turbo-q5_0"
     let dir  = p.parent()?;
+    // whisper.cpp 直接在 stem 後接 -encoder.mlmodelc，不去掉量化後綴
     Some(dir.join(format!("{}-encoder.mlmodelc", stem)))
 }
 
@@ -671,10 +690,15 @@ async fn run_coreml_download(app: &AppHandle, model_path: &str, model_id: &str) 
         let model_dir = p.parent()
             .ok_or_else(|| AppError::Import("無法取得模型目錄".to_string()))?;
 
-        // HuggingFace 上的預編譯格式為 .mlmodelc（已被 coremlc 編譯的二進位格式）
-        // 對應檔名：ggml-base.en-encoder.mlmodelc.zip
-        let coreml_name = format!("{}-encoder.mlmodelc", stem);
-        let zip_name    = format!("{}.zip", coreml_name);
+        // HuggingFace 上的 CoreML 檔案不含量化後綴：
+        //   ggml-large-v3-turbo-q5_0.bin → ggml-large-v3-turbo-encoder.mlmodelc.zip
+        // whisper.cpp 執行時卻依完整 stem 尋找（含量化後綴）：
+        //   ggml-large-v3-turbo-q5_0-encoder.mlmodelc
+        // 因此：下載 URL 用 base_stem（去掉量化後綴），解壓後重新命名為 full_stem 版本。
+        let base_stem   = strip_quantization_suffix(stem);
+        let base_coreml = format!("{}-encoder.mlmodelc", base_stem); // URL / zip 內容用
+        let dest_coreml = format!("{}-encoder.mlmodelc", stem);       // whisper.cpp 期望路徑
+        let zip_name    = format!("{}.zip", base_coreml);
         let hf_url = format!(
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}",
             zip_name
@@ -745,7 +769,19 @@ async fn run_coreml_download(app: &AppHandle, model_path: &str, model_id: &str) 
             return Err(AppError::Import(format!("解壓失敗：{}", msg)));
         }
 
-        let coreml_path = model_dir.join(&coreml_name);
+        // 若模型含量化後綴（如 q5_0），zip 解壓出的目錄名稱是不含後綴的版本，
+        // 需重新命名為 whisper.cpp 期望的完整名稱。
+        // 範例：ggml-large-v3-turbo-encoder.mlmodelc → ggml-large-v3-turbo-q5_0-encoder.mlmodelc
+        if base_coreml != dest_coreml {
+            let extracted = model_dir.join(&base_coreml);
+            let dest      = model_dir.join(&dest_coreml);
+            if extracted.exists() {
+                std::fs::rename(&extracted, &dest)
+                    .map_err(|e| AppError::Import(format!("重新命名 CoreML 目錄失敗：{}", e)))?;
+            }
+        }
+
+        let coreml_path = model_dir.join(&dest_coreml);
         Ok(coreml_path.to_string_lossy().into_owned())
     }
 }
