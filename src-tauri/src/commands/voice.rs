@@ -285,6 +285,14 @@ pub async fn transcribe_audio(
         .await?
         .unwrap_or_else(|| "auto".to_string());
 
+    // zh-TW / zh-CN 都使用 whisper 的 "zh" 語言代碼，
+    // 但加入 initial_prompt 導引輸出字體（whisper 無法區分繁簡，靠 prompt 引導）
+    let (whisper_lang, initial_prompt): (&str, Option<&str>) = match lang.as_str() {
+        "zh-TW" => ("zh", Some("以下是繁體中文。")),
+        "zh-CN" => ("zh", Some("以下是简体中文。")),
+        other   => (other, None),
+    };
+
     // 在記憶體中建構 WAV，避免磁碟 I/O 造成延遲
     let wav_bytes = build_wav_bytes(&pcm_data, sample_rate);
 
@@ -297,12 +305,15 @@ pub async fn transcribe_audio(
         .file_name("audio.wav")
         .mime_str("audio/wav")
         .map_err(|e| AppError::Voice(e.to_string()))?;
-    let form = reqwest::multipart::Form::new()
+    let mut form = reqwest::multipart::Form::new()
         .part("file", part)
         .text("response_format", "json")
-        .text("language", lang)
+        .text("language", whisper_lang.to_string())
         .text("temperature", "0.0")
         .text("beam_size", "1");  // greedy decoding，大幅減少延遲
+    if let Some(prompt) = initial_prompt {
+        form = form.text("initial_prompt", prompt.to_string());
+    }
 
     let resp = client
         .post(format!("{}/inference", base_url))
@@ -335,10 +346,11 @@ pub async fn transcribe_audio(
 /// temperature=0 仍會出現這些輸出，需在應用層過濾
 fn is_whisper_hallucination(text: &str) -> bool {
     let s = text.trim().to_lowercase();
-    // 去掉末尾標點再比對
-    let s = s.trim_end_matches(['.', '!', '?', ',', '。', '！', '？']).trim();
+    // 去掉末尾標點再比對（含中英文標點）
+    let s = s.trim_end_matches(['.', '!', '?', ',', '。', '！', '？', '…']).trim();
     matches!(
         s,
+        // ── 英文 ────────────────────────────────────────────
         "thank you"
             | "thanks"
             | "thanks for watching"
@@ -346,10 +358,12 @@ fn is_whisper_hallucination(text: &str) -> bool {
             | "thank you for listening"
             | "please subscribe"
             | "like and subscribe"
+            | "subscribe"
             | "bye"
             | "bye bye"
             | "you"
             | "subtitles by the amara.org community"
+        // ── 標記符號（各語言通用）────────────────────────────
             | "[silence]"
             | "[ silence ]"
             | "[blank_audio]"
@@ -357,11 +371,32 @@ fn is_whisper_hallucination(text: &str) -> bool {
             | "[music]"
             | "[ music ]"
             | "[applause]"
+            | "[音乐]"
+            | "[ 音乐 ]"
+            | "[掌声]"
+            | "[ 掌声 ]"
+            | "[音樂]"
+            | "[ 音樂 ]"
+            | "[掌聲]"
+            | "[ 掌聲 ]"
+        // ── 繁體中文 ─────────────────────────────────────────
             | "謝謝"
             | "謝謝你"
             | "謝謝大家"
             | "謝謝觀看"
             | "謝謝收看"
+            | "訂閱"
+            | "請訂閱"
+            | "按讚訂閱"
+        // ── 簡體中文 ─────────────────────────────────────────
+            | "谢谢"
+            | "谢谢你"
+            | "谢谢大家"
+            | "谢谢观看"
+            | "谢谢收看"
+            | "订阅"
+            | "请订阅"
+            | "请关注"
     )
 }
 

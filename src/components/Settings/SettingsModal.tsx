@@ -757,7 +757,8 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                 <label style={labelStyle}>辨識語言</label>
                 <select value={draft.whisper_language} onChange={(e) => up({ whisper_language: e.target.value })} style={inputStyle}>
                   <option value="auto">自動偵測</option>
-                  <option value="zh">中文</option>
+                  <option value="zh-TW">繁體中文</option>
+                  <option value="zh-CN">简体中文</option>
                   <option value="en">English</option>
                   <option value="ja">日本語</option>
                   <option value="ko">한국어</option>
