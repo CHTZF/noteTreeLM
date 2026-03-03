@@ -85,6 +85,12 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   const [llamaBinarySpeedBps, setLlamaBinarySpeedBps] = useState(0)
   const [llamaBinaryInstalled, setLlamaBinaryInstalled] = useState(false)
 
+  const [coremlInstalled, setCoremlInstalled] = useState(false)
+  const [coremlDownloading, setCoremlDownloading] = useState(false)
+  const [coremlDownloadedBytes, setCoremlDownloadedBytes] = useState(0)
+  const [coremlTotalBytes, setCoremlTotalBytes] = useState(0)
+  const [coremlSpeedBps, setCoremlSpeedBps] = useState(0)
+
   const [memoryRules, setMemoryRules] = useState<MemoryRuleEntry[]>([])
   const [memoryRulesLoading, setMemoryRulesLoading] = useState(false)
 
@@ -150,6 +156,42 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
         setBinaryTotalBytes(0)
         setBinarySpeedBps(0)
         toast.error('下載失敗：' + p.error)
+      }
+    }).then(fn => { if (cancelled) fn(); else unlisten = fn })
+    return () => { cancelled = true; unlisten?.() }
+  }, [])
+
+  // 檢查 CoreML 模型套件是否已安裝
+  useEffect(() => {
+    if (tab !== 'voice' || !draft.whisper_model_path) return
+    invoke<string | null>('get_coreml_model_path', { modelPath: draft.whisper_model_path })
+      .then(p => setCoremlInstalled(!!p))
+  }, [tab, draft.whisper_model_path])
+
+  // 監聽 CoreML 下載進度
+  useEffect(() => {
+    let unlisten: (() => void) | null = null
+    let cancelled = false
+    listen<any>('model-download-progress', (e) => {
+      if (e.payload.model_id !== '__coreml__') return
+      const p = e.payload
+      if (p.status === 'downloading') {
+        setCoremlDownloadedBytes(p.downloaded_bytes ?? 0)
+        setCoremlTotalBytes(p.total_bytes ?? 0)
+        setCoremlSpeedBps(p.speed_bps ?? 0)
+      } else if (p.status === 'completed') {
+        setCoremlDownloading(false)
+        setCoremlDownloadedBytes(0)
+        setCoremlTotalBytes(0)
+        setCoremlSpeedBps(0)
+        setCoremlInstalled(true)
+        toast.success('CoreML 模型下載完成，下次啟動 whisper-server 時自動生效')
+      } else if (p.status === 'error') {
+        setCoremlDownloading(false)
+        setCoremlDownloadedBytes(0)
+        setCoremlTotalBytes(0)
+        setCoremlSpeedBps(0)
+        toast.error('CoreML 下載失敗：' + p.error)
       }
     }).then(fn => { if (cancelled) fn(); else unlisten = fn })
     return () => { cancelled = true; unlisten?.() }
@@ -760,6 +802,74 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                 onChange={(v) => up({ whisper_model_path: v })}
                 disabled={whisperStatus === 'running'}
               />
+
+              {/* ── CoreML Acceleration ─────────────────────────────────────── */}
+              {draft.whisper_model_path && (
+                <>
+                  <SectionDivider />
+                  <SectionHeader label="CoreML 加速（Apple Neural Engine）" />
+                  <div style={fieldStyle}>
+                    <label style={labelStyle}>ANE 加速套件</label>
+                    {coremlInstalled ? (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <span style={{ fontSize: '13px', color: 'var(--color-success, #22c55e)' }}>✓ 已安裝</span>
+                        <button
+                          onClick={() => {
+                            setCoremlDownloading(true)
+                            invoke('download_coreml_model', { modelPath: draft.whisper_model_path }).catch((e: any) => {
+                              setCoremlDownloading(false)
+                              toast.error('下載失敗：' + (e?.Import ?? String(e)))
+                            })
+                          }}
+                          disabled={coremlDownloading || whisperStatus === 'running'}
+                          style={{ fontSize: '12px', padding: '2px 10px', borderRadius: '5px', background: 'var(--color-bg-overlay)', border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)', cursor: 'pointer' }}
+                        >
+                          {coremlDownloading ? '更新中…' : '重新下載'}
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => {
+                          setCoremlDownloading(true)
+                          invoke('download_coreml_model', { modelPath: draft.whisper_model_path }).catch((e: any) => {
+                            setCoremlDownloading(false)
+                            toast.error('下載失敗：' + (e?.Import ?? String(e)))
+                          })
+                        }}
+                        disabled={coremlDownloading || whisperStatus === 'running'}
+                        style={{ ...inputStyle, cursor: coremlDownloading || whisperStatus === 'running' ? 'not-allowed' : 'pointer', opacity: coremlDownloading || whisperStatus === 'running' ? 0.6 : 1 }}
+                      >
+                        {coremlDownloading ? '下載中…' : '下載 CoreML 模型包（Apple Neural Engine）'}
+                      </button>
+                    )}
+                    {coremlDownloading && (
+                      <div style={{ marginTop: '8px' }}>
+                        <div style={{ height: '4px', borderRadius: '2px', background: 'var(--color-bg-overlay)', overflow: 'hidden' }}>
+                          <div style={{
+                            height: '100%',
+                            width: coremlTotalBytes > 0 ? `${Math.round(coremlDownloadedBytes / coremlTotalBytes * 100)}%` : '100%',
+                            background: 'var(--color-accent)',
+                            borderRadius: '2px',
+                            transition: coremlTotalBytes > 0 ? 'width 0.3s ease' : undefined,
+                            animation: coremlTotalBytes === 0 ? 'pulse 1.5s ease-in-out infinite' : undefined,
+                          }} />
+                        </div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: 'var(--color-text-muted)', marginTop: '4px' }}>
+                          <span>{fmtBytes(coremlDownloadedBytes)}{coremlTotalBytes > 0 ? ` / ${fmtBytes(coremlTotalBytes)}` : ''}</span>
+                          <span>
+                            {coremlTotalBytes > 0 ? `${Math.round(coremlDownloadedBytes / coremlTotalBytes * 100)}%` : '連線中…'}
+                            {coremlSpeedBps > 0 ? ` · ${fmtSpeed(coremlSpeedBps)}` : ''}
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                    <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '4px 0 0', lineHeight: 1.5 }}>
+                      下載後放置於模型同目錄，重啟 whisper-server 即自動啟用 Apple Neural Engine，推論速度可提升 2–4 倍。
+                      whisper-server binary 需為 CoreML 版（重新執行「自動安裝最新版」）。
+                    </p>
+                  </div>
+                </>
+              )}
             </>}
 
             {tab === 'local' && <>

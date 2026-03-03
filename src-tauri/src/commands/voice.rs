@@ -294,7 +294,8 @@ pub async fn transcribe_audio(
         .part("file", part)
         .text("response_format", "json")
         .text("language", lang)
-        .text("temperature", "0.0");
+        .text("temperature", "0.0")
+        .text("beam_size", "1");  // greedy decoding，大幅減少延遲
 
     let resp = client
         .post(format!("{}/inference", base_url))

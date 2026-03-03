@@ -170,6 +170,8 @@ pub fn run() {
             download_whisper_server,
             get_llama_binary_path,
             download_llama_server,
+            get_coreml_model_path,
+            download_coreml_model,
         ])
         .build(tauri::generate_context!())
         .expect("noteTreeLM 構建失敗")

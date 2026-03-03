@@ -475,6 +475,157 @@ async fn download_single_binary(
 }
 
 
+// ── CoreML model download (macOS only) ───────────────────────────────────────
+
+/// 從主模型路徑推導 CoreML encoder 套件的預期目錄路徑
+fn derive_coreml_path(model_path: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(model_path);
+    let stem = p.file_stem()?.to_str()?;          // "ggml-base.en"（去掉 .bin）
+    let dir  = p.parent()?;
+    Some(dir.join(format!("{}-encoder.mlpackage", stem)))
+}
+
+/// 檢查 CoreML 模型套件是否已安裝（回傳路徑或 None）
+#[tauri::command]
+pub fn get_coreml_model_path(model_path: String) -> Option<String> {
+    let path = derive_coreml_path(&model_path)?;
+    if path.exists() { Some(path.to_string_lossy().into_owned()) } else { None }
+}
+
+/// 從 HuggingFace 下載對應模型的 CoreML encoder 套件並解壓至模型目錄
+/// 進度透過 model-download-progress 事件推送（model_id = "__coreml__"）
+#[tauri::command]
+pub async fn download_coreml_model(
+    app: AppHandle,
+    model_path: String,
+    dl_state: tauri::State<'_, DownloadState>,
+) -> Result<(), AppError> {
+    const MODEL_ID: &str = "__coreml__";
+
+    {
+        let mut active = dl_state.active.lock().await;
+        if active.contains_key(MODEL_ID) { return Ok(()); }
+        active.insert(MODEL_ID.to_string(), Arc::new(AtomicBool::new(false)));
+    }
+
+    let app2 = app.clone();
+    tokio::spawn(async move {
+        let result = run_coreml_download(&app2, &model_path, MODEL_ID).await;
+
+        if let Some(ds) = app2.try_state::<DownloadState>() {
+            ds.active.lock().await.remove(MODEL_ID);
+        }
+
+        match result {
+            Ok(path) => emit_progress(&app2, DownloadProgress {
+                model_id: MODEL_ID.to_string(),
+                downloaded_bytes: 0, total_bytes: 0, speed_bps: 0,
+                status: "completed".to_string(), file_path: Some(path), error: None,
+            }),
+            Err(e) => emit_progress(&app2, DownloadProgress {
+                model_id: MODEL_ID.to_string(),
+                downloaded_bytes: 0, total_bytes: 0, speed_bps: 0,
+                status: "error".to_string(), file_path: None, error: Some(e.to_string()),
+            }),
+        }
+    });
+
+    Ok(())
+}
+
+async fn run_coreml_download(app: &AppHandle, model_path: &str, model_id: &str) -> Result<String, AppError> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, model_path, model_id);
+        return Err(AppError::Import("CoreML 僅支援 macOS".to_string()));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let p = std::path::Path::new(model_path);
+        let stem = p.file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| AppError::Import("無法解析模型路徑".to_string()))?;
+        let model_dir = p.parent()
+            .ok_or_else(|| AppError::Import("無法取得模型目錄".to_string()))?;
+
+        let coreml_name = format!("{}-encoder.mlpackage", stem);
+        let zip_name    = format!("{}.zip", coreml_name);
+        let hf_url = format!(
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}",
+            zip_name
+        );
+
+        let client = reqwest::Client::builder()
+            .user_agent("noteTreeLM/1.0")
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| AppError::Import(e.to_string()))?;
+
+        let resp = client.get(&hf_url).send().await
+            .map_err(|e| AppError::Import(format!("無法連接 HuggingFace：{}", e)))?;
+
+        if !resp.status().is_success() {
+            return Err(AppError::Import(format!(
+                "下載失敗 HTTP {}（此模型可能沒有 CoreML 版本）", resp.status()
+            )));
+        }
+
+        let total_bytes = resp.content_length().unwrap_or(0);
+        let zip_part = model_dir.join(format!("{}.part", zip_name));
+
+        let mut file = std::fs::File::create(&zip_part)?;
+        let mut downloaded = 0u64;
+        let mut last_emit = std::time::Instant::now();
+        let mut last_emit_downloaded = 0u64;
+        let mut resp = resp;
+
+        loop {
+            match resp.chunk().await.map_err(|e| AppError::Import(e.to_string()))? {
+                None => break,
+                Some(chunk) => {
+                    file.write_all(&chunk)?;
+                    downloaded += chunk.len() as u64;
+                    let elapsed = last_emit.elapsed();
+                    if elapsed >= std::time::Duration::from_millis(300) {
+                        let speed_bps = if elapsed.as_secs_f64() > 0.0 {
+                            ((downloaded - last_emit_downloaded) as f64 / elapsed.as_secs_f64()) as u64
+                        } else { 0 };
+                        last_emit = std::time::Instant::now();
+                        last_emit_downloaded = downloaded;
+                        emit_progress(app, DownloadProgress {
+                            model_id: model_id.to_string(),
+                            downloaded_bytes: downloaded, total_bytes: total_bytes,
+                            speed_bps, status: "downloading".to_string(),
+                            file_path: None, error: None,
+                        });
+                    }
+                }
+            }
+        }
+        file.flush()?;
+        drop(file);
+
+        // 用系統 unzip 解壓目錄型 .mlpackage（macOS 一定有 unzip）
+        let out = tokio::process::Command::new("unzip")
+            .arg("-o").arg("-q")
+            .arg(&zip_part)
+            .arg("-d").arg(model_dir)
+            .output().await
+            .map_err(|e| AppError::Import(format!("unzip 失敗：{}", e)))?;
+
+        let _ = std::fs::remove_file(&zip_part);
+
+        if !out.status.success() {
+            let msg = String::from_utf8_lossy(&out.stderr).to_string();
+            return Err(AppError::Import(format!("解壓失敗：{}", msg)));
+        }
+
+        let coreml_path = model_dir.join(&coreml_name);
+        Ok(coreml_path.to_string_lossy().into_owned())
+    }
+}
+
 // ── Binary (llama-server) download ───────────────────────────────────────────
 
 /// Returns the absolute path to the downloaded llama-server binary, or None if not installed.
