@@ -1,4 +1,5 @@
 use sqlx::SqlitePool;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -27,6 +28,10 @@ pub struct AppState {
     pub llama_start_lock: Arc<Mutex<()>>,
     /// whisper-server 啟動鎖：同上
     pub whisper_start_lock: Arc<Mutex<()>>,
+    /// 使用者主動停止旗標：true 時 ensure_whisper_server_running 不會自動重啟
+    pub whisper_user_stopped: Arc<AtomicBool>,
+    /// 使用者主動停止旗標：true 時 ensure_server_running 不會自動重啟
+    pub llama_user_stopped: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -43,6 +48,8 @@ impl AppState {
             whisper_actual_port: Arc::new(Mutex::new(None)),
             llama_start_lock: Arc::new(Mutex::new(())),
             whisper_start_lock: Arc::new(Mutex::new(())),
+            whisper_user_stopped: Arc::new(AtomicBool::new(false)),
+            llama_user_stopped: Arc::new(AtomicBool::new(false)),
         }
     }
 

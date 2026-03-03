@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, State};
 use tokio::io::AsyncReadExt;
@@ -65,6 +66,11 @@ async fn ensure_server_running(
     state: &AppState,
     app: &AppHandle,
 ) -> Result<String, AppError> {
+    // 使用者主動停止旗標：若為 true，拒絕自動重啟
+    if state.llama_user_stopped.load(Ordering::SeqCst) {
+        return Err(AppError::AI("llama-server 已手動停止".to_string()));
+    }
+
     // 啟動鎖：確保同一時刻只有一個呼叫者在跑啟動 / 等待流程
     let _start_lock = state.llama_start_lock.lock().await;
 
@@ -736,12 +742,17 @@ pub async fn warmup_llama_server(state: &AppState, app: &AppHandle) {
 /// 手動停止 llama-server（App 退出時也會自動呼叫）
 #[tauri::command]
 pub async fn stop_llama_server(state: State<'_, AppState>) -> Result<(), AppError> {
+    // 先設旗標，阻止後續請求（stream_chat 等）在 kill+wait 期間或之後重啟
+    state.llama_user_stopped.store(true, Ordering::SeqCst);
+
     let mut guard = state.llama_server.lock().await;
     if let Some(mut child) = guard.take() {
         child.kill().await.ok();
         // 等待進程真正退出，確保下一次 health ping 不會再回應
         child.wait().await.ok();
     }
+    // 清除 port，讓 get_llama_server_status 直接回傳 stopped 而不再 ping
+    *state.llama_actual_port.lock().await = None;
     Ok(())
 }
 
@@ -785,6 +796,8 @@ pub async fn start_llama_server(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), AppError> {
+    // 清除停止旗標，允許重新啟動
+    state.llama_user_stopped.store(false, Ordering::SeqCst);
     ensure_server_running(state.inner(), &app).await?;
     Ok(())
 }
@@ -795,6 +808,8 @@ pub async fn restart_llama_server(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), AppError> {
+    // 清除停止旗標，允許重新啟動
+    state.llama_user_stopped.store(false, Ordering::SeqCst);
     {
         let mut guard = state.llama_server.lock().await;
         if let Some(mut child) = guard.take() {

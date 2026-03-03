@@ -1,6 +1,7 @@
 use crate::{db::queries, error::AppError, state::AppState};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, State};
 
@@ -79,6 +80,11 @@ async fn ensure_whisper_server_running(
     state: &AppState,
     app: &AppHandle,
 ) -> Result<String, AppError> {
+    // 使用者主動停止旗標：若為 true，拒絕自動重啟（防止 transcribe_audio 在停止後重啟）
+    if state.whisper_user_stopped.load(Ordering::SeqCst) {
+        return Err(AppError::Voice("whisper-server 已手動停止".to_string()));
+    }
+
     // 啟動鎖：確保同一時刻只有一個呼叫者在跑啟動 / 等待流程
     // 第二個呼叫者在此等待，直到第一個完成後再進入 Phase 1
     // → 第二個呼叫者在 Phase 1 發現伺服器已就緒，直接回傳，不重複 emit
@@ -437,6 +443,9 @@ fn build_silent_wav(duration_secs: f32, sample_rate: u32) -> Vec<u8> {
 /// 手動停止 whisper-server（App 關閉時也會自動呼叫）
 #[tauri::command]
 pub async fn stop_whisper_server(state: State<'_, AppState>) -> Result<(), AppError> {
+    // 先設旗標，阻止 transcribe_audio 在本次 kill+wait 期間或之後重啟
+    state.whisper_user_stopped.store(true, Ordering::SeqCst);
+
     let mut guard = state.whisper_server.lock().await;
     if let Some(mut child) = guard.take() {
         child.kill().await.ok();
@@ -445,6 +454,8 @@ pub async fn stop_whisper_server(state: State<'_, AppState>) -> Result<(), AppEr
         //   這段空窗期輪詢會看到 "running" 而誤判為重新連線）
         child.wait().await.ok();
     }
+    // 清除 port，讓 get_whisper_server_status 直接回傳 stopped 而不再 ping
+    *state.whisper_actual_port.lock().await = None;
     Ok(())
 }
 
@@ -492,6 +503,8 @@ pub async fn start_whisper_server(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), AppError> {
+    // 清除停止旗標，允許重新啟動
+    state.whisper_user_stopped.store(false, Ordering::SeqCst);
     ensure_whisper_server_running(state.inner(), &app).await?;
     Ok(())
 }
@@ -502,6 +515,8 @@ pub async fn restart_whisper_server(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), AppError> {
+    // 清除停止旗標，允許重新啟動
+    state.whisper_user_stopped.store(false, Ordering::SeqCst);
     {
         let mut guard = state.whisper_server.lock().await;
         if let Some(mut child) = guard.take() {
