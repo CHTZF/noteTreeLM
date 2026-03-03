@@ -482,7 +482,7 @@ fn derive_coreml_path(model_path: &str) -> Option<std::path::PathBuf> {
     let p = std::path::Path::new(model_path);
     let stem = p.file_stem()?.to_str()?;          // "ggml-base.en"（去掉 .bin）
     let dir  = p.parent()?;
-    Some(dir.join(format!("{}-encoder.mlpackage", stem)))
+    Some(dir.join(format!("{}-encoder.mlmodelc", stem)))
 }
 
 /// 檢查 CoreML 模型套件是否已安裝（回傳路徑或 None）
@@ -549,7 +549,9 @@ async fn run_coreml_download(app: &AppHandle, model_path: &str, model_id: &str) 
         let model_dir = p.parent()
             .ok_or_else(|| AppError::Import("無法取得模型目錄".to_string()))?;
 
-        let coreml_name = format!("{}-encoder.mlpackage", stem);
+        // HuggingFace 上的預編譯格式為 .mlmodelc（已被 coremlc 編譯的二進位格式）
+        // 對應檔名：ggml-base.en-encoder.mlmodelc.zip
+        let coreml_name = format!("{}-encoder.mlmodelc", stem);
         let zip_name    = format!("{}.zip", coreml_name);
         let hf_url = format!(
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}",
@@ -606,7 +608,7 @@ async fn run_coreml_download(app: &AppHandle, model_path: &str, model_id: &str) 
         file.flush()?;
         drop(file);
 
-        // 用系統 unzip 解壓目錄型 .mlpackage（macOS 一定有 unzip）
+        // 用系統 unzip 解壓 .mlmodelc 目錄（macOS 一定有 unzip）
         let out = tokio::process::Command::new("unzip")
             .arg("-o").arg("-q")
             .arg(&zip_part)
