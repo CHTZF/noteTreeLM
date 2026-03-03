@@ -26,8 +26,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASES_PAT }}
         run: |
-          SIZE=$(gh api repos/$RELEASES_REPO --jq '.size')
-          if [ "$SIZE" = "0" ]; then
+          PUSHED=$(gh api repos/$RELEASES_REPO --jq '.pushed_at')
+          if [ "$PUSHED" = "null" ]; then
             CONTENT=$(printf '# noteTreeLM Releases\n\nPre-built binaries for [noteTreeLM](https://github.com/CHTZF/noteTreeLM).\n' | base64 -w 0)
             gh api repos/$RELEASES_REPO/contents/README.md \
               --method PUT \
@@ -35,7 +35,7 @@ jobs:
               -f content="$CONTENT"
             echo "✅ Initialized $RELEASES_REPO"
           else
-            echo "ℹ️ $RELEASES_REPO already has commits (size=$SIZE), skipping init"
+            echo "ℹ️ $RELEASES_REPO already has commits, skipping init"
           fi
 
   build-macos-arm64:
