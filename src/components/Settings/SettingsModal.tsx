@@ -281,7 +281,17 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
       <button
         disabled={disabled}
         onClick={async () => {
-          const r = await open({ directory: isDir, multiple: false })
+          let defaultPath: string | undefined
+          if (value) {
+            if (isDir) {
+              defaultPath = value
+            } else {
+              const sep = value.includes('\\') ? '\\' : '/'
+              const idx = value.lastIndexOf(sep)
+              if (idx > 0) defaultPath = value.substring(0, idx)
+            }
+          }
+          const r = await open({ directory: isDir, multiple: false, ...(defaultPath ? { defaultPath } : {}) })
           if (r) onChange(typeof r === 'string' ? r : String(r))
         }}
         style={{ height: '32px', padding: '0 12px', borderRadius: '6px', background: 'var(--color-bg-overlay)', color: disabled ? 'var(--color-text-muted)' : 'var(--color-text-primary)', fontSize: '13px', border: '1px solid var(--color-border)', flexShrink: 0, whiteSpace: 'nowrap', opacity: disabled ? 0.4 : 1, cursor: disabled ? 'not-allowed' : 'pointer' }}
