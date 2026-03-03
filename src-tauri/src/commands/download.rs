@@ -254,6 +254,128 @@ pub async fn set_external_model_paths(
     Ok(())
 }
 
+// ── Model file import (copy to models dir) ───────────────────────────────────
+
+/// 將外部模型檔案複製到應用程式管理的 models 目錄，方便統一管理。
+/// 若來源已在 models_dir 中則直接回傳路徑；否則在背景以 1 MB chunk 複製並推送進度事件。
+/// model-download-progress.model_id = 檔名（與下載系統相容，前端可用同一監聽器顯示進度）
+#[tauri::command]
+pub async fn import_model_file(
+    app: AppHandle,
+    src_path: String,
+    dl_state: tauri::State<'_, DownloadState>,
+) -> Result<String, AppError> {
+    let src = std::path::PathBuf::from(&src_path);
+    let filename = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| AppError::Import("無法解析檔名".to_string()))?
+        .to_string();
+
+    let dest_dir = models_dir(&app)?;
+    let dest = dest_dir.join(&filename);
+
+    // 來源已在 models_dir，直接回傳，不需複製
+    if src == dest {
+        return Ok(dest.to_string_lossy().into_owned());
+    }
+
+    // 防止同一檔名重複匯入
+    {
+        let mut active = dl_state.active.lock().await;
+        if active.contains_key(&filename) {
+            return Ok(dest.to_string_lossy().into_owned());
+        }
+        active.insert(filename.clone(), Arc::new(AtomicBool::new(false)));
+    }
+
+    let app2 = app.clone();
+    let filename2 = filename.clone();
+    let src2 = src.clone();
+    let dest2 = dest.clone();
+    tokio::spawn(async move {
+        let result = copy_with_progress(&app2, &src2, &dest2, &filename2).await;
+        if let Some(ds) = app2.try_state::<DownloadState>() {
+            ds.active.lock().await.remove(&filename2);
+        }
+        match result {
+            Ok(path) => emit_progress(&app2, DownloadProgress {
+                model_id: filename2.clone(),
+                downloaded_bytes: 0, total_bytes: 0, speed_bps: 0,
+                status: "completed".to_string(),
+                file_path: Some(path),
+                error: None,
+            }),
+            Err(e) => emit_progress(&app2, DownloadProgress {
+                model_id: filename2.clone(),
+                downloaded_bytes: 0, total_bytes: 0, speed_bps: 0,
+                status: "error".to_string(),
+                file_path: None,
+                error: Some(e.to_string()),
+            }),
+        }
+    });
+
+    Ok(dest.to_string_lossy().into_owned())
+}
+
+/// 帶進度事件的非同步檔案複製（1 MB 緩衝區，每 300 ms 推送一次進度）
+async fn copy_with_progress(
+    app: &AppHandle,
+    src: &std::path::Path,
+    dest: &std::path::Path,
+    model_id: &str,
+) -> Result<String, AppError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let total_bytes = tokio::fs::metadata(src).await
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    let mut reader = tokio::fs::File::open(src).await
+        .map_err(|e| AppError::Import(format!("無法開啟來源檔案：{}", e)))?;
+    let mut writer = tokio::fs::File::create(dest).await
+        .map_err(|e| AppError::Import(format!("無法建立目標檔案：{}", e)))?;
+
+    let mut buf = vec![0u8; 1024 * 1024]; // 1 MB buffer
+    let mut copied = 0u64;
+    let mut last_emit = std::time::Instant::now();
+    let mut last_copied = 0u64;
+
+    loop {
+        let n = reader.read(&mut buf).await
+            .map_err(|e| AppError::Import(format!("讀取失敗：{}", e)))?;
+        if n == 0 { break; }
+
+        writer.write_all(&buf[..n]).await
+            .map_err(|e| AppError::Import(format!("寫入失敗：{}", e)))?;
+        copied += n as u64;
+
+        let elapsed = last_emit.elapsed();
+        if elapsed >= std::time::Duration::from_millis(300) {
+            let speed_bps = if elapsed.as_secs_f64() > 0.0 {
+                ((copied - last_copied) as f64 / elapsed.as_secs_f64()) as u64
+            } else { 0 };
+            last_emit = std::time::Instant::now();
+            last_copied = copied;
+            emit_progress(app, DownloadProgress {
+                model_id: model_id.to_string(),
+                downloaded_bytes: copied,
+                total_bytes: total_bytes,
+                speed_bps,
+                status: "downloading".to_string(),
+                file_path: None,
+                error: None,
+            });
+        }
+    }
+
+    writer.flush().await.map_err(|e| AppError::Import(format!("寫入失敗：{}", e)))?;
+    drop(writer);
+
+    Ok(dest.to_string_lossy().into_owned())
+}
+
 // ── Binary (whisper-server) download ─────────────────────────────────────────
 
 fn binaries_dir(app: &AppHandle) -> Result<std::path::PathBuf, AppError> {

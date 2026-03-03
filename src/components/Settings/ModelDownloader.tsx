@@ -33,13 +33,13 @@ export interface ModelItem {
   recommended?: boolean
 }
 
-// Represents a model ready for use (complete + in models dir, or externally imported)
+// Represents a model ready for use (complete + in models dir)
 interface AvailableModel {
   key: string          // unique identifier (filename or full external path)
   path: string         // absolute path to use
   displayName: string  // short label shown in dropdown / 已下載 list
   sizeBytesStr?: string
-  isExternal: boolean
+  isLegacyExternal?: boolean  // backward compat: path not in models dir
 }
 
 // ── Model catalogues ───────────────────────────────────────────────────────────
@@ -157,30 +157,28 @@ interface Props {
 
 export default function ModelDownloader({ models, title, kind, value, onChange, disabled = false }: Props) {
   const [dirInfos, setDirInfos] = useState<ModelFileInfo[]>([])
-  const [externalPaths, setExternalPaths] = useState<string[]>([])
   const [progress, setProgress] = useState<Record<string, DownloadProgress>>({})
   const unlistenRef = useRef<UnlistenFn | null>(null)
+  // ref tracks active import filename so the progress listener can react without stale closure
+  const importingFilenameRef = useRef<string | null>(null)
 
   const ext = kind === 'whisper' ? '.bin' : '.gguf'
 
   // Complete (non-partial) models in models dir that match our extension
   const completeDirModels = dirInfos.filter(m => !m.is_partial && m.filename.endsWith(ext))
 
-  // Combined list of all models ready for use
+  // All available models; if current value is not in managed dir, add as legacy entry for backward compat
   const availableModels: AvailableModel[] = [
     ...completeDirModels.map(m => ({
       key: m.filename,
       path: m.file_path,
       displayName: m.filename,
       sizeBytesStr: fmtBytes(m.size_bytes),
-      isExternal: false,
     })),
-    ...externalPaths.map(p => ({
-      key: p,
-      path: p,
-      displayName: p.split('/').pop() || p,
-      isExternal: true,
-    })),
+    // Backward compat: current value not in models dir (e.g. previously set via path picker)
+    ...(value && !completeDirModels.some(m => m.file_path === value)
+      ? [{ key: value, path: value, displayName: (value.split('/').pop() || value) + ' (外部路徑)', isLegacyExternal: true }]
+      : []),
   ]
 
   const refreshDir = useCallback(async () => {
@@ -192,26 +190,26 @@ export default function ModelDownloader({ models, title, kind, value, onChange, 
     }
   }, [])
 
-  const refreshExternal = useCallback(async () => {
-    try {
-      const paths = await invoke<string[]>('get_external_model_paths', { kind })
-      setExternalPaths(paths)
-    } catch (e) {
-      console.error('get_external_model_paths failed:', e)
-    }
-  }, [kind])
-
   useEffect(() => {
     refreshDir()
-    refreshExternal()
 
     let cancelled = false
     listen<DownloadProgress>('model-download-progress', (event) => {
       if (cancelled) return
       const prog = event.payload
       setProgress(prev => ({ ...prev, [prog.model_id]: prog }))
-      if (prog.status === 'completed') refreshDir()
+      if (prog.status === 'completed') {
+        refreshDir()
+        // If this was an import we initiated, auto-select the copied model
+        if (importingFilenameRef.current === prog.model_id && prog.file_path) {
+          importingFilenameRef.current = null
+          onChange(prog.file_path)
+        }
+      }
       if (['completed', 'cancelled', 'error'].includes(prog.status)) {
+        if (importingFilenameRef.current === prog.model_id) {
+          importingFilenameRef.current = null
+        }
         setTimeout(() => {
           if (cancelled) return
           setProgress(prev => { const n = { ...prev }; delete n[prog.model_id]; return n })
@@ -226,7 +224,7 @@ export default function ModelDownloader({ models, title, kind, value, onChange, 
       cancelled = true
       unlistenRef.current?.()
     }
-  }, [refreshDir, refreshExternal])
+  }, [refreshDir, onChange])
 
   // ── Handlers ─────────────────────────────────────────────────────────────────
 
@@ -237,14 +235,17 @@ export default function ModelDownloader({ models, title, kind, value, onChange, 
         filters: [{ name: title, extensions: [ext.slice(1)] }],
       })
       if (!file) return
-      const path = typeof file === 'string' ? file : (file as any).path ?? String(file)
-      if (externalPaths.includes(path)) return  // already imported
-      const newPaths = [...externalPaths, path]
-      await invoke('set_external_model_paths', { kind, paths: newPaths })
-      setExternalPaths(newPaths)
-      onChange(path)  // auto-select the imported model
+      const srcPath = typeof file === 'string' ? file : (file as any).path ?? String(file)
+      const filename = srcPath.split('/').pop() || srcPath.split('\\').pop() || srcPath
+
+      // Track import so the progress listener can auto-select on completion
+      importingFilenameRef.current = filename
+
+      // Kick off background copy; returns immediately
+      await invoke('import_model_file', { srcPath })
     } catch (e) {
-      console.error('import failed:', e)
+      importingFilenameRef.current = null
+      console.error('import_model_file failed:', e)
     }
   }
 
@@ -255,17 +256,6 @@ export default function ModelDownloader({ models, title, kind, value, onChange, 
       await refreshDir()
     } catch (e) {
       console.error('delete_model_file failed:', e)
-    }
-  }
-
-  const handleDeleteExternal = async (path: string) => {
-    try {
-      const newPaths = externalPaths.filter(p => p !== path)
-      await invoke('set_external_model_paths', { kind, paths: newPaths })
-      setExternalPaths(newPaths)
-      if (value === path) onChange('')
-    } catch (e) {
-      console.error('set_external_model_paths failed:', e)
     }
   }
 
@@ -305,20 +295,60 @@ export default function ModelDownloader({ models, title, kind, value, onChange, 
 
   // ── Render ────────────────────────────────────────────────────────────────────
 
+  // Models currently being imported (not in catalogue, progress tracked by filename)
+  const importingEntries = Object.entries(progress).filter(([modelId, p]) =>
+    p.status === 'downloading' &&
+    !models.some(m => m.id === modelId) &&
+    modelId.endsWith(ext)
+  )
+
   return (
     <div style={{ marginBottom: '20px' }}>
 
       {/* ─── 已下載模型 ─────────────────────────────────────────────────────── */}
       <div style={sectionLabel}>
         <span style={{ fontWeight: 500 }}>{title} — 已下載模型</span>
-        <button onClick={handleImport} disabled={disabled} style={{ ...smallBtn(), ...(disabled ? { opacity: 0.4, cursor: 'not-allowed' } : {}) }}>+ 匯入模型</button>
+        <button
+          onClick={handleImport}
+          disabled={disabled}
+          style={{ ...smallBtn(), ...(disabled ? { opacity: 0.4, cursor: 'not-allowed' } : {}) }}
+        >
+          + 匯入模型
+        </button>
       </div>
 
       <div style={{
         border: '1px solid var(--color-border)', borderRadius: '8px',
         overflow: 'hidden', marginBottom: '14px',
       }}>
-        {availableModels.length === 0 ? (
+        {/* Import-in-progress rows (copying large files) */}
+        {importingEntries.map(([filename, prog]) => {
+          const pct = prog.total_bytes > 0 ? Math.round(prog.downloaded_bytes / prog.total_bytes * 100) : -1
+          return (
+            <div key={filename} style={{
+              padding: '8px 14px',
+              background: 'var(--color-bg-elevated)',
+              borderBottom: '1px solid var(--color-border)',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span style={{ fontSize: '12px', color: 'var(--color-text-secondary)', flex: 1 }}>
+                  {filename}
+                </span>
+                <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>
+                  複製中{pct >= 0 ? ` ${pct}%` : '…'}
+                  {prog.speed_bps > 0 ? ` · ${fmtSpeed(prog.speed_bps)}` : ''}
+                </span>
+              </div>
+              {pct >= 0 && (
+                <div style={{ marginTop: '6px', height: '3px', borderRadius: '2px', background: 'var(--color-bg-overlay)', overflow: 'hidden' }}>
+                  <div style={{ height: '100%', width: `${pct}%`, background: 'var(--color-accent)', borderRadius: '2px', transition: 'width 0.3s ease' }} />
+                </div>
+              )}
+            </div>
+          )
+        })}
+
+        {availableModels.length === 0 && importingEntries.length === 0 ? (
           <div style={{
             padding: '12px 14px', fontSize: '12px',
             color: 'var(--color-text-muted)',
@@ -329,7 +359,7 @@ export default function ModelDownloader({ models, title, kind, value, onChange, 
         ) : availableModels.map((am, i) => (
           <div key={am.key} style={{
             padding: '8px 14px',
-            borderTop: i > 0 ? '1px solid var(--color-border)' : 'none',
+            borderTop: i > 0 || importingEntries.length > 0 ? '1px solid var(--color-border)' : 'none',
             background: value === am.path ? 'rgba(124,140,248,0.06)' : 'var(--color-bg-elevated)',
             display: 'flex', alignItems: 'center', gap: '8px',
           }}>
@@ -343,20 +373,14 @@ export default function ModelDownloader({ models, title, kind, value, onChange, 
                   {am.sizeBytesStr}
                 </span>
               )}
-              {am.isExternal && (
-                <span style={{ fontSize: '10px', color: 'var(--color-text-muted)', marginLeft: '8px' }}>
-                  外部匯入
-                </span>
-              )}
             </div>
-            <button
-              onClick={() => am.isExternal
-                ? handleDeleteExternal(am.path)
-                : handleDeleteDir(dirInfos.find(d => d.file_path === am.path)!)
-              }
-              style={smallBtn()}
-              title="刪除此模型"
-            >刪除</button>
+            {!am.isLegacyExternal && (
+              <button
+                onClick={() => handleDeleteDir(dirInfos.find(d => d.file_path === am.path)!)}
+                style={smallBtn()}
+                title="刪除此模型"
+              >刪除</button>
+            )}
           </div>
         ))}
       </div>

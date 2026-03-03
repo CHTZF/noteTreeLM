@@ -166,6 +166,7 @@ pub fn run() {
             delete_model_file,
             get_external_model_paths,
             set_external_model_paths,
+            import_model_file,
             get_whisper_binary_path,
             download_whisper_server,
             get_llama_binary_path,
