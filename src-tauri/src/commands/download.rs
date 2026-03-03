@@ -489,7 +489,7 @@ pub async fn get_llama_binary_path(app: AppHandle) -> Result<Option<String>, App
     }
 }
 
-/// Downloads the latest llama-server binary from ggerganov/llama.cpp GitHub Releases.
+/// Downloads the latest static llama-server binary from CHTZF/noteTreeLM-releases.
 /// Returns immediately; progress is pushed via "model-download-progress" events
 /// with model_id = "__llama_server__".
 #[tauri::command]
@@ -544,12 +544,12 @@ pub async fn download_llama_server(
     Ok(())
 }
 
-/// 回傳當前平台對應的 (asset 關鍵字, 壓縮格式副檔名, binary 名稱)
-fn llama_platform_pattern() -> Result<(&'static str, &'static str, &'static str), AppError> {
+/// 回傳當前平台對應的 llama-server asset 名稱（在 CHTZF/noteTreeLM-releases 上）
+fn llama_asset_name() -> Result<&'static str, AppError> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos",   "aarch64") => Ok(("macos-arm64", ".tar.gz", "llama-server")),
-        ("macos",   "x86_64")  => Ok(("macos-x64",   ".tar.gz", "llama-server")),
-        ("windows", "x86_64")  => Ok(("win-cpu-x64",  ".zip",   "llama-server.exe")),
+        ("macos",   "aarch64") => Ok("llama-server-macos-arm64"),
+        ("macos",   "x86_64")  => Ok("llama-server-macos-x86_64"),
+        ("windows", "x86_64")  => Ok("llama-server-windows-x64.exe"),
         (os, arch) => Err(AppError::Import(format!(
             "此平台（{}/{}）尚不支援自動下載", os, arch
         ))),
@@ -557,7 +557,8 @@ fn llama_platform_pattern() -> Result<(&'static str, &'static str, &'static str)
 }
 
 async fn run_llama_download(app: &AppHandle, model_id: &str) -> Result<String, AppError> {
-    let (asset_pattern, file_ext, binary_name) = llama_platform_pattern()?;
+    let asset_name = llama_asset_name()?;
+    let bin_name = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
 
     let client = reqwest::Client::builder()
         .user_agent("noteTreeLM/1.0")
@@ -565,57 +566,47 @@ async fn run_llama_download(app: &AppHandle, model_id: &str) -> Result<String, A
         .build()
         .map_err(|e| AppError::Import(e.to_string()))?;
 
-    // 查詢 ggerganov/llama.cpp 最新 release
-    let release: serde_json::Value = client
-        .get("https://api.github.com/repos/ggerganov/llama.cpp/releases/latest")
+    // 在 CHTZF/noteTreeLM-releases 中尋找最新含有目標 asset 的 llama-* release
+    let releases: Vec<serde_json::Value> = client
+        .get(format!("https://api.github.com/repos/{}/releases?per_page=20", OUR_REPO))
         .send().await
-        .map_err(|e| AppError::Import(format!("無法連接 GitHub API：{}", e)))?
+        .map_err(|e| AppError::Import(e.to_string()))?
         .json().await
         .map_err(|e| AppError::Import(e.to_string()))?;
 
-    let assets = release["assets"].as_array()
-        .ok_or_else(|| AppError::Import("GitHub release 格式異常".to_string()))?;
-
-    // 選出符合平台的 archive（macOS: .tar.gz，Windows: .zip）
-    let download_url = assets.iter()
-        .find_map(|a| {
-            let name = a["name"].as_str()?.to_lowercase();
-            let url  = a["browser_download_url"].as_str()?;
-            if name.contains(asset_pattern) && name.ends_with(file_ext) {
-                Some(url.to_string())
-            } else {
-                None
-            }
+    let download_url = releases.iter()
+        .find(|r| r["tag_name"].as_str().map(|t| t.starts_with("llama-")).unwrap_or(false))
+        .and_then(|r| r["assets"].as_array())
+        .and_then(|assets| {
+            assets.iter().find_map(|a| {
+                if a["name"].as_str() == Some(asset_name) {
+                    a["browser_download_url"].as_str().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
         })
-        .ok_or_else(|| AppError::Import(format!(
-            "找不到適合 {} 平台的 llama-server 下載包",
-            asset_pattern
-        )))?;
+        .ok_or_else(|| AppError::Import(
+            "找不到預建版本。請至 GitHub → Actions → \
+             「Build llama-server」手動執行 workflow 後再試。\n\
+             或自行編譯：cmake … -DBUILD_SHARED_LIBS=OFF \
+             -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON"
+                .to_string()
+        ))?;
 
-    download_and_extract_llama(app, model_id, &client, &download_url, file_ext, binary_name).await
-}
+    // 下載單一靜態 binary（無需解壓）
+    let bin_dir = binaries_dir(app)?;
+    let dest = bin_dir.join(bin_name);
+    let part = bin_dir.join(format!("{}.part", bin_name));
 
-/// 下載壓縮包（zip 或 tar.gz），解壓出 llama-server binary，儲存到 bin_dir
-async fn download_and_extract_llama(
-    app: &AppHandle,
-    model_id: &str,
-    client: &reqwest::Client,
-    url: &str,
-    file_ext: &str,
-    binary_name: &str,
-) -> Result<String, AppError> {
-    let resp = client.get(url).send().await
+    let resp = client.get(&download_url).send().await
         .map_err(|e| AppError::Import(e.to_string()))?;
-
     if !resp.status().is_success() {
         return Err(AppError::Import(format!("下載失敗 HTTP {}", resp.status())));
     }
 
     let total_bytes = resp.content_length().unwrap_or(0);
-    let bin_dir = binaries_dir(app)?;
-    let archive_part = bin_dir.join(format!("llama-server{}.part", file_ext));
-
-    let mut file = std::fs::File::create(&archive_part)?;
+    let mut file = std::fs::File::create(&part)?;
     let mut downloaded = 0u64;
     let mut last_emit = std::time::Instant::now();
     let mut last_emit_downloaded = 0u64;
@@ -650,66 +641,7 @@ async fn download_and_extract_llama(
     file.flush()?;
     drop(file);
 
-    let dest = bin_dir.join(binary_name);
-    let archive_bytes = std::fs::read(&archive_part)
-        .map_err(|e| AppError::Import(e.to_string()))?;
-
-    if file_ext == ".tar.gz" {
-        // macOS / Linux：tar.gz 解壓
-        // 解壓所有檔案（含 .dylib），讓 llama-server 能找到動態連結函式庫
-        use flate2::read::GzDecoder;
-        use tar::Archive;
-        let gz = GzDecoder::new(std::io::Cursor::new(archive_bytes));
-        let mut tar = Archive::new(gz);
-        let mut found = false;
-        for entry in tar.entries().map_err(|e| AppError::Import(e.to_string()))? {
-            let mut entry = entry.map_err(|e| AppError::Import(e.to_string()))?;
-            let entry_type = entry.header().entry_type();
-            // 只解壓一般檔案（跳過目錄、symlink 等）
-            if !entry_type.is_file() { continue; }
-            let path = entry.path().map_err(|e| AppError::Import(e.to_string()))?.to_string_lossy().to_string();
-            // 取最末一段作為檔名（不保留子目錄結構，平舖到 bin_dir）
-            let file_name = path.rsplit('/').next().unwrap_or(&path).to_string();
-            if file_name.is_empty() { continue; }
-            let out_path = bin_dir.join(&file_name);
-            let mut out = std::fs::File::create(&out_path)
-                .map_err(|e| AppError::Import(format!("建立 {} 失敗：{}", file_name, e)))?;
-            std::io::copy(&mut entry, &mut out)
-                .map_err(|e| AppError::Import(format!("解壓 {} 失敗：{}", file_name, e)))?;
-            // 對主 binary 標記 found
-            if file_name.to_lowercase() == binary_name.to_lowercase() {
-                found = true;
-            }
-        }
-        if !found {
-            return Err(AppError::Import(format!("tar.gz 中找不到 {}", binary_name)));
-        }
-        // chmod +x 主 binary
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
-        }
-    } else {
-        // Windows：zip 解壓
-        let cursor = std::io::Cursor::new(archive_bytes);
-        let mut archive = zip::ZipArchive::new(cursor)
-            .map_err(|e| AppError::Import(format!("zip 解壓失敗：{}", e)))?;
-
-        let entry_name = (0..archive.len())
-            .find_map(|i| {
-                let e = archive.by_index(i).ok()?;
-                let name = e.name().to_string();
-                let file_part = name.rsplit('/').next().unwrap_or(&name).to_lowercase();
-                if file_part == binary_name.to_lowercase() { Some(name) } else { None }
-            })
-            .ok_or_else(|| AppError::Import(format!("zip 中找不到 {}", binary_name)))?;
-
-        let mut entry = archive.by_name(&entry_name)
-            .map_err(|e| AppError::Import(e.to_string()))?;
-        let mut out = std::fs::File::create(&dest)?;
-        std::io::copy(&mut entry, &mut out)?;
-    }
+    std::fs::rename(&part, &dest)?;
 
     #[cfg(unix)]
     {
@@ -717,7 +649,6 @@ async fn download_and_extract_llama(
         std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
     }
 
-    let _ = std::fs::remove_file(&archive_part);
     Ok(dest.to_string_lossy().into_owned())
 }
 

@@ -1,0 +1,223 @@
+name: Build llama-server
+
+# 把編譯好的靜態 binary 推到 CHTZF/noteTreeLM-releases，
+# 讓 App 可以不需要 token 就能下載。
+# 前置作業與 build-whisper-server.yml 相同（共用 RELEASES_PAT）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      llama_tag:
+        description: "llama.cpp tag (e.g. b4639), leave empty for latest"
+        required: false
+        default: ""
+  schedule:
+    - cron: "0 3 * * 1"  # 每週一自動檢查（錯開 whisper 的 02:00）
+
+env:
+  RELEASES_REPO: CHTZF/noteTreeLM-releases
+
+jobs:
+  init-releases-repo:
+    name: Init releases repo
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create initial commit if repo is empty
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+        run: |
+          SIZE=$(gh api repos/$RELEASES_REPO --jq '.size')
+          if [ "$SIZE" = "0" ]; then
+            CONTENT=$(printf '# noteTreeLM Releases\n\nPre-built binaries for [noteTreeLM](https://github.com/CHTZF/noteTreeLM).\n' | base64 -w 0)
+            gh api repos/$RELEASES_REPO/contents/README.md \
+              --method PUT \
+              -f message="chore: initialize releases repository" \
+              -f content="$CONTENT"
+            echo "✅ Initialized $RELEASES_REPO"
+          else
+            echo "ℹ️ $RELEASES_REPO already has commits (size=$SIZE), skipping init"
+          fi
+
+  build-macos-arm64:
+    name: macOS ARM64 (Metal, static)
+    runs-on: macos-15
+    needs: init-releases-repo
+    steps:
+      - name: Resolve llama.cpp tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          INPUT_TAG="${{ github.event.inputs.llama_tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+          else
+            TAG=$(gh api repos/ggerganov/llama.cpp/releases/latest --jq '.tag_name')
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if binary already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          EXISTS=$(gh release view "llama-$TAG" --repo "$RELEASES_REPO" \
+                   --json assets -q ".assets[].name" 2>/dev/null \
+                   | grep -c "^llama-server-macos-arm64$" || true)
+          echo "exists=$EXISTS" >> "$GITHUB_OUTPUT"
+
+      - name: Download llama.cpp source
+        if: steps.check.outputs.exists == '0'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          curl -sL "https://github.com/ggerganov/llama.cpp/archive/refs/tags/${TAG}.tar.gz" \
+               -o llama-src.tar.gz
+          mkdir llama-src
+          tar -xzf llama-src.tar.gz -C llama-src --strip-components=1
+
+      - name: Install cmake
+        if: steps.check.outputs.exists == '0'
+        run: brew install cmake
+
+      - name: Build llama-server (Metal, static)
+        if: steps.check.outputs.exists == '0'
+        run: |
+          cmake -S llama-src -B llama-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_METAL=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DLLAMA_BUILD_TESTS=OFF
+
+          cmake --build llama-build \
+            --target llama-server \
+            --config Release \
+            --parallel
+
+          BINARY=$(find llama-build -name "llama-server" -type f | head -1)
+          if [ -z "$BINARY" ]; then
+            echo "ERROR: llama-server binary not found"
+            find llama-build -type f -name "*server*"
+            exit 1
+          fi
+
+          cp "$BINARY" llama-server-macos-arm64
+          chmod +x llama-server-macos-arm64
+          file llama-server-macos-arm64
+          ls -lh llama-server-macos-arm64
+
+      - name: Upload to public releases repo
+        if: steps.check.outputs.exists == '0'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          RELEASE_TAG="llama-$TAG"
+
+          gh release view "$RELEASE_TAG" --repo "$RELEASES_REPO" > /dev/null 2>&1 || \
+          gh release create "$RELEASE_TAG" \
+            --repo "$RELEASES_REPO" \
+            --title "llama-server $TAG" \
+            --notes "Pre-built static llama-server from llama.cpp $TAG (Metal, no dylib)." \
+            --prerelease
+
+          gh release upload "$RELEASE_TAG" \
+            --repo "$RELEASES_REPO" \
+            --clobber \
+            llama-server-macos-arm64
+
+          echo "✅ Uploaded to $RELEASES_REPO @ $RELEASE_TAG"
+
+  build-windows-x64:
+    name: Windows x64 (static)
+    runs-on: windows-latest
+    needs: init-releases-repo
+    steps:
+      - name: Resolve llama.cpp tag
+        id: tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          INPUT_TAG="${{ github.event.inputs.llama_tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+          else
+            TAG=$(gh api repos/ggerganov/llama.cpp/releases/latest --jq '.tag_name')
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if binary already exists
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          EXISTS=$(gh release view "llama-$TAG" --repo "$RELEASES_REPO" \
+                   --json assets -q ".assets[].name" 2>/dev/null \
+                   | grep -c "^llama-server-windows-x64.exe$" || true)
+          echo "exists=$EXISTS" >> "$GITHUB_OUTPUT"
+
+      - name: Download llama.cpp source
+        if: steps.check.outputs.exists == '0'
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          curl -sL "https://github.com/ggerganov/llama.cpp/archive/refs/tags/${TAG}.tar.gz" \
+               -o llama-src.tar.gz
+          mkdir llama-src
+          tar -xzf llama-src.tar.gz -C llama-src --strip-components=1
+
+      - name: Build llama-server (Windows, static)
+        if: steps.check.outputs.exists == '0'
+        shell: cmd
+        run: |
+          cmake -S llama-src -B llama-build ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DBUILD_SHARED_LIBS=OFF ^
+            -DLLAMA_BUILD_TESTS=OFF
+
+          cmake --build llama-build ^
+            --target llama-server ^
+            --config Release ^
+            --parallel
+
+      - name: Collect binary
+        if: steps.check.outputs.exists == '0'
+        shell: bash
+        run: |
+          BINARY=$(find llama-build -name "llama-server.exe" -type f | head -1)
+          if [ -z "$BINARY" ]; then
+            echo "ERROR: llama-server.exe not found"
+            find llama-build -type f -name "*.exe"
+            exit 1
+          fi
+          cp "$BINARY" llama-server-windows-x64.exe
+          ls -lh llama-server-windows-x64.exe
+
+      - name: Upload to public releases repo
+        if: steps.check.outputs.exists == '0'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          RELEASE_TAG="llama-$TAG"
+
+          gh release view "$RELEASE_TAG" --repo "$RELEASES_REPO" > /dev/null 2>&1 || \
+          gh release create "$RELEASE_TAG" \
+            --repo "$RELEASES_REPO" \
+            --title "llama-server $TAG" \
+            --notes "Pre-built static llama-server from llama.cpp $TAG." \
+            --prerelease
+
+          gh release upload "$RELEASE_TAG" \
+            --repo "$RELEASES_REPO" \
+            --clobber \
+            llama-server-windows-x64.exe
+
+          echo "✅ Uploaded to $RELEASES_REPO @ $RELEASE_TAG"
