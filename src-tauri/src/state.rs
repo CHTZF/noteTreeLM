@@ -32,6 +32,8 @@ pub struct AppState {
     pub whisper_user_stopped: Arc<AtomicBool>,
     /// 使用者主動停止旗標：true 時 ensure_server_running 不會自動重啟
     pub llama_user_stopped: Arc<AtomicBool>,
+    /// 全域 port 分配鎖：防止 whisper 與 llama 並發 find_free_port 時取到同一個 port
+    pub port_allocator: Arc<Mutex<()>>,
 }
 
 impl AppState {
@@ -50,6 +52,7 @@ impl AppState {
             whisper_start_lock: Arc::new(Mutex::new(())),
             whisper_user_stopped: Arc::new(AtomicBool::new(false)),
             llama_user_stopped: Arc::new(AtomicBool::new(false)),
+            port_allocator: Arc::new(Mutex::new(())),
         }
     }
 

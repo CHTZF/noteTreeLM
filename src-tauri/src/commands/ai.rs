@@ -77,7 +77,9 @@ async fn ensure_server_running(
     let (bin, model_path) = resolve_server_config(state).await?;
 
     // 取得或自動分配 port（只分配一次，後續重用）
+    // port_allocator 確保 whisper 與 llama 不會並發 find_free_port 取到同一 port
     let port = {
+        let _alloc_lock = state.port_allocator.lock().await;
         let mut guard = state.llama_actual_port.lock().await;
         if let Some(p) = *guard {
             p

@@ -156,7 +156,7 @@ export default function Editor({ canGoBack, canGoForward, onBack, onForward }: E
       return
     }
     const cursor = view.state.selection.main.head
-    const insert = cursor > 0 ? ' ' + text : text
+    const insert = text  // 段落空格由 useVoiceRecorder 的 enqueueTypewriter 負責
     view.dispatch({
       changes: { from: cursor, insert },
       selection: { anchor: cursor + insert.length },

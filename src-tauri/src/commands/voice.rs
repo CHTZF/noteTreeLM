@@ -93,7 +93,9 @@ async fn ensure_whisper_server_running(
     let (bin, model_path, threads) = resolve_whisper_server_config(state).await?;
 
     // 取得或自動分配 port（只分配一次，後續重用）
+    // port_allocator 確保 whisper 與 llama 不會並發 find_free_port 取到同一 port
     let port = {
+        let _alloc_lock = state.port_allocator.lock().await;
         let mut guard = state.whisper_actual_port.lock().await;
         if let Some(p) = *guard {
             p
@@ -287,9 +289,16 @@ pub async fn transcribe_audio(
 
     // zh-TW / zh-CN 都使用 whisper 的 "zh" 語言代碼，
     // 但加入 initial_prompt 導引輸出字體（whisper 無法區分繁簡，靠 prompt 引導）
+    // zh-TW 使用較長的繁體中文 prompt，讓 whisper decoder 強烈偏向繁體字
+    // （單句短 prompt 不足以覆蓋模型對簡體的訓練偏好）
+    const ZH_TW_PROMPT: &str = "以下是繁體中文語音辨識內容，使用臺灣標準繁體字。\
+        這段語音辨識結果將以正體中文呈現，\
+        包含學習、時間、語言、發展、國家、開始、對話、動態、實際、問題、\
+        關係、經驗、處理、業務、義務、氣候、類別、讓步、點選、話語等詞彙，\
+        確保所有輸出均為繁體字型。";
     let (whisper_lang, initial_prompt): (&str, Option<&str>) = match lang.as_str() {
-        "zh-TW" => ("zh", Some("以下是繁體中文。")),
-        "zh-CN" => ("zh", Some("以下是简体中文。")),
+        "zh-TW" => ("zh", Some(ZH_TW_PROMPT)),
+        "zh-CN" => ("zh", Some("以下是普通话语音识别内容，使用简体中文书写，包括学习、时间、语言、发展、国家、问题等词汇。")),
         other   => (other, None),
     };
 

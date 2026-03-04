@@ -73,6 +73,9 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   const [llamaStatus, setLlamaStatus] = useState<ServerStatus>('unknown')
   const [whisperBusy, setWhisperBusy] = useState(false)
   const [llamaBusy, setLlamaBusy] = useState(false)
+  // Whisper 推論速度測試（毫秒/秒音頻，即 RTF × 1000）
+  const [whisperBenchmarkMs, setWhisperBenchmarkMs] = useState<number | null>(null)
+  const [whisperBenchmarking, setWhisperBenchmarking] = useState(false)
   const [binaryDownloading, setBinaryDownloading] = useState(false)
   const [binaryDownloadedBytes, setBinaryDownloadedBytes] = useState(0)
   const [binaryTotalBytes, setBinaryTotalBytes] = useState(0)
@@ -160,6 +163,29 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
     }).then(fn => { if (cancelled) fn(); else unlisten = fn })
     return () => { cancelled = true; unlisten?.() }
   }, [])
+
+  // 模型更換時清除舊測速結果
+  useEffect(() => { setWhisperBenchmarkMs(null) }, [draft.whisper_model_path])
+
+  // Whisper 推論速度自動測速：Voice 頁 + 伺服器已啟動 + 尚未測過
+  // 發送 1 秒 440Hz 正弦波，測 round-trip 時間（包含 IPC + 推論）
+  useEffect(() => {
+    if (tab !== 'voice') return
+    if (whisperStatus !== 'running') return
+    if (whisperBenchmarkMs !== null) return
+    if (whisperBenchmarking) return
+    if (!draft.whisper_model_path) return
+    setWhisperBenchmarking(true)
+    const sampleRate = 16000
+    const pcmData = Array.from({ length: sampleRate }, (_, i) =>
+      Math.sin(2 * Math.PI * 440 * i / sampleRate) * 0.3,
+    )
+    const t0 = Date.now()
+    invoke<{ text: string }>('transcribe_audio', { pcmData, sampleRate })
+      .then(() => { setWhisperBenchmarkMs(Date.now() - t0) })
+      .catch(() => {})
+      .finally(() => setWhisperBenchmarking(false))
+  }, [tab, whisperStatus, whisperBenchmarkMs, whisperBenchmarking, draft.whisper_model_path])
 
   // 檢查 CoreML 模型套件是否已安裝
   useEffect(() => {
@@ -767,6 +793,69 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                 </select>
               </div>
               <ToggleRow label="辨識完成後自動插入編輯器" value={draft.whisper_auto_insert} onChange={(v) => up({ whisper_auto_insert: v })} />
+              <ToggleRow
+                label="錄音時顯示即時預覽（定期送 Whisper 預測）"
+                value={draft.voice_preview_enabled ?? true}
+                onChange={(v) => up({ voice_preview_enabled: v })}
+              />
+              <div style={fieldStyle}>
+                <label style={labelStyle}>語音處理長度</label>
+                <select
+                  value={draft.voice_preview_interval ?? 5000}
+                  onChange={(e) => up({ voice_preview_interval: Number(e.target.value) })}
+                  style={inputStyle}
+                  disabled={!(draft.voice_preview_enabled ?? true)}
+                >
+                  {[1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000].map((ms) => (
+                    <option key={ms} value={ms}>{`${ms / 1000} 秒`}</option>
+                  ))}
+                </select>
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '4px 0 0', lineHeight: 1.5 }}>
+                  每隔此長度的音頻送一次 Whisper 預覽辨識。
+                </p>
+              </div>
+              {/* 語音響應時間：唯讀顯示，根據選取長度 + 實測 Whisper 速度計算 */}
+              {(draft.voice_preview_enabled ?? true) && (
+                <div style={fieldStyle}>
+                  <label style={labelStyle}>語音響應時間</label>
+                  {whisperBenchmarking && (
+                    <p style={{ fontSize: '12px', color: 'var(--color-text-muted)', margin: 0, lineHeight: 1.5 }}>
+                      ⏱ 測試 Whisper 推論速度中…
+                    </p>
+                  )}
+                  {!whisperBenchmarking && whisperBenchmarkMs !== null && (() => {
+                    const intervalMs  = draft.voice_preview_interval ?? 5000
+                    const inferMs     = Math.round(whisperBenchmarkMs / 1000 * intervalMs)  // RTF × 段長
+                    const totalMs     = intervalMs + inferMs
+                    const rtf         = whisperBenchmarkMs / 1000
+                    const noteColor   = rtf < 0.3
+                      ? 'var(--color-success, #10b981)'
+                      : rtf < 0.7
+                        ? 'var(--color-warning, #f59e0b)'
+                        : 'var(--color-error, #ef4444)'
+                    return (
+                      <p style={{ fontSize: '12px', color: noteColor, margin: 0, lineHeight: 1.8 }}>
+                        約 {(totalMs / 1000).toFixed(1)} 秒
+                        <span style={{ fontSize: '11px', color: 'var(--color-text-muted)', marginLeft: 6 }}>
+                          （處理長度 {intervalMs / 1000}s + Whisper 推論 ~{inferMs}ms）
+                        </span>
+                      </p>
+                    )
+                  })()}
+                  {!whisperBenchmarking && whisperBenchmarkMs === null && (
+                    <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: 0, lineHeight: 1.5 }}>
+                      {whisperStatus === 'running'
+                        ? '測速中，請稍候…'
+                        : '啟動 Whisper 伺服器後自動測速並顯示估算值'}
+                    </p>
+                  )}
+                </div>
+              )}
+              <ToggleRow
+                label="RNNoise 雜訊抑制（關閉則使用瀏覽器內建抑制）"
+                value={draft.voice_noise_suppression ?? true}
+                onChange={(v) => up({ voice_noise_suppression: v })}
+              />
               <div style={fieldStyle}>
                 <label style={labelStyle}>語音後處理模式</label>
                 <select

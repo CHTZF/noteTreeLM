@@ -6,6 +6,7 @@ import { useEditorStore } from '../../stores/editorStore'
 import { useDebugStore } from '../../stores/debugStore'
 import { toast } from '../common/Toast'
 import { useVoiceRecorder } from '../../hooks/useVoiceRecorder'
+import VoiceOverlay from '../common/VoiceOverlay'
 
 interface Message {
   role: 'user' | 'assistant' | 'tool' | 'notice'
@@ -28,6 +29,12 @@ export default function ChatPanel() {
   const [isCompressing, setIsCompressing] = useState(false)
   const [lastMemoryPath, setLastMemoryPath] = useState<string | null>(null)
 
+  // ─── Voice overlay ────────────────────────────────────────────────────────────
+  const [voiceTranscript, setVoiceTranscript]   = useState('')
+  const [voicePreview, setVoicePreview]         = useState<string | null>(null)
+  const [showVoiceOverlay, setShowVoiceOverlay] = useState(false)
+  const pendingVoiceActionRef = useRef<'confirm' | 'discard' | null>(null)
+
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const streamingRef = useRef('')
@@ -42,12 +49,52 @@ export default function ChatPanel() {
   const whisperConfigured = !!settings.whisper_cli_path && !!settings.whisper_model_path
   const vaultConfigured = !!settings.vault_path
 
-  // 語音轉文字：每段結果直接 append 到輸入框
+  // 語音轉文字：逐字累積到 overlay buffer（不直接寫入輸入框）
   const handleTranscript = useCallback((text: string) => {
-    if (!text.trim()) return
-    setInput((prev) => prev ? prev + ' ' + text : text)
+    if (!text) return
+    setVoiceTranscript((prev) => prev + text)
   }, [])
-  const { state: voiceState, toggle: toggleVoice } = useVoiceRecorder(handleTranscript)
+  // 臨時預覽：null = 清除，string = 更新預覽文字
+  const handlePreview = useCallback((text: string | null) => {
+    setVoicePreview(text)
+  }, [])
+  const previewEnabled          = settings.voice_preview_enabled !== false
+  const noiseSuppressionEnabled = settings.voice_noise_suppression !== false
+  const previewIntervalMs       = settings.voice_preview_interval ?? 5000
+  const { state: voiceState, isSpeaking: voiceIsSpeaking, toggle: toggleVoice } = useVoiceRecorder(
+    handleTranscript,
+    previewEnabled ? handlePreview : undefined,
+    noiseSuppressionEnabled,
+    previewIntervalMs,
+  )
+
+  // 錄音開始時顯示 overlay，並重置轉錄文字與預覽
+  useEffect(() => {
+    if (voiceState === 'recording') {
+      setVoiceTranscript('')
+      setVoicePreview(null)
+      setShowVoiceOverlay(true)
+    }
+  }, [voiceState])
+
+  // 有待執行動作（confirm/discard）時，等辨識完成後執行
+  useEffect(() => {
+    const action = pendingVoiceActionRef.current
+    if (!action) return
+    if (voiceState === 'done' || voiceState === 'idle') {
+      pendingVoiceActionRef.current = null
+      const text = voiceTranscript
+      setVoiceTranscript('')
+      setVoicePreview(null)
+      setShowVoiceOverlay(false)
+      if (action === 'confirm' && text) {
+        setInput((prev) => {
+          const sep = prev && !prev.endsWith(' ') ? ' ' : ''
+          return prev + sep + text
+        })
+      }
+    }
+  }, [voiceState, voiceTranscript])
 
   // 語音帶入時自動調整 textarea 高度
   useEffect(() => {
@@ -55,6 +102,7 @@ export default function ChatPanel() {
     if (!t) return
     t.style.height = 'auto'
     t.style.height = Math.min(t.scrollHeight, 120) + 'px'
+    t.scrollTop = t.scrollHeight
   }, [input])
 
   // 持續監聽 llm:stderr → 寫入 debug
@@ -232,6 +280,41 @@ export default function ChatPanel() {
     setLastMemoryPath(null)
   }
 
+  // 填入：若仍在錄音/辨識中則先停止，完成後填入輸入框
+  const handleVoiceConfirm = useCallback(() => {
+    if (voiceState === 'recording') {
+      pendingVoiceActionRef.current = 'confirm'
+      toggleVoice()
+    } else if (voiceState === 'transcribing') {
+      pendingVoiceActionRef.current = 'confirm'
+    } else {
+      const text = voiceTranscript
+      setVoiceTranscript('')
+      setVoicePreview(null)
+      setShowVoiceOverlay(false)
+      if (text) {
+        setInput((prev) => {
+          const sep = prev && !prev.endsWith(' ') ? ' ' : ''
+          return prev + sep + text
+        })
+      }
+    }
+  }, [voiceState, voiceTranscript, toggleVoice])
+
+  // 捨棄：若仍在錄音/辨識中則先停止，完成後直接關閉 overlay
+  const handleVoiceDiscard = useCallback(() => {
+    if (voiceState === 'recording') {
+      pendingVoiceActionRef.current = 'discard'
+      toggleVoice()
+    } else if (voiceState === 'transcribing') {
+      pendingVoiceActionRef.current = 'discard'
+    } else {
+      setVoiceTranscript('')
+      setVoicePreview(null)
+      setShowVoiceOverlay(false)
+    }
+  }, [voiceState, toggleVoice])
+
   // 壓縮記憶：把目前對話原文存成 memories/ai_memory_[timestamp].md
   const compressToMemory = useCallback(async () => {
     const toCompress = messages.filter(m => m.role !== 'tool')
@@ -270,7 +353,20 @@ export default function ChatPanel() {
   }, [messages.length, settings.enable_auto_memory, settings.memory_threshold, isStreaming, isCompressing, compressToMemory])
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', background: 'var(--color-bg-base)' }}>
+    <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', height: '100%', background: 'var(--color-bg-base)' }}>
+      {/* Voice Overlay */}
+      {showVoiceOverlay && (
+        <VoiceOverlay
+          voiceState={voiceState}
+          transcript={voiceTranscript}
+          preview={voicePreview}
+          previewEnabled={previewEnabled}
+          isSpeaking={voiceIsSpeaking}
+          onConfirm={handleVoiceConfirm}
+          onDiscard={handleVoiceDiscard}
+        />
+      )}
+
       {/* Header */}
       <div style={{
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
@@ -440,7 +536,7 @@ export default function ChatPanel() {
         {/* 錄音按鈕 */}
         <button
           onClick={toggleVoice}
-          disabled={!whisperConfigured || voiceState === 'transcribing'}
+          disabled={!whisperConfigured || voiceState === 'transcribing' || showVoiceOverlay}
           title={!whisperConfigured ? '請先到設定頁設定 Whisper' : voiceState === 'recording' ? '停止錄音' : '語音輸入'}
           style={{
             width: '34px', height: '34px', borderRadius: '6px', flexShrink: 0,

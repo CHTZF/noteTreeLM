@@ -31,6 +31,9 @@ export interface Settings {
   graph_font_size: number
   debug_mode: boolean
   voice_process_mode: 'none' | 'format' | 'summary'
+  voice_preview_enabled: boolean
+  voice_noise_suppression: boolean
+  voice_preview_interval: number
   enable_chat: boolean
   enable_auto_memory: boolean
   memory_threshold: number
@@ -71,6 +74,9 @@ export const DEFAULT_SETTINGS: Settings = {
   graph_font_size: 11,
   debug_mode: false,
   voice_process_mode: 'none',
+  voice_preview_enabled: true,
+  voice_noise_suppression: true,
+  voice_preview_interval: 5000,
   enable_chat: false,
   enable_auto_memory: false,
   memory_threshold: 20,
