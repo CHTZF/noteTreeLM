@@ -15,8 +15,6 @@ import Toolbar, { EditorAction } from './Toolbar'
 import PreviewPanel from './PreviewPanel'
 import BacklinksPanel from '../BacklinksPanel/BacklinksPanel'
 import { toast } from '../common/Toast'
-import { invoke } from '@tauri-apps/api/core'
-import { useVoiceRecorder } from '../../hooks/useVoiceRecorder'
 
 // CSS variables are live — when data-theme changes the editor repaints automatically
 const editorTheme = EditorView.theme({
@@ -43,7 +41,8 @@ export default function Editor({ canGoBack, canGoForward, onBack, onForward }: E
   // Ref so the CM6 updateListener always calls the latest version (avoids stale closure)
   const triggerAutoSaveRef = useRef<(content: string) => void>(() => {})
 
-  const { currentPath, content, isDirty, viewMode, setContent, setDirty, setCurrentPath, setViewMode } = useEditorStore()
+  const { currentPath, content, isDirty, viewMode, setContent, setDirty, setCurrentPath, setViewMode,
+          pendingContent, clearPendingContent } = useEditorStore()
   const [pendingAnchor, setPendingAnchor] = useState<string | undefined>(undefined)
   const { readNote, updateNote } = useVaultStore()
   const { settings } = useSettingsStore()
@@ -148,56 +147,21 @@ export default function Editor({ canGoBack, canGoForward, onBack, onForward }: E
     return () => window.removeEventListener('keydown', handler)
   }, [save])
 
-  // 語音輸入：辨識完成後插入游標處（或 toast 通知）
-  const insertAtCursor = useCallback((text: string) => {
+  // 外部寫入同步：ChatPanel 等外部呼叫 applyExternalWrite 後，把新內容同步到 CM6 視圖
+  useEffect(() => {
+    if (pendingContent === null) return
     const view = viewRef.current
-    if (!view || !currentPath) {
-      toast.success('語音轉錄：' + text)
-      return
+    if (view) {
+      view.dispatch({
+        changes: { from: 0, to: view.state.doc.length, insert: pendingContent },
+      })
+      // CM6 onChange 會呼叫 setContent 並把 isDirty 設為 true，
+      // 這裡馬上清回 false，避免 auto-save 以「舊+新」內容再蓋一次
+      setDirty(false)
     }
-    const cursor = view.state.selection.main.head
-    const insert = text  // 段落空格由 useVoiceRecorder 的 enqueueTypewriter 負責
-    view.dispatch({
-      changes: { from: cursor, insert },
-      selection: { anchor: cursor + insert.length },
-    })
-    view.focus()
-  }, [currentPath])
+    clearPendingContent()
+  }, [pendingContent, clearPendingContent, setDirty])
 
-  const handleTranscript = useCallback(async (text: string) => {
-    const mode = settings.voice_process_mode ?? 'none'
-
-    // 有設定後處理模式且 llama 已設定
-    if (mode !== 'none' && settings.llama_cli_path) {
-      // system 放角色指令，userContent 放待處理文字
-      // 分開傳讓模型知道這是任務而非對話，避免模型回應「請提供文字」
-      const system = mode === 'format'
-        ? '你是文字整理助手。你的唯一任務是將輸入的口語錄音文字整理成通順的書面文字，保留原意，不要增加任何新內容。直接輸出整理後的文字，不要問問題、不要說明、不要對話。'
-        : '你是筆記助手。你的唯一任務是分析輸入文字中的關鍵主題或概念，並將原始文字中出現的這些主題以 Obsidian wikilink 格式包圍（例如 [[主題]]）。直接輸出替換後的原始文字，不要增加任何新內容，不要問問題、不要說明、不要對話。'
-      toast.info('llama 處理中…')
-      try {
-        const result = await invoke<string>('process_with_llm', { system, userContent: text })
-        insertAtCursor(result.trim())
-      } catch (e: any) {
-        const msg = e?.AI ?? (typeof e === 'string' ? e : JSON.stringify(e))
-        toast.error('llama 處理失敗：' + msg)
-        // fallback：插入原始轉錄文字
-        if (settings.whisper_auto_insert) insertAtCursor(text)
-      }
-      return
-    }
-
-    // 預設行為
-    if (settings.whisper_auto_insert) {
-      insertAtCursor(text)
-    } else {
-      toast.success('轉錄完成（點擊複製）：' + text.slice(0, 60) + (text.length > 60 ? '…' : ''))
-    }
-  }, [settings.voice_process_mode, settings.llama_cli_path, settings.whisper_auto_insert, insertAtCursor])
-
-  const whisperConfigured = !!settings.whisper_model_path
-  const { state: voiceState, errorMsg: voiceError, segmentsDone: voiceSegmentsDone, toggle: voiceToggle } =
-    useVoiceRecorder(handleTranscript)
 
   const handleAction = useCallback(async (action: EditorAction) => {
     const view = viewRef.current
@@ -318,10 +282,6 @@ export default function Editor({ canGoBack, canGoForward, onBack, onForward }: E
         onForward={onForward}
         onAction={handleAction}
         onSave={save}
-        voiceState={whisperConfigured ? voiceState : undefined}
-        voiceError={voiceError}
-        voiceSegmentsDone={voiceSegmentsDone}
-        onVoiceToggle={whisperConfigured ? voiceToggle : undefined}
       />
 
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden', position: 'relative' }}>

@@ -1,5 +1,4 @@
 import { useEditorStore } from '../../stores/editorStore'
-import type { VoiceState } from '../../hooks/useVoiceRecorder'
 
 export type EditorAction = 'bold' | 'italic' | 'h1' | 'h2' | 'wikilink' | 'image'
 
@@ -10,15 +9,10 @@ interface ToolbarProps {
   onForward: () => void
   onAction: (action: EditorAction) => void
   onSave: () => void
-  voiceState?: VoiceState
-  voiceError?: string
-  voiceSegmentsDone?: number
-  onVoiceToggle?: () => void
 }
 
 export default function Toolbar({
   canGoBack, canGoForward, onBack, onForward, onAction, onSave,
-  voiceState, voiceError, voiceSegmentsDone, onVoiceToggle,
 }: ToolbarProps) {
   const { isDirty, viewMode, setViewMode } = useEditorStore()
 
@@ -73,41 +67,6 @@ export default function Toolbar({
       {isDirty && (
         <div style={{ width: '6px', height: '6px', borderRadius: '50%', background: 'var(--color-warning)' }} title="未儲存" />
       )}
-
-      {/* 語音輸入 */}
-      {onVoiceToggle && <>
-        <div style={{ width: '1px', height: '20px', background: 'var(--color-border)', margin: '0 2px' }} />
-        <button
-          onClick={onVoiceToggle}
-          disabled={voiceState === 'transcribing'}
-          title={
-            voiceState === 'recording'     ? '停止錄音'
-            : voiceState === 'transcribing' ? '辨識中…'
-            : voiceState === 'error'        ? (voiceError || '錯誤，點擊重試')
-            : '開始語音輸入'
-          }
-          style={{
-            padding: '4px 8px', borderRadius: '4px', fontSize: '13px',
-            color: voiceState === 'recording'     ? '#ef4444'
-                 : voiceState === 'error'          ? 'var(--color-warning, #f59e0b)'
-                 : voiceState === 'transcribing'   ? 'var(--color-accent)'
-                 : voiceState === 'done'            ? 'var(--color-success, #22c55e)'
-                 : 'var(--color-text-secondary)',
-            background: voiceState === 'recording'   ? 'rgba(239,68,68,0.10)'
-                       : voiceState === 'transcribing' ? 'var(--color-accent-dim)'
-                       : 'transparent',
-            transition: 'all 0.15s',
-            cursor: voiceState === 'transcribing' ? 'not-allowed' : 'pointer',
-          }}
-        >
-          {voiceState === 'recording'
-            ? `⏹ 停止${voiceSegmentsDone ? ` (${voiceSegmentsDone}段)` : ''}`
-            : voiceState === 'transcribing' ? '辨識中…'
-            : voiceState === 'done'          ? '🎙 ✓'
-            : voiceState === 'error'         ? '⚠ 重試'
-            : '🎙'}
-        </button>
-      </>}
 
       {/* 儲存（編輯模式才有意義） */}
       {isEditing && btn('儲存', '儲存 (⌘S)', onSave)}

@@ -33,7 +33,8 @@ export default function ChatPanel() {
   const [voiceTranscript, setVoiceTranscript]   = useState('')
   const [voicePreview, setVoicePreview]         = useState<string | null>(null)
   const [showVoiceOverlay, setShowVoiceOverlay] = useState(false)
-  const pendingVoiceActionRef = useRef<'confirm' | 'discard' | null>(null)
+  const pendingVoiceActionRef    = useRef<'confirm' | 'discard' | 'save_current' | 'save_new' | null>(null)
+  const pendingVoiceSaveNewRef   = useRef<{ title: string; folder: string } | null>(null)
 
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -79,7 +80,54 @@ export default function ChatPanel() {
     }
   }, [voiceState])
 
-  // 有待執行動作（confirm/discard）時，等辨識完成後執行
+  // 語音後處理：依 voice_process_mode 設定，用 llama 潤稿或加 wikilink
+  const applyVoicePostProcess = useCallback(async (text: string): Promise<string> => {
+    const mode = settings.voice_process_mode ?? 'none'
+    if (mode !== 'none' && settings.llama_cli_path) {
+      const system = mode === 'format'
+        ? '你是文字整理助手。你的唯一任務是將輸入的口語錄音文字整理成通順的書面文字，保留原意，不要增加任何新內容。直接輸出整理後的文字，不要問問題、不要說明、不要對話。'
+        : '你是筆記助手。你的唯一任務是分析輸入文字中的關鍵主題或概念，並將原始文字中出現的這些主題以 Obsidian wikilink 格式包圍（例如 [[主題]]）。直接輸出替換後的原始文字，不要增加任何新內容，不要問問題、不要說明、不要對話。'
+      toast.info('llama 後處理中…')
+      try {
+        const result = await invoke<string>('process_with_llm', { system, userContent: text })
+        return result.trim()
+      } catch (e: any) {
+        const msg = e?.AI ?? (typeof e === 'string' ? e : JSON.stringify(e))
+        toast.error('後處理失敗：' + msg)
+        return text // fallback：使用原始轉錄
+      }
+    }
+    return text
+  }, [settings.voice_process_mode, settings.llama_cli_path])
+
+  // 寫入當前筆記（讀最新 editorStore state，避免 closure 舊值）
+  const doSaveToCurrentNote = useCallback(async (text: string) => {
+    const processedText = await applyVoicePostProcess(text)
+    const { currentPath: path, content: existing } = useEditorStore.getState()
+    if (!path) { toast.error('請先開啟一個筆記'); return }
+    const newContent = existing ? existing + '\n\n' + processedText : processedText
+    try {
+      await invoke('update_note', { path, content: newContent })
+      // 同步 Editor CM6 視圖，防止 auto-save 用舊內容覆蓋
+      useEditorStore.getState().applyExternalWrite(newContent)
+      toast.success('已追加寫入當前筆記')
+    } catch (e) {
+      toast.error('寫入失敗：' + String(e))
+    }
+  }, [applyVoicePostProcess])
+
+  // 建立新筆記（title / folder 由 VoiceOverlay 表單傳入）
+  const doSaveToNewNote = useCallback(async (text: string, title: string, folder: string) => {
+    const processedText = await applyVoicePostProcess(text)
+    try {
+      await invoke('create_note', { title, folder: folder || null, content: processedText })
+      toast.success(`已建立筆記「${title}」`)
+    } catch (e) {
+      toast.error('建立失敗：' + String(e))
+    }
+  }, [applyVoicePostProcess])
+
+  // 有待執行動作（confirm/discard/save_*）時，等辨識完成後執行
   useEffect(() => {
     const action = pendingVoiceActionRef.current
     if (!action) return
@@ -94,9 +142,15 @@ export default function ChatPanel() {
           const sep = prev && !prev.endsWith(' ') ? ' ' : ''
           return prev + sep + text
         })
+      } else if (action === 'save_current' && text) {
+        doSaveToCurrentNote(text)
+      } else if (action === 'save_new' && text) {
+        const saveData = pendingVoiceSaveNewRef.current
+        pendingVoiceSaveNewRef.current = null
+        if (saveData) doSaveToNewNote(text, saveData.title, saveData.folder)
       }
     }
-  }, [voiceState, voiceTranscript])
+  }, [voiceState, voiceTranscript, doSaveToCurrentNote, doSaveToNewNote])
 
   // 語音帶入時自動調整 textarea 高度
   useEffect(() => {
@@ -317,6 +371,40 @@ export default function ChatPanel() {
     }
   }, [voiceState, toggleVoice])
 
+  // 寫入當前筆記：停止後追加轉錄文字
+  const handleVoiceSaveToCurrentNote = useCallback(() => {
+    if (voiceState === 'recording') {
+      pendingVoiceActionRef.current = 'save_current'
+      toggleVoice()
+    } else if (voiceState === 'transcribing') {
+      pendingVoiceActionRef.current = 'save_current'
+    } else {
+      const text = voiceTranscript
+      setVoiceTranscript('')
+      setVoicePreview(null)
+      setShowVoiceOverlay(false)
+      if (text) doSaveToCurrentNote(text)
+    }
+  }, [voiceState, voiceTranscript, toggleVoice, doSaveToCurrentNote])
+
+  // 建立新筆記：title / folder 由 VoiceOverlay 表單傳入
+  const handleVoiceSaveToNewNote = useCallback((title: string, folder: string) => {
+    if (voiceState === 'recording') {
+      pendingVoiceSaveNewRef.current = { title, folder }
+      pendingVoiceActionRef.current = 'save_new'
+      toggleVoice()
+    } else if (voiceState === 'transcribing') {
+      pendingVoiceSaveNewRef.current = { title, folder }
+      pendingVoiceActionRef.current = 'save_new'
+    } else {
+      const text = voiceTranscript
+      setVoiceTranscript('')
+      setVoicePreview(null)
+      setShowVoiceOverlay(false)
+      if (text) doSaveToNewNote(text, title, folder)
+    }
+  }, [voiceState, voiceTranscript, toggleVoice, doSaveToNewNote])
+
   // 壓縮記憶：把目前對話原文存成 memories/ai_memory_[timestamp].md
   const compressToMemory = useCallback(async () => {
     const toCompress = messages.filter(m => m.role !== 'tool')
@@ -355,7 +443,7 @@ export default function ChatPanel() {
   }, [messages.length, settings.enable_auto_memory, settings.memory_threshold, isStreaming, isCompressing, compressToMemory])
 
   return (
-    <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', height: '100%', background: 'var(--color-bg-base)' }}>
+    <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', width: '100%', height: '100%', background: 'var(--color-bg-base)', overflow: 'hidden' }}>
       {/* Voice Overlay */}
       {showVoiceOverlay && (
         <VoiceOverlay
@@ -366,248 +454,252 @@ export default function ChatPanel() {
           isSpeaking={voiceIsSpeaking}
           onConfirm={handleVoiceConfirm}
           onDiscard={handleVoiceDiscard}
+          onSaveToCurrentNote={currentPath ? handleVoiceSaveToCurrentNote : undefined}
+          onSaveToNewNote={handleVoiceSaveToNewNote}
         />
       )}
+      <div style={{ display: 'contents' }}>
+        {/* Header */}
+        <div style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          padding: '8px 12px', borderBottom: '1px solid var(--color-border)', flexShrink: 0,
+        }}>
+          <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)', letterSpacing: '0.05em' }}>
+            CHAT
+          </span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            {messages.length > 0 && (
+              <>
+                <button
+                  onClick={compressToMemory}
+                  disabled={isCompressing || isStreaming}
+                  title="將目前對話儲存為記憶筆記並清空對話"
+                  style={{
+                    fontSize: '11px', padding: '2px 8px', borderRadius: '4px',
+                    background: 'var(--color-bg-overlay)', border: '1px solid var(--color-border)',
+                    color: isCompressing ? 'var(--color-text-muted)' : 'var(--color-accent)',
+                    cursor: isCompressing || isStreaming ? 'not-allowed' : 'pointer',
+                    opacity: isCompressing || isStreaming ? 0.5 : 1,
+                  }}
+                >{isCompressing ? '儲存中…' : '壓縮記憶'}</button>
+                <button
+                  onClick={clearChat}
+                  style={{
+                    fontSize: '11px', padding: '2px 8px', borderRadius: '4px',
+                    background: 'var(--color-bg-overlay)', border: '1px solid var(--color-border)',
+                    color: 'var(--color-text-secondary)', cursor: 'pointer',
+                  }}
+                >清除</button>
+              </>
+            )}
+          </div>
+        </div>
 
-      {/* Header */}
-      <div style={{
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        padding: '8px 12px', borderBottom: '1px solid var(--color-border)', flexShrink: 0,
-      }}>
-        <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)', letterSpacing: '0.05em' }}>
-          CHAT
-        </span>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          {messages.length > 0 && (
-            <>
+        {/* 未設定警告 */}
+        {!isConfigured && (
+          <div style={{
+            margin: '10px 12px', padding: '8px 10px', borderRadius: '6px',
+            background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)',
+            fontSize: '12px', color: 'var(--color-warning, #f59e0b)', lineHeight: 1.5,
+          }}>
+            ⚠ 請先到 <strong>Settings &gt; AI</strong> 設定 llama CLI 路徑與本地模型。
+          </div>
+        )}
+
+        {/* 接近閾值警告（未開啟自動記憶時顯示） */}
+        {(() => {
+          const threshold = settings.memory_threshold ?? 20
+          const meaningful = messages.filter(m => m.role === 'user' || m.role === 'assistant').length
+          const nearLimit = meaningful >= Math.max(threshold - 4, 1) && meaningful < threshold
+          return !settings.enable_auto_memory && nearLimit ? (
+            <div style={{
+              margin: '4px 12px 0', padding: '6px 10px', borderRadius: '6px',
+              background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)',
+              fontSize: '11px', color: 'var(--color-warning, #f59e0b)', lineHeight: 1.5,
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            }}>
+              <span>對話已達 {meaningful} 則，接近閾值 {threshold}，建議壓縮記憶。</span>
               <button
                 onClick={compressToMemory}
-                disabled={isCompressing || isStreaming}
-                title="將目前對話儲存為記憶筆記並清空對話"
+                disabled={isCompressing}
                 style={{
-                  fontSize: '11px', padding: '2px 8px', borderRadius: '4px',
-                  background: 'var(--color-bg-overlay)', border: '1px solid var(--color-border)',
-                  color: isCompressing ? 'var(--color-text-muted)' : 'var(--color-accent)',
-                  cursor: isCompressing || isStreaming ? 'not-allowed' : 'pointer',
-                  opacity: isCompressing || isStreaming ? 0.5 : 1,
+                  marginLeft: '8px', fontSize: '11px', padding: '2px 8px', borderRadius: '4px',
+                  background: 'rgba(245,158,11,0.15)', border: '1px solid rgba(245,158,11,0.4)',
+                  color: 'var(--color-warning, #f59e0b)', cursor: 'pointer', flexShrink: 0,
                 }}
-              >{isCompressing ? '儲存中…' : '壓縮記憶'}</button>
+              >立即壓縮</button>
+            </div>
+          ) : null
+        })()}
+
+        {/* 訊息列表 */}
+        <div style={{ flex: 1, overflowY: 'auto', padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+          {messages.length === 0 && !isStreaming && (
+            <div style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              height: '100%', color: 'var(--color-text-muted)', fontSize: '12px',
+              textAlign: 'center', lineHeight: 1.6,
+            }}>
+              {'與本地 LLM 對話（自動使用工具）'}
+              <br />
+              <span style={{ fontSize: '11px', opacity: 0.7 }}>按 Enter 送出，Shift+Enter 換行</span>
+            </div>
+          )}
+
+          {messages.map((msg, i) => (
+            <MessageBubble key={i} message={msg} />
+          ))}
+
+          {/* 串流中 / agent 思考中的 assistant 泡泡 */}
+          {isStreaming && (
+            <MessageBubble
+              message={{ role: 'assistant', content: streamingText }}
+              streaming
+            />
+          )}
+
+          {/* 錯誤訊息 */}
+          {error && (
+            <div style={{
+              padding: '8px 10px', borderRadius: '6px', fontSize: '12px',
+              background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.2)',
+              color: 'var(--color-error, #ef4444)', wordBreak: 'break-all',
+            }}>
+              ⚠ {error}
+            </div>
+          )}
+
+          <div ref={bottomRef} />
+        </div>
+
+        {/* 寫入確認 Bubble */}
+        {pendingWriteDisplay && (
+          <div style={{
+            margin: '0 8px 8px', padding: '10px 14px', borderRadius: '8px',
+            background: 'var(--color-bg-elevated)', border: '1px solid var(--color-accent)',
+            fontSize: '13px', flexShrink: 0,
+          }}>
+            <div style={{ marginBottom: '8px', color: 'var(--color-text-primary)', whiteSpace: 'pre-wrap', fontFamily: 'var(--font-mono, monospace)', fontSize: '12px' }}>
+              {pendingWriteDisplay}
+            </div>
+            <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '8px' }}>
+              LLM 想執行此寫入操作，是否允許？
+            </div>
+            <div style={{ display: 'flex', gap: '6px' }}>
               <button
-                onClick={clearChat}
-                style={{
-                  fontSize: '11px', padding: '2px 8px', borderRadius: '4px',
-                  background: 'var(--color-bg-overlay)', border: '1px solid var(--color-border)',
-                  color: 'var(--color-text-secondary)', cursor: 'pointer',
-                }}
-              >清除</button>
-            </>
-          )}
-        </div>
-      </div>
-
-      {/* 未設定警告 */}
-      {!isConfigured && (
-        <div style={{
-          margin: '10px 12px', padding: '8px 10px', borderRadius: '6px',
-          background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)',
-          fontSize: '12px', color: 'var(--color-warning, #f59e0b)', lineHeight: 1.5,
-        }}>
-          ⚠ 請先到 <strong>Settings &gt; AI</strong> 設定 llama CLI 路徑與本地模型。
-        </div>
-      )}
-
-      {/* 接近閾值警告（未開啟自動記憶時顯示） */}
-      {(() => {
-        const threshold = settings.memory_threshold ?? 20
-        const meaningful = messages.filter(m => m.role === 'user' || m.role === 'assistant').length
-        const nearLimit = meaningful >= Math.max(threshold - 4, 1) && meaningful < threshold
-        return !settings.enable_auto_memory && nearLimit ? (
-          <div style={{
-            margin: '4px 12px 0', padding: '6px 10px', borderRadius: '6px',
-            background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)',
-            fontSize: '11px', color: 'var(--color-warning, #f59e0b)', lineHeight: 1.5,
-            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-          }}>
-            <span>對話已達 {meaningful} 則，接近閾值 {threshold}，建議壓縮記憶。</span>
-            <button
-              onClick={compressToMemory}
-              disabled={isCompressing}
-              style={{
-                marginLeft: '8px', fontSize: '11px', padding: '2px 8px', borderRadius: '4px',
-                background: 'rgba(245,158,11,0.15)', border: '1px solid rgba(245,158,11,0.4)',
-                color: 'var(--color-warning, #f59e0b)', cursor: 'pointer', flexShrink: 0,
-              }}
-            >立即壓縮</button>
-          </div>
-        ) : null
-      })()}
-
-      {/* 訊息列表 */}
-      <div style={{ flex: 1, overflowY: 'auto', padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
-        {messages.length === 0 && !isStreaming && (
-          <div style={{
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            height: '100%', color: 'var(--color-text-muted)', fontSize: '12px',
-            textAlign: 'center', lineHeight: 1.6,
-          }}>
-            {'與本地 LLM 對話（自動使用工具）'}
-            <br />
-            <span style={{ fontSize: '11px', opacity: 0.7 }}>按 Enter 送出，Shift+Enter 換行</span>
+                onClick={() => handleWriteConfirm(true)}
+                style={{ padding: '4px 12px', borderRadius: '4px', background: 'var(--color-accent)', color: '#fff', border: 'none', cursor: 'pointer', fontSize: '12px' }}
+              >允許</button>
+              <button
+                onClick={() => handleWriteConfirm(false)}
+                style={{ padding: '4px 12px', borderRadius: '4px', background: 'transparent', color: 'var(--color-text-secondary)', border: '1px solid var(--color-border)', cursor: 'pointer', fontSize: '12px' }}
+              >拒絕</button>
+            </div>
           </div>
         )}
 
-        {messages.map((msg, i) => (
-          <MessageBubble key={i} message={msg} />
-        ))}
-
-        {/* 串流中 / agent 思考中的 assistant 泡泡 */}
-        {isStreaming && (
-          <MessageBubble
-            message={{ role: 'assistant', content: streamingText }}
-            streaming
+        {/* 輸入區 */}
+        <div style={{
+          padding: '8px 12px', borderTop: '1px solid var(--color-border)', flexShrink: 0,
+          display: 'flex', gap: '6px', alignItems: 'flex-end',
+        }}>
+          <textarea
+            ref={inputRef}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            disabled={isStreaming || !isConfigured}
+            placeholder={isConfigured ? '輸入訊息…' : '請先設定 llama CLI'}
+            rows={1}
+            style={{
+              flex: 1, resize: 'none', padding: '7px 10px',
+              background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)',
+              borderRadius: '6px', color: 'var(--color-text-primary)', fontSize: '13px',
+              outline: 'none', fontFamily: 'var(--font-sans)', lineHeight: 1.5,
+              minHeight: '34px', maxHeight: '120px', overflowY: 'auto',
+              opacity: !isConfigured ? 0.5 : 1,
+            }}
+            onInput={(e) => {
+              const t = e.currentTarget
+              t.style.height = 'auto'
+              t.style.height = Math.min(t.scrollHeight, 120) + 'px'
+            }}
           />
-        )}
-
-        {/* 錯誤訊息 */}
-        {error && (
-          <div style={{
-            padding: '8px 10px', borderRadius: '6px', fontSize: '12px',
-            background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.2)',
-            color: 'var(--color-error, #ef4444)', wordBreak: 'break-all',
-          }}>
-            ⚠ {error}
-          </div>
-        )}
-
-        <div ref={bottomRef} />
-      </div>
-
-      {/* 寫入確認 Bubble */}
-      {pendingWriteDisplay && (
-        <div style={{
-          margin: '0 8px 8px', padding: '10px 14px', borderRadius: '8px',
-          background: 'var(--color-bg-elevated)', border: '1px solid var(--color-accent)',
-          fontSize: '13px', flexShrink: 0,
-        }}>
-          <div style={{ marginBottom: '8px', color: 'var(--color-text-primary)', whiteSpace: 'pre-wrap', fontFamily: 'var(--font-mono, monospace)', fontSize: '12px' }}>
-            {pendingWriteDisplay}
-          </div>
-          <div style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '8px' }}>
-            LLM 想執行此寫入操作，是否允許？
-          </div>
-          <div style={{ display: 'flex', gap: '6px' }}>
-            <button
-              onClick={() => handleWriteConfirm(true)}
-              style={{ padding: '4px 12px', borderRadius: '4px', background: 'var(--color-accent)', color: '#fff', border: 'none', cursor: 'pointer', fontSize: '12px' }}
-            >允許</button>
-            <button
-              onClick={() => handleWriteConfirm(false)}
-              style={{ padding: '4px 12px', borderRadius: '4px', background: 'transparent', color: 'var(--color-text-secondary)', border: '1px solid var(--color-border)', cursor: 'pointer', fontSize: '12px' }}
-            >拒絕</button>
-          </div>
+          {/* 錄音按鈕 */}
+          <button
+            onClick={toggleVoice}
+            disabled={!whisperConfigured || voiceState === 'transcribing' || showVoiceOverlay}
+            title={!whisperConfigured ? '請先到設定頁設定 Whisper' : voiceState === 'recording' ? '停止錄音' : '語音輸入'}
+            style={{
+              width: '34px', height: '34px', borderRadius: '6px', flexShrink: 0,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              border: '1px solid var(--color-border)',
+              background: voiceState === 'recording'
+                ? 'rgba(239,68,68,0.15)'
+                : voiceState === 'done'
+                  ? 'rgba(74,222,128,0.15)'
+                  : 'var(--color-bg-elevated)',
+              color: voiceState === 'recording'
+                ? '#ef4444'
+                : voiceState === 'done'
+                  ? '#4ade80'
+                  : voiceState === 'error'
+                    ? '#f59e0b'
+                    : 'var(--color-text-muted)',
+              cursor: !whisperConfigured || voiceState === 'transcribing' ? 'not-allowed' : 'pointer',
+              opacity: !whisperConfigured || voiceState === 'transcribing' ? 0.4 : 1,
+              transition: 'background 0.2s, color 0.2s',
+            }}
+          >
+            {voiceState === 'recording' ? (
+              // 停止方塊
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="3" y="3" width="18" height="18" rx="2"/>
+              </svg>
+            ) : voiceState === 'transcribing' ? (
+              // 轉圈點點
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                <circle cx="12" cy="12" r="9" strokeDasharray="28 56" strokeDashoffset="0">
+                  <animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="0.8s" repeatCount="indefinite"/>
+                </circle>
+              </svg>
+            ) : (
+              // 麥克風
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                <line x1="12" y1="19" x2="12" y2="23"/>
+                <line x1="8" y1="23" x2="16" y2="23"/>
+              </svg>
+            )}
+          </button>
+          {/* 送出按鈕（箭頭） */}
+          <button
+            onClick={send}
+            disabled={isStreaming || !input.trim() || !isConfigured}
+            title="送出"
+            style={{
+              width: '34px', height: '34px', borderRadius: '6px', flexShrink: 0,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              background: isStreaming || !input.trim() || !isConfigured ? 'var(--color-bg-overlay)' : 'var(--color-accent)',
+              color: isStreaming || !input.trim() || !isConfigured ? 'var(--color-text-muted)' : 'white',
+              border: 'none',
+              cursor: isStreaming || !input.trim() || !isConfigured ? 'not-allowed' : 'pointer',
+              opacity: isStreaming || !input.trim() || !isConfigured ? 0.5 : 1,
+            }}
+          >
+            {isStreaming ? (
+              <span style={{ fontSize: '16px', lineHeight: 1 }}>…</span>
+            ) : (
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="12" y1="19" x2="12" y2="5"/>
+                <polyline points="5 12 12 5 19 12"/>
+              </svg>
+            )}
+          </button>
         </div>
-      )}
-
-      {/* 輸入區 */}
-      <div style={{
-        padding: '8px 12px', borderTop: '1px solid var(--color-border)', flexShrink: 0,
-        display: 'flex', gap: '6px', alignItems: 'flex-end',
-      }}>
-        <textarea
-          ref={inputRef}
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          disabled={isStreaming || !isConfigured}
-          placeholder={isConfigured ? '輸入訊息…' : '請先設定 llama CLI'}
-          rows={1}
-          style={{
-            flex: 1, resize: 'none', padding: '7px 10px',
-            background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)',
-            borderRadius: '6px', color: 'var(--color-text-primary)', fontSize: '13px',
-            outline: 'none', fontFamily: 'var(--font-sans)', lineHeight: 1.5,
-            minHeight: '34px', maxHeight: '120px', overflowY: 'auto',
-            opacity: !isConfigured ? 0.5 : 1,
-          }}
-          onInput={(e) => {
-            const t = e.currentTarget
-            t.style.height = 'auto'
-            t.style.height = Math.min(t.scrollHeight, 120) + 'px'
-          }}
-        />
-        {/* 錄音按鈕 */}
-        <button
-          onClick={toggleVoice}
-          disabled={!whisperConfigured || voiceState === 'transcribing' || showVoiceOverlay}
-          title={!whisperConfigured ? '請先到設定頁設定 Whisper' : voiceState === 'recording' ? '停止錄音' : '語音輸入'}
-          style={{
-            width: '34px', height: '34px', borderRadius: '6px', flexShrink: 0,
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            border: '1px solid var(--color-border)',
-            background: voiceState === 'recording'
-              ? 'rgba(239,68,68,0.15)'
-              : voiceState === 'done'
-                ? 'rgba(74,222,128,0.15)'
-                : 'var(--color-bg-elevated)',
-            color: voiceState === 'recording'
-              ? '#ef4444'
-              : voiceState === 'done'
-                ? '#4ade80'
-                : voiceState === 'error'
-                  ? '#f59e0b'
-                  : 'var(--color-text-muted)',
-            cursor: !whisperConfigured || voiceState === 'transcribing' ? 'not-allowed' : 'pointer',
-            opacity: !whisperConfigured || voiceState === 'transcribing' ? 0.4 : 1,
-            transition: 'background 0.2s, color 0.2s',
-          }}
-        >
-          {voiceState === 'recording' ? (
-            // 停止方塊
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
-              <rect x="3" y="3" width="18" height="18" rx="2"/>
-            </svg>
-          ) : voiceState === 'transcribing' ? (
-            // 轉圈點點
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
-              <circle cx="12" cy="12" r="9" strokeDasharray="28 56" strokeDashoffset="0">
-                <animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="0.8s" repeatCount="indefinite"/>
-              </circle>
-            </svg>
-          ) : (
-            // 麥克風
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-              <line x1="12" y1="19" x2="12" y2="23"/>
-              <line x1="8" y1="23" x2="16" y2="23"/>
-            </svg>
-          )}
-        </button>
-        {/* 送出按鈕（箭頭） */}
-        <button
-          onClick={send}
-          disabled={isStreaming || !input.trim() || !isConfigured}
-          title="送出"
-          style={{
-            width: '34px', height: '34px', borderRadius: '6px', flexShrink: 0,
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            background: isStreaming || !input.trim() || !isConfigured ? 'var(--color-bg-overlay)' : 'var(--color-accent)',
-            color: isStreaming || !input.trim() || !isConfigured ? 'var(--color-text-muted)' : 'white',
-            border: 'none',
-            cursor: isStreaming || !input.trim() || !isConfigured ? 'not-allowed' : 'pointer',
-            opacity: isStreaming || !input.trim() || !isConfigured ? 0.5 : 1,
-          }}
-        >
-          {isStreaming ? (
-            <span style={{ fontSize: '16px', lineHeight: 1 }}>…</span>
-          ) : (
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-              <line x1="12" y1="19" x2="12" y2="5"/>
-              <polyline points="5 12 12 5 19 12"/>
-            </svg>
-          )}
-        </button>
       </div>
+     
     </div>
   )
 }
