@@ -36,6 +36,9 @@ pub struct Settings {
     pub graph_font_size: u32,
     pub debug_mode: bool,
     pub voice_process_mode: String,
+    pub voice_preview_enabled: bool,
+    pub voice_noise_suppression: bool,
+    pub voice_preview_interval: u32,
     pub enable_chat: bool,
     pub enable_auto_memory: bool,
     pub memory_threshold: u32,
@@ -92,6 +95,9 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<Settings, AppErr
         graph_font_size: get!("graph_font_size", "11").parse().unwrap_or(11),
         debug_mode: get!("debug_mode", "false") == "true",
         voice_process_mode: get!("voice_process_mode", "none"),
+        voice_preview_enabled: get!("voice_preview_enabled", "true") == "true",
+        voice_noise_suppression: get!("voice_noise_suppression", "true") == "true",
+        voice_preview_interval: get!("voice_preview_interval", "5000").parse().unwrap_or(5000),
         enable_chat: get!("enable_chat", "false") == "true",
         enable_auto_memory: get!("enable_auto_memory", "false") == "true",
         memory_threshold: get!("memory_threshold", "20").parse().unwrap_or(20),
@@ -145,6 +151,9 @@ pub async fn save_settings(
     save!("graph_font_size", settings.graph_font_size);
     save!("debug_mode", settings.debug_mode);
     save!("voice_process_mode", settings.voice_process_mode);
+    save!("voice_preview_enabled", settings.voice_preview_enabled);
+    save!("voice_noise_suppression", settings.voice_noise_suppression);
+    save!("voice_preview_interval", settings.voice_preview_interval);
     save!("enable_chat", settings.enable_chat);
     save!("enable_auto_memory", settings.enable_auto_memory);
     save!("memory_threshold", settings.memory_threshold);

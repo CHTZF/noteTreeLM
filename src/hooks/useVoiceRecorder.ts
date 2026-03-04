@@ -3,10 +3,6 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useDebugStore } from '../stores/debugStore'
 import { toast } from '../components/common/Toast'
-// rnnoise-wasm ES module URL — Vite resolves the package entry to a content-addressed
-// asset URL.  Passed to the AudioWorklet thread so it can import the WASM there.
-import rnnoiseModuleUrl from '@shiguredo/rnnoise-wasm?url'
-
 export type VoiceState = 'idle' | 'recording' | 'transcribing' | 'done' | 'error'
 
 // ─── Sample rates ─────────────────────────────────────────────────────────────
@@ -16,29 +12,30 @@ export type VoiceState = 'idle' | 'recording' | 'transcribing' | 'done' | 'error
 const RNNOISE_SAMPLE_RATE = 48000  // AudioContext sample rate when RNNoise enabled
 const WHISPER_SAMPLE_RATE = 16000  // samplesRef / whisper target sample rate
 
-// ─── WASM cache-warm singleton ────────────────────────────────────────────────
-// The actual WASM processing runs in the AudioWorklet thread.
-// This singleton is kept ONLY to pre-warm the browser's WASM compilation cache:
-// main thread loads rnnoise.js at mount time so the compiled WASM bytecode is
-// cached; the worklet's subsequent Rnnoise.load() call re-uses the cache and
-// completes much faster (no recompilation).
-let rnnoiseWarmDone = false
-async function warmupRNNoiseCache() {
-  if (rnnoiseWarmDone) return
-  rnnoiseWarmDone = true
+// ─── RNNoise module singleton (main-thread processing) ────────────────────────
+// Dynamic import() is prohibited in AudioWorkletGlobalScope, so RNNoise runs on
+// the main thread instead.  The WASM module is cached after first load; only
+// DenoiseState objects are created/destroyed per recording session.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let rnnoiseModCache: any = null
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function loadRNNoiseModule(): Promise<any> {
+  if (rnnoiseModCache) return rnnoiseModCache
   const { Rnnoise } = await import('@shiguredo/rnnoise-wasm')
-  await Rnnoise.load()   // instance is GC'd; compiled bytecode stays in browser cache
+  rnnoiseModCache = await Rnnoise.load()
+  return rnnoiseModCache
 }
 
 // ─── VAD parameters ───────────────────────────────────────────────────────────
 // samplesRef 儲存 16kHz 降取樣後的音頻，供 whisper 使用。
 // 所有基於樣本數的計算（門檻、片段長度）皆以 16kHz 為準。
-const RMS_THRESHOLD       = 0.01   // 均方根能量門檻：低於此值視為靜音（0–1 float scale）
+const RMS_THRESHOLD       = 0.015  // 均方根能量門檻：低於此值視為靜音（0–1 float scale）
+                                    // 0.015 比原本 0.01 更嚴格，減少環境噪音誤觸發
 const SILENCE_DURATION_MS = 400    // 靜音持續多久後觸發沖出（ms）
 const MIN_SEGMENT_SEC     = 0.3    // 最短有效片段（秒）
-// chunk 整體能量門檻：低於此值視為靜音，不送 whisper（低於 VAD per-frame 門檻，
-// 容許音量偏低的正常語音；主要用於過濾「完全無聲」的靜音片段）
-const MIN_CHUNK_RMS       = 0.002
+// chunk 整體能量門檻：VAD flush 前先確認整段平均能量，低於此值視為環境噪音不送 whisper
+// 真實語音即使偏小聲 RMS 仍通常 > 0.005；環境背景音通常在 0.002–0.008 之間
+const MIN_CHUNK_RMS       = 0.005
 
 // ─── Whisper 幻覺過濾 ──────────────────────────────────────────────────────────
 // whisper.cpp 對靜音或雜訊音頻會輸出固定字串（訓練資料噪音）。
@@ -83,7 +80,48 @@ const TYPEWRITER_INTERVAL_MS = 30
 // ─── Preview parameters ───────────────────────────────────────────────────────
 // 每隔 voice_preview_interval 秒把尚未 VAD-flush 的音頻送 whisper 預覽（best-effort，可能不完整）
 // VAD 沖出後立刻令牌失效並清除預覽，由正式轉錄結果取代
-const MIN_PREVIEW_SEC     = 1.5   // 至少需要這麼長的音頻才觸發預覽
+const MIN_PREVIEW_SEC           = 1.5   // 至少需要這麼長的音頻才觸發預覽
+// 已處理音頻（rawPreviewChunkStartRef 之前）超過此樣本數時壓縮陣列，釋放記憶體
+const COMPACT_THRESHOLD_SAMPLES = 5 * WHISPER_SAMPLE_RATE  // 5 秒
+
+// ─── Main-thread RNNoise parameters ───────────────────────────────────────────
+const DS_RATIO = 3  // 48 kHz → 16 kHz downsampling ratio
+
+// ─── Preview separator（CJK 語言不加空格）────────────────────────────────────
+// whisper_language 設定為 CJK 語系時段落拼接不插入空格；
+// 設為 'auto' 時依文字內容自動偵測，兼容混合語言。
+const CJK_LANGUAGES = new Set(['zh', 'zh-TW', 'zh-CN', 'ja', 'ko', 'yue', 'cantonese'])
+
+function isCJKChar(ch: string): boolean {
+  const cp = ch.codePointAt(0) ?? 0
+  return (
+    (cp >= 0x4E00 && cp <= 0x9FFF) ||  // CJK Unified Ideographs
+    (cp >= 0x3040 && cp <= 0x30FF) ||  // Hiragana + Katakana
+    (cp >= 0xAC00 && cp <= 0xD7AF) ||  // Hangul
+    (cp >= 0xFF00 && cp <= 0xFFEF)     // Fullwidth forms
+  )
+}
+
+/** whisper.cpp 輸出的文字內部可能含有 \n（句子邊界標記），需先移除。
+ *  CJK 語言：\n → ''（中日韓字元間不需空格）
+ *  其他語言：\n → ' '（保留詞間空格）
+ *  'auto'：保守使用 ' '，避免誤刪有意義的字詞間隔 */
+function normalizeTranscript(text: string, lang: string): string {
+  const nlSep = CJK_LANGUAGES.has(lang) ? '' : ' '
+  return text.replace(/[\n\r]+/g, nlSep).trim()
+}
+
+/** 根據語言設定決定 preview 段落間分隔符：CJK 語系 → ''，其餘 → ' '
+ *  - 明確設定語言：直接查 CJK_LANGUAGES，不做文字偵測
+ *  - 'auto'：依前段末尾與新段開頭字元自動判斷 */
+function previewSep(lang: string, prevText: string, newText: string): string {
+  if (!prevText) return ''
+  if (CJK_LANGUAGES.has(lang)) return ''
+  if (lang === 'auto') {
+    if (isCJKChar(prevText.slice(-1)) || isCJKChar(newText[0] ?? '')) return ''
+  }
+  return ' '
+}
 
 // Vite emits this file as a static asset and resolves the URL at build time
 const WORKLET_URL = new URL('../worklets/voice-processor.js', import.meta.url).href
@@ -101,6 +139,7 @@ export function useVoiceRecorder(
   onPreview?: (text: string | null) => void,
   noiseSuppressionEnabled = true,
   previewIntervalMs = 5000,
+  whisperLanguage = 'auto',
 ): UseVoiceRecorderReturn {
   const [state, setState] = useState<VoiceState>('idle')
   const [errorMsg, setErrorMsg] = useState('')
@@ -110,6 +149,8 @@ export function useVoiceRecorder(
   const streamRef    = useRef<MediaStream | null>(null)
   const audioCtxRef  = useRef<AudioContext | null>(null)
   const workletRef   = useRef<AudioWorkletNode | null>(null)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rnnoiseStateRef = useRef<any>(null)  // DenoiseState — created per session, destroyed on stop
 
   // Chain B: 16kHz raw AudioContext — 不跑 RNNoise，專供 preview 計時器使用
   // 與 Chain A（RNNoise）並行，不等 WASM 載入即可開始累積音頻
@@ -130,6 +171,10 @@ export function useVoiceRecorder(
   // 預覽間隔（ref 讓 startRecording 閉包永遠讀到最新值）
   const previewIntervalMsRef = useRef(previewIntervalMs)
   previewIntervalMsRef.current = previewIntervalMs
+
+  // 語言設定（ref 讓 startRecording 閉包永遠讀到最新值）
+  const whisperLanguageRef = useRef(whisperLanguage)
+  whisperLanguageRef.current = whisperLanguage
 
   // VAD state — maintained inside port.onmessage, no setInterval needed
   const speechActiveRef       = useRef(false)
@@ -161,8 +206,8 @@ export function useVoiceRecorder(
   // 儲存待逐字輸出的文字；轉錄結果 enqueue 後由 tickTypewriter 逐字 drain
   const typewriterBufferRef   = useRef<string>('')
   const typewriterTimerRef    = useRef<ReturnType<typeof setTimeout> | null>(null)
-  // 記錄本次錄音已 enqueue 幾個 segment，用來決定段落間是否加空格
-  const segmentEnqueuedRef    = useRef(0)
+  // 記錄上一個 enqueue 的 segment 原始文字，供 CJK 分隔符偵測使用
+  const lastEnqueuedTextRef   = useRef<string>('')
 
   // 每隔 TYPEWRITER_INTERVAL_MS 輸出一個字元
   const tickTypewriter = useCallback(() => {
@@ -179,12 +224,11 @@ export function useVoiceRecorder(
   }, [])
 
   // 將文字加入 typewriter queue；若 ticker 尚未運行則啟動
-  // 第一個 segment 不加前綴；後續 segment 前加空格作為段落分隔，
-  // 這樣呼叫端只需單純 append，不必自行管理空格
+  // 段落分隔符依語言設定決定：CJK → ''，其餘 → ' '
   const enqueueTypewriter = useCallback((text: string) => {
-    const prefix = segmentEnqueuedRef.current > 0 ? ' ' : ''
-    segmentEnqueuedRef.current += 1
-    typewriterBufferRef.current += prefix + text
+    const sep = previewSep(whisperLanguageRef.current, lastEnqueuedTextRef.current, text)
+    lastEnqueuedTextRef.current = text
+    typewriterBufferRef.current += sep + text
     if (typewriterTimerRef.current === null) {
       typewriterTimerRef.current = setTimeout(tickTypewriter, TYPEWRITER_INTERVAL_MS)
     }
@@ -197,15 +241,14 @@ export function useVoiceRecorder(
       typewriterTimerRef.current = null
     }
     typewriterBufferRef.current = ''
-    segmentEnqueuedRef.current  = 0
+    lastEnqueuedTextRef.current = ''
   }, [])
 
   // ─── Eager RNNoise WASM pre-load ──────────────────────────────────────────────
-  // 在元件掛載時立即開始在主執行緒暖機 WASM 編譯快取。
-  // 實際音頻處理在 AudioWorklet 執行緒；warmupRNNoiseCache 讓瀏覽器提前
-  // 編譯並快取 WASM bytecode，使 worklet 的首次 Rnnoise.load() 幾乎零延遲。
+  // 元件掛載時就開始載入 RNNoise WASM 模組並快取，
+  // 讓使用者點錄音時 DenoiseState 幾乎可以立即建立（避免前幾秒降到純降取樣）。
   useEffect(() => {
-    warmupRNNoiseCache().catch(() => {})
+    loadRNNoiseModule().catch(() => {})
   }, [])
 
   // 元件卸載時清除所有計時器與 Chain B，避免 memory leak
@@ -258,7 +301,7 @@ export function useVoiceRecorder(
             pcmData: chunk,
             sampleRate: sampleRateRef.current,
           })
-          const text = result.text.trim()
+          const text = normalizeTranscript(result.text, whisperLanguageRef.current)
           if (!text) {
             log('  片段辨識結果為空，略過')
           } else if (isWhisperHallucination(text)) {
@@ -307,8 +350,10 @@ export function useVoiceRecorder(
     void rawCtxRef.current?.close(); rawCtxRef.current = null
     rawPreviewSamplesRef.current = []; rawPreviewChunkStartRef.current = 0; previewTextAccumRef.current = ''
 
+    rnnoiseStateRef.current?.destroy()
+    rnnoiseStateRef.current = null
     const useRNNoise = noiseSuppressionRef.current
-    log(`▶ 開始錄音（AudioWorklet，雜訊抑制: ${useRNNoise ? 'RNNoise@worklet' : '瀏覽器內建'}）`)
+    log(`▶ 開始錄音（AudioWorklet，雜訊抑制: ${useRNNoise ? 'RNNoise@主執行緒' : '瀏覽器內建'}）`)
     try {
       // ── 裝置檢查：確認系統有 audioinput 設備 ─────────────────────────────
       const devices = await navigator.mediaDevices.enumerateDevices()
@@ -356,7 +401,6 @@ export function useVoiceRecorder(
       silentGain.connect(ctx.destination)
 
       // ── VAD 邏輯 ─────────────────────────────────────────────────────────────
-      let rnnoiseActive = false
       const runVAD = (nowSpeaking: boolean, sampleCount: number, label: string) => {
         if (nowSpeaking) {
           silenceSamplesRef.current = 0
@@ -387,12 +431,17 @@ export function useVoiceRecorder(
             const endIdx = samplesRef.current.length
             const chunk  = samplesRef.current.slice(chunkStartRef.current, endIdx)
             if (chunk.length >= minSegmentSamples) {
-              log(`VAD: 沖出 ${(chunk.length / sampleRateRef.current).toFixed(1)}s 片段（${label}）`)
-              previewGenRef.current++
-              onPreviewRef.current?.(null)
-              enqueueChunk([...chunk])
+              const rms = chunkRms(chunk)
+              if (rms >= MIN_CHUNK_RMS) {
+                log(`VAD: 沖出 ${(chunk.length / sampleRateRef.current).toFixed(1)}s 片段（${label}，RMS=${rms.toFixed(4)}）`)
+                previewGenRef.current++
+                onPreviewRef.current?.(null)
+                enqueueChunk([...chunk])
+              } else {
+                log(`VAD: 片段 RMS=${rms.toFixed(4)} 低於門檻（${MIN_CHUNK_RMS}），疑似環境噪音，略過`)
+              }
+              // 無論是否送出，都推進 chunk 起點並重置 Chain B（讓 preview 從新位置累積）
               chunkStartRef.current = endIdx
-              // Chain B：清空已沖出的預覽 buffer 與累積文字，VAD 段落由正式轉錄取代
               rawPreviewSamplesRef.current    = []
               rawPreviewChunkStartRef.current = 0
               previewTextAccumRef.current     = ''
@@ -407,26 +456,62 @@ export function useVoiceRecorder(
       // 錄音不等待 worklet ready 才開始：getUserMedia 完成就 setState('recording')，
       // worklet 尚未 ready 時 process() 靜默丟棄音頻（通常 < 200ms），
       // 幾乎不影響使用者體驗。
-      const handleAudio = (e: MessageEvent<{ samples: Float32Array; rms: number }>) => {
-        const { samples, rms } = e.data
-        for (let i = 0; i < samples.length; i++) samplesRef.current.push(samples[i])
-        runVAD(rms > RMS_THRESHOLD, samples.length, rnnoiseActive ? 'RNNoise@worklet' : '瀏覽器抑制')
-      }
-      worklet.port.onmessage = (e: MessageEvent<{ type?: string; rnnoiseError?: string }>) => {
-        if (e.data.type === 'ready') {
-          rnnoiseActive = useRNNoise && !e.data.rnnoiseError
-          if (e.data.rnnoiseError) {
-            warn(`RNNoise worklet 載入失敗，降級為原始路徑：${e.data.rnnoiseError}`)
-          } else if (useRNNoise) {
-            log('✓ RNNoise WASM 在 AudioWorklet 執行緒載入完成')
+      // 主執行緒音頻處理器：接收 worklet 原始幀，執行 RNNoise（若已載入）+ 降取樣
+      const handleAudio = (e: MessageEvent<{ samples: Float32Array }>) => {
+        const frame = e.data.samples
+        let pcm16: ArrayLike<number>
+        let rms: number
+
+        if (contextSampleRate > 16000) {
+          // 48 kHz 路徑：縮放至 16 位元範圍 → RNNoise（若已載入）→ 3:1 降取樣 → 16 kHz
+          for (let i = 0; i < frame.length; i++) frame[i] *= 32768
+          rnnoiseStateRef.current?.processFrame(frame)
+          const downCount = frame.length / DS_RATIO  // 480 / 3 = 160 samples @ 16 kHz
+          const out = new Float32Array(downCount)
+          let sumSq = 0
+          for (let i = 0, j = 0; i < frame.length; i += DS_RATIO, j++) {
+            const s = frame[i] / 32768
+            out[j] = s
+            sumSq += s * s
           }
+          pcm16 = out
+          rms = Math.sqrt(sumSq / downCount)
+        } else {
+          // 16 kHz 直通（RNNoise 關閉，AudioContext 已在 16 kHz）
+          let sumSq = 0
+          for (let i = 0; i < frame.length; i++) sumSq += frame[i] * frame[i]
+          pcm16 = frame
+          rms = Math.sqrt(sumSq / frame.length)
+        }
+
+        for (let i = 0; i < pcm16.length; i++) samplesRef.current.push(pcm16[i])
+        runVAD(rms > RMS_THRESHOLD, pcm16.length, rnnoiseStateRef.current ? 'RNNoise@主執行緒' : '瀏覽器抑制')
+      }
+      worklet.port.onmessage = (e: MessageEvent<{ type?: string }>) => {
+        if (e.data.type === 'ready') {
           worklet.port.onmessage = handleAudio   // 切換為音頻資料處理器
         }
       }
 
       // ── getUserMedia（唯一需要 await 的步驟）────────────────────────────────
       // worklet init 與 getUserMedia 同時執行；stream 一到位就立即開始錄音。
-      worklet.port.postMessage({ type: 'init', rnnoiseUrl: rnnoiseModuleUrl, enabled: useRNNoise })
+      worklet.port.postMessage({ type: 'init' })
+
+      // 非同步載入 RNNoise WASM（主執行緒）；通常在第一個 VAD 片段被沖出前就完成
+      if (useRNNoise) {
+        ;(async () => {
+          try {
+            const mod = await loadRNNoiseModule()
+            if (audioCtxRef.current) {   // 確認錄音仍在進行中
+              rnnoiseStateRef.current = mod.createDenoiseState()
+              log('✓ RNNoise WASM 在主執行緒載入完成')
+            }
+            // 若已停止錄音，DenoiseState 不建立即可；mod 本身已快取，不需釋放
+          } catch (e) {
+            warn(`RNNoise 主執行緒載入失敗：${e}，降級為僅降取樣`)
+          }
+        })()
+      }
 
       const stream = await navigator.mediaDevices.getUserMedia({
         // RNNoise 啟用時，關閉瀏覽器內建抑制，由 RNNoise 全權處理
@@ -457,7 +542,7 @@ export function useVoiceRecorder(
           }
         }
       }
-      rawWorklet.port.postMessage({ type: 'init', enabled: false })
+      rawWorklet.port.postMessage({ type: 'init' })
       rawCtx.createMediaStreamSource(stream).connect(rawWorklet)
       rawCtxRef.current    = rawCtx
       rawWorkletRef.current = rawWorklet
@@ -477,23 +562,40 @@ export function useVoiceRecorder(
         if (unprocessed.length < sampleRateRef.current * minSec) return
 
         previewBusyRef.current = true
-        const myGen = previewGenRef.current
+        const myGen     = previewGenRef.current
+        const prevAccum = previewTextAccumRef.current
+        // 辨識進行中提示（VAD flush 時會被 onPreview(null) 覆蓋，無需特別清除）
+        // 分隔符與語言一致：CJK → '…'，其餘 → ' …'
+        const loadingText = prevAccum
+          ? prevAccum + previewSep(whisperLanguageRef.current, prevAccum, '…') + '…'
+          : '語音辨識中…'
+        onPreviewRef.current?.(loadingText)
+
         try {
           const result = await invoke<{ text: string }>('transcribe_audio', {
             pcmData: [...unprocessed],
             sampleRate: sampleRateRef.current,
           })
           if (previewGenRef.current !== myGen) return  // VAD 已沖出，結果已過期
-          const text = result.text.trim()
+          const text = normalizeTranscript(result.text, whisperLanguageRef.current)
           if (text && !isWhisperHallucination(text)) {
-            const sep = previewTextAccumRef.current ? ' ' : ''
+            const sep = previewSep(whisperLanguageRef.current, previewTextAccumRef.current, text)
             previewTextAccumRef.current += sep + text
             log(`  預覽辨識（累積）：「${previewTextAccumRef.current.slice(0, 60)}…」`)
             onPreviewRef.current?.(previewTextAccumRef.current)
             rawPreviewChunkStartRef.current = snapshotEnd  // 推進，下次只送新增音頻
+            // 壓縮：已處理的前端音頻不再需要，避免陣列無限增長
+            if (rawPreviewChunkStartRef.current > COMPACT_THRESHOLD_SAMPLES) {
+              rawPreviewSamplesRef.current = rawPreviewSamplesRef.current.slice(rawPreviewChunkStartRef.current)
+              rawPreviewChunkStartRef.current = 0
+            }
+          } else {
+            // 幻覺或空結果：恢復辨識前的顯示狀態
+            onPreviewRef.current?.(prevAccum || null)
           }
         } catch {
-          // preview 是 best-effort，忽略錯誤
+          // preview 是 best-effort，忽略錯誤，恢復辨識前的顯示狀態
+          onPreviewRef.current?.(prevAccum || null)
         } finally {
           previewBusyRef.current = false
         }
@@ -544,7 +646,9 @@ export function useVoiceRecorder(
     rawWorkletRef.current?.port.close()
     stream.getTracks().forEach((t) => t.stop())
     await Promise.all([ctx.close(), rawCtxRef.current?.close()])
-    // RNNoise DenoiseState 由 worklet GC 時自動釋放（ctx.close() 終止 worklet 執行緒）
+    // 釋放主執行緒 RNNoise DenoiseState
+    rnnoiseStateRef.current?.destroy()
+    rnnoiseStateRef.current = null
 
     streamRef.current   = null
     audioCtxRef.current = null

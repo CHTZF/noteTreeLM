@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef } from 'react'
 import type { VoiceState } from '../../hooks/useVoiceRecorder'
 
 interface VoiceOverlayProps {
@@ -11,39 +11,15 @@ interface VoiceOverlayProps {
   onDiscard: () => void
 }
 
-/** preview 關閉時的佔位動畫：點點循環 + 每 5 秒 fade-in 重置 */
+/** preview 關閉時的佔位動畫：三點 CSS 波浪，無 JS timer */
 function RecordingStatus({ voiceState }: { voiceState: VoiceState }) {
-  const [dots, setDots] = useState('...')
-  const [animKey, setAnimKey] = useState(0)
-
-  useEffect(() => {
-    if (voiceState !== 'recording') return
-    const dotsTimer = setInterval(() => {
-      setDots((d) => (d.length >= 3 ? '' : d + '.'))
-    }, 400)
-    const refreshTimer = setInterval(() => {
-      setAnimKey((k) => k + 1)
-    }, 5000)
-    return () => {
-      clearInterval(dotsTimer)
-      clearInterval(refreshTimer)
-    }
-  }, [voiceState])
-
-  if (voiceState === 'transcribing') {
-    return <span style={{ color: 'rgba(255,255,255,0.3)', fontStyle: 'italic' }}>辨識中…</span>
-  }
-
+  const label = voiceState === 'transcribing' ? '辨識中' : '語音辨識中'
+  const dot = (delay: string) => (
+    <span style={{ animation: `voice-dot-blink 1.4s ease-in-out ${delay} infinite` }}>.</span>
+  )
   return (
-    <span
-      key={animKey}
-      style={{
-        color: 'rgba(255,255,255,0.3)',
-        fontStyle: 'italic',
-        animation: 'voice-overlay-in 400ms ease-out both',
-      }}
-    >
-      語音辨識中{dots}
+    <span style={{ color: 'rgba(255,255,255,0.3)' }}>
+      {label}{dot('0ms')}{dot('230ms')}{dot('460ms')}
     </span>
   )
 }
@@ -134,6 +110,7 @@ export default function VoiceOverlay({
           flex: 1,
           padding: '16px 18px',
           overflowY: 'auto',
+          fontFamily: 'var(--font-sans)',
           fontSize: '15px',
           lineHeight: 1.8,
           color: transcript ? 'rgba(255,255,255,0.90)' : 'rgba(255,255,255,0.2)',
@@ -146,11 +123,11 @@ export default function VoiceOverlay({
         {transcript}
 
         {previewEnabled ? (
-          /* Preview 開啟：顯示臨時辨識結果（淡色斜體）或佔位提示 */
+          /* Preview 開啟：顯示臨時辨識結果（淡色）或佔位提示 */
           !transcript && !preview
             ? '說話後文字將顯示在這裡…'
             : preview && (
-              <span style={{ color: 'rgba(255,255,255,0.35)', fontStyle: 'italic' }}>
+              <span style={{ color: 'rgba(255,255,255,0.35)' }}>
                 {transcript ? ' ' : ''}{preview}
               </span>
             )

@@ -61,11 +61,13 @@ export default function ChatPanel() {
   const previewEnabled          = settings.voice_preview_enabled !== false
   const noiseSuppressionEnabled = settings.voice_noise_suppression !== false
   const previewIntervalMs       = settings.voice_preview_interval ?? 5000
+  const whisperLanguage         = settings.whisper_language ?? 'auto'
   const { state: voiceState, isSpeaking: voiceIsSpeaking, toggle: toggleVoice } = useVoiceRecorder(
     handleTranscript,
     previewEnabled ? handlePreview : undefined,
     noiseSuppressionEnabled,
     previewIntervalMs,
+    whisperLanguage,
   )
 
   // 錄音開始時顯示 overlay，並重置轉錄文字與預覽

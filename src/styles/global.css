@@ -99,6 +99,12 @@ a {
   50%       { transform: scale(2.4); opacity: 0;    }
 }
 
+/* "語音辨識中..." 三點波浪動畫：每個點輪流淡入，間隔 230ms */
+@keyframes voice-dot-blink {
+  0%, 70%, 100% { opacity: 0.2; }
+  35%            { opacity: 1;   }
+}
+
 /* Toast animations (iOS notification style) */
 @keyframes toast-slide-in {
   from { opacity: 0; transform: translateY(-14px) scale(0.88); }
