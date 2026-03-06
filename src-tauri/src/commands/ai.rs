@@ -356,6 +356,7 @@ pub async fn stream_chat(
     state: State<'_, AppState>,
     messages: Vec<ChatMessage>,
     system: Option<String>,
+    use_tools: Option<bool>,
 ) -> Result<String, AppError> {
     let base_url = ensure_server_running(state.inner(), &app).await?;
     let client = reqwest::Client::new();
@@ -396,8 +397,24 @@ pub async fn stream_chat(
         messages_json.push(serde_json::json!({"role": msg.role, "content": msg.content}));
     }
 
-    let tools = vault_tools(); // 所有 8 個工具
     let mut final_text = String::new();
+
+    // use_tools=false → Live Chat / 純對話模式：單輪無工具直接串流
+    if use_tools == Some(false) {
+        let body = serde_json::json!({
+            "messages": messages_json,
+            "max_tokens": 2048,
+            "temperature": 0.7,
+            "stream": true,
+        });
+        let result = send_streaming_request(&client, &base_url, body, &app).await?;
+        final_text = result.full_text;
+        let _ = app.emit("llm:stderr", format!("[chat] 完成，回應 {} 字元", final_text.len()));
+        let _ = app.emit("llm:done", &final_text);
+        return Ok(final_text);
+    }
+
+    let tools = vault_tools(); // 所有 8 個工具
 
     // 多輪迴圈（最多 5 輪工具調用）
     for _round in 0..5 {
@@ -448,6 +465,54 @@ pub async fn stream_chat(
         } else {
             "用戶拒絕了此寫入操作。".to_string()
         };
+
+        // 若工具是筆記相關的讀取操作，emit note 絕對路徑供前端導航
+        if approved && !vault_path.is_empty() {
+            let note_abs_paths: Vec<String> = match tool_name.as_str() {
+                "read_note" => {
+                    if let Some(p) = tool_args["path"].as_str() {
+                        vec![std::path::PathBuf::from(&vault_path)
+                            .join(p)
+                            .to_string_lossy()
+                            .to_string()]
+                    } else {
+                        vec![]
+                    }
+                }
+                "search_vault" => {
+                    // 從結果中解析 "- **title** (rel_path.md)" 格式取出相對路徑
+                    tool_result
+                        .lines()
+                        .filter_map(|line| {
+                            let line = line.trim();
+                            if line.starts_with("- **") {
+                                if let Some(lp) = line.rfind('(') {
+                                    if let Some(rp) = line[lp..].find(')') {
+                                        let rel = &line[lp + 1..lp + rp];
+                                        if rel.ends_with(".md") {
+                                            let abs = std::path::PathBuf::from(&vault_path).join(rel);
+                                            return Some(abs.to_string_lossy().to_string());
+                                        }
+                                    }
+                                }
+                            }
+                            None
+                        })
+                        .collect()
+                }
+                _ => vec![],
+            };
+            if !note_abs_paths.is_empty() {
+                let _ = app.emit("agent:note_refs", &note_abs_paths);
+            }
+        }
+
+        // open_note 是純 UI 操作，不需要再讓 LLM 生成下一輪回覆。
+        // 直接用工具回傳值當 final_text break 迴圈，避免空字串或無限 tool-call 迴圈。
+        if tool_name == "open_note" {
+            final_text = tool_result;
+            break;
+        }
 
         // 注入工具結果到 messages（native / text-fallback 兩種格式）
         if !tool_id.is_empty() {
@@ -868,7 +933,7 @@ async fn call_external_ai_tool(query: &str, config: &ExtAiConfig, app: &AppHandl
 
     let _ = app.emit(
         "llm:stderr",
-        format!("[外部 AI] 查詢：{}", &query[..query.len().min(80)]),
+        format!("[外部 AI] 查詢：{}", query.chars().take(80).collect::<String>()),
     );
 
     let client = reqwest::Client::new();
@@ -979,7 +1044,8 @@ fn vault_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "read_note",
-                "description": "讀取指定筆記的完整 Markdown 內容",
+                "description": "讀取指定筆記的完整 Markdown 內容，用於需要分析或摘要筆記內容時。\
+注意：若使用者只是要「打開」或「查看」筆記，請改用 open_note 工具；read_note 僅用於需要理解筆記內容才能回答問題的情況。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1077,6 +1143,25 @@ fn vault_tools() -> serde_json::Value {
                     "required": ["query"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "open_note",
+                "description": "在筆記編輯器中打開（切換至）指定筆記，讓使用者在編輯器中直接看到內容。\
+使用者說「打開」「開啟」「跳轉到」「要查看」「幫我看」「看一下」某筆記時，優先使用此工具，不要用 read_note。\
+若不確定路徑，先用 search_vault 找到路徑再呼叫。呼叫後只需回覆「已打開 xxx 筆記」，不要輸出任何筆記內容。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "筆記的相對路徑，例如 'folder/note.md'"
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
         }
     ])
 }
@@ -1143,7 +1228,11 @@ fn tool_read_note(rel_path: &str, vault_path: &str) -> String {
     match std::fs::read_to_string(&abs_path) {
         Ok(content) => {
             if content.len() > 6000 {
-                format!("{}\n\n[…內容過長，已截斷至 6000 字元]", &content[..6000])
+                // Snap to a valid char boundary — CJK chars are 3 bytes each,
+                // so the raw byte index 6000 can land mid-character.
+                let mut end = 6000usize;
+                while end > 0 && !content.is_char_boundary(end) { end -= 1; }
+                format!("{}\n\n[…內容過長，已截斷至約 6000 字元]", &content[..end])
             } else {
                 content
             }
@@ -1426,8 +1515,12 @@ async fn tool_search_vault(query: &str, vault_db: &sqlx::SqlitePool, app: &AppHa
                         let q = fts_query.to_lowercase();
                         let cl = c.to_lowercase();
                         if let Some(pos) = cl.find(&q) {
-                            let start = pos.saturating_sub(60);
-                            let end = (pos + q.len() + 100).min(c.len());
+                            // Snap to char boundaries — CJK chars are 3 bytes each,
+                            // so raw arithmetic offsets can land mid-character.
+                            let mut start = pos.saturating_sub(60);
+                            while start > 0 && !c.is_char_boundary(start) { start -= 1; }
+                            let mut end = (pos + q.len() + 100).min(c.len());
+                            while end < c.len() && !c.is_char_boundary(end) { end += 1; }
                             format!("...{}...", c[start..end].trim())
                         } else {
                             c.chars().take(120).collect::<String>() + "..."
@@ -1593,6 +1686,16 @@ async fn execute_vault_tool(
                 None => "Vault 資料庫未就緒".to_string(),
             }
         }
+        "open_note" => {
+            let path = args["path"].as_str().unwrap_or("");
+            if path.is_empty() {
+                return "請提供筆記路徑".to_string();
+            }
+            let abs_path = std::path::PathBuf::from(vault_path).join(path);
+            let abs_str = abs_path.to_string_lossy().to_string();
+            let _ = app.emit("ui:open_note", &abs_str);
+            format!("✅ 已打開筆記：{}", path)
+        }
         _ => format!("未知工具：{}", name),
     }
 }
@@ -1638,9 +1741,10 @@ fn tool_call_display(name: &str, args: &serde_json::Value) -> String {
         "create_folder" => format!("📁 建立資料夾: {}", args["path"].as_str().unwrap_or("")),
         "call_external_ai" => {
             let q = args["query"].as_str().unwrap_or("");
-            let preview = &q[..q.len().min(50)];
+            let preview: String = q.chars().take(50).collect();
             format!("🌐 外部 AI：\"{}\"", preview)
         }
+        "open_note" => format!("📂 打開筆記: {}", args["path"].as_str().unwrap_or("")),
         _ => format!("執行工具: {}", name),
     }
 }
@@ -2576,6 +2680,47 @@ pub async fn resolve_memory_context(
         .await.unwrap_or_default().unwrap_or_else(|| "8080".to_string())
         .parse::<u16>().unwrap_or(8080);
     run_memory_agent(&db, &query, port).await
+}
+
+/// 直接測試單一 Agent 工具，供 debug 面板使用
+#[tauri::command]
+pub async fn test_vault_tool(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    tool_name: String,
+    args: serde_json::Value,
+) -> Result<String, AppError> {
+    let vault_path = state.get_vault_path().await;
+    let vault_db = state.get_vault_db().await.ok();
+
+    // Only build ext_config for call_external_ai — other tools ignore it entirely.
+    // Avoids unnecessary keychain access (read_api_key_sync) which can block on macOS
+    // if the security framework is busy during concurrent operations.
+    let ext_config = if tool_name == "call_external_ai" {
+        let settings_db = &state.settings_db;
+        let ext_provider = queries::get_setting(settings_db, "ai_provider")
+            .await.unwrap_or_default().unwrap_or_default();
+        let ext_base_url = queries::get_setting(settings_db, "ai_base_url")
+            .await.unwrap_or_default()
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        let ext_model = queries::get_setting(settings_db, "ai_model")
+            .await.unwrap_or_default()
+            .unwrap_or_else(|| "gpt-4o".to_string());
+        let ext_api_key = read_api_key_sync(&ext_provider);
+        ExtAiConfig { provider: ext_provider, base_url: ext_base_url, model: ext_model, api_key: ext_api_key }
+    } else {
+        ExtAiConfig { provider: String::new(), base_url: String::new(), model: String::new(), api_key: String::new() }
+    };
+
+    let result = execute_vault_tool(
+        &tool_name,
+        &args,
+        vault_db.as_ref(),
+        &vault_path,
+        &app,
+        &ext_config,
+    ).await;
+    Ok(result)
 }
 
 #[cfg(test)]

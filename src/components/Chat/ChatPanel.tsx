@@ -13,7 +13,7 @@ interface Message {
   content: string
 }
 
-export default function ChatPanel() {
+export default function ChatPanel({ liveChatActive = false }: { liveChatActive?: boolean }) {
   const { settings } = useSettingsStore()
   const { content: noteContent, currentPath } = useEditorStore()
   const { addLog } = useDebugStore()
@@ -628,7 +628,7 @@ export default function ChatPanel() {
           {/* 錄音按鈕 */}
           <button
             onClick={toggleVoice}
-            disabled={!whisperConfigured || voiceState === 'transcribing' || showVoiceOverlay}
+            disabled={!whisperConfigured || voiceState === 'transcribing' || showVoiceOverlay || liveChatActive}
             title={!whisperConfigured ? '請先到設定頁設定 Whisper' : voiceState === 'recording' ? '停止錄音' : '語音輸入'}
             style={{
               width: '34px', height: '34px', borderRadius: '6px', flexShrink: 0,

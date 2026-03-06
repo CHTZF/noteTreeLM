@@ -13,13 +13,15 @@ import GraphView from './components/Graph/GraphView'
 import SearchPanel from './components/Search/SearchPanel'
 import DebugPanel from './components/Debug/DebugPanel'
 import ChatPanel from './components/Chat/ChatPanel'
+import LiveChatPanel from './components/LiveChat/LiveChatPanel'
 import QuickOpen from './components/QuickOpen/QuickOpen'
 import SettingsModal from './components/Settings/SettingsModal'
+import AgentToolPanel from './components/AgentTools/AgentToolPanel'
 import TrashPanel from './components/Trash/TrashPanel'
 import Toast, { toast } from './components/common/Toast'
 import './styles/App.css'
 
-type RightPanelTab = 'graph' | 'search' | 'debug' | 'chat'
+type RightPanelTab = 'graph' | 'search' | 'debug' | 'chat' | 'live_chat'
 
 export default function App() {
   const { load: loadSettings, settings } = useSettingsStore()
@@ -32,10 +34,12 @@ export default function App() {
   const [showOnboarding, setShowOnboarding] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [showTrash, setShowTrash] = useState(false)
+  const [showAgentTools, setShowAgentTools] = useState(false)
   const [rightTab, setRightTab] = useState<RightPanelTab>('graph')
   const [showQuickOpen, setShowQuickOpen] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(240)
   const [rightPanelWidth, setRightPanelWidth] = useState(320)
+  const [liveChatActive, setLiveChatActive] = useState(false)
   const isDraggingLeft = useRef(false)
   const isDraggingRight = useRef(false)
 
@@ -90,9 +94,9 @@ export default function App() {
     if (!settings.debug_mode && rightTab === 'debug') setRightTab('graph')
   }, [settings.debug_mode])
 
-  // Chat 關閉時，若當前在 chat tab 則切回 graph
+  // Chat / Live Chat 關閉時，若當前在相關 tab 則切回 graph
   useEffect(() => {
-    if (!settings.enable_chat && rightTab === 'chat') setRightTab('graph')
+    if (!settings.enable_chat && (rightTab === 'chat' || rightTab === 'live_chat')) setRightTab('graph')
   }, [settings.enable_chat])
 
   // whisper-server 啟動進度通知（全域唯一，避免多個 useVoiceRecorder 實例重複顯示）
@@ -285,6 +289,13 @@ export default function App() {
             onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.opacity = '1'; (e.currentTarget as HTMLElement).style.background = 'var(--color-bg-hover)' }}
             onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = '0.6'; (e.currentTarget as HTMLElement).style.background = 'transparent' }}
           >🗑</button>
+          <button
+            onClick={() => setShowAgentTools(true)}
+            title="Agent Tool 測試台"
+            style={{ color: 'var(--color-text-secondary)', fontSize: '15px', padding: '4px 6px', borderRadius: '5px', flexShrink: 0, opacity: 0.6 }}
+            onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.opacity = '1'; (e.currentTarget as HTMLElement).style.background = 'var(--color-bg-hover)' }}
+            onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = '0.6'; (e.currentTarget as HTMLElement).style.background = 'transparent' }}
+          >⚡</button>
         </div>
       </aside>
 
@@ -327,6 +338,14 @@ export default function App() {
               Chat
             </button>
           )}
+          {settings.enable_chat && (
+            <button
+              className={`tab-btn ${rightTab === 'live_chat' ? 'active' : ''}`}
+              onClick={() => setRightTab('live_chat')}
+            >
+              Live Chat
+            </button>
+          )}
           {settings.debug_mode && (
             <button
               className={`tab-btn ${rightTab === 'debug' ? 'active' : ''}`}
@@ -346,7 +365,12 @@ export default function App() {
           </div>
           {settings.enable_chat && (
             <div style={{ display: rightTab === 'chat' ? 'contents' : 'none' }}>
-              <ChatPanel />
+              <ChatPanel liveChatActive={liveChatActive} />
+            </div>
+          )}
+          {settings.enable_chat && (
+            <div style={{ display: rightTab === 'live_chat' ? 'contents' : 'none' }}>
+              <LiveChatPanel onOpenNote={openNote} onActiveChange={setLiveChatActive} />
             </div>
           )}
           {settings.debug_mode && (
@@ -364,6 +388,9 @@ export default function App() {
           onClose={() => setShowQuickOpen(false)}
         />
       )}
+
+      {/* Agent Tool Panel */}
+      {showAgentTools && <AgentToolPanel onClose={() => setShowAgentTools(false)} />}
 
       {/* Settings Modal */}
       {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
