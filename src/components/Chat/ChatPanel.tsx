@@ -291,14 +291,15 @@ export default function ChatPanel({ liveChatActive = false }: { liveChatActive?:
         log(`⏹ llm:done 事件收到，共 ${tokenCountRef.current} 字元`)
       })
 
-      log('  呼叫 invoke("stream_chat")')
-      const responseText = await invoke<string>('stream_chat', {
+      log('  呼叫 invoke("invoke_agent")')
+      const responseText = await invoke<string>('invoke_agent', {
+        input: text,
         messages: llmMessages,
         system,
       })
 
       const finalContent = responseText || streamingRef.current
-      log(`✓ stream_chat 完成，回覆 ${finalContent.length} 字元`)
+      log(`✓ invoke_agent 完成，回覆 ${finalContent.length} 字元`)
       setMessages((prev) => [...prev, { role: 'assistant', content: finalContent }])
     } catch (e: unknown) {
       const msg =

@@ -365,7 +365,8 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
     })
 
     try {
-      await invoke('stream_chat', {
+      await invoke('invoke_agent', {
+        input: query,
         messages: [...messagesRef.current, { role: 'user', content: query }],
         system: LIVE_CHAT_SYSTEM,
       })
@@ -385,11 +386,12 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
     }
   }, [toggle])
 
-  // ── Barge-in: user speaks while AI is speaking → cancel TTS ──────────────
+  // ── Barge-in: user speaks while AI is speaking → cancel TTS + LLM stream ──
   useEffect(() => {
     if (liveChatState !== 'speaking') return
     if (isSpeaking) {
       window.speechSynthesis.cancel()
+      invoke('cancel_agent').catch(() => {})  // signal Rust to stop SSE loop
       // VAD is already recording (useVoiceRecorder keeps running)
       // Just update state — the transcript will accumulate and auto-stop after 1.5s silence
       transcriptRef.current = ''

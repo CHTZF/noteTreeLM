@@ -1,11 +1,16 @@
 use crate::{db::queries, error::AppError, state::AppState};
-use chrono::{Datelike, Local};
+use crate::runtime::memory_agent::{
+    extract_cjk_bigrams_with_extra_stops, format_memory_rows, load_memory_rules,
+    parse_query_since_with_rules, parse_text_tool_calls, run_memory_agent, tool_query_memory,
+};
+use chrono::Local;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, State};
 use tokio::io::AsyncReadExt;
@@ -225,6 +230,7 @@ async fn send_streaming_request(
     base_url: &str,
     body: serde_json::Value,
     app: &AppHandle,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> Result<StreamResult, AppError> {
     let response = client
         .post(format!("{}/v1/chat/completions", base_url))
@@ -250,6 +256,9 @@ async fn send_streaming_request(
     let mut tool_call_chunks: Vec<ToolCallAccumulator> = Vec::new();
 
     while let Some(item) = stream.next().await {
+        if cancel.as_ref().map_or(false, |c| c.load(Ordering::Relaxed)) {
+            break;
+        }
         let bytes = item.map_err(|e| AppError::AI(format!("串流讀取失敗：{}", e)))?;
         sse_buf.push_str(&String::from_utf8_lossy(&bytes));
 
@@ -348,47 +357,43 @@ fn external_ai_tool_definition() -> serde_json::Value {
     }])
 }
 
-/// 串流聊天：透過 llama-server /v1/chat/completions (stream=true)
-/// tokens 以 "llm:token" 事件即時推送前端，完成後發送 "llm:done"
+/// 取消正在進行的 Agent 串流（設定取消旗標，同時拒絕待確認的寫入工具）
 #[tauri::command]
-pub async fn stream_chat(
+pub async fn cancel_agent(state: State<'_, AppState>) -> Result<(), AppError> {
+    state.agent_cancel.store(true, Ordering::Relaxed);
+    if let Some(tx) = state.write_confirm_tx.lock().await.take() {
+        let _ = tx.send(false);
+    }
+    Ok(())
+}
+
+/// 帶意圖分類的 Agent 串流
+/// 透過 runtime::Agent 執行：意圖分類 → 取消/確認/多輪 LLM+工具 loop
+/// 每輪工具呼叫透過 ToolRegistry + Transaction 執行（支援 rollback）
+#[tauri::command]
+pub async fn invoke_agent(
     app: AppHandle,
     state: State<'_, AppState>,
+    input: String,
     messages: Vec<ChatMessage>,
     system: Option<String>,
     use_tools: Option<bool>,
 ) -> Result<String, AppError> {
+    use crate::runtime::agent::Agent;
+    use crate::runtime::dispatcher::Dispatcher;
+    use crate::runtime::intent_classifier::IntentClassifier;
+    use crate::runtime::tool_registry::ToolRegistry;
+    use crate::runtime::types::{ConfirmWriteFn, EmitEventFn, LlmFn, LlmRound};
+
+    // 1. 確保 llama-server 運行，取得 base_url
     let base_url = ensure_server_running(state.inner(), &app).await?;
     let client = reqwest::Client::new();
 
-    // 讀取外部 AI 設定
-    let settings_db = &state.settings_db;
-    let ext_provider = queries::get_setting(settings_db, "ai_provider")
-        .await?
-        .unwrap_or_default();
-    let ext_config = if !ext_provider.is_empty() {
-        let base = queries::get_setting(settings_db, "ai_base_url")
-            .await?
-            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-        let model = queries::get_setting(settings_db, "ai_model")
-            .await?
-            .unwrap_or_else(|| "gpt-4o".to_string());
-        let api_key = read_api_key_sync(&ext_provider);
-        ExtAiConfig { provider: ext_provider, base_url: base, model, api_key }
-    } else {
-        ExtAiConfig {
-            provider: String::new(),
-            base_url: String::new(),
-            model: String::new(),
-            api_key: String::new(),
-        }
-    };
-
-    // 取得 vault 資訊（Vault 未設定時 vault_db_opt 為 None，vault_path 為空字串）
+    // 2. Vault 資訊
     let vault_path = state.get_vault_path().await;
     let vault_db_opt = state.get_vault_db().await.ok();
 
-    // 組裝初始 messages 陣列
+    // 3. 組裝 messages_json（system + history + current user msg）
     let mut messages_json: Vec<serde_json::Value> = Vec::new();
     if let Some(sys) = &system {
         messages_json.push(serde_json::json!({"role": "system", "content": sys}));
@@ -397,170 +402,89 @@ pub async fn stream_chat(
         messages_json.push(serde_json::json!({"role": msg.role, "content": msg.content}));
     }
 
-    let mut final_text = String::new();
+    // 4. 建立 ToolRegistry（vault 可用時注入工具）
+    let registry = if !vault_path.is_empty() {
+        if let Some(db) = vault_db_opt {
+            crate::tools::build_vault_registry(vault_path.clone(), db, app.clone())
+        } else {
+            Arc::new(ToolRegistry::new())
+        }
+    } else {
+        Arc::new(ToolRegistry::new())
+    };
 
-    // use_tools=false → Live Chat / 純對話模式：單輪無工具直接串流
-    if use_tools == Some(false) {
-        let body = serde_json::json!({
-            "messages": messages_json,
-            "max_tokens": 2048,
-            "temperature": 0.7,
-            "stream": true,
-        });
-        let result = send_streaming_request(&client, &base_url, body, &app).await?;
-        final_text = result.full_text;
-        let _ = app.emit("llm:stderr", format!("[chat] 完成，回應 {} 字元", final_text.len()));
-        let _ = app.emit("llm:done", &final_text);
-        return Ok(final_text);
-    }
+    // 5. llm_fn：執行一輪 LLM 串流，返回 LlmRound
+    let tools_def = vault_tools();
+    let client_fn = client.clone();
+    let base_fn = base_url.clone();
+    let app_fn = app.clone();
+    let llm_fn: LlmFn = Arc::new(move |msgs, with_tools, cancel| {
+        let client = client_fn.clone();
+        let base = base_fn.clone();
+        let app = app_fn.clone();
+        let tools = tools_def.clone();
+        Box::pin(async move {
+            let body = if with_tools {
+                serde_json::json!({
+                    "messages": msgs,
+                    "tools": tools,
+                    "tool_choice": "auto",
+                    "max_tokens": 2048,
+                    "temperature": 0.7,
+                    "stream": true,
+                })
+            } else {
+                serde_json::json!({
+                    "messages": msgs,
+                    "max_tokens": 2048,
+                    "temperature": 0.7,
+                    "stream": true,
+                })
+            };
+            let result = send_streaming_request(&client, &base, body, &app, cancel)
+                .await
+                .map_err(|e| e.to_string())?;
+            let tool_call = detect_tool_call(&result);
+            Ok(LlmRound { full_text: result.full_text, tool_call })
+        })
+    });
 
-    let tools = vault_tools(); // 所有 8 個工具
-
-    // 多輪迴圈（最多 5 輪工具調用）
-    for _round in 0..5 {
-        let body = serde_json::json!({
-            "messages": messages_json,
-            "tools": tools,
-            "tool_choice": "auto",
-            "max_tokens": 2048,
-            "temperature": 0.7,
-            "stream": true,
-        });
-
-        let result = send_streaming_request(&client, &base_url, body, &app).await?;
-
-        // 無 tool call → 完成
-        let Some((tool_id, tool_name, tool_args)) = detect_tool_call(&result) else {
-            final_text = result.full_text;
-            break;
-        };
-
-        // 顯示工具呼叫進度給前端
-        let display = tool_call_display(&tool_name, &tool_args);
-        let _ = app.emit("agent:tool_call", &display);
-
-        // 寫入工具：等待前端確認（存入 oneshot sender，等候 confirm_write_tool 命令）
-        let approved = if is_write_tool(&tool_name) {
-            let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-            *state.write_confirm_tx.lock().await = Some(tx);
-            let _ = app.emit("agent:write_request", &display);
-            tokio::time::timeout(Duration::from_secs(60), rx)
+    // 6. confirm_write_fn：設定 oneshot channel，等待 confirm_write_tool 命令
+    let write_tx = Arc::clone(&state.write_confirm_tx);
+    let confirm_write: ConfirmWriteFn = Arc::new(move |_display: String| {
+        let tx = Arc::clone(&write_tx);
+        Box::pin(async move {
+            let (ch_tx, ch_rx) = tokio::sync::oneshot::channel::<bool>();
+            *tx.lock().await = Some(ch_tx);
+            tokio::time::timeout(Duration::from_secs(60), ch_rx)
                 .await
                 .unwrap_or(Ok(false))
                 .unwrap_or(false)
-        } else {
-            true
-        };
+        })
+    });
 
-        let tool_result = if approved {
-            execute_vault_tool(
-                &tool_name,
-                &tool_args,
-                vault_db_opt.as_ref(),
-                &vault_path,
-                &app,
-                &ext_config,
-            )
-            .await
-        } else {
-            "用戶拒絕了此寫入操作。".to_string()
-        };
+    // 7. emit_fn：通用事件發送（包裝 AppHandle::emit）
+    let app_emit = app.clone();
+    let emit_fn: EmitEventFn = Arc::new(move |event: String, payload: serde_json::Value| {
+        let _ = app_emit.emit(&event, payload);
+    });
 
-        // 若工具是筆記相關的讀取操作，emit note 絕對路徑供前端導航
-        if approved && !vault_path.is_empty() {
-            let note_abs_paths: Vec<String> = match tool_name.as_str() {
-                "read_note" => {
-                    if let Some(p) = tool_args["path"].as_str() {
-                        vec![std::path::PathBuf::from(&vault_path)
-                            .join(p)
-                            .to_string_lossy()
-                            .to_string()]
-                    } else {
-                        vec![]
-                    }
-                }
-                "search_vault" => {
-                    // 從結果中解析 "- **title** (rel_path.md)" 格式取出相對路徑
-                    tool_result
-                        .lines()
-                        .filter_map(|line| {
-                            let line = line.trim();
-                            if line.starts_with("- **") {
-                                if let Some(lp) = line.rfind('(') {
-                                    if let Some(rp) = line[lp..].find(')') {
-                                        let rel = &line[lp + 1..lp + rp];
-                                        if rel.ends_with(".md") {
-                                            let abs = std::path::PathBuf::from(&vault_path).join(rel);
-                                            return Some(abs.to_string_lossy().to_string());
-                                        }
-                                    }
-                                }
-                            }
-                            None
-                        })
-                        .collect()
-                }
-                _ => vec![],
-            };
-            if !note_abs_paths.is_empty() {
-                let _ = app.emit("agent:note_refs", &note_abs_paths);
-            }
-        }
-
-        // open_note 是純 UI 操作，不需要再讓 LLM 生成下一輪回覆。
-        // 直接用工具回傳值當 final_text break 迴圈，避免空字串或無限 tool-call 迴圈。
-        if tool_name == "open_note" {
-            final_text = tool_result;
-            break;
-        }
-
-        // 注入工具結果到 messages（native / text-fallback 兩種格式）
-        if !tool_id.is_empty() {
-            // Native OpenAI tool_calls 格式
-            messages_json.push(serde_json::json!({
-                "role": "assistant",
-                "content": serde_json::Value::Null,
-                "tool_calls": [{
-                    "id": tool_id,
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "arguments": serde_json::to_string(&tool_args).unwrap_or_default()
-                    }
-                }]
-            }));
-            messages_json.push(serde_json::json!({
-                "role": "tool",
-                "tool_call_id": tool_id,
-                "content": tool_result
-            }));
-        } else {
-            // 文字格式 fallback：保留前言，以 user 訊息注入結果
-            let preamble = result
-                .full_text
-                .find("<tool_call>")
-                .map(|p| result.full_text[..p].trim().to_string())
-                .unwrap_or_default();
-            if !preamble.is_empty() {
-                messages_json
-                    .push(serde_json::json!({"role": "assistant", "content": preamble}));
-            }
-            messages_json.push(serde_json::json!({
-                "role": "user",
-                "content": format!(
-                    "工具執行結果：\n\n[{}]\n{}",
-                    tool_name, tool_result
-                )
-            }));
-        }
-    }
-
-    let _ = app.emit(
-        "llm:stderr",
-        format!("[chat] 完成，回應 {} 字元", final_text.len()),
+    // 8. 建立 Agent，執行
+    let agent = Agent::new(
+        Dispatcher::new(registry),
+        IntentClassifier::new(state.settings_db.clone()),
+        llm_fn,
+        confirm_write,
+        emit_fn,
+        vault_path,
+        Arc::clone(&state.agent_cancel),
+        Arc::clone(&state.agent_session),
     );
-    let _ = app.emit("llm:done", &final_text);
-    Ok(final_text)
+
+    agent
+        .run(input, messages_json, use_tools.unwrap_or(true))
+        .await
+        .map_err(AppError::AI)
 }
 
 /// 串流聊天（外部 AI 提供商）：OpenAI / Anthropic / Ollama
@@ -1167,7 +1091,7 @@ fn vault_tools() -> serde_json::Value {
 }
 
 /// 驗證相對路徑安全性（防止路徑穿越），返回絕對路徑
-fn resolve_vault_path(rel_path: &str, vault_path: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve_vault_path(rel_path: &str, vault_path: &str) -> Result<PathBuf, String> {
     if rel_path.contains("..") {
         return Err("不允許路徑穿越（..）".to_string());
     }
@@ -1180,7 +1104,7 @@ fn resolve_vault_path(rel_path: &str, vault_path: &str) -> Result<PathBuf, Strin
 }
 
 /// 列出指定資料夾的子資料夾和 .md 筆記（單層）
-fn tool_list_structure(rel_path: &str, vault_path: &str) -> String {
+pub(crate) fn tool_list_structure(rel_path: &str, vault_path: &str) -> String {
     let abs_path = if rel_path.is_empty() {
         PathBuf::from(vault_path)
     } else {
@@ -1220,7 +1144,7 @@ fn tool_list_structure(rel_path: &str, vault_path: &str) -> String {
 }
 
 /// 讀取筆記內容（最多 6000 字元）
-fn tool_read_note(rel_path: &str, vault_path: &str) -> String {
+pub(crate) fn tool_read_note(rel_path: &str, vault_path: &str) -> String {
     let abs_path = match resolve_vault_path(rel_path, vault_path) {
         Ok(p) => p,
         Err(e) => return e,
@@ -1442,7 +1366,7 @@ fn filter_lines_by_comparison(content: &str, cmp: &Comparison) -> Vec<String> {
 }
 
 /// 全文搜索 Vault（使用 SQLite FTS5），支援比較條件過濾
-async fn tool_search_vault(query: &str, vault_db: &sqlx::SqlitePool, app: &AppHandle) -> String {
+pub(crate) async fn tool_search_vault(query: &str, vault_db: &sqlx::SqlitePool, app: &AppHandle) -> String {
     if query.trim().is_empty() {
         return "請提供搜索關鍵字".to_string();
     }
@@ -1558,7 +1482,7 @@ async fn tool_search_vault(query: &str, vault_db: &sqlx::SqlitePool, app: &AppHa
 }
 
 /// 建立新筆記（自動建立父資料夾）
-async fn tool_create_note(rel_path: &str, content: &str, vault_path: &str) -> String {
+pub(crate) async fn tool_create_note(rel_path: &str, content: &str, vault_path: &str) -> String {
     let abs_path = match resolve_vault_path(rel_path, vault_path) {
         Ok(p) => p,
         Err(e) => return e,
@@ -1573,7 +1497,7 @@ async fn tool_create_note(rel_path: &str, content: &str, vault_path: &str) -> St
 }
 
 /// 更新現有筆記（覆寫全文）
-async fn tool_update_note(rel_path: &str, content: &str, vault_path: &str) -> String {
+pub(crate) async fn tool_update_note(rel_path: &str, content: &str, vault_path: &str) -> String {
     let abs_path = match resolve_vault_path(rel_path, vault_path) {
         Ok(p) => p,
         Err(e) => return e,
@@ -1585,7 +1509,7 @@ async fn tool_update_note(rel_path: &str, content: &str, vault_path: &str) -> St
 }
 
 /// 建立資料夾
-async fn tool_create_folder(rel_path: &str, vault_path: &str) -> String {
+pub(crate) async fn tool_create_folder(rel_path: &str, vault_path: &str) -> String {
     let abs_path = match resolve_vault_path(rel_path, vault_path) {
         Ok(p) => p,
         Err(e) => return e,
@@ -1700,55 +1624,6 @@ async fn execute_vault_tool(
     }
 }
 
-/// 解析 LLM 以文字格式輸出的工具調用
-/// 支援格式：<tool_call>{"name":"func","arguments":{...}}</tool_call>
-fn parse_text_tool_calls(content: &str) -> Vec<serde_json::Value> {
-    let mut calls = Vec::new();
-    let mut remaining = content;
-    while let Some(start) = remaining.find("<tool_call>") {
-        let after_open = &remaining[start + "<tool_call>".len()..];
-        if let Some(end) = after_open.find("</tool_call>") {
-            let json_str = after_open[..end].trim();
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
-                let name = v["name"].as_str().unwrap_or("").to_string();
-                let args_str = serde_json::to_string(&v["arguments"])
-                    .unwrap_or_else(|_| "{}".to_string());
-                calls.push(serde_json::json!({
-                    "id": format!("call_{}", name),
-                    "type": "function",
-                    "function": { "name": name, "arguments": args_str }
-                }));
-            }
-            remaining = &after_open[end + "</tool_call>".len()..];
-        } else {
-            break;
-        }
-    }
-    calls
-}
-
-/// 工具調用的可讀摘要（發送給前端的 agent:tool_call 事件內容）
-fn tool_call_display(name: &str, args: &serde_json::Value) -> String {
-    match name {
-        "search_vault" => format!("🔍 搜索: \"{}\"", args["query"].as_str().unwrap_or("")),
-        "list_structure" => {
-            let path = args["path"].as_str().unwrap_or("");
-            format!("📂 列出: {}", if path.is_empty() { "根目錄" } else { path })
-        }
-        "read_note" => format!("📄 讀取: {}", args["path"].as_str().unwrap_or("")),
-        "create_note" => format!("✏️  建立筆記: {}", args["path"].as_str().unwrap_or("")),
-        "update_note" => format!("✏️  更新筆記: {}", args["path"].as_str().unwrap_or("")),
-        "create_folder" => format!("📁 建立資料夾: {}", args["path"].as_str().unwrap_or("")),
-        "call_external_ai" => {
-            let q = args["query"].as_str().unwrap_or("");
-            let preview: String = q.chars().take(50).collect();
-            format!("🌐 外部 AI：\"{}\"", preview)
-        }
-        "open_note" => format!("📂 打開筆記: {}", args["path"].as_str().unwrap_or("")),
-        _ => format!("執行工具: {}", name),
-    }
-}
-
 /// 前端確認/拒絕寫入工具（stream_chat 等待此命令後繼續執行）
 #[tauri::command]
 pub async fn confirm_write_tool(
@@ -1760,447 +1635,6 @@ pub async fn confirm_write_tool(
         let _ = tx.send(approved);
     }
     Ok(())
-}
-
-/// Vault Agent 聊天：內建工具調用迴圈，可搜索/讀取/新增/編輯 Vault 中的筆記與資料夾
-/// 每次工具調用會發送 "agent:tool_call" 事件讓前端即時顯示進度
-/// 工具清單包含 call_external_ai，LLM 可自動決定何時呼叫外部資源
-#[tauri::command]
-pub async fn agent_chat(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    messages: Vec<ChatMessage>,
-    system: Option<String>,
-) -> Result<String, AppError> {
-    let base_url = ensure_server_running(state.inner(), &app).await?;
-    let vault_path = state.get_vault_path().await;
-    let vault_db = state.get_vault_db().await?;
-    let client = reqwest::Client::new();
-
-    // 讀取外部 AI 設定（provider/model/base_url 存在 settings_db，api_key 存在 keyring）
-    let settings_db = &state.settings_db;
-    let ext_provider = queries::get_setting(settings_db, "ai_provider")
-        .await?.unwrap_or_default();
-    let ext_base_url = queries::get_setting(settings_db, "ai_base_url")
-        .await?.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-    let ext_model = queries::get_setting(settings_db, "ai_model")
-        .await?.unwrap_or_else(|| "gpt-4o".to_string());
-    let ext_api_key = read_api_key_sync(&ext_provider);
-    let ext_config = ExtAiConfig {
-        provider: ext_provider,
-        base_url: ext_base_url,
-        model: ext_model,
-        api_key: ext_api_key,
-    };
-
-    // Agent 系統 prompt：說明工具能力，附上可選的筆記上下文
-    let agent_system = format!(
-        "你是一個能操作 Vault 筆記庫的智慧助手，使用繁體中文回答。\
-Vault 中的筆記為 Markdown 格式（.md 副檔名），以資料夾階層組織，路徑使用 / 分隔。\n\
-\n\
-【工具說明】\n\
-- search_vault(query)：對筆記標題和內容做全文搜索，query 只能是關鍵字，不支援數字比較運算。\n\
-- list_structure(path)：列出資料夾內容，path 傳空字串表示根目錄。\n\
-- read_note(path)：讀取指定筆記的完整內容。\n\
-- create_note(path, content)：建立新筆記。\n\
-- update_note(path, content)：更新現有筆記。\n\
-- create_folder(path)：建立新資料夾。\n\
-\n\
-【搜索策略】\n\
-1. search_vault 支援比較條件關鍵字（低於/高於/小於/大於/等於/大約/至少/至多/不超過 + 數字 + 單位），可直接帶入完整條件搜索，例如「奶茶 低於65元」、「飲料 高於100元」。\n\
-2. 搜索時帶上核心名詞 + 比較條件，系統會自動過濾筆記中符合數值的行。\n\
-3. 若第一次搜索無結果，改用更簡短的同義詞再試一次（例如「飲料」→「奶茶」），不要直接向用戶求助。\n\
-4. 整合所有工具結果後給出清晰完整的繁體中文回答，不要要求用戶自己去查。{}",
-        system
-            .as_deref()
-            .map(|s| format!("\n\n---\n目前開啟的筆記內容（供參考）：\n{}", s))
-            .unwrap_or_default()
-    );
-
-    // 組裝初始 messages
-    let mut llm_messages: Vec<serde_json::Value> =
-        vec![serde_json::json!({"role": "system", "content": agent_system})];
-    for msg in &messages {
-        llm_messages.push(serde_json::json!({"role": msg.role, "content": msg.content}));
-    }
-
-    let tools = vault_tools();
-
-    // Agent 迴圈（最多 8 輪工具調用）
-    for _iter in 0..8 {
-        let body = serde_json::json!({
-            "messages": llm_messages,
-            "tools": tools,
-            "tool_choice": "auto",
-            "max_tokens": 2048,
-            "temperature": 0.7,
-            "stream": false,
-        });
-
-        let response = client
-            .post(format!("{}/v1/chat/completions", base_url))
-            .json(&body)
-            .timeout(Duration::from_secs(120))
-            .send()
-            .await
-            .map_err(|e| AppError::AI(format!("請求 llama-server 失敗：{}", e)))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(AppError::AI(format!(
-                "llama-server 回應錯誤 {}：{}",
-                status, text
-            )));
-        }
-
-        let json: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| AppError::AI(format!("解析回應失敗：{}", e)))?;
-
-        let choice = &json["choices"][0];
-        let finish_reason = choice["finish_reason"].as_str().unwrap_or("stop");
-        let message = &choice["message"];
-
-        let content_str = message["content"].as_str().unwrap_or("").to_string();
-        let tool_calls_arr = message["tool_calls"].as_array();
-        let has_native_tool_calls = tool_calls_arr.map(|arr| !arr.is_empty()).unwrap_or(false);
-
-        if finish_reason == "tool_calls" || has_native_tool_calls {
-            // === 標準 OpenAI tool_calls 格式 ===
-            llm_messages.push(message.clone());
-            let calls = tool_calls_arr.cloned().unwrap_or_default();
-            for call in &calls {
-                let tool_id = call["id"].as_str().unwrap_or("").to_string();
-                let tool_name = call["function"]["name"].as_str().unwrap_or("").to_string();
-                let args_str = call["function"]["arguments"].as_str().unwrap_or("{}");
-                let args: serde_json::Value =
-                    serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
-                let display = tool_call_display(&tool_name, &args);
-                let _ = app.emit("agent:tool_call", &display);
-                let result =
-                    execute_vault_tool(&tool_name, &args, Some(&vault_db), &vault_path, &app, &ext_config).await;
-                llm_messages.push(serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": tool_id,
-                    "content": result,
-                }));
-            }
-        } else {
-            // === 嘗試解析文字格式工具調用 <tool_call>...</tool_call> ===
-            let text_calls = parse_text_tool_calls(&content_str);
-            if !text_calls.is_empty() {
-                // 取 <tool_call> 之前的思考前言作為 assistant 內容
-                let preamble = content_str
-                    .find("<tool_call>")
-                    .map(|p| content_str[..p].trim().to_string())
-                    .unwrap_or_default();
-                llm_messages.push(serde_json::json!({
-                    "role": "assistant",
-                    "content": preamble
-                }));
-                let mut results_text = Vec::new();
-                for call in &text_calls {
-                    let tool_name =
-                        call["function"]["name"].as_str().unwrap_or("").to_string();
-                    let args_str = call["function"]["arguments"].as_str().unwrap_or("{}");
-                    let args: serde_json::Value =
-                        serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
-                    let display = tool_call_display(&tool_name, &args);
-                    let _ = app.emit("agent:tool_call", &display);
-                    let result =
-                        execute_vault_tool(&tool_name, &args, Some(&vault_db), &vault_path, &app, &ext_config).await;
-                    results_text.push(format!("[工具: {}]\n{}", tool_name, result));
-                }
-                // 文字格式模型不支援 role:tool，改用 user 訊息傳回結果
-                llm_messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": format!(
-                        "以下是工具執行結果，請根據結果回答用戶：\n\n{}",
-                        results_text.join("\n\n")
-                    )
-                }));
-            } else {
-                // 最終回覆（無更多工具調用）
-                let text = content_str.trim().to_string();
-                let _ = app.emit("llm:done", &text);
-                return Ok(text);
-            }
-        }
-    }
-
-    Err(AppError::AI(
-        "Agent 工具調用超過最大輪次（8），請簡化您的請求。".to_string(),
-    ))
-}
-
-// ─── Memory Agent ─────────────────────────────────────────────────────────────
-
-/// 從查詢字串中提取模式前方的數字（阿拉伯或中文，供 temporal_unit 規則使用）
-fn extract_number_before(query: &str, suffix: &str) -> Option<i64> {
-    let pos = query.find(suffix)?;
-    let before: Vec<char> = query[..pos].chars().collect();
-    // 阿拉伯數字（從尾端往前取連續數字）
-    let digits: String = before.iter().rev().take_while(|c| c.is_ascii_digit())
-        .collect::<String>().chars().rev().collect();
-    if !digits.is_empty() { return digits.parse().ok(); }
-    // 中文數字（單字）
-    let last = before.last()?;
-    [('一',1i64),('二',2),('三',3),('四',4),('五',5),
-     ('六',6),('七',7),('八',8),('九',9),('十',10)]
-        .iter().find(|&&(c,_)| c == *last).map(|&(_,v)| v)
-}
-
-/// 載入 memory_rules 表中的規則
-async fn load_memory_rules(db: &sqlx::SqlitePool) -> Vec<(String, String, String)> {
-    sqlx::query_as::<_, (String, String, String)>(
-        "SELECT pattern_type, pattern, value FROM memory_rules ORDER BY id"
-    )
-    .fetch_all(db).await.unwrap_or_default()
-}
-
-/// 與 parse_query_since 相同，但先套用資料庫中的自訂規則
-fn parse_query_since_with_rules(
-    query: &str,
-    now: &chrono::DateTime<Local>,
-    rules: &[(String, String, String)],
-) -> Option<i64> {
-    let day_start = |d: chrono::NaiveDate| -> Option<i64> {
-        d.and_hms_opt(0, 0, 0)?.and_local_timezone(Local).earliest()
-            .map(|dt| dt.timestamp_millis())
-    };
-    // 先套用自訂規則
-    for (ptype, pattern, value) in rules {
-        match ptype.as_str() {
-            "temporal_exact_days" if query.contains(pattern.as_str()) => {
-                let days: i64 = value.parse().unwrap_or(0);
-                return day_start(now.date_naive() + chrono::TimeDelta::days(days));
-            }
-            "temporal_unit" if query.contains(pattern.as_str()) => {
-                if let Some(n) = extract_number_before(query, pattern) {
-                    return Some(match value.as_str() {
-                        "hours"   => (now.clone() - chrono::TimeDelta::hours(n)).timestamp_millis(),
-                        "minutes" => (now.clone() - chrono::TimeDelta::minutes(n)).timestamp_millis(),
-                        "weeks"   => return day_start(now.date_naive() - chrono::TimeDelta::weeks(n)),
-                        _         => return None,
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-    // 回退到內建規則
-    parse_query_since(query, now)
-}
-
-/// 與 extract_cjk_bigrams 相同，但合併來自 memory_rules 的額外停用詞
-fn extract_cjk_bigrams_with_extra_stops(query: &str, extra_stops: &[char]) -> Vec<String> {
-    const STOPS: &[char] = &[
-        '你','我','他','她','它','的','了','嗎','啊','哦','嗯','是','有','在',
-        '說','知','道','記','得','什','麼','怎','樣','那','這','就','都','也',
-        '還','不','沒','要','會','可','以','和','與','或','但','如','果','因',
-        '為','所','而','且','雖','然','呢','嘛','吧','喔','囉','啦','呀','嘿',
-        '哈','去','來','到','對','把','被','讓','幫','請','謝','好','很',
-    ];
-    let cjk: Vec<char> = query.chars().filter(|c| is_cjk(*c)).collect();
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for pair in cjk.windows(2) {
-        let in_stops = |c: char| STOPS.contains(&c) || extra_stops.contains(&c);
-        if in_stops(pair[0]) && in_stops(pair[1]) { continue; }
-        let bigram: String = pair.iter().collect();
-        if seen.insert(bigram.clone()) { out.push(bigram); }
-    }
-    out
-}
-
-/// 將規則寫入 memory_rules 表（供 run_memory_agent 工具呼叫與 add_memory_rule command 共用）
-async fn add_memory_rule_to_db(db: &sqlx::SqlitePool, pattern_type: &str, pattern: &str, value: &str) -> String {
-    match sqlx::query(
-        "INSERT OR REPLACE INTO memory_rules(pattern_type, pattern, value) VALUES (?, ?, ?)"
-    )
-    .bind(pattern_type).bind(pattern).bind(value)
-    .execute(db).await {
-        Ok(_)  => format!("規則已儲存：[{}] {} → {}", pattern_type, pattern, value),
-        Err(e) => format!("規則儲存失敗：{}", e),
-    }
-}
-
-/// memory_agent 核心邏輯（取 &AppState，供 Tauri command 與 resolve_memory_context fallback 共用）
-///
-/// 工具：
-///   query_memory    — 搜尋記憶筆記
-///   add_memory_rule — 寫入新規則，讓 resolve_memory_context 下次直接處理（自我學習）
-async fn run_memory_agent(vault_db: &sqlx::SqlitePool, query: &str, port: u16) -> Result<String, AppError> {
-    let base_url = format!("http://127.0.0.1:{}", port);
-    let client = reqwest::Client::new();
-
-    let now = Local::now();
-    let today_str      = now.format("%Y-%m-%d").to_string();
-    let yesterday_str  = (now - chrono::TimeDelta::days(1)).format("%Y-%m-%d").to_string();
-    let day_before_str = (now - chrono::TimeDelta::days(2)).format("%Y-%m-%d").to_string();
-    let this_month_str = now.format("%Y-%m-01").to_string();
-    let last_month_str = {
-        let (y, m) = (now.year(), now.month());
-        if m == 1 { format!("{}-12-01", y - 1) } else { format!("{}-{:02}-01", y, m - 1) }
-    };
-
-    let system = format!(
-        "你是一個記憶查詢助手。今天是 {today}。\
-根據使用者的問題，搜尋相關的過去對話記憶，整理成簡潔摘要後直接輸出。\n\
-【時間表達式轉換規則】\n\
-- 剛剛／剛才／最近 → keywords=[], 不帶 since\n\
-- 今天 → since=\"{today}\"  昨天 → since=\"{yesterday}\"  前天 → since=\"{day_before}\"\n\
-- N天前（N≥3）→ since 自行計算  本月 → since=\"{this_month}\"  上月 → since=\"{last_month}\"\n\
-- 本週 → since 為本週一（今天是週{weekday}）  X月 → since=\"{{year}}-{{X:02}}-01\"\n\
-- 遇到 Rust 不認識的時間表達式（如「3小時前」「大前天」「上上週」）→ 先呼叫 add_memory_rule 儲存規則，再呼叫 query_memory\n\
-【add_memory_rule 規則】\n\
-  temporal_exact_days: 固定天數，value 為負整數（如「大前天」\"-3\"）\n\
-  temporal_unit: 數字+後綴，value 為 hours/minutes/weeks（如「小時前」\"hours\"）\n\
-  stopword: 應過濾的停用字，value 為空字串\n\
-【輸出規則】只輸出記憶摘要，不對話，不提問。找不到記憶只回覆「未找到相關記憶」。",
-        today = today_str, yesterday = yesterday_str, day_before = day_before_str,
-        this_month = this_month_str, last_month = last_month_str,
-        weekday = now.weekday().number_from_monday(),
-    );
-
-    let tools = serde_json::json!([
-        {
-            "type": "function",
-            "function": {
-                "name": "query_memory",
-                "description": "搜尋過去對話記憶。keywords 空陣列=取最新記憶；有關鍵字=FTS 搜尋。since 為時間下限 YYYY-MM-DD。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "keywords": { "type": "array", "items": { "type": "string" },
-                            "description": "搜尋關鍵字，空陣列=最新記憶" },
-                        "since":    { "type": "string",  "description": "時間下限 YYYY-MM-DD" },
-                        "limit":    { "type": "integer", "description": "最多筆數，預設 3" }
-                    },
-                    "required": []
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "add_memory_rule",
-                "description": "發現 Rust 不認識的時間表達式時，儲存規則讓系統下次直接處理（不再需要 LLM）",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "pattern_type": { "type": "string",
-                            "enum": ["temporal_exact_days","temporal_unit","stopword"],
-                            "description": "規則類型" },
-                        "pattern": { "type": "string",
-                            "description": "觸發字串，如「大前天」「小時前」" },
-                        "value": { "type": "string",
-                            "description": "temporal_exact_days: 負整數如\"-3\"；temporal_unit: hours/minutes/weeks；stopword: 空字串" }
-                    },
-                    "required": ["pattern_type","pattern","value"]
-                }
-            }
-        }
-    ]);
-
-    let mut messages: Vec<serde_json::Value> = vec![
-        serde_json::json!({"role": "user", "content": query}),
-    ];
-
-    // 最多 4 輪（考慮 add_memory_rule + query_memory 共兩次工具）
-    for _ in 0..4 {
-        let mut api_messages = vec![serde_json::json!({"role": "system", "content": system})];
-        api_messages.extend(messages.iter().cloned());
-
-        let body = serde_json::json!({
-            "model": "local",
-            "messages": api_messages,
-            "tools": tools,
-            "tool_choice": "auto",
-            "max_tokens": 1024,
-            "stream": false,
-        });
-
-        let resp = client.post(format!("{}/v1/chat/completions", base_url))
-            .json(&body).timeout(Duration::from_secs(60)).send().await
-            .map_err(|e| AppError::AI(format!("memory_agent 請求失敗：{}", e)))?;
-
-        let json: serde_json::Value = resp.json().await
-            .map_err(|e| AppError::AI(format!("memory_agent 回應解析失敗：{}", e)))?;
-
-        let message = &json["choices"][0]["message"];
-        let content_str = message["content"].as_str().unwrap_or("").to_string();
-        let finish_reason = json["choices"][0]["finish_reason"].as_str().unwrap_or("");
-        let tool_calls_arr = message["tool_calls"].as_array();
-        let has_native_calls = tool_calls_arr.map(|a| !a.is_empty()).unwrap_or(false);
-
-        if finish_reason != "tool_calls" && !has_native_calls {
-            let text_calls = parse_text_tool_calls(&content_str);
-            if text_calls.is_empty() { return Ok(content_str); }
-
-            messages.push(serde_json::json!({"role": "assistant", "content": content_str}));
-            let mut results = Vec::new();
-            for call in &text_calls {
-                let tool_name = call["function"]["name"].as_str().unwrap_or("");
-                let args: serde_json::Value = serde_json::from_str(
-                    call["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or_default();
-                let r = dispatch_memory_tool(tool_name, &args, vault_db).await;
-                results.push(r);
-            }
-            messages.push(serde_json::json!({
-                "role": "user",
-                "content": format!("以下是工具結果，請整理後回答：\n\n{}", results.join("\n\n"))
-            }));
-            continue;
-        }
-
-        // 標準 tool_calls 格式
-        messages.push(message.clone());
-        for call in tool_calls_arr.cloned().unwrap_or_default() {
-            let tool_id = call["id"].as_str().unwrap_or("").to_string();
-            let tool_name = call["function"]["name"].as_str().unwrap_or("");
-            let args: serde_json::Value = serde_json::from_str(
-                call["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or_default();
-            let result = dispatch_memory_tool(tool_name, &args, vault_db).await;
-            messages.push(serde_json::json!({
-                "role": "tool", "tool_call_id": tool_id, "content": result
-            }));
-        }
-    }
-
-    Ok("未找到相關記憶".to_string())
-}
-
-/// memory_agent / resolve_memory_context 共用工具分派
-async fn dispatch_memory_tool(tool_name: &str, args: &serde_json::Value, vault_db: &sqlx::SqlitePool) -> String {
-    match tool_name {
-        "query_memory" => {
-            let keywords: Vec<String> = args["keywords"].as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
-            let since = args["since"].as_str().map(String::from);
-            let limit = args["limit"].as_u64().map(|v| v as usize);
-            tool_query_memory(keywords, since, limit, vault_db).await
-        }
-        "add_memory_rule" => {
-            let ptype   = args["pattern_type"].as_str().unwrap_or("");
-            let pattern = args["pattern"].as_str().unwrap_or("");
-            let value   = args["value"].as_str().unwrap_or("");
-            add_memory_rule_to_db(vault_db, ptype, pattern, value).await
-        }
-        other => format!("未知工具：{}", other),
-    }
-}
-
-#[tauri::command]
-pub async fn memory_agent(state: State<'_, AppState>, query: String) -> Result<String, AppError> {
-    let port = queries::get_setting(&state.settings_db, "llama_server_port")
-        .await.unwrap_or_default().unwrap_or_else(|| "8080".to_string())
-        .parse::<u16>().unwrap_or(8080);
-    let vault_db = state.get_vault_db().await?;
-    run_memory_agent(&vault_db, &query, port).await
 }
 
 /// 讓前端或其他命令可以直接向資料庫新增記憶規則
@@ -2254,126 +1688,6 @@ pub async fn delete_memory_rule(state: State<'_, AppState>, id: i64) -> Result<(
 // ─── Memory ───────────────────────────────────────────────────────────────────
 
 /// Agent 工具：查詢記憶筆記（回傳格式化純文字，供 LLM 直接使用）
-async fn tool_query_memory(
-    keywords: Vec<String>,
-    since: Option<String>,
-    limit: Option<usize>,
-    vault_db: &sqlx::SqlitePool,
-) -> String {
-    let limit = limit.unwrap_or(3).min(10) as i64;
-
-    // 可選：時間篩選（since 格式 YYYY-MM-DD）
-    let since_ts: Option<i64> = since.and_then(|s| {
-        chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok().map(|d| {
-            d.and_hms_opt(0, 0, 0)
-                .and_then(|dt| dt.and_local_timezone(Local).earliest())
-                .map(|dt| dt.timestamp_millis())
-                .unwrap_or(0)
-        })
-    });
-
-    let rows: Vec<(String, String, i64)> = if keywords.is_empty() {
-        // 無關鍵字：按時間降序回傳最新記憶（不走 FTS，適合「你還記得什麼嗎」類型的問題）
-        let mut q = sqlx::query_as::<_, (String, String, i64)>(
-            "SELECT path, title, created_at
-             FROM notes
-             WHERE path LIKE 'memories/ai_memory_%'
-             ORDER BY created_at DESC
-             LIMIT ?"
-        )
-        .bind(limit)
-        .fetch_all(vault_db)
-        .await
-        .unwrap_or_default();
-
-        if let Some(min_ts) = since_ts {
-            q.retain(|(_, _, ts)| *ts >= min_ts);
-        }
-        q
-    } else {
-        // 有關鍵字：用 FTS5 MATCH 搜尋（OR 連接）
-        // 注意：FTS5 unicode61 對連續漢字以空格分詞，若關鍵字為多字詞需用引號括起
-        let fts_terms: Vec<String> = keywords.iter()
-            .map(|k| format!("\"{}\"", k.replace('"', "")))
-            .collect();
-        let fts_query = fts_terms.join(" OR ");
-
-        let rows = sqlx::query_as::<_, (String, String, i64)>(
-            "SELECT s.path, s.title, n.created_at
-             FROM search_fts s
-             JOIN notes n ON n.path = s.path
-             WHERE s.path LIKE 'memories/ai_memory_%'
-               AND search_fts MATCH ?
-             ORDER BY bm25(search_fts)
-             LIMIT ?"
-        )
-        .bind(&fts_query)
-        .bind(limit)
-        .fetch_all(vault_db)
-        .await
-        .unwrap_or_default();
-
-        rows.into_iter()
-            .filter(|(_, _, ts)| since_ts.map_or(true, |min_ts| *ts >= min_ts))
-            .collect()
-    };
-
-    if rows.is_empty() {
-        if keywords.is_empty() {
-            return "目前沒有任何已儲存的記憶筆記".to_string();
-        }
-        // FTS 找不到時，降級到最新 1 筆，避免空手而回
-        let fallback = sqlx::query_as::<_, (String, String, i64)>(
-            "SELECT path, title, created_at
-             FROM notes
-             WHERE path LIKE 'memories/ai_memory_%'
-             ORDER BY created_at DESC
-             LIMIT 1"
-        )
-        .fetch_optional(vault_db)
-        .await
-        .unwrap_or_default();
-
-        if fallback.is_none() {
-            return format!("未找到關鍵字「{}」相關的記憶筆記，且目前無任何記憶存檔", keywords.join("、"));
-        }
-        // 用最新一筆繼續往下格式化
-        let rows_fallback = fallback.into_iter().collect::<Vec<_>>();
-        return format_memory_rows(&rows_fallback, &format!("（關鍵字「{}」無精確匹配，以下為最新記憶）", keywords.join("、")), vault_db).await;
-    }
-
-    format_memory_rows(&rows, "", vault_db).await
-}
-
-async fn format_memory_rows(rows: &[(String, String, i64)], prefix: &str, vault_db: &sqlx::SqlitePool) -> String {
-    let mut output = if prefix.is_empty() {
-        format!("找到 {} 筆記憶筆記：\n\n", rows.len())
-    } else {
-        format!("{}\n找到 {} 筆記憶筆記：\n\n", prefix, rows.len())
-    };
-
-    for (path, title, created_ms) in rows {
-        let dt = chrono::DateTime::from_timestamp_millis(*created_ms)
-            .map(|dt| dt.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string())
-            .unwrap_or_else(|| "未知時間".to_string());
-
-        // 取前 600 字元的摘要（跳過 frontmatter 分隔符）
-        let snippet: String = sqlx::query_scalar::<_, String>("SELECT content FROM notes WHERE path = ?")
-            .bind(path)
-            .fetch_optional(vault_db)
-            .await
-            .unwrap_or_default()
-            .unwrap_or_default()
-            .chars()
-            .skip_while(|c| *c == '-' || *c == '\n')
-            .take(600)
-            .collect();
-
-        output.push_str(&format!("【{}】{}\n路徑：{}\n內容：\n{}…\n\n", dt, title, path, snippet.trim()));
-    }
-    output
-}
-
 /// 將當前對話原文儲存為記憶筆記（memories/ai_memory_[timestamp].md）
 /// 返回建立的筆記相對路徑
 #[tauri::command]
@@ -2532,82 +1846,6 @@ pub async fn query_memory(
 //   2. 提取 CJK 雙字元 n-gram → LIKE 條件（繞過 FTS CJK 斷詞問題）
 //   3. 降級策略：LIKE 找不到 → 取最新一筆
 //   4. 回傳格式化純文字，供 stream_chat system 注入
-
-/// 判斷是否為 CJK 漢字
-fn is_cjk(c: char) -> bool {
-    matches!(c as u32,
-        0x4E00..=0x9FFF | 0x3400..=0x4DBF |
-        0x20000..=0x2A6DF | 0xF900..=0xFAFF | 0x2F800..=0x2FA1F
-    )
-}
-
-/// 從查詢字串解析時間表達式，回傳 since 毫秒時間戳（None = 不限時間）
-fn parse_query_since(query: &str, now: &chrono::DateTime<Local>) -> Option<i64> {
-    use chrono::Datelike;
-
-    let day_start = |d: chrono::NaiveDate| -> Option<i64> {
-        d.and_hms_opt(0, 0, 0)?
-            .and_local_timezone(Local).earliest()
-            .map(|dt| dt.timestamp_millis())
-    };
-
-    if query.contains("今天") {
-        return day_start(now.date_naive());
-    }
-    if query.contains("昨天") {
-        return day_start(now.date_naive() - chrono::TimeDelta::days(1));
-    }
-    if query.contains("前天") {
-        return day_start(now.date_naive() - chrono::TimeDelta::days(2));
-    }
-
-    // "3天前" / "三天前"
-    let chars: Vec<char> = query.chars().collect();
-    for w in chars.windows(3) {
-        if w[1] == '天' && w[2] == '前' {
-            let days: Option<i64> = if let Some(d) = w[0].to_digit(10) {
-                Some(d as i64)
-            } else {
-                [('一',1i64),('二',2),('三',3),('四',4),('五',5),
-                 ('六',6),('七',7),('八',8),('九',9)]
-                    .iter().find(|&&(c, _)| c == w[0]).map(|&(_, v)| v)
-            };
-            if let Some(d) = days {
-                return day_start(now.date_naive() - chrono::TimeDelta::days(d));
-            }
-        }
-    }
-
-    if query.contains("本週") || query.contains("這週") || query.contains("本周") || query.contains("這周") {
-        use chrono::Datelike;
-        let offset = now.weekday().num_days_from_monday() as i64;
-        return day_start(now.date_naive() - chrono::TimeDelta::days(offset));
-    }
-    if query.contains("本月") || query.contains("這個月") || query.contains("這月") {
-        return day_start(chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)?);
-    }
-    if query.contains("上個月") || query.contains("上月") {
-        let (y, m) = if now.month() == 1 { (now.year() - 1, 12u32) } else { (now.year(), now.month() - 1) };
-        return day_start(chrono::NaiveDate::from_ymd_opt(y, m, 1)?);
-    }
-
-    // 中文月份 "一月".."十二月" / 阿拉伯 "1月".."12月"
-    let cn_months = [("一月",1u32),("二月",2),("三月",3),("四月",4),
-                     ("五月",5),("六月",6),("七月",7),("八月",8),
-                     ("九月",9),("十月",10),("十一月",11),("十二月",12)];
-    for &(name, m) in &cn_months {
-        if query.contains(name) {
-            return day_start(chrono::NaiveDate::from_ymd_opt(now.year(), m, 1)?);
-        }
-    }
-    for m in 1u32..=12 {
-        if query.contains(&format!("{}月", m)) {
-            return day_start(chrono::NaiveDate::from_ymd_opt(now.year(), m, 1)?);
-        }
-    }
-
-    None // 剛剛/剛才/最近/不限時間
-}
 
 
 #[tauri::command]

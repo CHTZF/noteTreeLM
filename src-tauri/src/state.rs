@@ -34,6 +34,10 @@ pub struct AppState {
     pub llama_user_stopped: Arc<AtomicBool>,
     /// 全域 port 分配鎖：防止 whisper 與 llama 並發 find_free_port 時取到同一個 port
     pub port_allocator: Arc<Mutex<()>>,
+    /// Agent 取消旗標：設為 true 時 invoke_agent 的 SSE 迴圈中止
+    pub agent_cancel: Arc<AtomicBool>,
+    /// Agent 目前活躍的 session_id（None 表示閒置）
+    pub agent_session: Arc<Mutex<Option<String>>>,
 }
 
 impl AppState {
@@ -53,6 +57,8 @@ impl AppState {
             whisper_user_stopped: Arc::new(AtomicBool::new(false)),
             llama_user_stopped: Arc::new(AtomicBool::new(false)),
             port_allocator: Arc::new(Mutex::new(())),
+            agent_cancel: Arc::new(AtomicBool::new(false)),
+            agent_session: Arc::new(Mutex::new(None)),
         }
     }
 

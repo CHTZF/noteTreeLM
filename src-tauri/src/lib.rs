@@ -1,15 +1,17 @@
 mod commands;
 mod db;
 mod error;
+pub mod runtime;
 mod state;
+pub mod tools;
 mod vault;
 
 use commands::{
-    ai::{stream_chat, stream_chat_external, process_with_llm, stop_llama_server, warmup_llama_server, agent_chat,
+    ai::{stream_chat_external, process_with_llm, stop_llama_server, warmup_llama_server,
          get_llama_server_status, start_llama_server, restart_llama_server,
-         save_memory_session, query_memory, memory_agent, add_memory_rule,
+         save_memory_session, query_memory, add_memory_rule,
          get_memory_rules, delete_memory_rule, resolve_memory_context, confirm_write_tool,
-         test_vault_tool},
+         test_vault_tool, cancel_agent, invoke_agent},
     download::*, graph::*, import::*, search::*,
     settings::{get_settings, save_settings, get_api_key, set_api_key,
                get_vault_last_note, set_vault_last_note},
@@ -143,10 +145,8 @@ pub fn run() {
             start_whisper_server,
             restart_whisper_server,
             // AI / LLM
-            stream_chat,
             stream_chat_external,
             process_with_llm,
-            agent_chat,
             confirm_write_tool,
             test_vault_tool,
             stop_llama_server,
@@ -155,11 +155,12 @@ pub fn run() {
             restart_llama_server,
             save_memory_session,
             query_memory,
-            memory_agent,
             add_memory_rule,
             get_memory_rules,
             delete_memory_rule,
             resolve_memory_context,
+            cancel_agent,
+            invoke_agent,
             // Download
             get_models_dir,
             get_downloaded_models,

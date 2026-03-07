@@ -67,6 +67,20 @@ INSERT OR IGNORE INTO settings(key, value) VALUES
   ('memory_threshold',   '20');
 
 -- ============================================================
+-- Intent Keywords (for runtime intent classifier)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS intent_keywords (
+  intent   TEXT PRIMARY KEY,
+  keywords TEXT NOT NULL  -- JSON array of strings
+);
+
+INSERT OR IGNORE INTO intent_keywords(intent, keywords) VALUES
+  ('CANCEL',    '["算了","取消","不要","停止","不用了","停","不用","別","不行"]'),
+  ('INTERRUPT', '["等等","先停","暫停","先等","hold on","wait"]'),
+  ('CONFIRM',   '["確認","好的","是","對","OK","ok","確定","沒錯","對對","行","好"]'),
+  ('REPEAT',    '["再說一次","再講一次","重複","請再說","再說","重說"]');
+
+-- ============================================================
 -- Vault States (per-vault metadata, e.g. last open note)
 -- ============================================================
 CREATE TABLE IF NOT EXISTS vault_states (
