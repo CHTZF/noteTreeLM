@@ -886,6 +886,70 @@ pub async fn delete_asset(
     Ok(())
 }
 
+/// 重命名 Vault 中的檔案資源（圖片等）
+#[tauri::command]
+pub async fn rename_asset(
+    state: State<'_, AppState>,
+    path: String,
+    new_name: String,
+) -> Result<String, AppError> {
+    let vault_path = state.get_vault_path().await;
+    if path.contains("..") || new_name.contains("..") || new_name.contains('/') || new_name.contains('\\') {
+        return Err(AppError::Vault("無效的路徑或名稱".to_string()));
+    }
+    let abs_path = PathBuf::from(&vault_path).join(&path);
+    let parent = abs_path.parent()
+        .ok_or_else(|| AppError::Vault("無法取得父目錄".to_string()))?;
+    let new_abs_path = parent.join(&new_name);
+    if new_abs_path.exists() {
+        return Err(AppError::Vault(format!("檔案 {} 已存在", new_name)));
+    }
+    tokio::fs::rename(&abs_path, &new_abs_path).await
+        .map_err(|e| AppError::Vault(format!("重命名失敗：{}", e)))?;
+    // 回傳新的相對路徑
+    let new_rel = crate::vault::to_relative_path(&vault_path, &new_abs_path)
+        .ok_or_else(|| AppError::Vault("無法計算新路徑".to_string()))?;
+    Ok(new_rel)
+}
+
+/// 使用系統預設程式開啟指定的 Vault 內部檔案
+#[tauri::command]
+pub async fn open_path_externally(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<(), AppError> {
+    let vault_path = state.get_vault_path().await;
+    if path.contains("..") {
+        return Err(AppError::Vault("無效的路徑".to_string()));
+    }
+    let abs_path = PathBuf::from(&vault_path).join(&path);
+    if !abs_path.exists() {
+        return Err(AppError::Vault(format!("檔案不存在：{}", path)));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        tokio::process::Command::new("open")
+            .arg(&abs_path)
+            .spawn()
+            .map_err(|e| AppError::Vault(format!("無法開啟檔案：{}", e)))?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        tokio::process::Command::new("explorer")
+            .arg(&abs_path)
+            .spawn()
+            .map_err(|e| AppError::Vault(format!("無法開啟檔案：{}", e)))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        tokio::process::Command::new("xdg-open")
+            .arg(&abs_path)
+            .spawn()
+            .map_err(|e| AppError::Vault(format!("無法開啟檔案：{}", e)))?;
+    }
+    Ok(())
+}
+
 // ─────────────────────────────── Trash ──────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Clone, sqlx::FromRow)]

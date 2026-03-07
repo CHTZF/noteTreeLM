@@ -22,6 +22,8 @@ interface VaultStore {
   deleteFolder: (folderPath: string) => Promise<number>
   importImage: (sourcePath: string, folder?: string) => Promise<string>
   deleteAsset: (path: string) => Promise<void>
+  renameAsset: (path: string, newName: string) => Promise<string>
+  openPathExternally: (path: string) => Promise<void>
   // Trash
   listTrash: () => Promise<TrashItem[]>
   restoreTrashItem: (id: string, targetFolder: string) => Promise<string>
@@ -116,6 +118,16 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
   deleteAsset: async (path) => {
     await invoke('delete_asset', { path })
     await get().loadNotes()
+  },
+
+  renameAsset: async (path, newName) => {
+    const newPath = await invoke<string>('rename_asset', { path, newName })
+    await get().loadNotes()
+    return newPath
+  },
+
+  openPathExternally: async (path) => {
+    await invoke('open_path_externally', { path })
   },
 
   // ── Trash ──────────────────────────────────────────────────

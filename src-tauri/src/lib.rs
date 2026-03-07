@@ -127,6 +127,8 @@ pub fn run() {
             import_image,
             list_assets,
             delete_asset,
+            rename_asset,
+            open_path_externally,
             // Trash
             trash_note,
             trash_folder,

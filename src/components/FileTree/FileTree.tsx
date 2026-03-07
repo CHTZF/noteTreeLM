@@ -17,7 +17,7 @@ import { FileTreeNode } from '../../types/models'
 import { toast } from '../common/Toast'
 import { ask } from '@tauri-apps/plugin-dialog'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
-import { open as shellOpen } from '@tauri-apps/plugin-shell'
+
 
 // ── 檔案類型 icon + 顏色映射（VSCode Material Icon Theme 風格）────────────
 // 顏色在深色/淺色主題下均清晰可辨
@@ -429,7 +429,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
   const [renameValue, setRenameValue] = useState('')
   const [menuX, setMenuX] = useState(0)
   const [menuY, setMenuY] = useState(0)
-  const { deleteNote, createFolder, renameFolder, deleteFolder, importImage, deleteAsset, renameNote } = useVaultStore()
+  const { deleteNote, createFolder, renameFolder, deleteFolder, importImage, deleteAsset, renameNote, renameAsset, openPathExternally } = useVaultStore()
   const { currentPath: editorPath, setCurrentPath, setContent } = useEditorStore()
 
   // 點選選單外部時關閉
@@ -454,7 +454,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
 
   const handleDeleteNote = async (e: React.MouseEvent) => {
     e.stopPropagation(); setMenuOpen(false)
-    const confirmed = await ask(`確定要刪除「${node.name}」嗎？此操作無法復原。`, { title: '刪除筆記', kind: 'warning' })
+    const confirmed = await ask(`確定要刪除「${node.path.split('/').pop() ?? node.name}」嗎？此操作無法復原。`, { title: '刪除', kind: 'warning' })
     if (!confirmed) return
     try {
       await deleteNote(node.path)
@@ -480,29 +480,60 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
 
   const handleDeleteAsset = async (e: React.MouseEvent) => {
     e.stopPropagation()
-    const confirmed = await ask(`確定要刪除圖片「${node.name}」嗎？此操作無法復原。`, { title: '刪除圖片', kind: 'warning' })
+    const confirmed = await ask(`確定要刪除「${node.name}」嗎？此操作無法復原。`, { title: '刪除', kind: 'warning' })
     if (!confirmed) return
     try { await deleteAsset(node.path); toast.success(`已刪除「${node.name}」`) }
     catch (e: any) { toast.error(e.message || '刪除失敗') }
   }
 
+  const handleRenameAsset = (e: React.MouseEvent) => {
+    e.stopPropagation(); setMenuOpen(false)
+    setRenameValue(node.name); setIsRenaming(true)
+    setTimeout(() => renameInputRef.current?.focus(), 30)
+  }
+  const handleRenameAssetSubmit = async () => {
+    setIsRenaming(false)
+    const name = renameValue.trim()
+    if (!name || name === node.name) return
+    try {
+      await renameAsset(node.path, name)
+      toast.success(`已重新命名為「${name}」`)
+    } catch (e: any) { toast.error(e.message || '重新命名失敗') }
+  }
+
   // ── 圖片節點 ──────────────────────────────────────────────
   if (node.isImage) {
     const parentEncoded = node.path.includes('/') ? node.path.split('/').slice(0, -1).join('/') : '__root__'
+    const displayName = node.path.split('/').pop() ?? node.name
     return (
       <div
         data-item-path={node.path}
         data-item-parent={parentEncoded}
-        onClick={async () => { try { await shellOpen(`${vaultPath}/${node.path}`) } catch { toast.error('無法開啟圖片') } }}
+        onClick={async () => { if (isRenaming) return; try { await openPathExternally(node.path) } catch { toast.error('無法開啟圖片') } }}
         onContextMenu={(e) => { if (isRenaming) return; e.preventDefault(); e.stopPropagation(); window.getSelection()?.removeAllRanges(); setMenuX(e.clientX); setMenuY(e.clientY); setMenuOpen(true) }}
         onMouseEnter={() => setIsHovered(true)}
         onMouseLeave={() => setIsHovered(false)}
         style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '3px 8px 3px ' + (8 + depth * 16) + 'px', cursor: 'pointer', fontSize: '13px', color: 'var(--color-text-secondary)', background: isHovered ? 'var(--color-bg-hover)' : 'transparent', borderRadius: '4px', margin: '0 4px', transition: 'background 0.1s', userSelect: 'none' }}>
         <FontAwesomeIcon icon={getFileIcon(node.name, true).icon} style={{ fontSize: '11px', flexShrink: 0, color: getFileIcon(node.name, true).color }} />
-        <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{node.name}</span>
+        {isRenaming ? (
+          <input
+            ref={renameInputRef}
+            value={renameValue}
+            onChange={(e) => setRenameValue(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleRenameAssetSubmit() } if (e.key === 'Escape') { e.stopPropagation(); setIsRenaming(false) } }}
+            onBlur={handleRenameAssetSubmit}
+            onClick={(e) => e.stopPropagation()}
+            onMouseDown={(e) => e.stopPropagation()}
+            style={{ flex: 1, padding: '1px 4px', background: 'var(--color-bg-base)', border: '1px solid var(--color-accent)', borderRadius: '3px', color: 'var(--color-text-primary)', fontSize: '13px', outline: 'none' }}
+          />
+        ) : (
+          <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayName}</span>
+        )}
         {menuOpen && (
-          <div ref={menuRef} style={{ position: 'fixed', left: menuX, top: menuY - 15, background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)', borderRadius: '6px', boxShadow: '0 4px 16px rgba(0,0,0,0.35)', zIndex: 200, minWidth: '120px', overflow: 'hidden', padding: '4px 0' }}>
-            <MenuItem icon={faTrash} label="刪除圖片" danger onClick={handleDeleteAsset} />
+          <div ref={menuRef} style={{ position: 'fixed', left: menuX, top: menuY - 15, background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)', borderRadius: '6px', boxShadow: '0 4px 16px rgba(0,0,0,0.35)', zIndex: 200, minWidth: '130px', overflow: 'hidden', padding: '4px 0' }}>
+            <MenuItem icon={faPen} label="重新命名" onClick={handleRenameAsset} />
+            <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
+            <MenuItem icon={faTrash} label="刪除" danger onClick={handleDeleteAsset} />
           </div>
         )}
       </div>
@@ -896,14 +927,14 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
         />
       ) : (
         <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: isActive ? 'var(--color-text-primary)' : 'var(--color-text-secondary)' }}>
-          {node.name}
+          {node.path.split('/').pop() ?? node.name}
         </span>
       )}
       {menuOpen && (
         <div ref={menuRef} style={{ position: 'fixed', left: menuX, top: menuY - 15, background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)', borderRadius: '6px', boxShadow: '0 4px 16px rgba(0,0,0,0.35)', zIndex: 200, minWidth: '130px', overflow: 'hidden', padding: '4px 0' }}>
           <MenuItem icon={faPen} label="重新命名" onClick={handleRenameNote} />
           <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
-          <MenuItem icon={faTrash} label="刪除筆記" danger onClick={handleDeleteNote} />
+          <MenuItem icon={faTrash} label="刪除" danger onClick={handleDeleteNote} />
         </div>
       )}
     </div>
