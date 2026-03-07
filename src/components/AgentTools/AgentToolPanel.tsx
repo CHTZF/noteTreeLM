@@ -37,7 +37,7 @@ const TOOLS: ToolDef[] = [
     label: '📁 list_structure',
     description: '列出指定資料夾路徑下的子資料夾和筆記（.md）',
     params: [
-      { key: 'path', label: '路徑 (path)', type: 'text', placeholder: '空字串 = 根目錄', required: true, defaultValue: '' },
+      { key: 'path', label: '路徑 (path)', type: 'text', placeholder: '空字串 = 根目錄', required: false, defaultValue: '' },
     ],
   },
   {
@@ -117,7 +117,8 @@ function buildInvokeArgs(tool: ToolDef, params: Record<string, string>): Record<
   const args: Record<string, unknown> = {}
   tool.params.forEach(p => {
     const v = (params[p.key] ?? '').trim()
-    if (!v && !p.required) return
+    // 非必填且無明確 defaultValue（undefined）才跳過空值；有 defaultValue（含 ''）的始終包含
+    if (!v && !p.required && p.defaultValue === undefined) return
     if (p.key === 'keywords') {
       args[p.key] = v.split(',').map(s => s.trim()).filter(Boolean)
     } else if (p.type === 'number' && v) {
@@ -270,7 +271,7 @@ function ToolCard({ tool }: ToolCardProps) {
               padding: '8px 10px', borderRadius: '6px', fontSize: '12px',
               fontFamily: 'monospace', lineHeight: 1.6,
               whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-              maxHeight: '240px', overflowY: 'auto',
+              maxHeight: '400px', overflowY: 'auto',
               background: result.ok ? 'var(--color-bg-base)' : 'rgba(239,68,68,0.08)',
               border: `1px solid ${result.ok ? 'var(--color-border)' : 'rgba(239,68,68,0.3)'}`,
               color: result.ok ? 'var(--color-text-primary)' : '#ef4444',
@@ -598,7 +599,7 @@ function PipelineBuilder() {
                   marginTop: '4px', padding: '6px 10px', borderRadius: '6px',
                   fontSize: '11px', fontFamily: 'monospace', lineHeight: 1.5,
                   whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-                  maxHeight: '160px', overflowY: 'auto',
+                  maxHeight: '300px', overflowY: 'auto',
                   background: r.ok ? 'var(--color-bg-base)' : 'rgba(239,68,68,0.08)',
                   border: `1px solid ${r.ok ? 'var(--color-border)' : 'rgba(239,68,68,0.3)'}`,
                   color: r.ok ? 'var(--color-text-primary)' : '#ef4444',
@@ -735,12 +736,11 @@ export default function AgentToolPanel({ onClose }: AgentToolPanelProps) {
         background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(2px)',
         zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center',
       }}
-      onClick={e => { if (e.target === e.currentTarget) onClose() }}
     >
       <div style={{
         width: mode === 'pipeline' ? '620px' : '560px',
         maxWidth: '96vw',
-        maxHeight: '88vh',
+        maxHeight: '94vh',
         background: 'var(--color-bg-base)',
         borderRadius: '12px',
         border: '1px solid var(--color-border)',

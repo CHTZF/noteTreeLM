@@ -227,7 +227,11 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
       listen('vault:note-deleted', () => get().loadNotes()),
       listen('vault:note-renamed', () => get().loadNotes()),
       // Agent 工具測試台寫入 commit 後觸發（create_note / update_note / create_folder）
-      listen('vault:changed', () => get().loadNotes()),
+      // 工具直接寫磁碟不更新 DB，需先 scan_vault 重建索引再 loadNotes
+      listen('vault:changed', async () => {
+        await invoke('scan_vault').catch(() => {})
+        await get().loadNotes()
+      }),
     ])
     return () => unlisteners.forEach((u) => u())
   },
