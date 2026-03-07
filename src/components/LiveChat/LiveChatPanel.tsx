@@ -239,10 +239,12 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
           drainTTSQueue()
         } else if (llmDone) {
           // All TTS done & LLM done → commit message, go back to listening
-          setMessages(prev => [...prev, {
-            role: 'assistant', content: fullResponse,
-            wikilinks: localNoteRefs.length > 0 ? localNoteRefs : undefined,
-          }])
+          if (fullResponse) {
+            setMessages(prev => [...prev, {
+              role: 'assistant', content: fullResponse,
+              wikilinks: localNoteRefs.length > 0 ? localNoteRefs : undefined,
+            }])
+          }
           setStreamingText('')
           // Use a small delay to let state settle before starting recorder again
           setTimeout(() => {
@@ -340,13 +342,15 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
       unlistenDone()
       // If TTS queue is empty and nothing is playing, transition now
       if (!ttsActive && ttsQueue.length === 0) {
-        setMessages(prev => [...prev, {
-          role: 'assistant', content: fullResponse,
-          wikilinks: localNoteRefs.length > 0 ? localNoteRefs : undefined,
-        }])
+        if (fullResponse) {
+          setMessages(prev => [...prev, {
+            role: 'assistant', content: fullResponse,
+            wikilinks: localNoteRefs.length > 0 ? localNoteRefs : undefined,
+          }])
+        }
         setStreamingText('')
         setTimeout(() => {
-          if (liveChatStateRef.current === 'thinking') {
+          if (liveChatStateRef.current === 'thinking' || liveChatStateRef.current === 'speaking') {
             transcriptRef.current = ''
             setDisplayTranscript('')
             setLiveChatState('listening')

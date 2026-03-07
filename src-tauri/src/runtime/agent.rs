@@ -89,11 +89,15 @@ impl Agent {
             Intent::Cancel | Intent::Interrupt => {
                 self.stream_cancel.store(true, Ordering::Relaxed);
                 (self.emit)("agent:cancelled".into(), Value::Null);
+                // 必須 emit llm:done，否則前端 sendToLLM 的 unlistenDone 永遠不觸發 → UI 卡在 thinking
+                (self.emit)("llm:done".into(), Value::String(String::new()));
                 return Ok(String::new());
             }
 
             // ── 確認（行內確認由 confirm_write 閉包處理；此處略過）────
             Intent::Confirm => {
+                // 必須 emit llm:done，否則前端 sendToLLM 的 unlistenDone 永遠不觸發 → UI 卡在 thinking
+                (self.emit)("llm:done".into(), Value::String(String::new()));
                 return Ok(String::new());
             }
 
