@@ -6,6 +6,8 @@ pub enum Intent {
     Interrupt,
     Cancel,
     Confirm,
+    /// 記憶查詢意圖：路由至 MemoryAgent（非串流 LLM loop）
+    Memory,
     ToolUse,
     Chat,
 }
@@ -56,6 +58,7 @@ impl IntentClassifier {
                             "CANCEL"    => Intent::Cancel,
                             "INTERRUPT" => Intent::Interrupt,
                             "CONFIRM"   => Intent::Confirm,
+                            "MEMORY"    => Intent::Memory,
                             _           => Intent::Chat,
                         };
                     }

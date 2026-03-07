@@ -7,10 +7,11 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::dispatcher::Dispatcher;
-use super::graph::ToolGraph;
 use super::intent_classifier::{Intent, IntentClassifier};
+use super::memory_agent::MemoryAgent;
+use super::planner::Planner;
 use super::transaction::Transaction;
-use super::types::{ConfirmWriteFn, EmitEventFn, LlmFn, ToolCall, TxDebugEvent};
+use super::types::{ConfirmWriteFn, EmitEventFn, LlmFn, PrefetchFn, TxDebugEvent};
 
 pub struct Agent {
     dispatcher: Dispatcher,
@@ -27,6 +28,10 @@ pub struct Agent {
     stream_cancel: Arc<AtomicBool>,
     /// 目前活躍的 session_id（與 AppState.agent_session 共享同一個 Arc）
     current_session: Arc<Mutex<Option<String>>>,
+    /// 預設工具列表（ToolUse/Chat 路徑使用；None = 不傳工具給 LLM）
+    vault_tools: Option<Value>,
+    /// 記憶預取回呼（Intent::Memory 路徑的初始種子；None = 無 vault DB）
+    prefetch_memory: Option<PrefetchFn>,
 }
 
 impl Agent {
@@ -39,6 +44,8 @@ impl Agent {
         vault_path: String,
         stream_cancel: Arc<AtomicBool>,
         current_session: Arc<Mutex<Option<String>>>,
+        vault_tools: Option<Value>,
+        prefetch_memory: Option<PrefetchFn>,
     ) -> Self {
         Self {
             dispatcher,
@@ -49,6 +56,8 @@ impl Agent {
             vault_path,
             stream_cancel,
             current_session,
+            vault_tools,
+            prefetch_memory,
         }
     }
 
@@ -63,6 +72,16 @@ impl Agent {
         mut messages: Vec<Value>,
         use_tools: bool,
     ) -> Result<String, String> {
+        // ── 記憶預取（所有意圖共用，單次 DB query）────────────────────────
+        // 結果暫存於 prefetched；Cancel/Confirm 路徑不會用到，但代價極低（<1ms 空查詢）
+        let prefetched = if let Some(ref pf) = self.prefetch_memory {
+            pf(user_input.clone()).await
+        } else {
+            String::new()
+        };
+
+        // 對 Chat/ToolUse 意圖：將記憶上下文追加到現有 system prompt 尾端
+        // （Memory 意圖會在下方整個替換 messages[0]，此處注入會被覆蓋，故暫不插入）
         let intent = self.intent_classifier.classify(&user_input).await;
 
         match intent {
@@ -78,138 +97,186 @@ impl Agent {
                 return Ok(String::new());
             }
 
-            // ── 工具使用 / 對話 → 多輪 LLM loop ──────────────────────
-            Intent::ToolUse | Intent::Chat => {
-                // 重置取消旗標，生成新 session_id
+            // ── 記憶查詢 → 替換 system prompt + 限縮工具，走串流 loop ─
+            Intent::Memory => {
+                // 串聯優化：使用頂端已預取的記憶作為初始種子注入 MemoryAgent system prompt
+                // LLM 可直接利用此上下文回答，或再呼叫 query_memory 工具深化搜尋
+                let base_system = MemoryAgent::build_system_prompt();
+                let memory_system = if prefetched.is_empty() {
+                    base_system
+                } else {
+                    format!(
+                        "{}\n\n【預先擷取的記憶上下文（可直接使用，也可再呼叫 query_memory 深化搜尋）】\n{}",
+                        base_system, prefetched
+                    )
+                };
+
+                if messages.first().and_then(|m| m["role"].as_str()) == Some("system") {
+                    messages[0] = serde_json::json!({"role": "system", "content": memory_system});
+                } else {
+                    messages.insert(0, serde_json::json!({"role": "system", "content": memory_system}));
+                }
                 self.stream_cancel.store(false, Ordering::Relaxed);
                 let session_id = Uuid::new_v4().to_string();
                 *self.current_session.lock().await = Some(session_id.clone());
+                self.run_streaming_loop(messages, Some(MemoryAgent::tools_definition()), session_id).await
+            }
 
-                // 建立 Transaction → prepare → emit
-                let tx = Arc::new(Transaction::new());
-                tx.prepare().await?;
-                self.emit_tx(&session_id, "prepare", &tx).await;
-
-                let cancel = Arc::clone(&self.stream_cancel);
-                let mut final_text = String::new();
-
-                // 多輪 LLM loop（最多 5 輪工具調用）
-                'outer: for _round in 0..5 {
-                    // 每輪前檢查取消旗標
-                    if cancel.load(Ordering::Relaxed) {
-                        let _ = tx.cancel().await;
-                        self.emit_tx(&session_id, "cancel", &tx).await;
-                        self.clear_session().await;
-                        return Ok(String::new());
-                    }
-
-                    // LLM 串流（token 由 llm_fn 內部 emit llm:token）
-                    let round = (self.llm_fn)(
-                        messages.clone(),
-                        use_tools,
-                        Some(Arc::clone(&cancel)),
-                    )
-                    .await?;
-
-                    // 串流完成後再次檢查
-                    if cancel.load(Ordering::Relaxed) {
-                        let _ = tx.cancel().await;
-                        self.emit_tx(&session_id, "cancel", &tx).await;
-                        self.clear_session().await;
-                        return Ok(String::new());
-                    }
-
-                    // 無工具呼叫 → 此輪即為最終回覆
-                    let Some((tool_id, tool_name, tool_args)) = round.tool_call else {
-                        final_text = round.full_text;
-                        break 'outer;
-                    };
-
-                    // 顯示工具呼叫給前端
-                    let display = self.tool_display(&tool_name, &tool_args);
-                    (self.emit)("agent:tool_call".into(), Value::String(display.clone()));
-
-                    // 寫入工具：emit write_request → 等待 confirm_write 回呼
-                    let approved = if self.is_write(&tool_name) {
-                        (self.emit)("agent:write_request".into(), Value::String(display.clone()));
-                        (self.confirm_write)(display).await
-                    } else {
-                        true
-                    };
-
-                    if !approved {
-                        // 用戶拒絕，注入拒絕訊息後繼續下一輪
-                        messages.push(serde_json::json!({
-                            "role": "user",
-                            "content": "用戶拒絕了此寫入操作。"
-                        }));
-                        continue 'outer;
-                    }
-
-                    // 執行工具 via Dispatcher（單節點 ToolGraph，有 Transaction + rollback）
-                    let mut graph = ToolGraph::new();
-                    graph.add_node(
-                        tool_id.clone(),
-                        ToolCall {
-                            id: tool_id.clone(),
-                            name: tool_name.clone(),
-                            args: tool_args.clone(),
-                        },
-                        vec![],
-                    );
-                    let results = self.dispatcher.run(Arc::clone(&tx), graph).await?;
-
-                    let tool_result = results
-                        .first()
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-
-                    // 發送 note_refs（read_note / search_vault）
-                    self.maybe_emit_note_refs(&tool_name, &tool_args, &tool_result);
-
-                    // 注入工具結果回 messages（native tool_calls 格式優先）
-                    if !tool_id.is_empty() {
-                        messages.push(serde_json::json!({
-                            "role": "assistant",
-                            "content": Value::Null,
-                            "tool_calls": [{
-                                "id": &tool_id,
-                                "type": "function",
-                                "function": {
-                                    "name": &tool_name,
-                                    "arguments": serde_json::to_string(&tool_args).unwrap_or_default()
-                                }
-                            }]
-                        }));
-                        messages.push(serde_json::json!({
-                            "role": "tool",
-                            "tool_call_id": &tool_id,
-                            "content": &tool_result
-                        }));
-                    } else {
-                        // text-fallback format
-                        messages.push(serde_json::json!({
-                            "role": "user",
-                            "content": format!("工具執行結果：\n\n[{}]\n{}", tool_name, tool_result)
-                        }));
+            // ── 工具使用 / 對話 → 多輪串流 LLM loop ─────────────────
+            Intent::ToolUse | Intent::Chat => {
+                // 將預取的記憶上下文追加到現有 system prompt 尾端
+                if !prefetched.is_empty() {
+                    let section = format!("\n\n以下是相關的過去對話記憶（供參考）：\n{}", prefetched);
+                    if let Some(sys) = messages.first_mut().filter(|m| m["role"] == "system") {
+                        let old = sys["content"].as_str().unwrap_or("").to_string();
+                        sys["content"] = Value::String(old + &section);
                     }
                 }
-
-                // 所有輪次完成（或 5 輪耗盡）→ commit → emit done
-                tx.commit().await?;
-                self.emit_tx(&session_id, "commit", &tx).await;
-                self.clear_session().await;
-
-                (self.emit)(
-                    "llm:stderr".into(),
-                    Value::String(format!("[agent] 完成，回應 {} 字元", final_text.len())),
-                );
-                (self.emit)("llm:done".into(), Value::String(final_text.clone()));
-
-                Ok(final_text)
+                self.stream_cancel.store(false, Ordering::Relaxed);
+                let session_id = Uuid::new_v4().to_string();
+                *self.current_session.lock().await = Some(session_id.clone());
+                let tools = if use_tools { self.vault_tools.clone() } else { None };
+                self.run_streaming_loop(messages, tools, session_id).await
             }
         }
+    }
+
+    /// 多輪 LLM 串流 loop（最多 5 輪工具呼叫）
+    ///
+    /// - `tools`：None = 不傳工具；Some(json) = 傳指定工具列表
+    /// - 每輪 LLM 回應的所有工具呼叫由 Planner 轉成 ToolGraph，Dispatcher 執行
+    async fn run_streaming_loop(
+        &self,
+        mut messages: Vec<Value>,
+        tools: Option<Value>,
+        session_id: String,
+    ) -> Result<String, String> {
+        // 建立 Transaction → prepare → emit
+        let tx = Arc::new(Transaction::new());
+        tx.prepare().await?;
+        self.emit_tx(&session_id, "prepare", &tx).await;
+
+        let cancel = Arc::clone(&self.stream_cancel);
+        let mut final_text = String::new();
+
+        'outer: for _round in 0..5 {
+            // 每輪前檢查取消旗標
+            if cancel.load(Ordering::Relaxed) {
+                let _ = tx.cancel().await;
+                self.emit_tx(&session_id, "cancel", &tx).await;
+                self.clear_session().await;
+                return Ok(String::new());
+            }
+
+            // LLM 串流（token 由 llm_fn 內部 emit llm:token）
+            let round = (self.llm_fn)(
+                messages.clone(),
+                tools.clone(),
+                Some(Arc::clone(&cancel)),
+            )
+            .await?;
+
+            // 串流完成後再次檢查
+            if cancel.load(Ordering::Relaxed) {
+                let _ = tx.cancel().await;
+                self.emit_tx(&session_id, "cancel", &tx).await;
+                self.clear_session().await;
+                return Ok(String::new());
+            }
+
+            // 無工具呼叫 → 此輪即為最終回覆
+            if round.tool_calls.is_empty() {
+                final_text = round.full_text;
+                break 'outer;
+            }
+
+            // ── 顯示所有工具呼叫給前端 ────────────────────────────────
+            for (_, tool_name, tool_args) in &round.tool_calls {
+                let display = self.tool_display(tool_name, tool_args);
+                (self.emit)("agent:tool_call".into(), Value::String(display));
+            }
+
+            // ── 寫入工具確認（批次：任一需確認則整批詢問一次）─────────
+            let has_write = round.tool_calls.iter().any(|(_, n, _)| self.is_write(n));
+            if has_write {
+                let batch_display = round.tool_calls.iter()
+                    .filter(|(_, n, _)| self.is_write(n))
+                    .map(|(_, n, a)| self.tool_display(n, a))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (self.emit)("agent:write_request".into(), Value::String(batch_display.clone()));
+                let approved = (self.confirm_write)(batch_display).await;
+                if !approved {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": "用戶拒絕了此寫入操作。"
+                    }));
+                    continue 'outer;
+                }
+            }
+
+            // ── Planner 建立 ToolGraph，Dispatcher 執行 ───────────────
+            let graph = Planner::plan(&round.tool_calls);
+            let results = self.dispatcher.run(Arc::clone(&tx), graph).await?;
+
+            // ── 發送 note_refs（每個工具分別檢查）────────────────────
+            for ((_, tool_name, tool_args), result) in round.tool_calls.iter().zip(results.iter()) {
+                self.maybe_emit_note_refs(tool_name, tool_args, result.as_str().unwrap_or(""));
+            }
+
+            // ── 注入工具結果回 messages ────────────────────────────────
+            let use_native = round.tool_calls.first().map(|(id, _, _)| !id.is_empty()).unwrap_or(false);
+            if use_native {
+                // Native OpenAI format：一個 assistant turn + 每工具一個 tool turn
+                let tool_calls_json: Vec<Value> = round.tool_calls.iter()
+                    .map(|(id, name, args)| serde_json::json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": serde_json::to_string(args).unwrap_or_default()
+                        }
+                    }))
+                    .collect();
+                messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "tool_calls": tool_calls_json
+                }));
+                for ((tool_id, _, _), result) in round.tool_calls.iter().zip(results.iter()) {
+                    messages.push(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": tool_id,
+                        "content": result.as_str().unwrap_or("")
+                    }));
+                }
+            } else {
+                // 文字格式 fallback：所有結果合併成一個 user 訊息
+                let combined = round.tool_calls.iter().zip(results.iter())
+                    .map(|((_, name, _), result)| {
+                        format!("[{}]\n{}", name, result.as_str().unwrap_or(""))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!("工具執行結果：\n\n{}", combined)
+                }));
+            }
+        }
+
+        // 所有輪次完成（或 5 輪耗盡）→ commit → emit done
+        tx.commit().await?;
+        self.emit_tx(&session_id, "commit", &tx).await;
+        self.clear_session().await;
+
+        (self.emit)(
+            "llm:stderr".into(),
+            Value::String(format!("[agent] 完成，回應 {} 字元", final_text.len())),
+        );
+        (self.emit)("llm:done".into(), Value::String(final_text.clone()));
+
+        Ok(final_text)
     }
 
     // ── helpers ──────────────────────────────────────────────────
@@ -249,6 +316,7 @@ impl Agent {
             "update_note" => format!("✏️  更新筆記: {}", args["path"].as_str().unwrap_or("")),
             "create_folder" => format!("📁 建立資料夾: {}", args["path"].as_str().unwrap_or("")),
             "query_memory" => "🧠 查詢記憶".into(),
+            "add_memory_rule" => format!("🧠 新增記憶規則: {}", args["pattern"].as_str().unwrap_or("")),
             _ => format!("[{}]", name),
         }
     }

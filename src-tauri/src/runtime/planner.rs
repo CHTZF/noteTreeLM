@@ -6,45 +6,22 @@ use serde_json::Value;
 pub struct Planner;
 
 impl Planner {
-
-    pub fn plan(
-        llm_output: Value,
-    ) -> ToolGraph {
-
+    /// 將 LLM 回傳的工具呼叫清單轉成循序 ToolGraph（A→B→C dep chain）。
+    ///
+    /// 文字格式的 tool calls id 可能為空，此處補上 `call_{i}` 確保 HashMap key 唯一。
+    pub fn plan(tool_calls: &[(String, String, Value)]) -> ToolGraph {
         let mut graph = ToolGraph::new();
-
-        let tools = llm_output
-            .as_array()
-            .unwrap();
-
         let mut prev: Option<String> = None;
 
-        for t in tools {
-
-            let id = t["id"].as_str().unwrap().to_string();
-
-            let name = t["name"].as_str().unwrap().to_string();
-
-            let args = t["args"].clone();
-
-            let deps = match &prev {
-
-                Some(p) => vec![p.clone()],
-
-                None => vec![],
-            };
-
+        for (i, (id, name, args)) in tool_calls.iter().enumerate() {
+            let eid = if id.is_empty() { format!("call_{}", i) } else { id.clone() };
+            let deps = prev.iter().cloned().collect();
             graph.add_node(
-                id.clone(),
-                ToolCall {
-                    id: id.clone(),
-                    name,
-                    args,
-                },
+                eid.clone(),
+                ToolCall { id: eid.clone(), name: name.clone(), args: args.clone() },
                 deps,
             );
-
-            prev = Some(id);
+            prev = Some(eid);
         }
 
         graph

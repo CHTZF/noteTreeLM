@@ -1,166 +1,26 @@
 // memory_agent.rs
 //
-// MemoryAgent：非串流 LLM agent，專責記憶筆記的時間解析與查詢。
-//
-// 架構與 agent.rs 相同：以依賴注入（LLM fn + 工具 fn）避免直接依賴 reqwest / sqlx。
+// MemoryAgent：提供記憶查詢的系統 Prompt 與工具定義（無狀態靜態方法）。
 //
 // 公開入口：
-//   run_memory_agent() — 便利函數（供 commands/ai.rs 的 resolve_memory_context fallback 呼叫）
-//   MemoryAgent        — 可獨立構建的 struct（測試 / 擴充時可換注入）
+//   MemoryAgent::build_system_prompt() — 動態建立記憶查詢系統提示詞
+//   MemoryAgent::tools_definition()    — query_memory + add_memory_rule 工具定義
 //
-// 層次：
-//   MemoryAgent::run()  — 多輪 LLM loop（最多 4 輪）
-//   MemoryAgent::dispatch() — 工具分派（query_memory / add_memory_rule）
-//   parse_query_since*  — 時間表達式解析（純 Rust，< 1µs）
-//   tool_query_memory   — 查詢記憶 DB，格式化純文字
-//   parse_text_tool_calls — 解析 <tool_call>...</tool_call> 格式
-
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
+// 輔助函式：
+//   parse_query_since*                 — 時間表達式解析（純 Rust，< 1µs）
+//   tool_query_memory                  — 查詢記憶 DB，格式化純文字
+//   parse_text_tool_calls              — 解析 <tool_call>...</tool_call> 格式
 
 use chrono::{Datelike, Local};
 use serde_json::Value;
 use sqlx::SqlitePool;
-use std::time::Duration;
-
-use crate::error::AppError;
-
-// ── 回呼型別（與 types.rs 中的 LlmFn 平行，但針對非串流場景）─────────────────
-
-/// 非串流 LLM 回呼
-/// 參數：api_messages（已含 system prompt）
-/// 回傳：choices\[0\] JSON（含 finish_reason 和 message）
-pub type MemoryLlmFn = Arc<
-    dyn Fn(Vec<Value>) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>
-    + Send + Sync
->;
-
-/// query_memory 工具回呼：(keywords, since, limit) → result_text
-pub type QueryMemoryFn = Arc<
-    dyn Fn(Vec<String>, Option<String>, Option<usize>) -> Pin<Box<dyn Future<Output = String> + Send>>
-    + Send + Sync
->;
-
-/// add_memory_rule 工具回呼：(pattern_type, pattern, value) → result_text
-pub type AddRuleFn = Arc<
-    dyn Fn(String, String, String) -> Pin<Box<dyn Future<Output = String> + Send>>
-    + Send + Sync
->;
 
 // ── MemoryAgent ───────────────────────────────────────────────────────────────
 
-/// 記憶查詢 Agent（非串流 LLM loop）
-///
-/// 依賴注入策略與 `Agent` 相同：
-/// - `llm_fn`          — HTTP 請求由外層注入，避免 runtime 直接依賴 reqwest
-/// - `query_memory_fn` — DB 查詢由外層注入，避免 runtime 直接依賴 sqlx
-/// - `add_rule_fn`     — DB 寫入由外層注入
-pub struct MemoryAgent {
-    /// 非串流 LLM 回呼（由外層注入）
-    llm_fn: MemoryLlmFn,
-    /// query_memory 工具回呼
-    query_memory_fn: QueryMemoryFn,
-    /// add_memory_rule 工具回呼
-    add_rule_fn: AddRuleFn,
-}
+/// 記憶查詢的系統 Prompt 與工具定義提供者（無狀態，僅提供靜態方法）
+pub struct MemoryAgent;
 
 impl MemoryAgent {
-    pub fn new(
-        llm_fn: MemoryLlmFn,
-        query_memory_fn: QueryMemoryFn,
-        add_rule_fn: AddRuleFn,
-    ) -> Self {
-        Self { llm_fn, query_memory_fn, add_rule_fn }
-    }
-
-    /// 主執行函數
-    ///
-    /// 以 `query` 為起點，最多 4 輪工具呼叫，回傳記憶摘要文字。
-    pub async fn run(&self, query: &str) -> Result<String, String> {
-        let system = Self::build_system_prompt();
-
-        let mut messages: Vec<Value> = vec![
-            serde_json::json!({"role": "user", "content": query}),
-        ];
-
-        for _ in 0..4 {
-            // 組裝含 system prompt 的完整 messages
-            let mut api_messages = vec![serde_json::json!({"role": "system", "content": &system})];
-            api_messages.extend(messages.iter().cloned());
-
-            // 非串流 LLM 呼叫（llm_fn 負責 HTTP 與 tools 注入）
-            let choice = (self.llm_fn)(api_messages).await?;
-            let message = &choice["message"];
-            let content_str = message["content"].as_str().unwrap_or("").to_string();
-            let finish_reason = choice["finish_reason"].as_str().unwrap_or("");
-            let tool_calls_arr = message["tool_calls"].as_array();
-            let has_native_calls = tool_calls_arr.map(|a| !a.is_empty()).unwrap_or(false);
-
-            if finish_reason != "tool_calls" && !has_native_calls {
-                // ── 嘗試解析文字格式工具調用 <tool_call>...</tool_call> ──
-                let text_calls = parse_text_tool_calls(&content_str);
-                if text_calls.is_empty() {
-                    // 無工具調用 → 最終回覆
-                    return Ok(content_str);
-                }
-
-                // 文字格式：全部分派，結果以 user 訊息注入（模型不支援 role:tool）
-                messages.push(serde_json::json!({"role": "assistant", "content": &content_str}));
-                let mut results = Vec::new();
-                for call in &text_calls {
-                    let tool_name = call["function"]["name"].as_str().unwrap_or("");
-                    let args: Value = serde_json::from_str(
-                        call["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or_default();
-                    results.push(self.dispatch(tool_name, &args).await);
-                }
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": format!("以下是工具結果，請整理後回答：\n\n{}", results.join("\n\n"))
-                }));
-            } else {
-                // ── 標準 OpenAI tool_calls 格式 ──
-                messages.push(message.clone());
-                for call in tool_calls_arr.cloned().unwrap_or_default() {
-                    let tool_id   = call["id"].as_str().unwrap_or("").to_string();
-                    let tool_name = call["function"]["name"].as_str().unwrap_or("");
-                    let args: Value = serde_json::from_str(
-                        call["function"]["arguments"].as_str().unwrap_or("{}")).unwrap_or_default();
-                    let result = self.dispatch(tool_name, &args).await;
-                    messages.push(serde_json::json!({
-                        "role": "tool", "tool_call_id": tool_id, "content": result
-                    }));
-                }
-            }
-
-        }
-
-        Ok("未找到相關記憶".to_string())
-    }
-
-    // ── helpers ──────────────────────────────────────────────────────────────
-
-    /// 分派工具呼叫到對應的回呼函式
-    async fn dispatch(&self, tool_name: &str, args: &Value) -> String {
-        match tool_name {
-            "query_memory" => {
-                let keywords: Vec<String> = args["keywords"].as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
-                let since = args["since"].as_str().map(String::from);
-                let limit = args["limit"].as_u64().map(|v| v as usize);
-                (self.query_memory_fn)(keywords, since, limit).await
-            }
-            "add_memory_rule" => {
-                let ptype   = args["pattern_type"].as_str().unwrap_or("").to_string();
-                let pattern = args["pattern"].as_str().unwrap_or("").to_string();
-                let value   = args["value"].as_str().unwrap_or("").to_string();
-                (self.add_rule_fn)(ptype, pattern, value).await
-            }
-            other => format!("未知工具：{}", other),
-        }
-    }
-
     /// 記憶查詢 System Prompt（含今日/昨日等動態日期）
     pub fn build_system_prompt() -> String {
         let now = Local::now();
@@ -234,64 +94,6 @@ impl MemoryAgent {
             }
         ])
     }
-}
-
-// ── 便利函數（保留原有介面，供 commands/ai.rs 直接呼叫）────────────────────────
-
-/// 建立 MemoryAgent 並執行（ai.rs 的 resolve_memory_context fallback 入口）
-///
-/// 注入策略：
-///   llm_fn          — reqwest 請求（capture: client, base_url, tools）
-///   query_memory_fn — tool_query_memory（capture: vault_db clone）
-///   add_rule_fn     — add_memory_rule_to_db（capture: vault_db clone）
-pub(crate) async fn run_memory_agent(vault_db: &SqlitePool, query: &str, port: u16) -> Result<String, AppError> {
-    let base_url = format!("http://127.0.0.1:{}", port);
-    let client = reqwest::Client::new();
-    let tools = MemoryAgent::tools_definition();
-
-    // ── llm_fn：封裝非串流 HTTP 請求 ───────────────────────────────────────
-    let llm_fn: MemoryLlmFn = Arc::new(move |api_messages| {
-        let client    = client.clone();
-        let base_url  = base_url.clone();
-        let tools_ref = tools.clone();
-        Box::pin(async move {
-            let body = serde_json::json!({
-                "model": "local",
-                "messages": api_messages,
-                "tools": tools_ref,
-                "tool_choice": "auto",
-                "max_tokens": 1024,
-                "stream": false,
-            });
-            let json: Value = client
-                .post(format!("{}/v1/chat/completions", base_url))
-                .json(&body)
-                .timeout(Duration::from_secs(60))
-                .send().await
-                .map_err(|e| format!("memory_agent 請求失敗：{}", e))?
-                .json().await
-                .map_err(|e| format!("memory_agent 回應解析失敗：{}", e))?;
-            Ok(json["choices"][0].clone())
-        })
-    });
-
-    // ── query_memory_fn：封裝 DB 查詢 ──────────────────────────────────────
-    let db_q = vault_db.clone();
-    let query_memory_fn: QueryMemoryFn = Arc::new(move |keywords, since, limit| {
-        let db = db_q.clone();
-        Box::pin(async move { tool_query_memory(keywords, since, limit, &db).await })
-    });
-
-    // ── add_rule_fn：封裝 DB 寫入 ──────────────────────────────────────────
-    let db_r = vault_db.clone();
-    let add_rule_fn: AddRuleFn = Arc::new(move |ptype, pattern, value| {
-        let db = db_r.clone();
-        Box::pin(async move { add_memory_rule_to_db(&db, &ptype, &pattern, &value).await })
-    });
-
-    MemoryAgent::new(llm_fn, query_memory_fn, add_rule_fn)
-        .run(query).await
-        .map_err(AppError::AI)
 }
 
 // ── 字元工具 ─────────────────────────────────────────────────────────────────
@@ -451,7 +253,7 @@ pub(crate) fn extract_cjk_bigrams_with_extra_stops(query: &str, extra_stops: &[c
 
 // ── 記憶 DB 工具 ──────────────────────────────────────────────────────────────
 
-/// 將規則寫入 memory_rules 表（供 add_rule_fn 與 add_memory_rule command 共用）
+/// 將規則寫入 memory_rules 表（供 add_memory_rule command 共用）
 pub(crate) async fn add_memory_rule_to_db(db: &SqlitePool, pattern_type: &str, pattern: &str, value: &str) -> String {
     match sqlx::query(
         "INSERT OR REPLACE INTO memory_rules(pattern_type, pattern, value) VALUES (?, ?, ?)"

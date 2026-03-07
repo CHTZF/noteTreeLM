@@ -1,7 +1,7 @@
 use crate::{db::queries, error::AppError, state::AppState};
 use crate::runtime::memory_agent::{
     extract_cjk_bigrams_with_extra_stops, format_memory_rows, load_memory_rules,
-    parse_query_since_with_rules, parse_text_tool_calls, run_memory_agent, tool_query_memory,
+    parse_query_since_with_rules, parse_text_tool_calls, tool_query_memory,
 };
 use chrono::Local;
 use futures_util::StreamExt;
@@ -383,7 +383,7 @@ pub async fn invoke_agent(
     use crate::runtime::dispatcher::Dispatcher;
     use crate::runtime::intent_classifier::IntentClassifier;
     use crate::runtime::tool_registry::ToolRegistry;
-    use crate::runtime::types::{ConfirmWriteFn, EmitEventFn, LlmFn, LlmRound};
+    use crate::runtime::types::{ConfirmWriteFn, EmitEventFn, LlmFn, LlmRound, PrefetchFn};
 
     // 1. 確保 llama-server 運行，取得 base_url
     let base_url = ensure_server_running(state.inner(), &app).await?;
@@ -404,8 +404,8 @@ pub async fn invoke_agent(
 
     // 4. 建立 ToolRegistry（vault 可用時注入工具）
     let registry = if !vault_path.is_empty() {
-        if let Some(db) = vault_db_opt {
-            crate::tools::build_vault_registry(vault_path.clone(), db, app.clone())
+        if let Some(ref db) = vault_db_opt {
+            crate::tools::build_vault_registry(vault_path.clone(), db.clone(), app.clone())
         } else {
             Arc::new(ToolRegistry::new())
         }
@@ -414,17 +414,16 @@ pub async fn invoke_agent(
     };
 
     // 5. llm_fn：執行一輪 LLM 串流，返回 LlmRound
-    let tools_def = vault_tools();
+    //    tools_opt: None = 不傳工具；Some(json) = 傳指定工具列表（由 Agent 決定）
     let client_fn = client.clone();
     let base_fn = base_url.clone();
     let app_fn = app.clone();
-    let llm_fn: LlmFn = Arc::new(move |msgs, with_tools, cancel| {
+    let llm_fn: LlmFn = Arc::new(move |msgs, tools_opt, cancel| {
         let client = client_fn.clone();
         let base = base_fn.clone();
         let app = app_fn.clone();
-        let tools = tools_def.clone();
         Box::pin(async move {
-            let body = if with_tools {
+            let body = if let Some(tools) = tools_opt {
                 serde_json::json!({
                     "messages": msgs,
                     "tools": tools,
@@ -444,8 +443,8 @@ pub async fn invoke_agent(
             let result = send_streaming_request(&client, &base, body, &app, cancel)
                 .await
                 .map_err(|e| e.to_string())?;
-            let tool_call = detect_tool_call(&result);
-            Ok(LlmRound { full_text: result.full_text, tool_call })
+            let tool_calls = detect_tool_calls(&result);
+            Ok(LlmRound { full_text: result.full_text, tool_calls })
         })
     });
 
@@ -470,6 +469,67 @@ pub async fn invoke_agent(
     });
 
     // 8. 建立 Agent，執行
+    //    vault_tools: Agent 在 ToolUse/Chat 路徑使用（None = 無 vault 工具）
+    //    Intent::Memory 路徑由 Agent 自行注入 MemoryAgent::tools_definition()
+    let vault_tools_opt = if !vault_path.is_empty() && vault_db_opt.is_some() {
+        Some(vault_tools())
+    } else {
+        None
+    };
+
+    // 9. prefetch_memory：Intent::Memory 路徑的純 Rust 預取（<100ms，無 LLM）
+    //    有結果 → 注入 system prompt 作為初始種子；無結果 → 空字串，LLM 自行用 query_memory 搜尋
+    let prefetch_memory: Option<PrefetchFn> = if let Some(ref db) = vault_db_opt {
+        let db_pf = db.clone();
+        Some(Arc::new(move |query: String| {
+            let db = db_pf.clone();
+            Box::pin(async move {
+                let now = Local::now();
+                let rules = load_memory_rules(&db).await;
+                let extra_stops: Vec<char> = rules.iter()
+                    .filter(|(pt, _, _)| pt == "stopword")
+                    .filter_map(|(_, pattern, _)| pattern.chars().next())
+                    .collect();
+                let since_ts = parse_query_since_with_rules(&query, &now, &rules);
+                let terms = extract_cjk_bigrams_with_extra_stops(&query, &extra_stops);
+                let limit = 3i64;
+
+                let rows: Vec<(String, String, i64)> = if terms.is_empty() {
+                    sqlx::query_as::<_, (String, String, i64)>(
+                        "SELECT path, title, created_at FROM notes
+                         WHERE path LIKE 'memories/ai_memory_%'
+                         ORDER BY created_at DESC LIMIT ?"
+                    )
+                    .bind(limit).fetch_all(&db).await.unwrap_or_default()
+                    .into_iter().filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min))
+                    .collect()
+                } else {
+                    let conditions: String = terms.iter()
+                        .map(|t| format!("content LIKE '%{}%'", t))
+                        .collect::<Vec<_>>().join(" OR ");
+                    let sql = format!(
+                        "SELECT path, title, created_at FROM notes
+                         WHERE path LIKE 'memories/ai_memory_%' AND ({})
+                         ORDER BY created_at DESC LIMIT {}",
+                        conditions, limit
+                    );
+                    sqlx::query_as::<_, (String, String, i64)>(&sql)
+                        .fetch_all(&db).await.unwrap_or_default()
+                        .into_iter().filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min))
+                        .collect()
+                };
+
+                if rows.is_empty() {
+                    String::new()
+                } else {
+                    format_memory_rows(&rows, "", &db).await
+                }
+            })
+        }))
+    } else {
+        None
+    };
+
     let agent = Agent::new(
         Dispatcher::new(registry),
         IntentClassifier::new(state.settings_db.clone()),
@@ -479,6 +539,8 @@ pub async fn invoke_agent(
         vault_path,
         Arc::clone(&state.agent_cancel),
         Arc::clone(&state.agent_session),
+        vault_tools_opt,
+        prefetch_memory,
     );
 
     agent
@@ -1525,29 +1587,30 @@ fn is_write_tool(name: &str) -> bool {
     matches!(name, "create_note" | "update_note" | "create_folder")
 }
 
-/// 從 StreamResult 提取 tool call（native 格式優先，fallback 文字格式）
-/// 回傳 (tool_id, tool_name, tool_args)
-fn detect_tool_call(
+/// 從 StreamResult 提取所有 tool calls（native 格式優先，fallback 文字格式）
+/// 回傳 Vec<(tool_id, tool_name, tool_args)>，空 Vec 表示純文字回覆
+fn detect_tool_calls(
     result: &StreamResult,
-) -> Option<(String, String, serde_json::Value)> {
-    // Native OpenAI tool_calls 格式
+) -> Vec<(String, String, serde_json::Value)> {
+    // Native OpenAI tool_calls 格式（可能多個）
     if result.finish_reason == "tool_calls" && !result.tool_call_chunks.is_empty() {
-        let acc = &result.tool_call_chunks[0];
-        let args: serde_json::Value =
-            serde_json::from_str(&acc.arguments).unwrap_or(serde_json::json!({}));
-        return Some((acc.id.clone(), acc.name.clone(), args));
+        return result.tool_call_chunks.iter().map(|acc| {
+            let args: serde_json::Value =
+                serde_json::from_str(&acc.arguments).unwrap_or(serde_json::json!({}));
+            (acc.id.clone(), acc.name.clone(), args)
+        }).collect();
     }
-    // 文字格式 fallback <tool_call>...</tool_call>
+    // 文字格式 fallback <tool_call>...</tool_call>（可能多個）
     if result.full_text.contains("<tool_call>") {
-        if let Some(call) = parse_text_tool_calls(&result.full_text).into_iter().next() {
+        return parse_text_tool_calls(&result.full_text).into_iter().map(|call| {
             let name = call["function"]["name"].as_str().unwrap_or("").to_string();
             let args_str = call["function"]["arguments"].as_str().unwrap_or("{}");
             let args: serde_json::Value =
                 serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
-            return Some((String::new(), name, args));
-        }
+            (String::new(), name, args)
+        }).collect();
     }
-    None
+    vec![]
 }
 
 /// 分派工具調用到對應的實作函式
@@ -1682,6 +1745,55 @@ pub async fn delete_memory_rule(state: State<'_, AppState>, id: i64) -> Result<(
     let db = state.get_vault_db().await?;
     sqlx::query("DELETE FROM memory_rules WHERE id = ?")
         .bind(id).execute(&db).await?;
+    Ok(())
+}
+
+// ─── Intent Keywords CRUD ─────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct IntentKeywordsRow {
+    pub intent: String,
+    pub keywords: Vec<String>,
+}
+
+/// 取得所有 intent_keywords 列（供設定頁面顯示）
+#[tauri::command]
+pub async fn get_intent_keywords(
+    state: State<'_, AppState>,
+) -> Result<Vec<IntentKeywordsRow>, AppError> {
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT intent, keywords FROM intent_keywords ORDER BY intent"
+    )
+    .fetch_all(&state.settings_db).await?;
+    Ok(rows.into_iter().map(|(intent, kw_json)| {
+        let keywords: Vec<String> = serde_json::from_str(&kw_json).unwrap_or_default();
+        IntentKeywordsRow { intent, keywords }
+    }).collect())
+}
+
+/// 新增或更新一個 intent 的完整 keywords 列表
+#[tauri::command]
+pub async fn save_intent_keywords(
+    state: State<'_, AppState>,
+    intent: String,
+    keywords: Vec<String>,
+) -> Result<(), AppError> {
+    let kw_json = serde_json::to_string(&keywords).unwrap_or_else(|_| "[]".into());
+    sqlx::query("INSERT OR REPLACE INTO intent_keywords(intent, keywords) VALUES (?, ?)")
+        .bind(&intent).bind(&kw_json)
+        .execute(&state.settings_db).await?;
+    Ok(())
+}
+
+/// 刪除整個 intent 列（包含其所有 keywords）
+#[tauri::command]
+pub async fn delete_intent_row(
+    state: State<'_, AppState>,
+    intent: String,
+) -> Result<(), AppError> {
+    sqlx::query("DELETE FROM intent_keywords WHERE intent = ?")
+        .bind(&intent)
+        .execute(&state.settings_db).await?;
     Ok(())
 }
 
@@ -1837,87 +1949,6 @@ pub async fn query_memory(
         .collect();
 
     Ok(results)
-}
-
-// ─── resolve_memory_context（純 Rust，取代 memory_agent）─────────────────────
-//
-// 延遲 < 100ms（無 LLM 呼叫）：
-//   1. 解析查詢中的時間表達式 → since_ts
-//   2. 提取 CJK 雙字元 n-gram → LIKE 條件（繞過 FTS CJK 斷詞問題）
-//   3. 降級策略：LIKE 找不到 → 取最新一筆
-//   4. 回傳格式化純文字，供 stream_chat system 注入
-
-
-#[tauri::command]
-pub async fn resolve_memory_context(
-    state: State<'_, AppState>,
-    query: String,
-) -> Result<String, AppError> {
-    let now = Local::now();
-    let db = state.get_vault_db().await?;
-
-    // 1. 載入自訂規則（來自 memory_rules 表，由 memory_agent 自動學習新增）
-    let rules = load_memory_rules(&db).await;
-    let extra_stops: Vec<char> = rules.iter()
-        .filter(|(pt, _, _)| pt == "stopword")
-        .filter_map(|(_, pattern, _)| pattern.chars().next())
-        .collect();
-
-    // 2. 套用規則解析時間表達式 + 提取搜尋詞
-    let since_ts = parse_query_since_with_rules(&query, &now, &rules);
-    let terms = extract_cjk_bigrams_with_extra_stops(&query, &extra_stops);
-
-    let limit = 3i64;
-    let rows: Vec<(String, String, i64)> = if terms.is_empty() {
-        sqlx::query_as::<_, (String, String, i64)>(
-            "SELECT path, title, created_at FROM notes
-             WHERE path LIKE 'memories/ai_memory_%'
-             ORDER BY created_at DESC LIMIT ?"
-        )
-        .bind(limit).fetch_all(&db).await.unwrap_or_default()
-        .into_iter().filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min))
-        .collect()
-    } else {
-        // CJK bigrams → LIKE 搜尋（terms 只含 CJK 字元，無 SQL injection 風險）
-        let conditions: String = terms.iter()
-            .map(|t| format!("content LIKE '%{}%'", t))
-            .collect::<Vec<_>>().join(" OR ");
-        let sql = format!(
-            "SELECT path, title, created_at FROM notes
-             WHERE path LIKE 'memories/ai_memory_%' AND ({})
-             ORDER BY created_at DESC LIMIT {}",
-            conditions, limit
-        );
-        let mut rows = sqlx::query_as::<_, (String, String, i64)>(&sql)
-            .fetch_all(&db).await.unwrap_or_default()
-            .into_iter().filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min))
-            .collect::<Vec<_>>();
-
-        // LIKE 無結果 → 降級取最新 1 筆（仍受 since 篩選）
-        if rows.is_empty() {
-            rows = sqlx::query_as::<_, (String, String, i64)>(
-                "SELECT path, title, created_at FROM notes
-                 WHERE path LIKE 'memories/ai_memory_%'
-                 ORDER BY created_at DESC LIMIT 1"
-            )
-            .fetch_all(&db).await.unwrap_or_default()
-            .into_iter().filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min))
-            .collect();
-        }
-        rows
-    };
-
-    // 3. Rust 找到結果 → 直接回傳（快速路徑）
-    if !rows.is_empty() {
-        return Ok(format_memory_rows(&rows, "", &db).await);
-    }
-
-    // 4. Rust 完全找不到（since 過濾後也空） → fallback 到 memory_agent（LLM）
-    //    memory_agent 可辨識新時間表達式並呼叫 add_memory_rule 自我學習
-    let port = queries::get_setting(&state.settings_db, "llama_server_port")
-        .await.unwrap_or_default().unwrap_or_else(|| "8080".to_string())
-        .parse::<u16>().unwrap_or(8080);
-    run_memory_agent(&db, &query, port).await
 }
 
 /// 直接測試單一 Agent 工具，供 debug 面板使用

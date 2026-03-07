@@ -16,7 +16,7 @@ use crate::commands::ai::{
     resolve_vault_path, tool_create_folder, tool_create_note, tool_list_structure,
     tool_read_note, tool_search_vault, tool_update_note,
 };
-use crate::runtime::memory_agent::tool_query_memory;
+use crate::runtime::memory_agent::{add_memory_rule_to_db, tool_query_memory};
 use crate::runtime::tool_registry::ToolRegistry;
 use crate::runtime::types::Tool;
 
@@ -229,6 +229,26 @@ pub fn build_vault_registry(
                         Ok(Value::Null)
                     })
                 })),
+            },
+        );
+    }
+
+    // add_memory_rule — 讓 LLM 學習新的時間表達式規則（冪等，rollback 不需要）
+    {
+        let db = vault_db.clone();
+        registry.register(
+            "add_memory_rule".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let ptype   = args["pattern_type"].as_str().unwrap_or("").to_string();
+                    let pattern = args["pattern"].as_str().unwrap_or("").to_string();
+                    let value   = args["value"].as_str().unwrap_or("").to_string();
+                    let db = db.clone();
+                    Box::pin(async move {
+                        Ok(Value::String(add_memory_rule_to_db(&db, &ptype, &pattern, &value).await))
+                    })
+                }),
+                rollback: None,
             },
         );
     }

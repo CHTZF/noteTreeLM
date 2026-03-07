@@ -239,24 +239,8 @@ export default function ChatPanel({ liveChatActive = false }: { liveChatActive?:
           ? `你是一個筆記助手。以下是使用者目前開啟的筆記內容，請根據此內容協助回答問題：\n\n${noteContent.slice(0, 4000)}`
           : null
 
-      // 若有記憶存檔，由 resolve_memory_context 查詢（純 Rust，< 100ms）
-      let memoryPart: string | null = null
-      if (lastMemoryPath) {
-        try {
-          const memorySummary = await invoke<string>('resolve_memory_context', { query: text })
-          if (memorySummary) {
-            memoryPart = `以下是相關的過去對話記憶（供參考）：\n\n${memorySummary}`
-            log(`  帶入記憶摘要（${memorySummary.length} 字元）`)
-          } else {
-            log('  resolve_memory_context：無相關記憶，略過注入')
-          }
-        } catch (e) {
-          const msg = typeof e === 'string' ? e : e instanceof Error ? e.message : String(e)
-          err('resolve_memory_context 查詢失敗：' + msg)
-        }
-      }
-
-      const system = [notePart, memoryPart].filter(Boolean).join('\n\n') || undefined
+      // 記憶上下文由 agent 內部自動預取注入（prefetch_memory），前端不需再呼叫 resolve_memory_context
+      const system = notePart || undefined
       if (system) log(`  帶入 system 上下文（${system.length} 字元）`)
 
       // 監聽工具調用顯示

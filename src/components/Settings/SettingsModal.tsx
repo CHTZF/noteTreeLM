@@ -34,7 +34,12 @@ interface MemoryRuleEntry {
   created_at: number
 }
 
-type Tab = 'general' | 'ai' | 'voice' | 'local' | 'advanced' | 'raw'
+interface IntentKeywordsRow {
+  intent: string
+  keywords: string[]
+}
+
+type Tab = 'general' | 'ai' | 'voice' | 'local' | 'advanced' | 'raw' | 'intent' | 'memory'
 type ServerStatus = 'unknown' | 'running' | 'loading' | 'stopped'
 
 // Provider → 預設模型清單
@@ -96,6 +101,14 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
 
   const [memoryRules, setMemoryRules] = useState<MemoryRuleEntry[]>([])
   const [memoryRulesLoading, setMemoryRulesLoading] = useState(false)
+  const [newRuleType, setNewRuleType] = useState<string>('temporal_exact_days')
+  const [newRulePattern, setNewRulePattern] = useState('')
+  const [newRuleValue, setNewRuleValue] = useState('')
+
+  const [intentKeywords, setIntentKeywords] = useState<IntentKeywordsRow[]>([])
+  const [intentLoading, setIntentLoading] = useState(false)
+  const [newKwInput, setNewKwInput] = useState<Record<string, string>>({})
+  const [newIntentName, setNewIntentName] = useState('')
 
   const colorScheme = draft.theme === 'dark' ? 'dark' : 'light'
   const inputStyle: React.CSSProperties = {
@@ -260,7 +273,7 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   }, [])
 
   useEffect(() => {
-    if (tab !== 'local') return
+    if (tab !== 'memory') return
     setMemoryRulesLoading(true)
     invoke<MemoryRuleEntry[]>('get_memory_rules')
       .then(setMemoryRules)
@@ -271,6 +284,58 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   const handleDeleteMemoryRule = async (id: number) => {
     await invoke('delete_memory_rule', { id }).catch(() => {})
     setMemoryRules((prev) => prev.filter((r) => r.id !== id))
+  }
+
+  const handleAddMemoryRule = async () => {
+    const pattern = newRulePattern.trim()
+    if (!pattern) return
+    await invoke('add_memory_rule', { patternType: newRuleType, pattern, value: newRuleValue.trim() }).catch(() => {})
+    // 重新載入以取得 server 產生的 id
+    const updated = await invoke<MemoryRuleEntry[]>('get_memory_rules').catch(() => memoryRules)
+    setMemoryRules(updated)
+    setNewRulePattern('')
+    setNewRuleValue('')
+  }
+
+  useEffect(() => {
+    if (tab !== 'intent') return
+    setIntentLoading(true)
+    invoke<IntentKeywordsRow[]>('get_intent_keywords')
+      .then(setIntentKeywords)
+      .catch(() => setIntentKeywords([]))
+      .finally(() => setIntentLoading(false))
+  }, [tab])
+
+  const handleAddKeyword = async (intent: string) => {
+    const kw = (newKwInput[intent] ?? '').trim()
+    if (!kw) return
+    const row = intentKeywords.find(r => r.intent === intent)
+    if (!row) return
+    const updated = [...row.keywords, kw]
+    await invoke('save_intent_keywords', { intent, keywords: updated }).catch(() => {})
+    setIntentKeywords(prev => prev.map(r => r.intent === intent ? { ...r, keywords: updated } : r))
+    setNewKwInput(prev => ({ ...prev, [intent]: '' }))
+  }
+
+  const handleDeleteKeyword = async (intent: string, kw: string) => {
+    const row = intentKeywords.find(r => r.intent === intent)
+    if (!row) return
+    const updated = row.keywords.filter(k => k !== kw)
+    await invoke('save_intent_keywords', { intent, keywords: updated }).catch(() => {})
+    setIntentKeywords(prev => prev.map(r => r.intent === intent ? { ...r, keywords: updated } : r))
+  }
+
+  const handleDeleteIntentRow = async (intent: string) => {
+    await invoke('delete_intent_row', { intent }).catch(() => {})
+    setIntentKeywords(prev => prev.filter(r => r.intent !== intent))
+  }
+
+  const handleAddIntentRow = async () => {
+    const name = newIntentName.trim().toUpperCase()
+    if (!name || intentKeywords.some(r => r.intent === name)) return
+    await invoke('save_intent_keywords', { intent: name, keywords: [] }).catch(() => {})
+    setIntentKeywords(prev => [...prev, { intent: name, keywords: [] }])
+    setNewIntentName('')
   }
 
   const patternTypeLabel = (pt: string) => {
@@ -453,7 +518,7 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   const modelIsCustom = hasProvider && !modelOptions.includes(draft.ai_model) && draft.ai_model
 
   const tabs: [Tab, string][] = [
-    ['general', '一般'], ['ai', '外部資源'], ['voice', 'Whisper'], ['local', 'Local LLM'], ['advanced', '進階'], ['raw', '設定檔'],
+    ['general', '一般'], ['ai', '外部資源'], ['voice', 'Whisper'], ['local', 'Local LLM'], ['advanced', '進階'], ['intent', '意圖關鍵字'], ['memory', '記憶規則'], ['raw', '設定檔'],
   ]
 
   const numInputStyle: React.CSSProperties = {
@@ -1125,74 +1190,6 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                 </div>
               </div>
 
-              {/* 查詢規則 */}
-              <div style={{ marginBottom: '16px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' }}>
-                  <span style={{ fontSize: '13px', fontWeight: 500, color: 'var(--color-text-primary)' }}>查詢規則</span>
-                  {memoryRulesLoading && (
-                    <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>載入中…</span>
-                  )}
-                </div>
-                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '0 0 12px', lineHeight: 1.5 }}>
-                  由 AI 自動學習並寫入的時間詞與停用詞規則，用於加速記憶查詢。可刪除不需要的規則。
-                </p>
-                {!memoryRulesLoading && memoryRules.length === 0 ? (
-                  <p style={{ fontSize: '12px', color: 'var(--color-text-muted)', fontStyle: 'italic' }}>尚無自訂規則</p>
-                ) : (
-                  <div style={{ border: '1px solid var(--color-border)', borderRadius: '6px', overflow: 'hidden' }}>
-                    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px' }}>
-                      <thead>
-                        <tr style={{ background: 'var(--color-bg-elevated)' }}>
-                          {['類型', '觸發詞', '值', '建立日期', ''].map((h) => (
-                            <th key={h} style={{
-                              textAlign: 'left', padding: '6px 10px',
-                              color: 'var(--color-text-secondary)', fontWeight: 500,
-                              borderBottom: '1px solid var(--color-border)',
-                            }}>{h}</th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {memoryRules.map((rule, i) => (
-                          <tr key={rule.id} style={{ background: i % 2 === 0 ? 'transparent' : 'var(--color-bg-elevated)' }}>
-                            <td style={{ padding: '6px 10px', color: 'var(--color-text-secondary)' }}>
-                              {patternTypeLabel(rule.pattern_type)}
-                            </td>
-                            <td style={{ padding: '6px 10px', color: 'var(--color-text-primary)', fontFamily: 'monospace' }}>
-                              {rule.pattern}
-                            </td>
-                            <td style={{ padding: '6px 10px', color: 'var(--color-text-secondary)', fontFamily: 'monospace' }}>
-                              {rule.value || '—'}
-                            </td>
-                            <td style={{ padding: '6px 10px', color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }}>
-                              {new Date(rule.created_at).toLocaleDateString('zh-TW')}
-                            </td>
-                            <td style={{ padding: '6px 8px', textAlign: 'right' }}>
-                              <button
-                                onClick={() => handleDeleteMemoryRule(rule.id)}
-                                style={{
-                                  padding: '2px 8px', borderRadius: '4px', fontSize: '11px',
-                                  background: 'transparent', border: '1px solid var(--color-border)',
-                                  color: 'var(--color-text-muted)', cursor: 'pointer',
-                                }}
-                                onMouseEnter={(e) => {
-                                  e.currentTarget.style.borderColor = '#e06c75'
-                                  e.currentTarget.style.color = '#e06c75'
-                                }}
-                                onMouseLeave={(e) => {
-                                  e.currentTarget.style.borderColor = 'var(--color-border)'
-                                  e.currentTarget.style.color = 'var(--color-text-muted)'
-                                }}
-                              >刪除</button>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </div>
-
               {/* ── Model Management ───────────────────────────────────────── */}
               <SectionDivider />
               <SectionHeader label="模型管理" locked={llamaStatus === 'running'} />
@@ -1232,6 +1229,160 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                     開啟後右側面板會新增 Debug 分頁，顯示語音錄音的詳細事件日誌。
                   </p>
                 )}
+              </div>
+            </>}
+
+            {tab === 'intent' && <>
+              {/* Header row */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
+                <span style={{ fontSize: '13px', fontWeight: 500, color: 'var(--color-text-primary)' }}>意圖關鍵字</span>
+                {intentLoading && <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>載入中…</span>}
+              </div>
+              <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '0 0 14px', lineHeight: 1.5 }}>
+                設定觸發各意圖的關鍵字。短關鍵字（≤5字）用精確比對，長的用子字串比對。
+              </p>
+
+              {/* Intent rows */}
+              {intentKeywords.map(row => (
+                <div key={row.intent} style={{ marginBottom: '12px', border: '1px solid var(--color-border)', borderRadius: '8px', padding: '10px 12px' }}>
+                  {/* Intent name + delete button */}
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                    <span style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-text-secondary)', letterSpacing: '0.06em', fontFamily: 'monospace' }}>{row.intent}</span>
+                    <button
+                      onClick={() => handleDeleteIntentRow(row.intent)}
+                      style={{ padding: '2px 8px', borderRadius: '4px', fontSize: '11px', background: 'transparent', border: '1px solid var(--color-border)', color: 'var(--color-text-muted)', cursor: 'pointer' }}
+                      onMouseEnter={e => { e.currentTarget.style.borderColor = '#e06c75'; e.currentTarget.style.color = '#e06c75' }}
+                      onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--color-border)'; e.currentTarget.style.color = 'var(--color-text-muted)' }}
+                    >刪除意圖</button>
+                  </div>
+
+                  {/* Keyword chips */}
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', alignItems: 'center' }}>
+                    {row.keywords.map(kw => (
+                      <span key={kw} style={{ display: 'inline-flex', alignItems: 'center', gap: '3px', padding: '2px 8px', borderRadius: '12px', background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)', fontSize: '12px', color: 'var(--color-text-primary)' }}>
+                        {kw}
+                        <button
+                          onClick={() => handleDeleteKeyword(row.intent, kw)}
+                          style={{ marginLeft: '2px', lineHeight: 1, fontSize: '13px', color: 'var(--color-text-muted)', background: 'none', border: 'none', cursor: 'pointer', padding: '0' }}
+                          onMouseEnter={e => { e.currentTarget.style.color = '#e06c75' }}
+                          onMouseLeave={e => { e.currentTarget.style.color = 'var(--color-text-muted)' }}
+                        >×</button>
+                      </span>
+                    ))}
+
+                    {/* Inline add keyword input */}
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                      <input
+                        value={newKwInput[row.intent] ?? ''}
+                        onChange={e => setNewKwInput(prev => ({ ...prev, [row.intent]: e.target.value }))}
+                        onKeyDown={e => { if (e.key === 'Enter') handleAddKeyword(row.intent) }}
+                        placeholder="新增關鍵字"
+                        style={{ height: '24px', padding: '0 8px', borderRadius: '12px', border: '1px dashed var(--color-border)', background: 'transparent', color: 'var(--color-text-primary)', fontSize: '12px', outline: 'none', width: '90px' }}
+                      />
+                      <button
+                        onClick={() => handleAddKeyword(row.intent)}
+                        style={{ padding: '2px 8px', borderRadius: '12px', fontSize: '11px', background: 'var(--color-accent-dim)', border: '1px solid var(--color-accent)', color: 'var(--color-accent)', cursor: 'pointer' }}
+                      >+</button>
+                    </span>
+                  </div>
+                </div>
+              ))}
+
+              {/* Add new intent */}
+              <div style={{ display: 'flex', gap: '6px', marginTop: '8px', alignItems: 'center' }}>
+                <input
+                  value={newIntentName}
+                  onChange={e => setNewIntentName(e.target.value.toUpperCase())}
+                  onKeyDown={e => { if (e.key === 'Enter') handleAddIntentRow() }}
+                  placeholder="新增意圖名稱（如 MEMORY）"
+                  style={{ flex: 1, height: '30px', padding: '0 10px', borderRadius: '6px', border: '1px solid var(--color-border)', background: 'var(--color-bg-elevated)', color: 'var(--color-text-primary)', fontSize: '12px', outline: 'none' }}
+                />
+                <button
+                  onClick={handleAddIntentRow}
+                  style={{ padding: '4px 12px', borderRadius: '6px', fontSize: '12px', background: 'var(--color-accent-dim)', border: '1px solid var(--color-accent)', color: 'var(--color-accent)', cursor: 'pointer', whiteSpace: 'nowrap' }}
+                >+ 新增意圖</button>
+              </div>
+            </>}
+
+            {tab === 'memory' && <>
+              {/* Header */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
+                <span style={{ fontSize: '13px', fontWeight: 500, color: 'var(--color-text-primary)' }}>記憶規則</span>
+                {memoryRulesLoading && <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>載入中…</span>}
+              </div>
+              <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '0 0 14px', lineHeight: 1.5 }}>
+                時間表達式與停用詞規則。AI 遇到未知時間詞時會自動新增；也可手動維護。
+              </p>
+
+              {/* Rules table */}
+              {!memoryRulesLoading && memoryRules.length === 0 ? (
+                <p style={{ fontSize: '12px', color: 'var(--color-text-muted)', fontStyle: 'italic', marginBottom: '14px' }}>尚無自訂規則</p>
+              ) : (
+                <div style={{ border: '1px solid var(--color-border)', borderRadius: '6px', overflow: 'hidden', marginBottom: '14px' }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px' }}>
+                    <thead>
+                      <tr style={{ background: 'var(--color-bg-elevated)' }}>
+                        {['類型', '觸發詞', '值', '建立日期', ''].map((h) => (
+                          <th key={h} style={{ textAlign: 'left', padding: '6px 10px', color: 'var(--color-text-secondary)', fontWeight: 500, borderBottom: '1px solid var(--color-border)' }}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {memoryRules.map((rule, i) => (
+                        <tr key={rule.id} style={{ background: i % 2 === 0 ? 'transparent' : 'var(--color-bg-elevated)' }}>
+                          <td style={{ padding: '6px 10px', color: 'var(--color-text-secondary)' }}>{patternTypeLabel(rule.pattern_type)}</td>
+                          <td style={{ padding: '6px 10px', color: 'var(--color-text-primary)', fontFamily: 'monospace' }}>{rule.pattern}</td>
+                          <td style={{ padding: '6px 10px', color: 'var(--color-text-secondary)', fontFamily: 'monospace' }}>{rule.value || '—'}</td>
+                          <td style={{ padding: '6px 10px', color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }}>
+                            {new Date(rule.created_at).toLocaleDateString('zh-TW')}
+                          </td>
+                          <td style={{ padding: '6px 8px', textAlign: 'right' }}>
+                            <button
+                              onClick={() => handleDeleteMemoryRule(rule.id)}
+                              style={{ padding: '2px 8px', borderRadius: '4px', fontSize: '11px', background: 'transparent', border: '1px solid var(--color-border)', color: 'var(--color-text-muted)', cursor: 'pointer' }}
+                              onMouseEnter={e => { e.currentTarget.style.borderColor = '#e06c75'; e.currentTarget.style.color = '#e06c75' }}
+                              onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--color-border)'; e.currentTarget.style.color = 'var(--color-text-muted)' }}
+                            >刪除</button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {/* Add new rule form */}
+              <div style={{ border: '1px solid var(--color-border)', borderRadius: '8px', padding: '10px 12px' }}>
+                <span style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-text-secondary)', display: 'block', marginBottom: '8px' }}>新增規則</span>
+                <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
+                  <select
+                    value={newRuleType}
+                    onChange={e => setNewRuleType(e.target.value)}
+                    style={{ height: '28px', padding: '0 6px', borderRadius: '6px', border: '1px solid var(--color-border)', background: 'var(--color-bg-elevated)', color: 'var(--color-text-primary)', fontSize: '12px', outline: 'none' }}
+                  >
+                    <option value="temporal_exact_days">固定天數</option>
+                    <option value="temporal_unit">時間單位</option>
+                    <option value="stopword">停用詞</option>
+                  </select>
+                  <input
+                    value={newRulePattern}
+                    onChange={e => setNewRulePattern(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter') handleAddMemoryRule() }}
+                    placeholder="觸發詞（如「大前天」）"
+                    style={{ flex: 1, minWidth: '100px', height: '28px', padding: '0 8px', borderRadius: '6px', border: '1px solid var(--color-border)', background: 'var(--color-bg-elevated)', color: 'var(--color-text-primary)', fontSize: '12px', outline: 'none' }}
+                  />
+                  <input
+                    value={newRuleValue}
+                    onChange={e => setNewRuleValue(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter') handleAddMemoryRule() }}
+                    placeholder={newRuleType === 'temporal_exact_days' ? '負整數如 -3' : newRuleType === 'temporal_unit' ? 'hours/minutes/weeks' : '（停用詞留空）'}
+                    style={{ flex: 1, minWidth: '100px', height: '28px', padding: '0 8px', borderRadius: '6px', border: '1px solid var(--color-border)', background: 'var(--color-bg-elevated)', color: 'var(--color-text-primary)', fontSize: '12px', outline: 'none' }}
+                  />
+                  <button
+                    onClick={handleAddMemoryRule}
+                    style={{ padding: '4px 12px', borderRadius: '6px', fontSize: '12px', background: 'var(--color-accent-dim)', border: '1px solid var(--color-accent)', color: 'var(--color-accent)', cursor: 'pointer', whiteSpace: 'nowrap' }}
+                  >+ 新增</button>
+                </div>
               </div>
             </>}
 
