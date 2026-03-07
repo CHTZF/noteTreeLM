@@ -1,6 +1,8 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
+import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
+import { faGear, faBolt, faChevronLeft, faChevronRight } from '@fortawesome/free-solid-svg-icons'
 import { useSettingsStore } from './stores/settingsStore'
 import { useVaultStore } from './stores/vaultStore'
 import { useGraphStore } from './stores/graphStore'
@@ -38,6 +40,7 @@ export default function App() {
   const [rightTab, setRightTab] = useState<RightPanelTab>('graph')
   const [showQuickOpen, setShowQuickOpen] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(240)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [rightPanelWidth, setRightPanelWidth] = useState(320)
   const [liveChatActive, setLiveChatActive] = useState(false)
   const isDraggingLeft = useRef(false)
@@ -285,9 +288,9 @@ export default function App() {
   return (
     <div className="app-layout">
       {/* 左側欄：FileTree + Settings 按鈕 */}
-      <aside className="sidebar" style={{ width: sidebarWidth }}>
+      <aside className={`sidebar${sidebarCollapsed ? ' collapsed' : ''}`} style={sidebarCollapsed ? {} : { width: sidebarWidth }}>
         <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-          <FileTree onOpenNote={openNote} />
+          <FileTree onOpenNote={openNote} onOpenTrash={() => setShowTrash(true)} />
         </div>
         <div style={{ padding: '8px 12px', borderTop: '1px solid var(--color-border)', flexShrink: 0, display: 'flex', alignItems: 'center', gap: '4px' }}>
           <button
@@ -297,28 +300,29 @@ export default function App() {
             onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--color-text-primary)')}
             onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--color-text-secondary)')}
           >
-            <span style={{ fontSize: '15px' }}>⚙</span>
+            <FontAwesomeIcon icon={faGear} style={{ fontSize: '13px' }} />
             <span>設定</span>
           </button>
           <button
-            onClick={() => setShowTrash(true)}
-            title="垃圾桶"
-            style={{ color: 'var(--color-text-secondary)', fontSize: '16px', padding: '4px 6px', borderRadius: '5px', flexShrink: 0, opacity: 0.6 }}
-            onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.opacity = '1'; (e.currentTarget as HTMLElement).style.background = 'var(--color-bg-hover)' }}
-            onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = '0.6'; (e.currentTarget as HTMLElement).style.background = 'transparent' }}
-          >🗑</button>
-          <button
             onClick={() => setShowAgentTools(true)}
             title="Agent Tool 測試台"
-            style={{ color: 'var(--color-text-secondary)', fontSize: '15px', padding: '4px 6px', borderRadius: '5px', flexShrink: 0, opacity: 0.6 }}
+            style={{ color: 'var(--color-text-secondary)', fontSize: '13px', padding: '4px 6px', borderRadius: '5px', flexShrink: 0, opacity: 0.6 }}
             onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.opacity = '1'; (e.currentTarget as HTMLElement).style.background = 'var(--color-bg-hover)' }}
             onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = '0.6'; (e.currentTarget as HTMLElement).style.background = 'transparent' }}
-          >⚡</button>
+          ><FontAwesomeIcon icon={faBolt} /></button>
         </div>
       </aside>
 
-      {/* 左側拖曳分隔線 */}
-      <div className="divider divider-left" onMouseDown={onLeftDividerMouseDown} />
+      {/* 左側拖曳分隔線（含收合按鈕） */}
+      <div className="divider divider-left" onMouseDown={sidebarCollapsed ? undefined : onLeftDividerMouseDown} style={{ cursor: sidebarCollapsed ? 'default' : 'col-resize' }}>
+        <button
+          className="sidebar-toggle-btn"
+          title={sidebarCollapsed ? '展開側欄' : '收合側欄'}
+          onClick={() => setSidebarCollapsed(v => !v)}
+        >
+          <FontAwesomeIcon icon={sidebarCollapsed ? faChevronRight : faChevronLeft} />
+        </button>
+      </div>
 
       {/* 中間：編輯器 */}
       <main className="editor-area">

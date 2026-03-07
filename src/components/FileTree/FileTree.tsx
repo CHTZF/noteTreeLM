@@ -1,5 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
+import {
+  faFolder, faFolderOpen, faFile, faImage, faTrash, faPen,
+  faChevronRight, faChevronDown, faEllipsisVertical,
+  faPlus, faFolderPlus, faArrowRightArrowLeft,
+} from '@fortawesome/free-solid-svg-icons'
 import { useVaultStore } from '../../stores/vaultStore'
 import { useEditorStore } from '../../stores/editorStore'
 import { useSettingsStore } from '../../stores/settingsStore'
@@ -199,9 +205,10 @@ async function performMove(draggedPath: string, targetFolder: string) {
 
 interface FileTreeProps {
   onOpenNote: (path: string) => void
+  onOpenTrash: () => void
 }
 
-export default function FileTree({ onOpenNote }: FileTreeProps) {
+export default function FileTree({ onOpenNote, onOpenTrash }: FileTreeProps) {
   const { fileTree, createNote, createFolder, importImage, scanVault } = useVaultStore()
   const { currentPath, setCurrentPath } = useEditorStore()
   const { settings, save } = useSettingsStore()
@@ -294,24 +301,28 @@ export default function FileTree({ onOpenNote }: FileTreeProps) {
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 12px 8px', borderBottom: '1px solid var(--color-border)' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '6px', overflow: 'hidden' }}>
-          <span style={{ fontSize: '14px', flexShrink: 0 }}>📁</span>
+          <FontAwesomeIcon icon={faFolder} style={{ fontSize: '13px', flexShrink: 0, color: 'var(--color-text-secondary)' }} />
           <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {vaultName}
           </span>
         </div>
         <div ref={headerMenuRef} style={{ position: 'relative', flexShrink: 0 }}>
-          <button onClick={() => setHeaderMenuOpen((v) => !v)} title="新增…"
-            style={{ color: 'var(--color-text-secondary)', fontSize: '11px', letterSpacing: '0.05em', padding: '2px 6px', opacity: 0.6 }}
+          <button onClick={() => setHeaderMenuOpen((v) => !v)} title="選單"
+            style={{ color: 'var(--color-text-secondary)', fontSize: '13px', padding: '2px 6px', opacity: 0.6, display: 'flex', alignItems: 'center' }}
             onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.opacity = '1' }}
-            onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = '0.6' }}>•••</button>
+            onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = '0.6' }}>
+            <FontAwesomeIcon icon={faEllipsisVertical} />
+          </button>
           {headerMenuOpen && (
             <div style={{ position: 'absolute', top: '100%', right: 0, background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)', borderRadius: '6px', boxShadow: '0 4px 16px rgba(0,0,0,0.35)', zIndex: 200, minWidth: '148px', overflow: 'hidden', padding: '4px 0' }}>
-              <MenuItem icon="📝" label="新增筆記" onClick={handleNewNote} />
-              <MenuItem icon="📁" label="新增資料夾" onClick={handleNewFolder} />
+              <MenuItem icon={faPlus} label="新增筆記" onClick={handleNewNote} />
+              <MenuItem icon={faFolderPlus} label="新增資料夾" onClick={handleNewFolder} />
               <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
-              <MenuItem icon="🖼" label="匯入圖片" onClick={handleImportImage} />
+              <MenuItem icon={faImage} label="匯入圖片" onClick={handleImportImage} />
               <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
-              <MenuItem icon="🔀" label="切換 Vault 資料夾" onClick={handleSwitchVault} />
+              <MenuItem icon={faArrowRightArrowLeft} label="切換 Vault 資料夾" onClick={handleSwitchVault} />
+              <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
+              <MenuItem icon={faTrash} label="垃圾桶" onClick={() => { setHeaderMenuOpen(false); onOpenTrash() }} />
             </div>
           )}
         </div>
@@ -443,11 +454,11 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
         onMouseEnter={() => setIsHovered(true)}
         onMouseLeave={() => setIsHovered(false)}
         style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '3px 8px 3px ' + (8 + depth * 16) + 'px', cursor: 'pointer', fontSize: '13px', color: 'var(--color-text-secondary)', background: isHovered ? 'var(--color-bg-hover)' : 'transparent', borderRadius: '4px', margin: '0 4px', transition: 'background 0.1s', userSelect: 'none' }}>
-        <span style={{ fontSize: '12px' }}>🖼</span>
+        <FontAwesomeIcon icon={faImage} style={{ fontSize: '11px', flexShrink: 0 }} />
         <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{node.name}</span>
         {menuOpen && (
           <div ref={menuRef} style={{ position: 'fixed', left: menuX, top: menuY - 15, background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)', borderRadius: '6px', boxShadow: '0 4px 16px rgba(0,0,0,0.35)', zIndex: 200, minWidth: '120px', overflow: 'hidden', padding: '4px 0' }}>
-            <MenuItem icon="🗑" label="刪除圖片" danger onClick={handleDeleteAsset} />
+            <MenuItem icon={faTrash} label="刪除圖片" danger onClick={handleDeleteAsset} />
           </div>
         )}
       </div>
@@ -642,7 +653,8 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
           onMouseEnter={() => setIsHovered(true)}
           onMouseLeave={() => setIsHovered(false)}
           style={{ display: 'flex', alignItems: 'center', gap: '4px', padding: '3px 8px 3px ' + (8 + depth * 16) + 'px', cursor: 'pointer', fontSize: '13px', color: 'var(--color-text-secondary)', userSelect: 'none', position: 'relative' }}>
-          <span style={{ fontSize: '10px' }}>{isExpanded ? '▼' : '▶'}</span>
+          <FontAwesomeIcon icon={isExpanded ? faChevronDown : faChevronRight} style={{ fontSize: '9px', width: '10px', flexShrink: 0 }} />
+          <FontAwesomeIcon icon={isExpanded ? faFolderOpen : faFolder} style={{ fontSize: '12px', flexShrink: 0 }} />
           {isRenaming ? (
             <input
               ref={renameInputRef}
@@ -655,18 +667,18 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
               style={{ flex: 1, padding: '1px 4px', background: 'var(--color-bg-base)', border: '1px solid var(--color-accent)', borderRadius: '3px', color: 'var(--color-text-primary)', fontSize: '13px', outline: 'none' }}
             />
           ) : (
-            <span style={{ flex: 1 }}>📁 {node.name}</span>
+            <span style={{ flex: 1 }}>{node.name}</span>
           )}
         </div>
         {menuOpen && (
           <div ref={menuRef} style={{ position: 'fixed', left: menuX, top: menuY - 15, background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)', borderRadius: '6px', boxShadow: '0 4px 16px rgba(0,0,0,0.35)', zIndex: 200, minWidth: '148px', overflow: 'hidden', padding: '4px 0' }}>
-            <MenuItem icon="📝" label="新增筆記" onClick={(e) => openSubInput('note', e)} />
-            <MenuItem icon="📁" label="新增子資料夾" onClick={(e) => openSubInput('folder', e)} />
+            <MenuItem icon={faPlus} label="新增筆記" onClick={(e) => openSubInput('note', e)} />
+            <MenuItem icon={faFolderPlus} label="新增子資料夾" onClick={(e) => openSubInput('folder', e)} />
             <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
-            <MenuItem icon="🖼" label="匯入圖片" onClick={handleImportImageToFolder} />
-            <MenuItem icon="✏️" label="重新命名" onClick={handleRenameFolder} />
+            <MenuItem icon={faImage} label="匯入圖片" onClick={handleImportImageToFolder} />
+            <MenuItem icon={faPen} label="重新命名" onClick={handleRenameFolder} />
             <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
-            <MenuItem icon="🗑" label="刪除資料夾" danger onClick={handleDeleteFolder} />
+            <MenuItem icon={faTrash} label="刪除資料夾" danger onClick={handleDeleteFolder} />
           </div>
         )}
         {isExpanded && (
@@ -714,7 +726,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
           document.body.style.cursor = 'default'
 
           const ghost = document.createElement('div')
-          ghost.textContent = `📝 ${srcName}`
+          ghost.textContent = srcName
           Object.assign(ghost.style, {
             position: 'fixed', left: `${ev.clientX + 14}px`, top: `${ev.clientY - 10}px`,
             pointerEvents: 'none', background: 'var(--color-bg-elevated)',
@@ -826,7 +838,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
         borderRadius: '4px', margin: '0 4px',
         transition: 'background 0.1s', userSelect: 'none',
       }}>
-      <span style={{ fontSize: '12px' }}>📝</span>
+      <FontAwesomeIcon icon={faFile} style={{ fontSize: '11px', flexShrink: 0 }} />
       {isRenaming ? (
         <input
           ref={renameInputRef}
@@ -845,9 +857,9 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
       )}
       {menuOpen && (
         <div ref={menuRef} style={{ position: 'fixed', left: menuX, top: menuY - 15, background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)', borderRadius: '6px', boxShadow: '0 4px 16px rgba(0,0,0,0.35)', zIndex: 200, minWidth: '130px', overflow: 'hidden', padding: '4px 0' }}>
-          <MenuItem icon="✏️" label="重新命名" onClick={handleRenameNote} />
+          <MenuItem icon={faPen} label="重新命名" onClick={handleRenameNote} />
           <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
-          <MenuItem icon="🗑" label="刪除筆記" danger onClick={handleDeleteNote} />
+          <MenuItem icon={faTrash} label="刪除筆記" danger onClick={handleDeleteNote} />
         </div>
       )}
     </div>
@@ -860,14 +872,15 @@ function countDescendantNotes(node: FileTreeNode): number {
 }
 
 interface MenuItemProps {
-  icon: string; label: string; danger?: boolean; onClick: (e: React.MouseEvent) => void
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  icon: any; label: string; danger?: boolean; onClick: (e: React.MouseEvent) => void
 }
 function MenuItem({ icon, label, danger, onClick }: MenuItemProps) {
   const [hovered, setHovered] = useState(false)
   return (
     <button onClick={onClick} onMouseEnter={() => setHovered(true)} onMouseLeave={() => setHovered(false)}
       style={{ display: 'flex', alignItems: 'center', gap: '8px', width: '100%', padding: '6px 12px', fontSize: '13px', textAlign: 'left', color: danger ? (hovered ? '#e06c75' : 'var(--color-text-secondary)') : 'var(--color-text-secondary)', background: hovered ? 'var(--color-bg-hover)' : 'transparent', cursor: 'pointer' }}>
-      <span style={{ fontSize: '12px' }}>{icon}</span>{label}
+      <FontAwesomeIcon icon={icon} style={{ fontSize: '11px', width: '12px' }} />{label}
     </button>
   )
 }
