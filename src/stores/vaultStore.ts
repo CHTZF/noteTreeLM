@@ -6,6 +6,7 @@ import { useSettingsStore } from './settingsStore'
 
 interface VaultStore {
   notes: Note[]
+  assets: string[]
   fileTree: FileTreeNode[]
   isScanning: boolean
   scanCount: number
@@ -34,6 +35,7 @@ interface VaultStore {
 
 export const useVaultStore = create<VaultStore>((set, get) => ({
   notes: [],
+  assets: [],
   fileTree: [],
   isScanning: false,
   scanCount: 0,
@@ -46,7 +48,7 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
     ])
     const { settings } = useSettingsStore.getState()
     const fileTree = get().buildFileTree(notes, extraFolders, assets, settings.sort_orders)
-    set({ notes, fileTree })
+    set({ notes, assets, fileTree })
   },
 
   scanVault: async () => {

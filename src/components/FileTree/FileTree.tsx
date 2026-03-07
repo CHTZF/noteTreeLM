@@ -321,11 +321,11 @@ export default function FileTree({ onOpenNote, onOpenTrash }: FileTreeProps) {
   const handleImportImage = async () => {
     setHeaderMenuOpen(false)
     try {
-      const file = await openDialog({ multiple: false, filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'] }] })
+      const file = await openDialog({ multiple: false })
       if (!file) return
       const filePath = typeof file === 'string' ? file : (file as any).path ?? String(file)
-      await importImage(filePath); toast.success('圖片已匯入 Vault')
-    } catch (e: any) { toast.error(e.message || '匯入圖片失敗') }
+      await importImage(filePath); toast.success('檔案已匯入 Vault')
+    } catch (e: any) { toast.error(e.message || '匯入檔案失敗') }
   }
   const handleNoteSubmit = async () => {
     const title = noteInputTitle.trim(); setShowNoteInput(false); setNoteInputTitle('')
@@ -362,7 +362,7 @@ export default function FileTree({ onOpenNote, onOpenTrash }: FileTreeProps) {
               <MenuItem icon={faPlus} label="新增筆記" onClick={handleNewNote} />
               <MenuItem icon={faFolderPlus} label="新增資料夾" onClick={handleNewFolder} />
               <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
-              <MenuItem icon={faFileImage} label="匯入圖片" onClick={handleImportImage} />
+              <MenuItem icon={faFileImage} label="匯入檔案" onClick={handleImportImage} />
               <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
               <MenuItem icon={faArrowRightArrowLeft} label="切換 Vault 資料夾" onClick={handleSwitchVault} />
               <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
@@ -665,11 +665,11 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
     const handleImportImageToFolder = async (e: React.MouseEvent) => {
       e.stopPropagation(); setMenuOpen(false)
       try {
-        const file = await openDialog({ multiple: false, filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'] }] })
+        const file = await openDialog({ multiple: false })
         if (!file) return
         const filePath = typeof file === 'string' ? file : (file as any).path ?? String(file)
-        await importImage(filePath, node.path); toast.success('圖片已匯入')
-      } catch (e: any) { toast.error(e.message || '匯入圖片失敗') }
+        await importImage(filePath, node.path); toast.success('檔案已匯入')
+      } catch (e: any) { toast.error(e.message || '匯入檔案失敗') }
     }
     const handleDeleteFolder = async (e: React.MouseEvent) => {
       e.stopPropagation(); setMenuOpen(false)
@@ -750,7 +750,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
             <MenuItem icon={faPlus} label="新增筆記" onClick={(e) => openSubInput('note', e)} />
             <MenuItem icon={faFolderPlus} label="新增子資料夾" onClick={(e) => openSubInput('folder', e)} />
             <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
-            <MenuItem icon={faFileImage} label="匯入圖片" onClick={handleImportImageToFolder} />
+            <MenuItem icon={faFileImage} label="匯入檔案" onClick={handleImportImageToFolder} />
             <MenuItem icon={faPen} label="重新命名" onClick={handleRenameFolder} />
             <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
             <MenuItem icon={faTrash} label="刪除資料夾" danger onClick={handleDeleteFolder} />

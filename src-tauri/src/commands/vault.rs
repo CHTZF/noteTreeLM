@@ -796,9 +796,7 @@ pub async fn delete_folder(
     Ok(note_paths.len() as u32)
 }
 
-const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"];
-
-/// 將圖片檔案複製到 Vault（指定資料夾，預設根目錄）
+/// 將任意檔案複製到 Vault（指定資料夾，預設根目錄）
 #[tauri::command]
 pub async fn import_image(
     state: State<'_, AppState>,
@@ -812,7 +810,7 @@ pub async fn import_image(
     let filename = PathBuf::from(&source_path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
-        .ok_or_else(|| AppError::Vault("無效的圖片路徑".to_string()))?;
+        .ok_or_else(|| AppError::Vault("無效的檔案路徑".to_string()))?;
     let folder = folder.unwrap_or_default();
     let rel_path = if folder.is_empty() {
         filename.clone()
@@ -860,10 +858,12 @@ async fn collect_assets(
             let ext = path.extension()
                 .map(|e| e.to_string_lossy().to_lowercase())
                 .unwrap_or_default();
-            if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
-                if let Some(rel) = crate::vault::to_relative_path(vault_root, &path) {
-                    assets.push(rel);
-                }
+            // 跳過 Markdown 筆記（已由 notes 系統管理）與 SQLite 附屬檔
+            if matches!(ext.as_str(), "md" | "markdown" | "mdx" | "db" | "db-shm" | "db-wal") {
+                continue;
+            }
+            if let Some(rel) = crate::vault::to_relative_path(vault_root, &path) {
+                assets.push(rel);
             }
         }
     }

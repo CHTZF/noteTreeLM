@@ -4,6 +4,7 @@ import fcose from 'cytoscape-fcose'
 import { useGraphStore } from '../../stores/graphStore'
 import { useEditorStore } from '../../stores/editorStore'
 import { useSettingsStore } from '../../stores/settingsStore'
+import { useVaultStore } from '../../stores/vaultStore'
 
 cytoscape.use(fcose)
 
@@ -12,6 +13,7 @@ const NODE_COLORS: Record<string, string> = {
   url: '#4ec9b0',
   image: '#d19a66',
   topic: '#e06c75',
+  file: '#98c379',
 }
 
 interface GraphViewProps {
@@ -24,10 +26,34 @@ export default function GraphView({ onOpenNote }: GraphViewProps) {
   const { graphData, load } = useGraphStore()
   const { currentPath } = useEditorStore()
   const { settings } = useSettingsStore()
+  const { assets, openPathExternally } = useVaultStore()
 
-  // Keep a ref of graphData so the theme-init effect can seed the graph
+  // Keep refs so theme-init effect can seed the graph with latest data
   const graphDataRef = useRef(graphData)
+  const assetsRef = useRef(assets)
   useEffect(() => { graphDataRef.current = graphData }, [graphData])
+  useEffect(() => { assetsRef.current = assets }, [assets])
+
+  const buildElements = (data: typeof graphData, assetPaths: string[]): cytoscape.ElementDefinition[] => {
+    const existingIds = new Set(data.nodes.map(n => n.id))
+    const assetNodes = assetPaths
+      .filter(p => !existingIds.has(p))
+      .map(p => ({
+        group: 'nodes' as const,
+        data: { id: p, label: p.split('/').pop() ?? p, node_type: 'file', file_path: p, link_count: 0 },
+      }))
+    return [
+      ...data.nodes.map((n) => ({
+        group: 'nodes' as const,
+        data: { id: n.id, label: n.label, node_type: n.node_type, link_count: n.link_count, file_path: n.file_path ?? '' },
+      })),
+      ...data.edges.map((e) => ({
+        group: 'edges' as const,
+        data: { id: String(e.id), source: e.source_id, target: e.target_id },
+      })),
+      ...assetNodes,
+    ]
+  }
 
   useEffect(() => { load() }, [])
 
@@ -78,24 +104,19 @@ export default function GraphView({ onOpenNote }: GraphViewProps) {
 
     cy.on('tap', 'node', (evt) => {
       const node = evt.target
-      if (node.data('node_type') === 'note') {
+      const nodeType = node.data('node_type')
+      if (nodeType === 'note') {
         onOpenNote(node.id())
+      } else if (nodeType === 'file') {
+        openPathExternally(node.data('file_path')).catch(() => {})
       }
     })
 
     // Seed with current data so graph isn't empty after theme switch
     const data = graphDataRef.current
-    if (data.nodes.length > 0) {
-      cy.add([
-        ...data.nodes.map((n) => ({
-          group: 'nodes' as const,
-          data: { id: n.id, label: n.label, node_type: n.node_type, link_count: n.link_count },
-        })),
-        ...data.edges.map((e) => ({
-          group: 'edges' as const,
-          data: { id: String(e.id), source: e.source_id, target: e.target_id },
-        })),
-      ])
+    const elems = buildElements(data, assetsRef.current)
+    if (elems.length > 0) {
+      cy.add(elems)
       cy.layout({ name: 'fcose', animate: false } as any).run()
     }
 
@@ -113,27 +134,14 @@ export default function GraphView({ onOpenNote }: GraphViewProps) {
       .update()
   }, [settings.graph_font_size])
 
-  // 更新資料
+  // 更新資料（graphData 或 assets 變化時重建）
   useEffect(() => {
     const cy = cyRef.current
     if (!cy) return
-
     cy.elements().remove()
-
-    const elements: cytoscape.ElementDefinition[] = [
-      ...graphData.nodes.map((n) => ({
-        group: 'nodes' as const,
-        data: { id: n.id, label: n.label, node_type: n.node_type, link_count: n.link_count },
-      })),
-      ...graphData.edges.map((e) => ({
-        group: 'edges' as const,
-        data: { id: String(e.id), source: e.source_id, target: e.target_id },
-      })),
-    ]
-
-    cy.add(elements)
+    cy.add(buildElements(graphData, assets))
     cy.layout({ name: 'fcose', animate: true, animationDuration: 500 } as any).run()
-  }, [graphData])
+  }, [graphData, assets])
 
   // 高亮當前筆記
   useEffect(() => {
