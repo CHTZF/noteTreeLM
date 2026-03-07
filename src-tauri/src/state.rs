@@ -38,6 +38,8 @@ pub struct AppState {
     pub agent_cancel: Arc<AtomicBool>,
     /// Agent 目前活躍的 session_id（None 表示閒置）
     pub agent_session: Arc<Mutex<Option<String>>>,
+    /// 工具測試台取消旗標：設為 true 時 run_tool_pipeline 的步驟迴圈中止
+    pub tool_test_cancel: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -59,6 +61,7 @@ impl AppState {
             port_allocator: Arc::new(Mutex::new(())),
             agent_cancel: Arc::new(AtomicBool::new(false)),
             agent_session: Arc::new(Mutex::new(None)),
+            tool_test_cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 

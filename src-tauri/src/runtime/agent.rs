@@ -158,6 +158,8 @@ impl Agent {
 
         let cancel = Arc::clone(&self.stream_cancel);
         let mut final_text = String::new();
+        // 跨輪次收集已提交的寫入工具（name, args），用於 commit 後 emit vault:changed
+        let mut committed_writes: Vec<(String, Value)> = Vec::new();
 
         'outer: for _round in 0..5 {
             // 每輪前檢查取消旗標
@@ -219,6 +221,13 @@ impl Agent {
             let graph = Planner::plan(&round.tool_calls);
             let results = self.dispatcher.run(Arc::clone(&tx), graph).await?;
 
+            // ── 記錄本輪已執行的寫入工具（用於 commit 後 emit vault:changed）
+            for (_, tool_name, tool_args) in &round.tool_calls {
+                if self.is_write(tool_name) {
+                    committed_writes.push((tool_name.clone(), tool_args.clone()));
+                }
+            }
+
             // ── 發送 note_refs（每個工具分別檢查）────────────────────
             for ((_, tool_name, tool_args), result) in round.tool_calls.iter().zip(results.iter()) {
                 self.maybe_emit_note_refs(tool_name, tool_args, result.as_str().unwrap_or(""));
@@ -268,6 +277,28 @@ impl Agent {
         // 所有輪次完成（或 5 輪耗盡）→ commit → emit done
         tx.commit().await?;
         self.emit_tx(&session_id, "commit", &tx).await;
+
+        // ── vault:changed（commit 且有寫入操作，觸發前端 sidebar + editor 刷新）
+        if !committed_writes.is_empty() {
+            let mut creates: Vec<&str> = Vec::new();
+            let mut updates: Vec<&str> = Vec::new();
+            for (name, args) in &committed_writes {
+                match name.as_str() {
+                    "create_note" | "create_folder" => {
+                        if let Some(p) = args["path"].as_str() { creates.push(p); }
+                    }
+                    "update_note" => {
+                        if let Some(p) = args["path"].as_str() { updates.push(p); }
+                    }
+                    _ => {}
+                }
+            }
+            (self.emit)("vault:changed".into(), serde_json::json!({
+                "creates": creates,
+                "updates": updates,
+            }));
+        }
+
         self.clear_session().await;
 
         (self.emit)(

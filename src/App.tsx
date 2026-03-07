@@ -174,9 +174,22 @@ export default function App() {
           (event) => listen(event, () => loadGraph())
         )
       )
+      // Agent 工具測試台寫入 commit 後：若目前開啟的筆記被 update_note，同步刷新編輯器
+      const vaultChangedUnlisten = await listen<{ creates: string[]; updates: string[] }>(
+        'vault:changed',
+        (e) => {
+          const { currentPath, applyExternalWrite } = useEditorStore.getState()
+          if (currentPath && e.payload.updates.includes(currentPath)) {
+            invoke<{ content: string }>('read_note', { path: currentPath })
+              .then((note) => applyExternalWrite(note.content))
+              .catch(() => {})
+          }
+        }
+      )
       cleanup = () => {
         vaultCleanup()
         graphListeners.forEach((u) => u())
+        vaultChangedUnlisten()
       }
     }
 
