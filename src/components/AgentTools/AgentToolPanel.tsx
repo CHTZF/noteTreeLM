@@ -837,7 +837,7 @@ export default function AgentToolPanel({ onClose }: AgentToolPanelProps) {
 
         {/* Scroll area */}
         <div style={{
-          flex: 1, overflowY: 'auto', padding: '12px',
+          flex: 1, minHeight: 0, overflowY: 'auto', padding: '12px',
           display: 'flex', flexDirection: 'column', gap: '8px',
         }}>
           {mode === 'tools'

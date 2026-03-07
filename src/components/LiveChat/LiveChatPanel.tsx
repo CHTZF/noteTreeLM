@@ -91,14 +91,6 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
     onActiveChange?.(liveChatState !== 'idle')
   }, [liveChatState, onActiveChange])
 
-  // LLM-triggered note navigation via open_note tool
-  useEffect(() => {
-    let unlisten: (() => void) | undefined
-    listen<string>('ui:open_note', (e) => {
-      onOpenNote(e.payload)
-    }).then(fn => { unlisten = fn })
-    return () => unlisten?.()
-  }, [onOpenNote])
 
   // Auto-scroll to bottom when messages or streaming changes
   useEffect(() => {

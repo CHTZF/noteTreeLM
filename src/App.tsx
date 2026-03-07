@@ -186,10 +186,15 @@ export default function App() {
           }
         }
       )
+      // open_note 工具導覽（relative path）— 全局監聽避免只有 LiveChat 才能處理
+      const openNoteUnlisten = await listen<string>('ui:open_note', (e) => {
+        if (e.payload) openNote(e.payload)
+      })
       cleanup = () => {
         vaultCleanup()
         graphListeners.forEach((u) => u())
         vaultChangedUnlisten()
+        openNoteUnlisten()
       }
     }
 

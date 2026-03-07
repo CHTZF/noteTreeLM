@@ -1588,6 +1588,15 @@ fn is_write_tool(name: &str) -> bool {
     matches!(name, "create_note" | "update_note" | "create_folder")
 }
 
+/// 筆記路徑：若不以 .md 結尾則自動補上
+fn ensure_md(path: &str) -> String {
+    if path.is_empty() || path.ends_with(".md") {
+        path.to_string()
+    } else {
+        format!("{}.md", path)
+    }
+}
+
 /// 從 StreamResult 提取所有 tool calls（native 格式優先，fallback 文字格式）
 /// 回傳 Vec<(tool_id, tool_name, tool_args)>，空 Vec 表示純文字回覆
 fn detect_tool_calls(
@@ -1645,18 +1654,18 @@ async fn execute_vault_tool(
             tool_list_structure(path, vault_path)
         }
         "read_note" => {
-            let path = args["path"].as_str().unwrap_or("");
-            tool_read_note(path, vault_path)
+            let path = ensure_md(args["path"].as_str().unwrap_or(""));
+            tool_read_note(&path, vault_path)
         }
         "create_note" => {
-            let path = args["path"].as_str().unwrap_or("");
+            let path = ensure_md(args["path"].as_str().unwrap_or(""));
             let content = args["content"].as_str().unwrap_or("");
-            tool_create_note(path, content, vault_path).await
+            tool_create_note(&path, content, vault_path).await
         }
         "update_note" => {
-            let path = args["path"].as_str().unwrap_or("");
+            let path = ensure_md(args["path"].as_str().unwrap_or(""));
             let content = args["content"].as_str().unwrap_or("");
-            tool_update_note(path, content, vault_path).await
+            tool_update_note(&path, content, vault_path).await
         }
         "create_folder" => {
             let path = args["path"].as_str().unwrap_or("");
@@ -1675,13 +1684,12 @@ async fn execute_vault_tool(
             }
         }
         "open_note" => {
-            let path = args["path"].as_str().unwrap_or("");
+            let path = ensure_md(args["path"].as_str().unwrap_or(""));
             if path.is_empty() {
                 return "請提供筆記路徑".to_string();
             }
-            let abs_path = std::path::PathBuf::from(vault_path).join(path);
-            let abs_str = abs_path.to_string_lossy().to_string();
-            let _ = app.emit("ui:open_note", &abs_str);
+            // 前端 openNote() 期望 relative path，直接傳入
+            let _ = app.emit("ui:open_note", &path);
             format!("✅ 已打開筆記：{}", path)
         }
         _ => format!("未知工具：{}", name),
