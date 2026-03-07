@@ -319,7 +319,9 @@ pub async fn transcribe_audio(
         .text("response_format", "json")
         .text("language", whisper_lang.to_string())
         .text("temperature", "0.0")
-        .text("beam_size", "1");  // greedy decoding，大幅減少延遲
+        .text("beam_size", "3")           // beam=3：準確度提升明顯，延遲增加有限
+        .text("no_speech_thold", "0.6")   // 無語音概率 > 0.6 → 輸出空字串，抑制幻覺
+        .text("suppress_blank", "true");  // 抑制空白 token，進一步減少雜訊幻覺
     if let Some(prompt) = initial_prompt {
         form = form.text("initial_prompt", prompt.to_string());
     }
