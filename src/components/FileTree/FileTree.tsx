@@ -1,8 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
+import { type IconDefinition } from '@fortawesome/fontawesome-svg-core'
 import {
-  faFolder, faFolderOpen, faFile, faImage, faTrash, faPen,
+  faFolder, faFolderOpen, faFile, faFileLines, faFileImage, faFileCode,
+  faFileAudio, faFileVideo, faFilePdf, faFileZipper,
+  faTrash, faPen,
   faChevronRight, faChevronDown, faEllipsisVertical,
   faPlus, faFolderPlus, faArrowRightArrowLeft,
 } from '@fortawesome/free-solid-svg-icons'
@@ -15,6 +18,47 @@ import { toast } from '../common/Toast'
 import { ask } from '@tauri-apps/plugin-dialog'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { open as shellOpen } from '@tauri-apps/plugin-shell'
+
+// ── 檔案類型 icon + 顏色映射（VSCode Material Icon Theme 風格）────────────
+// 顏色在深色/淺色主題下均清晰可辨
+const FOLDER_COLOR  = '#dcb862'   // 溫暖金黃
+const MD_COLOR      = '#519aba'   // 冷藍（Markdown）
+const IMAGE_COLOR   = '#c586c0'   // 紫（PNG/JPG/GIF/WEBP/BMP）
+const SVG_COLOR     = '#f0a500'   // 橘（SVG = 向量程式碼）
+const CODE_COLOR    = '#56b6c2'   // 青（HTML/CSS/JS/TS 等）
+const PDF_COLOR     = '#e06c75'   // 紅（PDF）
+const AUDIO_COLOR   = '#98c379'   // 綠（MP3/WAV 等）
+const VIDEO_COLOR   = '#61afef'   // 藍（MP4/MOV 等）
+const ZIP_COLOR     = '#e5c07b'   // 淡金（壓縮檔）
+const FILE_COLOR    = '#abb2bf'   // 灰（未知類型）
+
+function getFileIcon(name: string, isImage?: boolean): { icon: IconDefinition; color: string } {
+  const ext = name.toLowerCase().split('.').pop() ?? ''
+
+  // 圖片資產（已標記為 isImage 或依副檔名判斷）
+  if (isImage || ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'avif', 'ico', 'tiff', 'tif'].includes(ext))
+    return { icon: faFileImage, color: IMAGE_COLOR }
+
+  switch (ext) {
+    case 'md': case 'markdown': case 'mdx':
+      return { icon: faFileLines, color: MD_COLOR }
+    case 'svg':
+      return { icon: faFileCode, color: SVG_COLOR }
+    case 'html': case 'htm': case 'css': case 'js': case 'ts': case 'tsx': case 'jsx':
+    case 'json': case 'yaml': case 'yml': case 'toml': case 'xml': case 'rs': case 'py':
+      return { icon: faFileCode, color: CODE_COLOR }
+    case 'pdf':
+      return { icon: faFilePdf, color: PDF_COLOR }
+    case 'mp3': case 'wav': case 'ogg': case 'flac': case 'm4a': case 'aac':
+      return { icon: faFileAudio, color: AUDIO_COLOR }
+    case 'mp4': case 'mov': case 'avi': case 'mkv': case 'webm':
+      return { icon: faFileVideo, color: VIDEO_COLOR }
+    case 'zip': case 'rar': case '7z': case 'tar': case 'gz':
+      return { icon: faFileZipper, color: ZIP_COLOR }
+    default:
+      return { icon: faFile, color: FILE_COLOR }
+  }
+}
 
 // ── Mouse-event DnD（相容 macOS WKWebView）────────────────────────────────
 // 每個資料夾（含根容器）在 mount 時向這個 Map 登記
@@ -301,7 +345,7 @@ export default function FileTree({ onOpenNote, onOpenTrash }: FileTreeProps) {
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 12px 8px', borderBottom: '1px solid var(--color-border)' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '6px', overflow: 'hidden' }}>
-          <FontAwesomeIcon icon={faFolder} style={{ fontSize: '13px', flexShrink: 0, color: 'var(--color-text-secondary)' }} />
+          <FontAwesomeIcon icon={faFolder} style={{ fontSize: '13px', flexShrink: 0, color: FOLDER_COLOR }} />
           <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {vaultName}
           </span>
@@ -318,7 +362,7 @@ export default function FileTree({ onOpenNote, onOpenTrash }: FileTreeProps) {
               <MenuItem icon={faPlus} label="新增筆記" onClick={handleNewNote} />
               <MenuItem icon={faFolderPlus} label="新增資料夾" onClick={handleNewFolder} />
               <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
-              <MenuItem icon={faImage} label="匯入圖片" onClick={handleImportImage} />
+              <MenuItem icon={faFileImage} label="匯入圖片" onClick={handleImportImage} />
               <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
               <MenuItem icon={faArrowRightArrowLeft} label="切換 Vault 資料夾" onClick={handleSwitchVault} />
               <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
@@ -454,7 +498,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
         onMouseEnter={() => setIsHovered(true)}
         onMouseLeave={() => setIsHovered(false)}
         style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '3px 8px 3px ' + (8 + depth * 16) + 'px', cursor: 'pointer', fontSize: '13px', color: 'var(--color-text-secondary)', background: isHovered ? 'var(--color-bg-hover)' : 'transparent', borderRadius: '4px', margin: '0 4px', transition: 'background 0.1s', userSelect: 'none' }}>
-        <FontAwesomeIcon icon={faImage} style={{ fontSize: '11px', flexShrink: 0 }} />
+        <FontAwesomeIcon icon={getFileIcon(node.name, true).icon} style={{ fontSize: '11px', flexShrink: 0, color: getFileIcon(node.name, true).color }} />
         <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{node.name}</span>
         {menuOpen && (
           <div ref={menuRef} style={{ position: 'fixed', left: menuX, top: menuY - 15, background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)', borderRadius: '6px', boxShadow: '0 4px 16px rgba(0,0,0,0.35)', zIndex: 200, minWidth: '120px', overflow: 'hidden', padding: '4px 0' }}>
@@ -653,8 +697,8 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
           onMouseEnter={() => setIsHovered(true)}
           onMouseLeave={() => setIsHovered(false)}
           style={{ display: 'flex', alignItems: 'center', gap: '4px', padding: '3px 8px 3px ' + (8 + depth * 16) + 'px', cursor: 'pointer', fontSize: '13px', color: 'var(--color-text-secondary)', userSelect: 'none', position: 'relative' }}>
-          <FontAwesomeIcon icon={isExpanded ? faChevronDown : faChevronRight} style={{ fontSize: '9px', width: '10px', flexShrink: 0 }} />
-          <FontAwesomeIcon icon={isExpanded ? faFolderOpen : faFolder} style={{ fontSize: '12px', flexShrink: 0 }} />
+          <FontAwesomeIcon icon={isExpanded ? faChevronDown : faChevronRight} style={{ fontSize: '9px', width: '10px', flexShrink: 0, color: FOLDER_COLOR }} />
+          <FontAwesomeIcon icon={isExpanded ? faFolderOpen : faFolder} style={{ fontSize: '12px', flexShrink: 0, color: FOLDER_COLOR }} />
           {isRenaming ? (
             <input
               ref={renameInputRef}
@@ -675,7 +719,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
             <MenuItem icon={faPlus} label="新增筆記" onClick={(e) => openSubInput('note', e)} />
             <MenuItem icon={faFolderPlus} label="新增子資料夾" onClick={(e) => openSubInput('folder', e)} />
             <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
-            <MenuItem icon={faImage} label="匯入圖片" onClick={handleImportImageToFolder} />
+            <MenuItem icon={faFileImage} label="匯入圖片" onClick={handleImportImageToFolder} />
             <MenuItem icon={faPen} label="重新命名" onClick={handleRenameFolder} />
             <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
             <MenuItem icon={faTrash} label="刪除資料夾" danger onClick={handleDeleteFolder} />
@@ -838,7 +882,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
         borderRadius: '4px', margin: '0 4px',
         transition: 'background 0.1s', userSelect: 'none',
       }}>
-      <FontAwesomeIcon icon={faFile} style={{ fontSize: '11px', flexShrink: 0 }} />
+      <FontAwesomeIcon icon={getFileIcon(node.name).icon} style={{ fontSize: '11px', flexShrink: 0, color: getFileIcon(node.name).color }} />
       {isRenaming ? (
         <input
           ref={renameInputRef}
