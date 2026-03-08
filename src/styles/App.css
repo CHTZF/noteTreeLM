@@ -1,9 +1,62 @@
 .app-layout {
   display: flex;
+  flex-direction: row;
   width: 100%;
   height: 100vh;
   background: var(--color-bg-base);
   overflow: hidden;
+}
+
+/* Main content row — fills full height */
+.content-row {
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Left Icon Menubar — always visible, narrow vertical strip */
+.icon-menubar {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 40px;
+  flex-shrink: 0;
+  padding: 8px 0;
+  gap: 2px;
+  background: var(--color-bg-surface, var(--color-bg-overlay));
+  border-right: 1px solid var(--color-border);
+}
+
+.icon-menubar-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+.icon-menubar-btn:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+.icon-menubar-btn.active {
+  background: var(--color-accent-dim, rgba(124,140,248,0.15));
+  color: var(--color-accent);
+}
+.icon-menubar-sep {
+  width: 22px;
+  height: 1px;
+  background: var(--color-border);
+  margin: 4px 0;
+  flex-shrink: 0;
 }
 
 .app-loading {
@@ -37,7 +90,6 @@
   flex-direction: column;
   min-width: var(--sidebar-min-width);
   max-width: var(--sidebar-max-width);
-  height: 100%;
   background: var(--color-bg-surface);
   border-right: 1px solid var(--color-border);
   overflow: hidden;
@@ -83,11 +135,209 @@
   background: var(--color-bg-hover);
 }
 
+/* Editor column — contains tab bar + pane area */
+.editor-column {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Pane area — row for h-split, column for v-split */
+.pane-area {
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.pane-area-v {
+  flex-direction: column;
+}
+
+/* Pane column — wrapper for TabBar + content in each split pane */
+.pane-col {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-left: 1px solid var(--color-border);
+}
+/* First child in a row group has no left border */
+.pane-area > .pane-col:first-child,
+.pane-area > :first-child > .pane-col:first-child {
+  border-left: none;
+}
+.pane-area-v > .pane-col {
+  border-left: none;
+  border-top: 1px solid var(--color-border);
+}
+.pane-area-v > .pane-col:first-child {
+  border-top: none;
+}
+/* Focused pane subtle highlight */
+.pane-col-focused > .editor-area {
+  outline: none;
+}
+
+/* Split divider */
+.split-divider {
+  width: 4px;
+  flex-shrink: 0;
+  background: var(--color-border);
+  cursor: col-resize;
+}
+.split-divider-v {
+  width: auto;
+  height: 4px;
+  cursor: row-resize;
+}
+
+/* Drop overlay for drag-to-split */
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 100;
+  pointer-events: all;
+}
+.dz-indicator {
+  position: absolute;
+  background: var(--color-accent, #7c6ff7);
+  opacity: 0.18;
+  border: 2px solid var(--color-accent, #7c6ff7);
+  border-radius: 4px;
+  pointer-events: none;
+  transition: opacity 0.1s;
+}
+.dz-right {
+  top: 0; right: 0; bottom: 0;
+  width: 35%;
+}
+.dz-bottom {
+  left: 0; right: 0; bottom: 0;
+  height: 35%;
+}
+
+/* Tab bar right slot */
+.tab-bar-right {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  flex-shrink: 0;
+  padding: 0 4px;
+  margin-left: auto;
+  border-left: 1px solid var(--color-border);
+}
+
+/* Tab Bar */
+.tab-bar {
+  display: flex;
+  flex-direction: row;
+  overflow: hidden;
+  background: var(--color-bg-surface, var(--color-bg-overlay));
+  border-bottom: 1px solid var(--color-border);
+  flex-shrink: 0;
+  height: 33px;
+  align-items: stretch;
+}
+.tab-bar-icons {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  flex-shrink: 0;
+  padding: 0 4px;
+  gap: 2px;
+  border-right: 1px solid var(--color-border);
+}
+.tab-bar-tabs {
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border) transparent;
+  align-items: stretch;
+}
+.tab-bar-tabs::-webkit-scrollbar { height: 3px; }
+.tab-bar-tabs::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 2px; }
+.tab-bar-tabs::-webkit-scrollbar-track { background: transparent; }
+
+/* Prevent text selection while dragging tabs */
+body.dragging-tab,
+body.dragging-tab * {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+
+.tab-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px 0 12px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  border-right: 1px solid var(--color-border);
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  max-width: 200px;
+  user-select: none;
+  position: relative;
+}
+.tab-item:hover { background: var(--color-bg-hover); color: var(--color-text-primary); }
+.tab-item.drag-over::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 2px;
+  background: var(--color-accent);
+}
+.tab-item.active {
+  background: var(--color-bg-base);
+  color: var(--color-text-primary);
+  border-bottom: 2px solid var(--color-accent);
+}
+.tab-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+  min-width: 0;
+}
+.tab-dirty {
+  color: var(--color-accent);
+  font-size: 18px;
+  line-height: 1;
+  flex-shrink: 0;
+  margin-right: -2px;
+}
+.tab-close {
+  opacity: 0;
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 3px;
+  flex-shrink: 0;
+  font-size: 14px;
+  color: var(--color-text-muted);
+  line-height: 1;
+  padding: 0;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+.tab-item:hover .tab-close,
+.tab-item.active .tab-close { opacity: 1; }
+.tab-close:hover { background: var(--color-bg-elevated, var(--color-bg-hover)); color: var(--color-text-primary); }
+
 /* Editor Area */
 .editor-area {
   flex: 1;
   min-width: 0;
-  height: 100%;
   display: flex;
   flex-direction: column;
   background: var(--color-bg-base);

@@ -23,7 +23,18 @@ pub async fn search(
     let limit = limit.unwrap_or(20);
     let db = state.get_vault_db().await?;
 
-    // FTS5 搜尋（標題權重較高）
+    // FTS5 搜尋：每個空白分隔的詞用雙引號包起來，避免特殊字元造成語法錯誤，並加 * 做前綴比對
+    let fts_query = query
+        .split_whitespace()
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{}\"*", t.replace('"', "")))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if fts_query.is_empty() {
+        return Ok(vec![]);
+    }
+
     let rows = sqlx::query_as::<_, (String, String, f64)>(
         "SELECT s.path, s.title, bm25(search_fts) as score
          FROM search_fts s
@@ -31,7 +42,7 @@ pub async fn search(
          ORDER BY score
          LIMIT ?"
     )
-    .bind(&query)
+    .bind(&fts_query)
     .bind(limit)
     .fetch_all(&db)
     .await
@@ -66,10 +77,12 @@ fn extract_snippet(content: &str, query: &str) -> String {
     let content_lower = content.to_lowercase();
 
     if let Some(pos) = content_lower.find(&query_lower) {
-        let start = pos.saturating_sub(60);
-        let end = (pos + query.len() + 60).min(content.len());
-        let snippet = &content[start..end];
-        format!("...{}...", snippet.trim())
+        // 必須對齊 UTF-8 字元邊界，否則中文字（3 bytes）切到一半會 panic
+        let raw_start = pos.saturating_sub(60);
+        let start = (0..=raw_start).rev().find(|&i| content.is_char_boundary(i)).unwrap_or(0);
+        let raw_end = (pos + query_lower.len() + 60).min(content.len());
+        let end = (raw_end..=content.len()).find(|&i| content.is_char_boundary(i)).unwrap_or(content.len());
+        format!("...{}...", content[start..end].trim())
     } else {
         content.chars().take(120).collect::<String>() + "..."
     }

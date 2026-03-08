@@ -9,7 +9,6 @@ import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { useEditorStore } from '../../stores/editorStore'
 import { useVaultStore } from '../../stores/vaultStore'
 import { useSettingsStore } from '../../stores/settingsStore'
-import { useNavigationStore } from '../../stores/navigationStore'
 import { wikilinkPlugin } from './plugins/wikilinks'
 import Toolbar, { EditorAction } from './Toolbar'
 import PreviewPanel from './PreviewPanel'
@@ -32,27 +31,26 @@ interface EditorProps {
   canGoForward: boolean
   onBack: () => void
   onForward: () => void
+  onOpenNote: (path: string) => void
 }
 
-export default function Editor({ canGoBack, canGoForward, onBack, onForward }: EditorProps) {
+export default function Editor({ canGoBack, canGoForward, onBack, onForward, onOpenNote }: EditorProps) {
   const editorRef = useRef<HTMLDivElement>(null)
   const viewRef = useRef<EditorView | null>(null)
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Ref so the CM6 updateListener always calls the latest version (avoids stale closure)
   const triggerAutoSaveRef = useRef<(content: string) => void>(() => {})
 
-  const { currentPath, content, isDirty, viewMode, setContent, setDirty, setCurrentPath, setViewMode,
+  const { currentPath, content, isDirty, viewMode, setContent, setDirty, setViewMode,
           pendingContent, clearPendingContent } = useEditorStore()
   const [pendingAnchor, setPendingAnchor] = useState<string | undefined>(undefined)
   const { readNote, updateNote } = useVaultStore()
   const { settings } = useSettingsStore()
-  const { push: navPush } = useNavigationStore()
 
   const openNote = useCallback((path: string) => {
-    navPush(path)
-    setCurrentPath(path)
+    onOpenNote(path)
     setPendingAnchor(undefined)  // 清除殘留 anchor（非錨點導航時）
-  }, [navPush, setCurrentPath])
+  }, [onOpenNote])
 
   // 載入筆記（帶 cancellation 防止快速切換時 race condition）
   useEffect(() => {

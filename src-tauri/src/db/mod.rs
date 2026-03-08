@@ -1,5 +1,5 @@
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
-use std::path::Path;
+use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteJournalMode}, SqlitePool};
+use std::{path::Path, str::FromStr, time::Duration};
 
 pub mod queries;
 
@@ -23,9 +23,13 @@ pub async fn init_vault_db(vault_path: &Path) -> crate::error::Result<SqlitePool
 }
 
 async fn connect(db_url: String) -> crate::error::Result<SqlitePool> {
+    let opts = SqliteConnectOptions::from_str(&db_url)
+        .map_err(|e| crate::error::AppError::Database(e.to_string()))?
+        .journal_mode(SqliteJournalMode::Wal)  // 允許讀寫並行，避免搜尋被掃描 block
+        .busy_timeout(Duration::from_secs(5)); // 等待鎖最多 5 秒就放棄
     SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(&db_url)
+        .connect_with(opts)
         .await
         .map_err(|e| crate::error::AppError::Database(e.to_string()))
 }

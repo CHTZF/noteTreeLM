@@ -676,29 +676,22 @@ function PipelineBuilder() {
   )
 }
 
-// ── AgentToolPanel (modal overlay) ────────────────────────────────────────────
+// ── Shared inner content ───────────────────────────────────────────────────────
 
-interface AgentToolPanelProps {
-  onClose: () => void
-}
-
-export default function AgentToolPanel({ onClose }: AgentToolPanelProps) {
+function AgentToolInner({ onClose }: { onClose?: () => void }) {
   const [mode, setMode] = useState<'tools' | 'pipeline'>('tools')
   const [txState, setTxState] = useState<TxDebugEvent | null>(null)
   const txTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  // 全域監聽 agent:tx_debug（涵蓋個別測試 + Pipeline 兩種模式）
   useEffect(() => {
     let unlisten: (() => void) | undefined
     listen<TxDebugEvent>('agent:tx_debug', (e) => {
       setTxState(e.payload)
-      // commit / cancel 後 2.5s 自動清除橫幅
       if (e.payload.kind !== 'prepare') {
         if (txTimerRef.current) clearTimeout(txTimerRef.current)
         txTimerRef.current = setTimeout(() => setTxState(null), 2500)
       }
     }).then(u => { unlisten = u })
-
     return () => {
       unlisten?.()
       if (txTimerRef.current) clearTimeout(txTimerRef.current)
@@ -711,7 +704,6 @@ export default function AgentToolPanel({ onClose }: AgentToolPanelProps) {
 
   const isPreparing = txState?.kind === 'prepare'
 
-  // TX status banner helpers
   const txBanner = txState ? (() => {
     switch (txState.kind) {
       case 'prepare': return {
@@ -730,77 +722,58 @@ export default function AgentToolPanel({ onClose }: AgentToolPanelProps) {
   })() : null
 
   return (
-    <div
-      style={{
-        position: 'fixed', inset: 0,
-        background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(2px)',
-        zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center',
-      }}
-    >
+    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, overflow: 'hidden' }}>
+      {/* Header */}
       <div style={{
-        width: mode === 'pipeline' ? '620px' : '560px',
-        maxWidth: '96vw',
-        maxHeight: '94vh',
-        background: 'var(--color-bg-base)',
-        borderRadius: '12px',
-        border: '1px solid var(--color-border)',
-        display: 'flex', flexDirection: 'column',
-        overflow: 'hidden',
-        boxShadow: '0 20px 60px rgba(0,0,0,0.3)',
-        transition: 'width 0.15s ease',
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        padding: '14px 16px', borderBottom: '1px solid var(--color-border)',
+        flexShrink: 0, gap: '10px',
       }}>
-        {/* Header */}
-        <div style={{
-          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-          padding: '14px 16px', borderBottom: '1px solid var(--color-border)',
-          flexShrink: 0, gap: '10px',
-        }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-            <span style={{ fontSize: '14px', fontWeight: 700, color: 'var(--color-text-primary)' }}>
-              ⚡ Agent Tool 測試台
-            </span>
-            {/* Mode switcher */}
-            <div style={{
-              display: 'flex', gap: '2px',
-              background: 'var(--color-bg-hover)',
-              borderRadius: '6px', padding: '2px',
-            }}>
-              {(['tools', 'pipeline'] as const).map(m => (
-                <button
-                  key={m}
-                  onClick={() => setMode(m)}
-                  style={{
-                    padding: '3px 10px', borderRadius: '4px', fontSize: '11px',
-                    fontWeight: 600, cursor: 'pointer',
-                    background: mode === m ? 'var(--color-bg-base)' : 'transparent',
-                    color: mode === m ? 'var(--color-text-primary)' : 'var(--color-text-muted)',
-                    boxShadow: mode === m ? '0 1px 3px rgba(0,0,0,0.12)' : 'none',
-                  }}
-                >
-                  {m === 'tools' ? '個別測試' : '🔗 Pipeline'}
-                </button>
-              ))}
-            </div>
-            <span style={{ fontSize: '12px', color: 'var(--color-text-muted)' }}>
-              {mode === 'tools' ? `${TOOLS.length} 個工具` : '自訂執行流程'}
-            </span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            {/* Cancel button — only enabled when tx is in prepare state */}
-            {isPreparing && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <span style={{ fontSize: '14px', fontWeight: 700, color: 'var(--color-text-primary)' }}>
+            ⚡ Agent Tool 測試台
+          </span>
+          <div style={{
+            display: 'flex', gap: '2px',
+            background: 'var(--color-bg-hover)',
+            borderRadius: '6px', padding: '2px',
+          }}>
+            {(['tools', 'pipeline'] as const).map(m => (
               <button
-                onClick={handleCancel}
-                title="中止目前執行"
+                key={m}
+                onClick={() => setMode(m)}
                 style={{
-                  padding: '4px 10px', borderRadius: '5px', fontSize: '11px',
+                  padding: '3px 10px', borderRadius: '4px', fontSize: '11px',
                   fontWeight: 600, cursor: 'pointer',
-                  background: 'rgba(239,68,68,0.1)', color: '#ef4444',
-                  border: '1px solid rgba(239,68,68,0.3)',
+                  background: mode === m ? 'var(--color-bg-base)' : 'transparent',
+                  color: mode === m ? 'var(--color-text-primary)' : 'var(--color-text-muted)',
+                  boxShadow: mode === m ? '0 1px 3px rgba(0,0,0,0.12)' : 'none',
                 }}
               >
-                ⏹ 中止
+                {m === 'tools' ? '個別測試' : '🔗 Pipeline'}
               </button>
-            )}
+            ))}
+          </div>
+          <span style={{ fontSize: '12px', color: 'var(--color-text-muted)' }}>
+            {mode === 'tools' ? `${TOOLS.length} 個工具` : '自訂執行流程'}
+          </span>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          {isPreparing && (
+            <button
+              onClick={handleCancel}
+              title="中止目前執行"
+              style={{
+                padding: '4px 10px', borderRadius: '5px', fontSize: '11px',
+                fontWeight: 600, cursor: 'pointer',
+                background: 'rgba(239,68,68,0.1)', color: '#ef4444',
+                border: '1px solid rgba(239,68,68,0.3)',
+              }}
+            >
+              ⏹ 中止
+            </button>
+          )}
+          {onClose && (
             <button
               onClick={onClose}
               style={{
@@ -812,39 +785,76 @@ export default function AgentToolPanel({ onClose }: AgentToolPanelProps) {
             >
               ✕
             </button>
-          </div>
+          )}
         </div>
+      </div>
 
-        {/* TX status banner */}
-        {txBanner && (
-          <div style={{
-            padding: '6px 14px', fontSize: '11px', fontWeight: 600,
-            display: 'flex', alignItems: 'center', gap: '6px',
-            background: txBanner.bg,
-            borderBottom: `1px solid ${txBanner.border}`,
-            color: txBanner.color,
-            flexShrink: 0,
-          }}>
-            <span>{txBanner.icon}</span>
-            <span>Transaction · {txBanner.label}</span>
-            {isPreparing && (
-              <span style={{ marginLeft: 'auto', opacity: 0.7, fontWeight: 400 }}>
-                session {txState!.session_id.slice(0, 8)}
-              </span>
-            )}
-          </div>
-        )}
-
-        {/* Scroll area */}
+      {/* TX status banner */}
+      {txBanner && (
         <div style={{
-          flex: 1, minHeight: 0, overflowY: 'auto', padding: '12px',
-          display: 'flex', flexDirection: 'column', gap: '8px',
+          padding: '6px 14px', fontSize: '11px', fontWeight: 600,
+          display: 'flex', alignItems: 'center', gap: '6px',
+          background: txBanner.bg,
+          borderBottom: `1px solid ${txBanner.border}`,
+          color: txBanner.color,
+          flexShrink: 0,
         }}>
+          <span>{txBanner.icon}</span>
+          <span>Transaction · {txBanner.label}</span>
+          {isPreparing && (
+            <span style={{ marginLeft: 'auto', opacity: 0.7, fontWeight: 400 }}>
+              session {txState!.session_id.slice(0, 8)}
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Scroll area — block container so children grow to natural height */}
+      <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '12px' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
           {mode === 'tools'
             ? TOOLS.map(tool => <ToolCard key={tool.name} tool={tool} />)
             : <PipelineBuilder />
           }
         </div>
+      </div>
+    </div>
+  )
+}
+
+// ── AgentToolContent (tab version, fills editor area) ─────────────────────────
+
+export function AgentToolContent() {
+  return <AgentToolInner />
+}
+
+// ── AgentToolPanel (modal overlay) ────────────────────────────────────────────
+
+interface AgentToolPanelProps {
+  onClose: () => void
+}
+
+export default function AgentToolPanel({ onClose }: AgentToolPanelProps) {
+  return (
+    <div
+      style={{
+        position: 'fixed', inset: 0,
+        background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(2px)',
+        zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center',
+      }}
+    >
+      <div style={{
+        width: '620px',
+        maxWidth: '96vw',
+        maxHeight: '94vh',
+        background: 'var(--color-bg-base)',
+        borderRadius: '12px',
+        border: '1px solid var(--color-border)',
+        display: 'flex', flexDirection: 'column',
+        overflow: 'hidden',
+        boxShadow: '0 20px 60px rgba(0,0,0,0.3)',
+      }}>
+        <AgentToolInner onClose={onClose} />
       </div>
     </div>
   )

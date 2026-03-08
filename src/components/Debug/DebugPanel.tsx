@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState } from 'react'
+import { useRef, useEffect, useState, useMemo } from 'react'
 import { useDebugStore, type DebugLevel } from '../../stores/debugStore'
 
 const LEVEL_COLOR: Record<DebugLevel, string> = {
@@ -18,6 +18,8 @@ const LEVEL_LABEL: Record<DebugLevel, string> = {
   warn:  'WARN',
   error: 'ERR ',
 }
+
+const ALL_LEVELS: DebugLevel[] = ['info', 'warn', 'error']
 
 function LogMessage({ message, color }: { message: string; color: string }) {
   const [expanded, setExpanded] = useState(false)
@@ -60,11 +62,54 @@ function LogMessage({ message, color }: { message: string; color: string }) {
 export default function DebugPanel() {
   const { entries, clear } = useDebugStore()
   const bottomRef = useRef<HTMLDivElement>(null)
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const atBottomRef = useRef(true)
 
-  // Auto-scroll to bottom on new entries
+  const [search, setSearch] = useState('')
+  const [activeCategory, setActiveCategory] = useState<string | null>(null)
+  const [hiddenLevels, setHiddenLevels] = useState<Set<DebugLevel>>(new Set())
+
+  // Unique categories derived from all entries
+  const categories = useMemo(() => {
+    const seen = new Set<string>()
+    for (const e of entries) seen.add(e.category)
+    return Array.from(seen).sort()
+  }, [entries])
+
+  // Filtered entries
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase()
+    return entries.filter((e) => {
+      if (activeCategory && e.category !== activeCategory) return false
+      if (hiddenLevels.has(e.level)) return false
+      if (q && !e.message.toLowerCase().includes(q) && !e.category.toLowerCase().includes(q)) return false
+      return true
+    })
+  }, [entries, activeCategory, hiddenLevels, search])
+
+  // Track scroll position to decide if we should auto-scroll
+  const handleScroll = () => {
+    const el = scrollRef.current
+    if (!el) return
+    atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+  }
+
+  // Auto-scroll to bottom only when no filter is active and we're near bottom
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    const isFiltering = search.trim() || activeCategory || hiddenLevels.size > 0
+    if (!isFiltering && atBottomRef.current) {
+      bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
   }, [entries.length])
+
+  const toggleLevel = (level: DebugLevel) => {
+    setHiddenLevels((prev) => {
+      const next = new Set(prev)
+      if (next.has(level)) next.delete(level)
+      else next.add(level)
+      return next
+    })
+  }
 
   return (
     <div style={{
@@ -82,7 +127,7 @@ export default function DebugPanel() {
         </span>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
           <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>
-            {entries.length} 筆
+            {filtered.length}/{entries.length} 筆
           </span>
           <button
             onClick={clear}
@@ -95,17 +140,84 @@ export default function DebugPanel() {
         </div>
       </div>
 
+      {/* Search */}
+      <div style={{ padding: '6px 10px', borderBottom: '1px solid var(--color-border)', flexShrink: 0 }}>
+        <input
+          type="text"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="搜尋訊息或分類…"
+          style={{
+            width: '100%', boxSizing: 'border-box',
+            padding: '4px 8px', fontSize: '11px',
+            background: 'var(--color-bg-overlay)', border: '1px solid var(--color-border)',
+            borderRadius: '5px', color: 'var(--color-text-primary)', outline: 'none',
+          }}
+        />
+      </div>
+
+      {/* Category chips + Level toggles */}
+      <div style={{ padding: '5px 10px', borderBottom: '1px solid var(--color-border)', flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 4 }}>
+        {/* Category chips */}
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+          <button
+            onClick={() => setActiveCategory(null)}
+            style={{
+              fontSize: '10px', padding: '1px 7px', borderRadius: '10px', cursor: 'pointer',
+              border: '1px solid var(--color-border)',
+              background: activeCategory === null ? 'var(--color-accent)' : 'var(--color-bg-overlay)',
+              color: activeCategory === null ? '#fff' : 'var(--color-text-secondary)',
+              fontWeight: activeCategory === null ? 600 : 400,
+            }}
+          >全部</button>
+          {categories.map((cat) => (
+            <button
+              key={cat}
+              onClick={() => setActiveCategory(activeCategory === cat ? null : cat)}
+              style={{
+                fontSize: '10px', padding: '1px 7px', borderRadius: '10px', cursor: 'pointer',
+                border: '1px solid var(--color-border)',
+                background: activeCategory === cat ? 'var(--color-accent)' : 'var(--color-bg-overlay)',
+                color: activeCategory === cat ? '#fff' : 'var(--color-text-muted)',
+                fontWeight: activeCategory === cat ? 600 : 400,
+              }}
+            >{cat}</button>
+          ))}
+        </div>
+
+        {/* Level toggles */}
+        <div style={{ display: 'flex', gap: 4 }}>
+          {ALL_LEVELS.map((level) => {
+            const hidden = hiddenLevels.has(level)
+            return (
+              <button
+                key={level}
+                onClick={() => toggleLevel(level)}
+                style={{
+                  fontSize: '10px', padding: '1px 7px', borderRadius: '4px', cursor: 'pointer',
+                  border: `1px solid ${hidden ? 'var(--color-border)' : LEVEL_COLOR[level]}`,
+                  background: hidden ? 'var(--color-bg-overlay)' : `${LEVEL_COLOR[level]}22`,
+                  color: hidden ? 'var(--color-text-muted)' : LEVEL_COLOR[level],
+                  fontFamily: 'var(--font-mono)', fontWeight: 600,
+                  opacity: hidden ? 0.5 : 1,
+                }}
+              >{LEVEL_LABEL[level].trim()}</button>
+            )
+          })}
+        </div>
+      </div>
+
       {/* Log entries */}
-      <div style={{ flex: 1, overflowY: 'auto', padding: '4px 0' }}>
-        {entries.length === 0 ? (
+      <div ref={scrollRef} onScroll={handleScroll} style={{ flex: 1, overflowY: 'auto', padding: '4px 0' }}>
+        {filtered.length === 0 ? (
           <div style={{
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             height: '100%', color: 'var(--color-text-muted)', fontSize: '12px',
           }}>
-            尚無日誌。點擊工具列的 🎙 按鈕開始錄音。
+            {entries.length === 0 ? '尚無日誌。' : '無符合的日誌。'}
           </div>
         ) : (
-          entries.map((entry) => (
+          filtered.map((entry) => (
             <div
               key={entry.id}
               style={{

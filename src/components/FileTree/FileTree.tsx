@@ -429,7 +429,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
   const [renameValue, setRenameValue] = useState('')
   const [menuX, setMenuX] = useState(0)
   const [menuY, setMenuY] = useState(0)
-  const { deleteNote, createFolder, renameFolder, deleteFolder, importImage, deleteAsset, renameNote, renameAsset, openPathExternally } = useVaultStore()
+  const { deleteNote, createFolder, renameFolder, deleteFolder, importImage, deleteAsset, renameNote, renameAsset } = useVaultStore()
   const { currentPath: editorPath, setCurrentPath, setContent } = useEditorStore()
 
   // 點選選單外部時關閉
@@ -509,7 +509,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
       <div
         data-item-path={node.path}
         data-item-parent={parentEncoded}
-        onClick={async () => { if (isRenaming) return; try { await openPathExternally(node.path) } catch { toast.error('無法開啟圖片') } }}
+        onClick={() => { if (isRenaming) return; onOpenNote(node.path) }}
         onContextMenu={(e) => { if (isRenaming) return; e.preventDefault(); e.stopPropagation(); window.getSelection()?.removeAllRanges(); setMenuX(e.clientX); setMenuY(e.clientY); setMenuOpen(true) }}
         onMouseEnter={() => setIsHovered(true)}
         onMouseLeave={() => setIsHovered(false)}

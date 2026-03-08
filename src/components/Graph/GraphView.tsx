@@ -26,7 +26,7 @@ export default function GraphView({ onOpenNote }: GraphViewProps) {
   const { graphData, load } = useGraphStore()
   const { currentPath } = useEditorStore()
   const { settings } = useSettingsStore()
-  const { assets, openPathExternally } = useVaultStore()
+  const { assets } = useVaultStore()
 
   // Keep refs so theme-init effect can seed the graph with latest data
   const graphDataRef = useRef(graphData)
@@ -108,7 +108,7 @@ export default function GraphView({ onOpenNote }: GraphViewProps) {
       if (nodeType === 'note') {
         onOpenNote(node.id())
       } else if (nodeType === 'file') {
-        openPathExternally(node.data('file_path')).catch(() => {})
+        onOpenNote(node.data('file_path'))
       }
     })
 
