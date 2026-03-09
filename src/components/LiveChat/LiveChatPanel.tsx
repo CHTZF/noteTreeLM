@@ -102,7 +102,15 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
   useEffect(() => {
     const saved = localStorage.getItem('live_chat_conversation_id')
     if (saved) {
-      setConversationId(saved)
+      // Verify it still exists in DB (handles stale IDs after DB reset)
+      invoke('get_conversation', { id: saved })
+        .then(() => setConversationId(saved))
+        .catch(() => {
+          invoke<string>('create_conversation', { mode: 'live_chat' }).then(id => {
+            setConversationId(id)
+            localStorage.setItem('live_chat_conversation_id', id)
+          }).catch(() => {})
+        })
     } else {
       invoke<string>('create_conversation', { mode: 'live_chat' }).then(id => {
         setConversationId(id)

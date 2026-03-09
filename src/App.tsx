@@ -755,6 +755,7 @@ export default function App() {
                 <ChatPanel
                   liveChatActive={false}
                   onActiveChange={active => { chatActiveRef.current.set(t.id, active) }}
+                  onOpenNote={openNote}
                 />
               )}
               {t.path === LIVE_CHAT_TAB && (

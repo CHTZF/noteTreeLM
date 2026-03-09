@@ -14,7 +14,10 @@ interface Message {
   content: string
 }
 
-export default function ChatPanel({ liveChatActive = false, onActiveChange }: { liveChatActive?: boolean; onActiveChange?: (active: boolean) => void }) {
+// Phrases that mean "yes, open that note" when there are pending note suggestions
+const CONFIRM_OPEN_RE = /^(要|好|是|好的|對|確認|打開|開啟|開一下|看一下|看看|幫我打開|請打開|好啊|可以|沒問題|就這個|開它|打開它|要看|我要看|行|ok|OK|好喔|沒錯)$/
+
+export default function ChatPanel({ liveChatActive = false, onActiveChange, onOpenNote }: { liveChatActive?: boolean; onActiveChange?: (active: boolean) => void; onOpenNote?: (path: string) => void }) {
   const { settings } = useSettingsStore()
   const { content: noteContent, currentPath } = useEditorStore()
   const { addLog } = useDebugStore()
@@ -49,6 +52,11 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange }: { 
   const justCompressedRef = useRef(false)
   const sessionWriteApprovedRef = useRef(false)
 
+  // Track note suggestions from agent:note_refs for "打開它" shortcut
+  const [noteSuggestions, setNoteSuggestions] = useState<{ absPath: string; label: string }[]>([])
+  const noteSuggestionsRef = useRef<{ absPath: string; label: string }[]>([])
+  useEffect(() => { noteSuggestionsRef.current = noteSuggestions }, [noteSuggestions])
+
   const log = useCallback((msg: string) => addLog('chat', 'info', msg), [addLog])
   const err = useCallback((msg: string) => addLog('chat', 'error', msg), [addLog])
 
@@ -73,6 +81,12 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange }: { 
       setMessages(msgs.filter(m => m.role === 'user' || m.role === 'assistant')
         .map(m => ({ role: m.role as 'user' | 'assistant', content: m.content })))
     } catch {
+      // Conversation not found in DB (stale localStorage ID) — create a fresh one
+      try {
+        const newId = await invoke<string>('create_conversation', { mode: 'chat' })
+        setConversationId(newId)
+        localStorage.setItem('chat_conversation_id', newId)
+      } catch {}
       setMessages([])
     }
   }, [])
@@ -262,6 +276,22 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange }: { 
     const text = input.trim()
     if (!text || isStreaming) return
 
+    // Shortcut: "打開它" style phrases when note suggestions are pending
+    const prevSuggestions = noteSuggestionsRef.current
+    if (prevSuggestions.length > 0 && CONFIRM_OPEN_RE.test(text) && onOpenNote) {
+      const note = prevSuggestions[0]
+      setNoteSuggestions([])
+      noteSuggestionsRef.current = []
+      setMessages(prev => [
+        ...prev,
+        { role: 'user', content: text },
+        { role: 'assistant', content: `已為你打開《${note.label}》` },
+      ])
+      setInput('')
+      onOpenNote(note.absPath)
+      return
+    }
+
     const userMsg: Message = { role: 'user', content: text }
     const allMessages = [...messages, userMsg]
     setMessages(allMessages)
@@ -283,6 +313,11 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange }: { 
     let unlistenDone: (() => void) | undefined
     let unlistenToolCall: (() => void) | undefined
     let unlistenWriteReq: (() => void) | undefined
+    let unlistenNoteRefs: (() => void) | undefined
+
+    // Clear previous suggestions at the start of each send
+    setNoteSuggestions([])
+    noteSuggestionsRef.current = []
 
     try {
       const notePart =
@@ -297,6 +332,16 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange }: { 
       // 監聽工具調用顯示
       unlistenToolCall = await listen<string>('agent:tool_call', (event) => {
         setMessages((prev) => [...prev, { role: 'tool', content: event.payload }])
+      })
+
+      // 追蹤筆記建議（供「打開它」捷徑使用）
+      unlistenNoteRefs = await listen<string[]>('agent:note_refs', (e) => {
+        const suggestions = e.payload.map(absPath => ({
+          absPath,
+          label: absPath.split('/').pop()?.replace(/\.md$/, '') ?? absPath,
+        }))
+        setNoteSuggestions(suggestions)
+        noteSuggestionsRef.current = suggestions
       })
 
       // 監聽寫入確認請求
@@ -351,12 +396,13 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange }: { 
       unlistenDone?.()
       unlistenToolCall?.()
       unlistenWriteReq?.()
+      unlistenNoteRefs?.()
       setPendingWriteDisplay(null)
       setIsStreaming(false)
       setStreamingText('')
       streamingRef.current = ''
     }
-  }, [input, isStreaming, messages, useNoteContext, writeConfirmMode, currentPath, noteContent, lastMemoryPath, conversationId, log, err])
+  }, [input, isStreaming, messages, useNoteContext, writeConfirmMode, currentPath, noteContent, lastMemoryPath, conversationId, onOpenNote, log, err])
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -625,6 +671,26 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange }: { 
 
           <div ref={bottomRef} />
         </div>
+
+        {/* 筆記建議捷徑 */}
+        {noteSuggestions.length > 0 && onOpenNote && (
+          <div style={{ padding: '4px 8px', display: 'flex', flexWrap: 'wrap', gap: '4px', flexShrink: 0 }}>
+            <span style={{ fontSize: '11px', color: 'var(--color-text-muted)', alignSelf: 'center' }}>找到筆記，要打開嗎？</span>
+            {noteSuggestions.map((note, i) => (
+              <button
+                key={i}
+                onClick={() => { setNoteSuggestions([]); noteSuggestionsRef.current = []; onOpenNote(note.absPath) }}
+                style={{
+                  fontSize: '11px', padding: '2px 8px', borderRadius: '12px',
+                  border: '1px solid var(--color-accent)', background: 'var(--color-accent-dim)',
+                  color: 'var(--color-accent)', cursor: 'pointer',
+                }}
+              >
+                {note.label}
+              </button>
+            ))}
+          </div>
+        )}
 
         {/* 寫入確認 Bubble */}
         {pendingWriteDisplay && (

@@ -171,6 +171,7 @@ pub async fn load_messages(db: &sqlx::SqlitePool, conv_id: &str) -> Result<serde
 }
 
 /// 儲存完整 messages_json 回 DB，同時更新 updated_at
+/// 使用 UPSERT：若 conversation row 不存在（例如 localStorage 殘留 stale ID），自動建立
 pub async fn save_messages(
     db: &sqlx::SqlitePool,
     conv_id: &str,
@@ -178,10 +179,14 @@ pub async fn save_messages(
 ) -> Result<(), AppError> {
     let json_str = serde_json::to_string(messages).map_err(|e| AppError::AI(e.to_string()))?;
     sqlx::query(
-        "UPDATE conversations SET messages_json = ?, updated_at = strftime('%s','now') WHERE id = ?"
+        "INSERT INTO conversations(id, mode, messages_json, updated_at) \
+         VALUES (?, 'chat', ?, strftime('%s','now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+           messages_json = excluded.messages_json, \
+           updated_at = excluded.updated_at"
     )
-    .bind(&json_str)
     .bind(conv_id)
+    .bind(&json_str)
     .execute(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
