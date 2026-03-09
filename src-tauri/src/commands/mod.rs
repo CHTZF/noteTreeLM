@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod conversation;
 pub mod download;
 pub mod graph;
 pub mod import;

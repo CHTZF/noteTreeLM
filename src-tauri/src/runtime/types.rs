@@ -68,3 +68,10 @@ pub type PrefetchFn = Arc<
     + Send + Sync
 >;
 
+/// Embedding 回呼：(text) → embedding 向量（空 Vec 表示失敗）
+/// 透過 llama-server /embedding endpoint 取得
+pub type EmbedFn = Arc<
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = Vec<f32>> + Send>>
+    + Send + Sync
+>;
+

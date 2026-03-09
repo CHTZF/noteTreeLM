@@ -10,6 +10,7 @@ pub async fn init_settings_db(app_data_dir: &Path) -> crate::error::Result<Sqlit
     let db_url = format!("sqlite://{}?mode=rwc", db_path.to_string_lossy());
     let pool = connect(db_url).await?;
     run_migrations(&pool, include_str!("../../migrations/settings_001.sql")).await?;
+    run_migrations(&pool, include_str!("../../migrations/settings_002.sql")).await?;
     Ok(pool)
 }
 

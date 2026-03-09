@@ -140,6 +140,7 @@ async fn ensure_server_running(
             "4096",
             "--parallel",
             "1",
+            "--embedding",   // 開啟 /embedding endpoint（用於 intent embedding）
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -222,6 +223,56 @@ async fn ensure_server_running(
     Err(AppError::AI(
         "llama-server 啟動超時（60 秒），請確認 llama-server 路徑與模型設定。".to_string(),
     ))
+}
+
+/// 呼叫 llama-server /embedding endpoint，取得單一文字的 embedding 向量
+/// 失敗時回傳空 Vec（非致命錯誤，由呼叫端 fallback）
+pub async fn get_embedding(client: &reqwest::Client, base_url: &str, text: &str) -> Vec<f32> {
+    let body = serde_json::json!({ "content": text });
+    let resp = client
+        .post(format!("{}/embedding", base_url))
+        .json(&body)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
+    let resp = match resp {
+        Ok(r) if r.status().is_success() => r,
+        _ => return vec![],
+    };
+    let json: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    // llama-server /embedding 回傳格式：{"embedding": [f32, ...]}
+    json["embedding"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect())
+        .unwrap_or_default()
+}
+
+/// 計算多個 embedding 向量的 centroid（平均向量），並做 L2 正規化
+pub fn compute_centroid(vecs: &[Vec<f32>]) -> Vec<f32> {
+    if vecs.is_empty() {
+        return vec![];
+    }
+    let dim = vecs[0].len();
+    if dim == 0 {
+        return vec![];
+    }
+    let mut centroid = vec![0f32; dim];
+    for v in vecs {
+        for (i, &f) in v.iter().enumerate() {
+            if i < dim { centroid[i] += f; }
+        }
+    }
+    let n = vecs.len() as f32;
+    for f in &mut centroid { *f /= n; }
+    // L2 normalize
+    let norm: f32 = centroid.iter().map(|f| f * f).sum::<f32>().sqrt();
+    if norm > 1e-8 {
+        for f in &mut centroid { *f /= norm; }
+    }
+    centroid
 }
 
 /// 封裝 OpenAI-compatible SSE 串流請求，返回 StreamResult
@@ -371,6 +422,9 @@ pub async fn cancel_agent(state: State<'_, AppState>) -> Result<(), AppError> {
 /// 帶意圖分類的 Agent 串流
 /// 透過 runtime::Agent 執行：意圖分類 → 取消/確認/多輪 LLM+工具 loop
 /// 每輪工具呼叫透過 ToolRegistry + Transaction 執行（支援 rollback）
+///
+/// conversation_id 存在時：後端從 DB 載入 messages，不使用前端傳入的 messages；
+/// 回應完成後自動將完整對話（含 LLM 回覆）存回 DB。
 #[tauri::command]
 pub async fn invoke_agent(
     app: AppHandle,
@@ -379,7 +433,9 @@ pub async fn invoke_agent(
     messages: Vec<ChatMessage>,
     system: Option<String>,
     use_tools: Option<bool>,
+    conversation_id: Option<String>,
 ) -> Result<String, AppError> {
+    use crate::commands::conversation::{load_messages, save_messages, maybe_set_title};
     use crate::runtime::agent::Agent;
     use crate::runtime::dispatcher::Dispatcher;
     use crate::runtime::intent_classifier::IntentClassifier;
@@ -394,13 +450,32 @@ pub async fn invoke_agent(
     let vault_path = state.get_vault_path().await;
     let vault_db_opt = state.get_vault_db().await.ok();
 
-    // 3. 組裝 messages_json（system + history + current user msg）
-    let mut messages_json: Vec<serde_json::Value> = Vec::new();
-    if let Some(sys) = &system {
-        messages_json.push(serde_json::json!({"role": "system", "content": sys}));
-    }
-    for msg in &messages {
-        messages_json.push(serde_json::json!({"role": msg.role, "content": msg.content}));
+    // 3. 組裝 messages_json
+    //    - conversation_id 存在：從 DB 載入歷史，追加當前 user 訊息
+    //    - 否則：使用前端傳入的 messages（向下相容）
+    let mut messages_json: Vec<serde_json::Value> = if let Some(ref conv_id) = conversation_id {
+        let mut db_msgs = load_messages(&state.settings_db, conv_id).await?;
+        let arr = db_msgs.as_array_mut()
+            .ok_or_else(|| AppError::AI("messages_json 格式錯誤".into()))?;
+        // 追加當前 user 訊息（input）
+        arr.push(serde_json::json!({"role": "user", "content": input}));
+        arr.clone()
+    } else {
+        let mut v: Vec<serde_json::Value> = Vec::new();
+        for msg in &messages {
+            v.push(serde_json::json!({"role": msg.role, "content": msg.content}));
+        }
+        v
+    };
+
+    // 若有 system prompt，插入最前面（conversation_id 模式下 system 每次由前端提供）
+    if let Some(ref sys) = system {
+        // 若第一條已是 system，覆蓋它；否則插入
+        if messages_json.first().and_then(|m| m["role"].as_str()) == Some("system") {
+            messages_json[0] = serde_json::json!({"role": "system", "content": sys});
+        } else {
+            messages_json.insert(0, serde_json::json!({"role": "system", "content": sys}));
+        }
     }
 
     // 4. 建立 ToolRegistry（vault 可用時注入工具）
@@ -467,6 +542,17 @@ pub async fn invoke_agent(
     let app_emit = app.clone();
     let emit_fn: EmitEventFn = Arc::new(move |event: String, payload: serde_json::Value| {
         let _ = app_emit.emit(&event, payload);
+    });
+
+    // 7b. embed_fn：呼叫 llama-server /embedding，取得向量
+    let client_emb = client.clone();
+    let base_emb = base_url.clone();
+    let embed_fn: crate::runtime::types::EmbedFn = Arc::new(move |text: String| {
+        let client = client_emb.clone();
+        let base = base_emb.clone();
+        Box::pin(async move {
+            get_embedding(&client, &base, &text).await
+        })
     });
 
     // 8. 建立 Agent，執行
@@ -542,12 +628,34 @@ pub async fn invoke_agent(
         Arc::clone(&state.agent_session),
         vault_tools_opt,
         prefetch_memory,
+        embed_fn,
+        state.settings_db.clone(),
+        conversation_id.clone(),
     );
 
-    agent
-        .run(input, messages_json, use_tools.unwrap_or(true))
+    let response_text = agent
+        .run(input, messages_json.clone(), use_tools.unwrap_or(true))
         .await
-        .map_err(AppError::AI)
+        .map_err(AppError::AI)?;
+
+    // 若有 conversation_id，將完整對話（含 LLM 回覆）存回 DB
+    if let Some(ref conv_id) = conversation_id {
+        // 過濾掉 system prompt 再存（messages_json[0] 可能是 system）
+        let mut to_save: Vec<serde_json::Value> = messages_json.into_iter()
+            .filter(|m| m["role"].as_str() != Some("system"))
+            .collect();
+
+        // 只有實際有文字回覆才追加 assistant 訊息
+        if !response_text.is_empty() {
+            to_save.push(serde_json::json!({"role": "assistant", "content": response_text}));
+        }
+
+        let arr = serde_json::Value::Array(to_save);
+        let _ = save_messages(&state.settings_db, conv_id, &arr).await;
+        let _ = maybe_set_title(&state.settings_db, conv_id, &arr).await;
+    }
+
+    Ok(response_text)
 }
 
 /// 串流聊天（外部 AI 提供商）：OpenAI / Anthropic / Ollama
@@ -1128,6 +1236,48 @@ fn vault_tools() -> serde_json::Value {
                         }
                     },
                     "required": ["query"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "plan_announce",
+                "description": "當你打算執行寫入操作（create_note / update_note / create_folder）且需要使用者確認時，\
+先呼叫此工具記錄計畫。提供使用者可能用來確認/取消/中斷的樣本短語（用於語意匹配），\
+以及你打算執行的工具清單（deferred_tools）。呼叫後再用文字告知使用者計畫內容，等待確認。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "confirm_phrases": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "使用者確認計畫時可能說的 10-15 個短語（口語、正式、縮短形式都要）"
+                        },
+                        "cancel_phrases": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "使用者取消計畫時可能說的 10-15 個短語"
+                        },
+                        "interrupt_phrases": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "使用者暫停/插話時可能說的短語"
+                        },
+                        "deferred_tools": {
+                            "type": "array",
+                            "description": "計畫執行的工具清單",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "args": {"type": "object"}
+                                },
+                                "required": ["name", "args"]
+                            }
+                        }
+                    },
+                    "required": ["confirm_phrases", "cancel_phrases", "interrupt_phrases", "deferred_tools"]
                 }
             }
         },

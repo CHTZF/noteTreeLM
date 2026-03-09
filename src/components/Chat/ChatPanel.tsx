@@ -7,13 +7,14 @@ import { useDebugStore } from '../../stores/debugStore'
 import { toast } from '../common/Toast'
 import { useVoiceRecorder } from '../../hooks/useVoiceRecorder'
 import VoiceOverlay from '../common/VoiceOverlay'
+import ConversationList from './ConversationList'
 
 interface Message {
   role: 'user' | 'assistant' | 'tool' | 'notice'
   content: string
 }
 
-export default function ChatPanel({ liveChatActive = false }: { liveChatActive?: boolean }) {
+export default function ChatPanel({ liveChatActive = false, onActiveChange }: { liveChatActive?: boolean; onActiveChange?: (active: boolean) => void }) {
   const { settings } = useSettingsStore()
   const { content: noteContent, currentPath } = useEditorStore()
   const { addLog } = useDebugStore()
@@ -21,6 +22,11 @@ export default function ChatPanel({ liveChatActive = false }: { liveChatActive?:
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [isStreaming, setIsStreaming] = useState(false)
+  const [conversationId, setConversationId] = useState<string | null>(null)
+  const [sidebarOpen, _setSidebarOpen] = useState(true)
+
+  // Notify parent when streaming state changes (for close confirmation)
+  useEffect(() => { onActiveChange?.(isStreaming) }, [isStreaming])
   const [streamingText, setStreamingText] = useState('')
   const useNoteContext = !!settings.chat_auto_include_note
   const writeConfirmMode = (settings.write_confirm_mode ?? 'always') as 'always' | 'once' | 'never'
@@ -45,6 +51,51 @@ export default function ChatPanel({ liveChatActive = false }: { liveChatActive?:
 
   const log = useCallback((msg: string) => addLog('chat', 'info', msg), [addLog])
   const err = useCallback((msg: string) => addLog('chat', 'error', msg), [addLog])
+
+  // 初始化：建立第一個對話（或從 localStorage 恢復上次選中的 conversation）
+  useEffect(() => {
+    const saved = localStorage.getItem('chat_conversation_id')
+    if (saved) {
+      setConversationId(saved)
+      loadConversationMessages(saved)
+    } else {
+      invoke<string>('create_conversation', { mode: 'chat' }).then(id => {
+        setConversationId(id)
+        localStorage.setItem('chat_conversation_id', id)
+      }).catch(() => {})
+    }
+  }, [])
+
+  const loadConversationMessages = useCallback(async (id: string) => {
+    try {
+      const snap: { messages_json: string } = await invoke('get_conversation', { id })
+      const msgs: Array<{ role: string; content: string }> = JSON.parse(snap.messages_json)
+      setMessages(msgs.filter(m => m.role === 'user' || m.role === 'assistant')
+        .map(m => ({ role: m.role as 'user' | 'assistant', content: m.content })))
+    } catch {
+      setMessages([])
+    }
+  }, [])
+
+  const handleSelectConversation = useCallback((id: string) => {
+    if (isStreaming) return
+    setConversationId(id)
+    localStorage.setItem('chat_conversation_id', id)
+    loadConversationMessages(id)
+    setError('')
+    setStreamingText('')
+    streamingRef.current = ''
+  }, [isStreaming, loadConversationMessages])
+
+  const handleNewConversation = useCallback((id: string) => {
+    if (!id) return
+    setConversationId(id)
+    localStorage.setItem('chat_conversation_id', id)
+    setMessages([])
+    setError('')
+    setStreamingText('')
+    streamingRef.current = ''
+  }, [])
 
   const isConfigured = !!settings.llama_cli_path && !!settings.llm_model_path
   const whisperConfigured = !!settings.whisper_cli_path && !!settings.whisper_model_path
@@ -280,6 +331,7 @@ export default function ChatPanel({ liveChatActive = false }: { liveChatActive?:
         input: text,
         messages: llmMessages,
         system,
+        conversationId: conversationId ?? undefined,
       })
 
       const finalContent = responseText || streamingRef.current
@@ -304,7 +356,7 @@ export default function ChatPanel({ liveChatActive = false }: { liveChatActive?:
       setStreamingText('')
       streamingRef.current = ''
     }
-  }, [input, isStreaming, messages, useNoteContext, writeConfirmMode, currentPath, noteContent, lastMemoryPath, log, err])
+  }, [input, isStreaming, messages, useNoteContext, writeConfirmMode, currentPath, noteContent, lastMemoryPath, conversationId, log, err])
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -428,7 +480,24 @@ export default function ChatPanel({ liveChatActive = false }: { liveChatActive?:
   }, [messages.length, settings.enable_auto_memory, settings.memory_threshold, isStreaming, isCompressing, compressToMemory])
 
   return (
-    <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', width: '100%', height: '100%', background: 'var(--color-bg-base)', overflow: 'hidden' }}>
+    <div style={{ position: 'relative', display: 'flex', flexDirection: 'row', width: '100%', height: '100%', background: 'var(--color-bg-base)', overflow: 'hidden' }}>
+      {/* Conversation sidebar */}
+      {sidebarOpen && (
+        <div style={{
+          width: '180px', flexShrink: 0, borderRight: '1px solid var(--color-border)',
+          display: 'flex', flexDirection: 'column', overflow: 'hidden',
+        }}>
+          <ConversationList
+            mode="chat"
+            selectedId={conversationId}
+            onSelect={handleSelectConversation}
+            onNew={handleNewConversation}
+          />
+        </div>
+      )}
+
+      {/* Main chat area */}
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minWidth: 0 }}>
       {/* Voice Overlay */}
       {showVoiceOverlay && (
         <VoiceOverlay
@@ -684,7 +753,7 @@ export default function ChatPanel({ liveChatActive = false }: { liveChatActive?:
           </button>
         </div>
       </div>
-     
+      </div>{/* end main chat area */}
     </div>
   )
 }

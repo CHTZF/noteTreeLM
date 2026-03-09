@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useVoiceRecorder } from '../../hooks/useVoiceRecorder'
+import ConversationList from '../Chat/ConversationList'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -67,6 +68,8 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
   // ── UI state ──────────────────────────────────────────────────────────────
   const [liveChatState, setLiveChatState] = useState<LiveChatState>('idle')
   const [messages, setMessages] = useState<Message[]>([])
+  const [conversationId, setConversationId] = useState<string | null>(null)
+  const [sidebarOpen, _setSidebarOpen] = useState(true)
   const [displayTranscript, setDisplayTranscript] = useState('')
   const [streamingText, setStreamingText] = useState('')
   // Note suggestions from search_vault / read_note tool calls
@@ -94,6 +97,32 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
   useEffect(() => {
     onActiveChange?.(liveChatState !== 'idle')
   }, [liveChatState, onActiveChange])
+
+  // 初始化 conversation（live_chat mode）
+  useEffect(() => {
+    const saved = localStorage.getItem('live_chat_conversation_id')
+    if (saved) {
+      setConversationId(saved)
+    } else {
+      invoke<string>('create_conversation', { mode: 'live_chat' }).then(id => {
+        setConversationId(id)
+        localStorage.setItem('live_chat_conversation_id', id)
+      }).catch(() => {})
+    }
+  }, [])
+
+  const handleSelectConversation = useCallback((id: string) => {
+    setConversationId(id)
+    localStorage.setItem('live_chat_conversation_id', id)
+    setMessages([])
+  }, [])
+
+  const handleNewConversation = useCallback((id: string) => {
+    if (!id) return
+    setConversationId(id)
+    localStorage.setItem('live_chat_conversation_id', id)
+    setMessages([])
+  }, [])
 
 
   // Auto-scroll to bottom when messages or streaming changes
@@ -365,10 +394,12 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
     })
 
     try {
+      const convId = conversationId
       await invoke('invoke_agent', {
         input: query,
         messages: [...messagesRef.current, { role: 'user', content: query }],
         system: LIVE_CHAT_SYSTEM,
+        conversationId: convId ?? undefined,
       })
     } catch {
       unlistenToken()
@@ -425,9 +456,26 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
   // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div style={{
-      display: 'flex', flexDirection: 'column', height: '100%',
+      display: 'flex', flexDirection: 'row', height: '100%',
       background: 'var(--color-bg-base)', color: 'var(--color-text-primary)',
     }}>
+      {/* Conversation sidebar */}
+      {sidebarOpen && (
+        <div style={{
+          width: '180px', flexShrink: 0, borderRight: '1px solid var(--color-border)',
+          display: 'flex', flexDirection: 'column', overflow: 'hidden',
+        }}>
+          <ConversationList
+            mode="live_chat"
+            selectedId={conversationId}
+            onSelect={handleSelectConversation}
+            onNew={handleNewConversation}
+          />
+        </div>
+      )}
+
+      {/* Main live chat area */}
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minWidth: 0 }}>
       {/* Header */}
       <div style={{
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
@@ -646,6 +694,7 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
         @keyframes live-chat-bar3 { from { height: 8px; } to { height: 12px; } }
         @keyframes live-chat-bar4 { from { height: 4px; } to { height: 16px; } }
       `}</style>
+      </div>{/* end main live chat area */}
     </div>
   )
 }

@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde_json::Value;
+use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -11,7 +12,7 @@ use super::intent_classifier::{Intent, IntentClassifier};
 use super::memory_agent::MemoryAgent;
 use super::planner::Planner;
 use super::transaction::Transaction;
-use super::types::{ConfirmWriteFn, EmitEventFn, LlmFn, PrefetchFn, TxDebugEvent};
+use super::types::{ConfirmWriteFn, EmbedFn, EmitEventFn, LlmFn, PrefetchFn, TxDebugEvent};
 
 pub struct Agent {
     dispatcher: Dispatcher,
@@ -32,6 +33,12 @@ pub struct Agent {
     vault_tools: Option<Value>,
     /// 記憶預取回呼（Intent::Memory 路徑的初始種子；None = 無 vault DB）
     prefetch_memory: Option<PrefetchFn>,
+    /// Embedding 回呼（用於 plan_announce centroid 計算）
+    embed_fn: EmbedFn,
+    /// settings DB（用於 pending_plans CRUD）
+    settings_db: SqlitePool,
+    /// 目前對話的 conversation_id（None = 無 DB 模式）
+    conversation_id: Option<String>,
 }
 
 impl Agent {
@@ -46,6 +53,9 @@ impl Agent {
         current_session: Arc<Mutex<Option<String>>>,
         vault_tools: Option<Value>,
         prefetch_memory: Option<PrefetchFn>,
+        embed_fn: EmbedFn,
+        settings_db: SqlitePool,
+        conversation_id: Option<String>,
     ) -> Self {
         Self {
             dispatcher,
@@ -58,6 +68,9 @@ impl Agent {
             current_session,
             vault_tools,
             prefetch_memory,
+            embed_fn,
+            settings_db,
+            conversation_id,
         }
     }
 
@@ -72,6 +85,76 @@ impl Agent {
         mut messages: Vec<Value>,
         use_tools: bool,
     ) -> Result<String, String> {
+        use crate::commands::conversation::{
+            load_pending_plan, delete_pending_plan,
+        };
+
+        // ── 檢查是否有 pending plan（conversation_id 模式）─────────────
+        if let Some(ref conv_id) = self.conversation_id {
+            let plan = load_pending_plan(&self.settings_db, conv_id).await
+                .unwrap_or(None);
+
+            if let Some(pending) = plan {
+                // TTL 檢查：超過 24h 自動取消
+                let age = chrono::Utc::now().timestamp() - pending.created_at;
+                if age > 86400 {
+                    let _ = delete_pending_plan(&self.settings_db, conv_id).await;
+                    // 通知 LLM 計畫已過期，繼續正常處理
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": "[系統] 先前的操作計畫已過期（超過 24 小時）自動取消。"
+                    }));
+                } else {
+                    // 用 embedding 分類 intent
+                    let intent = self.intent_classifier.classify_with_embedding(
+                        &user_input,
+                        &pending.confirm_centroid,
+                        &pending.cancel_centroid,
+                        &pending.interrupt_centroid,
+                        &self.embed_fn,
+                    ).await;
+
+                    // 無論任何 intent 都清除 pending plan
+                    let _ = delete_pending_plan(&self.settings_db, conv_id).await;
+
+                    match intent {
+                        Intent::Confirm => {
+                            // 執行 deferred tools：重新走 streaming loop，但 messages 已包含計畫確認
+                            // 將 deferred tools 注入為工具呼叫提示讓 LLM 執行
+                            let deferred_desc = pending.deferred_tools.iter()
+                                .map(|t| format!("- {} {:?}", t.name, t.args))
+                                .collect::<Vec<_>>().join("\n");
+                            messages.push(serde_json::json!({
+                                "role": "user",
+                                "content": format!(
+                                    "[系統] 使用者已確認，請立即執行以下計畫中的工具：\n{}",
+                                    deferred_desc
+                                )
+                            }));
+                            self.stream_cancel.store(false, Ordering::Relaxed);
+                            let session_id = Uuid::new_v4().to_string();
+                            *self.current_session.lock().await = Some(session_id.clone());
+                            let tools = if use_tools { self.vault_tools.clone() } else { None };
+                            return self.run_streaming_loop(messages, tools, session_id).await;
+                        }
+                        Intent::Cancel | Intent::Interrupt => {
+                            (self.emit)("agent:cancelled".into(), Value::Null);
+                            (self.emit)("llm:done".into(), Value::String(String::new()));
+                            return Ok(String::new());
+                        }
+                        _ => {
+                            // 無法辨識 → 自動 cancel，繼續當新查詢處理
+                            messages.push(serde_json::json!({
+                                "role": "user",
+                                "content": "[系統] 先前的操作計畫已自動取消，因為偵測到新的查詢請求。"
+                            }));
+                            // 落穿至下方正常 intent classify
+                        }
+                    }
+                }
+            }
+        }
+
         // ── 記憶預取（所有意圖共用，單次 DB query）────────────────────────
         // 結果暫存於 prefetched；Cancel/Confirm 路徑不會用到，但代價極低（<1ms 空查詢）
         let prefetched = if let Some(ref pf) = self.prefetch_memory {
@@ -155,6 +238,9 @@ impl Agent {
         tools: Option<Value>,
         session_id: String,
     ) -> Result<String, String> {
+        use crate::commands::conversation::{save_pending_plan, DeferredTool};
+        use crate::commands::ai::compute_centroid;
+
         // 建立 Transaction → prepare → emit
         let tx = Arc::new(Transaction::new());
         tx.prepare().await?;
@@ -164,6 +250,8 @@ impl Agent {
         let mut final_text = String::new();
         // 跨輪次收集已提交的寫入工具（name, args），用於 commit 後 emit vault:changed
         let mut committed_writes: Vec<(String, Value)> = Vec::new();
+        // plan_announce retry 計數器（最多反問 1 次）
+        let mut plan_announce_retried = false;
 
         'outer: for _round in 0..5 {
             // 每輪前檢查取消旗標
@@ -196,8 +284,149 @@ impl Agent {
                 break 'outer;
             }
 
-            // ── 顯示所有工具呼叫給前端 ────────────────────────────────
+            // ── plan_announce 攔截（conversation_id 模式）──────────────
+            if let Some(ref conv_id) = self.conversation_id {
+                let has_write = round.tool_calls.iter().any(|(_, n, _)| self.is_write(n));
+                let has_plan_announce = round.tool_calls.iter().any(|(_, n, _)| n == "plan_announce");
+
+                if has_write && !has_plan_announce {
+                    if !plan_announce_retried {
+                        plan_announce_retried = true;
+                        // 反問 LLM 要求提供 plan_announce
+                        messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": "在執行寫入操作之前，請先呼叫 plan_announce 工具，\
+                                提供 confirm_phrases、cancel_phrases、interrupt_phrases 樣本短語，\
+                                以及 deferred_tools（你打算執行的工具列表）。"
+                        }));
+                        continue 'outer;
+                    } else {
+                        // retry 失敗 → fallback 固定詞庫，直接建 PendingPlan
+                        let deferred: Vec<DeferredTool> = round.tool_calls.iter()
+                            .filter(|(_, n, _)| self.is_write(n))
+                            .map(|(_, name, args)| DeferredTool { name: name.clone(), args: args.clone() })
+                            .collect();
+                        if !deferred.is_empty() {
+                            let confirm_phrases = ["好", "確認", "沒問題", "執行", "對", "行", "繼續"];
+                            let cancel_phrases  = ["不要", "算了", "取消", "停", "不用"];
+                            let interrupt_phrases = ["等等", "先停", "稍等"];
+                            let confirm_vecs: Vec<Vec<f32>> = futures::future::join_all(
+                                confirm_phrases.iter().map(|p| (self.embed_fn)(p.to_string()))
+                            ).await;
+                            let cancel_vecs: Vec<Vec<f32>> = futures::future::join_all(
+                                cancel_phrases.iter().map(|p| (self.embed_fn)(p.to_string()))
+                            ).await;
+                            let interrupt_vecs: Vec<Vec<f32>> = futures::future::join_all(
+                                interrupt_phrases.iter().map(|p| (self.embed_fn)(p.to_string()))
+                            ).await;
+                            let c_confirm = compute_centroid(&confirm_vecs.iter().filter(|v| !v.is_empty()).cloned().collect::<Vec<_>>());
+                            let c_cancel  = compute_centroid(&cancel_vecs.iter().filter(|v| !v.is_empty()).cloned().collect::<Vec<_>>());
+                            let c_inter   = compute_centroid(&interrupt_vecs.iter().filter(|v| !v.is_empty()).cloned().collect::<Vec<_>>());
+                            let _ = save_pending_plan(
+                                &self.settings_db, conv_id, &deferred,
+                                &c_confirm, &c_cancel, &c_inter,
+                            ).await;
+                            // 通知 LLM 計畫已記錄
+                            messages.push(serde_json::json!({
+                                "role": "user",
+                                "content": "[系統] 操作計畫已記錄，等待使用者確認後執行。請告知使用者計畫內容並請求確認。"
+                            }));
+                            // 繼續讓 LLM 輸出確認請求文字
+                            continue 'outer;
+                        }
+                    }
+                }
+
+                if has_plan_announce {
+                    // 找出 plan_announce tool call
+                    let pa = round.tool_calls.iter().find(|(_, n, _)| n == "plan_announce");
+                    if let Some((_, _, pa_args)) = pa {
+                        let confirm_phrases: Vec<String> = pa_args["confirm_phrases"]
+                            .as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                            .unwrap_or_default();
+                        let cancel_phrases: Vec<String> = pa_args["cancel_phrases"]
+                            .as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                            .unwrap_or_default();
+                        let interrupt_phrases: Vec<String> = pa_args["interrupt_phrases"]
+                            .as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                            .unwrap_or_default();
+
+                        // deferred_tools：從 plan_announce args 或同輪寫入工具中取得
+                        let deferred: Vec<DeferredTool> = if let Some(arr) = pa_args["deferred_tools"].as_array() {
+                            arr.iter().filter_map(|t| {
+                                let name = t["name"].as_str()?.to_string();
+                                let args = t["args"].clone();
+                                Some(DeferredTool { name, args })
+                            }).collect()
+                        } else {
+                            round.tool_calls.iter()
+                                .filter(|(_, n, _)| self.is_write(n))
+                                .map(|(_, name, args)| DeferredTool { name: name.clone(), args: args.clone() })
+                                .collect()
+                        };
+
+                        if !deferred.is_empty() {
+                            // 生成 embedding centroids
+                            let embed_strs = |phrases: Vec<String>| {
+                                let ef = Arc::clone(&self.embed_fn);
+                                async move {
+                                    futures::future::join_all(
+                                        phrases.into_iter().map(|p| (ef)(p))
+                                    ).await
+                                }
+                            };
+                            let confirm_vecs   = embed_strs(confirm_phrases).await;
+                            let cancel_vecs    = embed_strs(cancel_phrases).await;
+                            let interrupt_vecs = embed_strs(interrupt_phrases).await;
+
+                            let non_empty = |vecs: Vec<Vec<f32>>| -> Vec<Vec<f32>> {
+                                vecs.into_iter().filter(|v| !v.is_empty()).collect()
+                            };
+                            let c_confirm = compute_centroid(&non_empty(confirm_vecs));
+                            let c_cancel  = compute_centroid(&non_empty(cancel_vecs));
+                            let c_inter   = compute_centroid(&non_empty(interrupt_vecs));
+
+                            let _ = save_pending_plan(
+                                &self.settings_db, conv_id, &deferred,
+                                &c_confirm, &c_cancel, &c_inter,
+                            ).await;
+                        }
+
+                        // 注入 plan_announce 假結果，讓 LLM 繼續輸出確認文字
+                        let tool_id = round.tool_calls.iter()
+                            .find(|(_, n, _)| n == "plan_announce")
+                            .map(|(id, _, _)| id.clone())
+                            .unwrap_or_default();
+                        if !tool_id.is_empty() {
+                            let tc_json = serde_json::json!([{
+                                "id": tool_id,
+                                "type": "function",
+                                "function": {"name": "plan_announce", "arguments": "{}"}
+                            }]);
+                            messages.push(serde_json::json!({
+                                "role": "assistant",
+                                "content": Value::Null,
+                                "tool_calls": tc_json
+                            }));
+                            messages.push(serde_json::json!({
+                                "role": "tool",
+                                "tool_call_id": tool_id,
+                                "content": "計畫已記錄，等待使用者確認。"
+                            }));
+                        } else {
+                            messages.push(serde_json::json!({
+                                "role": "user",
+                                "content": "[系統] 操作計畫已記錄，等待使用者確認後執行。"
+                            }));
+                        }
+                        continue 'outer;
+                    }
+                }
+            }
+
+            // ── 顯示所有工具呼叫給前端（排除 plan_announce）─────────────
             for (_, tool_name, tool_args) in &round.tool_calls {
+                if tool_name == "plan_announce" { continue; }
                 let display = self.tool_display(tool_name, tool_args);
                 (self.emit)("agent:tool_call".into(), Value::String(display));
             }
