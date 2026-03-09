@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use sqlx::SqlitePool;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 
 use crate::commands::ai::{
@@ -246,6 +246,31 @@ pub fn build_vault_registry(
                     let db = db.clone();
                     Box::pin(async move {
                         Ok(Value::String(add_memory_rule_to_db(&db, &ptype, &pattern, &value).await))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // open_note — 發送 ui:open_note 事件讓前端開啟筆記（唯讀，無 rollback）
+    {
+        let app = app.clone();
+        registry.register(
+            "open_note".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let app = app.clone();
+                    let mut path = args["path"].as_str().unwrap_or("").to_string();
+                    if !path.is_empty() && !path.ends_with(".md") {
+                        path.push_str(".md");
+                    }
+                    Box::pin(async move {
+                        if path.is_empty() {
+                            return Err("請提供筆記路徑".to_string());
+                        }
+                        let _ = app.emit("ui:open_note", &path);
+                        Ok(Value::String(format!("✅ 已打開筆記：{}", path)))
                     })
                 }),
                 rollback: None,
