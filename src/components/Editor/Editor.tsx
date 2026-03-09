@@ -246,6 +246,42 @@ export default function Editor({ canGoBack, canGoForward, onBack, onForward, onO
   const showEditor = viewMode === 'split' || viewMode === 'editor'
   const showPreviewPane = viewMode === 'preview' || viewMode === 'split'
 
+  const handleTextStyle = useCallback((text: string, styleStr: string, contextBefore: string) => {
+    const view = viewRef.current
+    if (!view) return
+    const doc = view.state.doc.toString()
+    // Collect all occurrences of the selected text
+    const occurrences: number[] = []
+    let search = 0
+    while (true) {
+      const i = doc.indexOf(text, search)
+      if (i < 0) break
+      occurrences.push(i)
+      search = i + 1
+    }
+    if (occurrences.length === 0) return
+    // Strip HTML tags so docBefore (which may contain <span> etc.) compares correctly
+    // against contextBefore (which is plain rendered text)
+    const stripTags = (s: string) => s.replace(/<[^>]*>/g, '')
+    // Pick occurrence whose preceding plain-text best matches contextBefore (longest common suffix)
+    let bestIdx = occurrences[0]
+    let bestScore = -1
+    for (const idx of occurrences) {
+      // Use a larger window (× 4) to account for HTML tag overhead after stripping
+      const rawBefore = doc.slice(Math.max(0, idx - (contextBefore.length + 20) * 4), idx)
+      const docBefore = stripTags(rawBefore)
+      let score = 0
+      for (let k = 1; k <= Math.min(contextBefore.length, docBefore.length); k++) {
+        if (contextBefore[contextBefore.length - k] === docBefore[docBefore.length - k]) score++
+        else break
+      }
+      if (score > bestScore) { bestScore = score; bestIdx = idx }
+    }
+    view.dispatch({
+      changes: { from: bestIdx, to: bestIdx + text.length, insert: `<span style="${styleStr}">${text}</span>` },
+    })
+  }, [])
+
   const wikilinkHandler = (title: string, anchor?: string) => {
     const note = useVaultStore.getState().notes.find((n) => n.title === title)
     if (!note) return
@@ -302,6 +338,7 @@ export default function Editor({ canGoBack, canGoForward, onBack, onForward, onO
             onEdit={viewMode === 'preview' ? () => setViewMode('split') : undefined}
             pendingAnchor={pendingAnchor}
             onAnchorScrolled={() => setPendingAnchor(undefined)}
+            onTextStyle={handleTextStyle}
           />
         )}
       </div>

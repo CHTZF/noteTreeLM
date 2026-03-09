@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import MarkdownIt from 'markdown-it'
 import mk from 'markdown-it-texmath'
@@ -11,7 +11,7 @@ import { useSettingsStore } from '../../stores/settingsStore'
 mermaid.initialize({ startOnLoad: false, theme: 'neutral' })
 
 const md = new MarkdownIt({
-  html: false,
+  html: true,
   linkify: true,
   typographer: true,
   breaks: true,
@@ -23,6 +23,14 @@ interface PreviewPanelProps {
   onEdit?: () => void
   pendingAnchor?: string
   onAnchorScrolled?: () => void
+  /** Called when user applies inline style via right-click menu */
+  onTextStyle?: (text: string, styleStr: string, contextBefore: string) => void
+}
+
+// ─── Text-style context-menu state ───────────────────────────────────────────
+interface CtxMenu {
+  x: number; y: number; text: string; contextBefore: string
+  mode: 'menu' | 'font' | 'color'
 }
 
 function slugifyHeading(text: string): string {
@@ -145,9 +153,64 @@ async function resolveImageSrc(src: string, vaultPath: string): Promise<string> 
   }
 }
 
-export default function PreviewPanel({ content, onWikilinkClick, onEdit, pendingAnchor, onAnchorScrolled }: PreviewPanelProps) {
+export default function PreviewPanel({ content, onWikilinkClick, onEdit, pendingAnchor, onAnchorScrolled, onTextStyle }: PreviewPanelProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const { settings } = useSettingsStore()
+
+  // ─── Right-click style menu ───────────────────────────────────────────────
+  const [ctxMenu, setCtxMenu] = useState<CtxMenu | null>(null)
+  const [fontFamily, setFontFamily] = useState('inherit')
+  const [fontSize, setFontSize] = useState('')
+  const [fontWeight, setFontWeight] = useState('inherit')
+  const [textColor, setTextColor] = useState('#e03030')
+  const menuRef = useRef<HTMLDivElement>(null)
+
+  // Close on outside click
+  useEffect(() => {
+    if (!ctxMenu) return
+    const close = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setCtxMenu(null)
+    }
+    setTimeout(() => window.addEventListener('mousedown', close), 0)
+    return () => window.removeEventListener('mousedown', close)
+  }, [ctxMenu])
+
+  const handleContextMenu = useCallback((e: React.MouseEvent) => {
+    if (!onTextStyle) return
+    const selection = window.getSelection()
+    const sel = selection?.toString()?.trim() ?? ''
+    if (!sel || !selection || selection.rangeCount === 0) return
+    e.preventDefault()
+    // Capture plain text before the selection within the container (for position disambiguation)
+    let contextBefore = ''
+    try {
+      const range = selection.getRangeAt(0)
+      if (containerRef.current) {
+        const beforeRange = document.createRange()
+        beforeRange.setStart(containerRef.current, 0)
+        beforeRange.setEnd(range.startContainer, range.startOffset)
+        contextBefore = beforeRange.toString()
+      }
+    } catch { /* ignore */ }
+    setCtxMenu({ x: e.clientX, y: e.clientY, text: sel, contextBefore, mode: 'menu' })
+    setFontFamily('inherit'); setFontSize(''); setFontWeight('inherit'); setTextColor('#e03030')
+  }, [onTextStyle])
+
+  const applyFont = useCallback(() => {
+    if (!ctxMenu) return
+    const parts: string[] = []
+    if (fontFamily && fontFamily !== 'inherit') parts.push(`font-family:${fontFamily}`)
+    if (fontSize) parts.push(`font-size:${fontSize}px`)
+    if (fontWeight && fontWeight !== 'inherit') parts.push(`font-weight:${fontWeight}`)
+    if (parts.length > 0) onTextStyle?.(ctxMenu.text, parts.join(';'), ctxMenu.contextBefore)
+    setCtxMenu(null)
+  }, [ctxMenu, fontFamily, fontSize, fontWeight, onTextStyle])
+
+  const applyColor = useCallback(() => {
+    if (!ctxMenu) return
+    onTextStyle?.(ctxMenu.text, `color:${textColor}`, ctxMenu.contextBefore)
+    setCtxMenu(null)
+  }, [ctxMenu, textColor, onTextStyle])
 
   // 渲染管線：
   //   preprocessImageUrls → md.render → processWikilinks → DOMPurify → processHtmlForPreview
@@ -156,7 +219,7 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit, pending
   const html = processHtmlForPreview(
     DOMPurify.sanitize(
       processWikilinks(md.render(preprocessImageUrls(content))),
-      { ADD_ATTR: ['data-wikilink', 'data-wikilink-anchor', 'class', 'data-img-size'] }
+      { ADD_ATTR: ['data-wikilink', 'data-wikilink-anchor', 'class', 'data-img-size', 'style'] }
     )
   )
 
@@ -289,6 +352,7 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit, pending
         ref={containerRef}
         className="preview-content"
         dangerouslySetInnerHTML={{ __html: html }}
+        onContextMenu={handleContextMenu}
         style={{
           flex: 1,
           overflowY: 'auto',
@@ -299,6 +363,126 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit, pending
           color: 'var(--color-text-primary)',
         }}
       />
+
+      {/* ── Right-click style menu ── */}
+      {ctxMenu && (
+        <div
+          ref={menuRef}
+          style={{
+            position: 'fixed', zIndex: 99999,
+            left: Math.min(ctxMenu.x, window.innerWidth - 240),
+            top: Math.min(ctxMenu.y, window.innerHeight - 320),
+            background: 'var(--color-bg-elevated)',
+            border: '1px solid var(--color-border)',
+            borderRadius: '8px',
+            boxShadow: '0 6px 24px rgba(0,0,0,0.3)',
+            minWidth: 220,
+            overflow: 'hidden',
+          }}
+          onMouseDown={e => e.stopPropagation()}
+        >
+          {ctxMenu.mode === 'menu' && (
+            <>
+              <div style={{ padding: '8px 12px', fontSize: '11px', color: 'var(--color-text-muted)', borderBottom: '1px solid var(--color-border)', userSelect: 'none' }}>
+                已選取：「{ctxMenu.text.slice(0, 20)}{ctxMenu.text.length > 20 ? '…' : ''}」
+              </div>
+              {[
+                { label: '複製文字', action: () => { navigator.clipboard.writeText(ctxMenu.text); setCtxMenu(null) } },
+                { label: '改變字型 (字型/大小/粗細)', action: () => setCtxMenu(m => m && ({ ...m, mode: 'font' })) },
+                { label: '改變顏色', action: () => setCtxMenu(m => m && ({ ...m, mode: 'color' })) },
+              ].map(item => (
+                <div
+                  key={item.label}
+                  onClick={item.action}
+                  style={{ padding: '9px 14px', fontSize: '13px', cursor: 'pointer', color: 'var(--color-text-primary)' }}
+                  onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-bg-hover)')}
+                  onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+                >
+                  {item.label}
+                </div>
+              ))}
+            </>
+          )}
+
+          {ctxMenu.mode === 'font' && (
+            <div style={{ padding: '12px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)' }}>改變字型</div>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: '12px', color: 'var(--color-text-muted)' }}>
+                字型
+                <select value={fontFamily} onChange={e => setFontFamily(e.target.value)}
+                  style={{ padding: '4px 6px', borderRadius: 5, border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '12px' }}>
+                  <option value="inherit">預設</option>
+                  <option value="serif">Serif</option>
+                  <option value="sans-serif">Sans-serif</option>
+                  <option value="monospace">Monospace</option>
+                  <option value="'Noto Serif TC', serif">Noto Serif TC</option>
+                  <option value="'Source Han Sans TC', sans-serif">Source Han Sans</option>
+                </select>
+              </label>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: '12px', color: 'var(--color-text-muted)' }}>
+                大小 (px)
+                <input type="number" min={8} max={72} placeholder="例: 16" value={fontSize}
+                  onChange={e => setFontSize(e.target.value)}
+                  style={{ padding: '4px 6px', borderRadius: 5, border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '12px', width: '100%', boxSizing: 'border-box' }} />
+              </label>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: '12px', color: 'var(--color-text-muted)' }}>
+                粗細
+                <select value={fontWeight} onChange={e => setFontWeight(e.target.value)}
+                  style={{ padding: '4px 6px', borderRadius: 5, border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '12px' }}>
+                  <option value="inherit">預設</option>
+                  <option value="300">細 (300)</option>
+                  <option value="normal">正常 (400)</option>
+                  <option value="500">中等 (500)</option>
+                  <option value="bold">粗 (700)</option>
+                  <option value="900">極粗 (900)</option>
+                </select>
+              </label>
+              <div style={{ display: 'flex', gap: 6, marginTop: 2 }}>
+                <button type="button" onClick={applyFont}
+                  style={{ flex: 1, padding: '5px', borderRadius: 5, background: 'var(--color-accent)', color: 'white', fontSize: '12px', cursor: 'pointer' }}>
+                  套用
+                </button>
+                <button type="button" onClick={() => setCtxMenu(m => m && ({ ...m, mode: 'menu' }))}
+                  style={{ flex: 1, padding: '5px', borderRadius: 5, background: 'var(--color-bg-hover)', color: 'var(--color-text-secondary)', fontSize: '12px', cursor: 'pointer' }}>
+                  返回
+                </button>
+              </div>
+            </div>
+          )}
+
+          {ctxMenu.mode === 'color' && (
+            <div style={{ padding: '12px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)' }}>改變顏色</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {['#e03030','#e07830','#d4c020','#30a850','#2080e0','#8040e0','#e030a0','#888888','#000000'].map(c => (
+                  <div key={c} onClick={() => setTextColor(c)}
+                    style={{ width: 22, height: 22, borderRadius: 4, background: c, cursor: 'pointer',
+                      border: textColor === c ? '2px solid var(--color-text-primary)' : '2px solid transparent' }} />
+                ))}
+              </div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '12px', color: 'var(--color-text-muted)' }}>
+                自訂
+                <input type="color" value={textColor} onChange={e => setTextColor(e.target.value)}
+                  style={{ width: 32, height: 24, padding: 0, border: '1px solid var(--color-border)', borderRadius: 4, cursor: 'pointer' }} />
+                <span style={{ fontFamily: 'monospace' }}>{textColor}</span>
+              </label>
+              <div style={{ padding: '8px 10px', borderRadius: 6, background: 'var(--color-bg-base)', fontSize: '13px', border: '1px solid var(--color-border)' }}>
+                <span style={{ color: textColor }}>{ctxMenu.text.slice(0, 30)}{ctxMenu.text.length > 30 ? '…' : ''}</span>
+              </div>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button type="button" onClick={applyColor}
+                  style={{ flex: 1, padding: '5px', borderRadius: 5, background: 'var(--color-accent)', color: 'white', fontSize: '12px', cursor: 'pointer' }}>
+                  套用
+                </button>
+                <button type="button" onClick={() => setCtxMenu(m => m && ({ ...m, mode: 'menu' }))}
+                  style={{ flex: 1, padding: '5px', borderRadius: 5, background: 'var(--color-bg-hover)', color: 'var(--color-text-secondary)', fontSize: '12px', cursor: 'pointer' }}>
+                  返回
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }

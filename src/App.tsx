@@ -1,8 +1,9 @@
 import { useEffect, useState, useRef, useCallback, Fragment } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
+import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
-import { faGear, faBolt, faChevronLeft, faChevronRight, faSitemap, faFolderTree, faMagnifyingGlass, faBug } from '@fortawesome/free-solid-svg-icons'
+import { faGear, faBolt, faChevronLeft, faChevronRight, faSitemap, faFolderTree, faMagnifyingGlass, faBug, faComments, faMicrophone, faArrowRightArrowLeft, faTrash } from '@fortawesome/free-solid-svg-icons'
 import { useSettingsStore } from './stores/settingsStore'
 import { useVaultStore } from './stores/vaultStore'
 import { useGraphStore } from './stores/graphStore'
@@ -31,10 +32,10 @@ import Onboarding from './components/Onboarding/Onboarding'
 import Toast, { toast } from './components/common/Toast'
 import './styles/App.css'
 
-type RightPanelTab = 'chat' | 'live_chat'
-
 const GRAPH_TAB = '__graph__'
 const AGENT_TOOLS_TAB = '__agent_tools__'
+const CHAT_TAB = '__chat__'
+const LIVE_CHAT_TAB = '__live_chat__'
 
 // ─── Pane tree types ───────────────────────────────────────────────────────
 interface PaneLeaf {
@@ -97,7 +98,7 @@ function reorderInLeaf(root: PaneNode, paneId: string, fromId: string, toId: str
 
 // ─── App ───────────────────────────────────────────────────────────────────
 export default function App() {
-  const { load: loadSettings, settings } = useSettingsStore()
+  const { load: loadSettings, settings, save: saveSettings } = useSettingsStore()
   const { scanVault, setupWatchers, readNote } = useVaultStore()
   const { load: loadGraph } = useGraphStore()
   const { currentPath } = useEditorStore()
@@ -107,12 +108,15 @@ export default function App() {
   const [showOnboarding, setShowOnboarding] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [showTrash, setShowTrash] = useState(false)
-  const [rightTab, setRightTab] = useState<RightPanelTab>('chat')
   const [showQuickOpen, setShowQuickOpen] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(240)
   const [leftPanel, setLeftPanel] = useState<'files' | 'search' | 'debug' | null>('files')
-  const [rightPanelWidth, setRightPanelWidth] = useState(320)
-  const [liveChatActive, setLiveChatActive] = useState(false)
+
+  // Tracks whether each chat/livechat tab (by tab id) is currently "active"
+  // (streaming or recording) — used for close confirmation
+  const chatActiveRef = useRef<Map<string, boolean>>(new Map())
+  // Paths being renamed — prevents vault:note-deleted from closing those tabs
+  const pendingRenamesRef = useRef<Set<string>>(new Set())
 
   // ─── Pane tree state ───────────────────────────────────────────────────
   const initialLeafIdRef = useRef('')
@@ -132,7 +136,6 @@ export default function App() {
 
   // ─── Drag state ────────────────────────────────────────────────────────
   const isDraggingLeft = useRef(false)
-  const isDraggingRight = useRef(false)
   const dragStateRef = useRef<{
     tabId: string; startX: number; startY: number; active: boolean; paneId: string
   } | null>(null)
@@ -207,7 +210,6 @@ export default function App() {
         setShowOnboarding(true)
       } else {
         setSidebarWidth(settings.sidebar_width)
-        setRightPanelWidth(settings.graph_panel_width)
         await scanVault()
         await loadGraph()
         const lastNote = await invoke<string | null>('get_vault_last_note', { vaultPath: settings.vault_path }).catch(() => null)
@@ -297,11 +299,43 @@ export default function App() {
       const openNoteUnlisten = await listen<string>('ui:open_note', e => {
         if (e.payload) openNote(e.payload)
       })
+      const noteDeletedUnlisten = await listen<string[]>('vault:note-deleted', e => {
+        const vaultPath = useSettingsStore.getState().settings.vault_path
+        const deletedRelPaths = e.payload
+          .filter(abs => abs.startsWith(vaultPath + '/'))
+          .map(abs => abs.slice(vaultPath.length + 1))
+        deletedRelPaths.forEach(relPath => {
+          if (pendingRenamesRef.current.has(relPath)) return
+          getAllLeaves(paneRootRef.current).forEach(leaf => {
+            leaf.tabs.filter(t => t.path === relPath).forEach(t => {
+              closeTabInPane(leaf.id, t.id)
+            })
+          })
+          toast.error(`「${relPath.split('/').pop()}」已被刪除`)
+        })
+      })
+      const handleNoteRenamed = (e: Event) => {
+        const { oldPath, newPath } = (e as CustomEvent).detail as { oldPath: string; newPath: string }
+        pendingRenamesRef.current.add(oldPath)
+        setTimeout(() => pendingRenamesRef.current.delete(oldPath), 3000)
+        getAllLeaves(paneRootRef.current).forEach(leaf => {
+          const updated = leaf.tabs.map(t => t.path === oldPath ? { ...t, path: newPath } : t)
+          if (updated.some((t, i) => t.path !== leaf.tabs[i].path)) {
+            setPaneRoot(prev => mapLeaf(prev, leaf.id, l => ({ ...l, tabs: updated })))
+            if (leaf.tabs.find(t => t.id === leaf.activeTabId)?.path === oldPath) {
+              useEditorStore.getState().setCurrentPath(newPath)
+            }
+          }
+        })
+      }
+      window.addEventListener('note:renamed', handleNoteRenamed)
       cleanup = () => {
         vaultCleanup()
         graphListeners.forEach(u => u())
         vaultChangedUnlisten()
         openNoteUnlisten()
+        noteDeletedUnlisten()
+        window.removeEventListener('note:renamed', handleNoteRenamed)
       }
     }
     setup()
@@ -363,6 +397,17 @@ export default function App() {
     const root = paneRootRef.current
     const leaf = findLeaf(root, paneId)
     if (!leaf) return
+
+    // Confirm if closing an active chat / live-chat tab
+    const closingTab = leaf.tabs.find(t => t.id === tabId)
+    if (closingTab && (closingTab.path === CHAT_TAB || closingTab.path === LIVE_CHAT_TAB)) {
+      if (chatActiveRef.current.get(tabId)) {
+        const name = closingTab.path === CHAT_TAB ? 'Chat' : 'Live Chat'
+        if (!window.confirm(`${name} 仍在對談中，確認要關閉嗎？`)) return
+      }
+      chatActiveRef.current.delete(tabId)
+    }
+
     const tabs = leaf.tabs.filter(t => t.id !== tabId)
     const idx = leaf.tabs.findIndex(t => t.id === tabId)
     const activeTabId = leaf.activeTabId === tabId
@@ -408,24 +453,35 @@ export default function App() {
 
   const openGraphTab = useCallback(() => openNote(GRAPH_TAB), [openNote])
 
+  const handleSwitchVault = useCallback(async () => {
+    try {
+      const result = await openDialog({ directory: true, multiple: false })
+      if (!result) return
+      const newPath = typeof result === 'string' ? result : String(result)
+      await saveSettings({ vault_path: newPath })
+      useEditorStore.getState().setCurrentPath(null)
+      await scanVault()
+      await useGraphStore.getState().load()
+    } catch (e: any) {
+      toast.error('切換 Vault 失敗：' + (e?.message ?? e))
+    }
+  }, [saveSettings, scanVault])
+
   const handleOnboardingComplete = useCallback(async () => {
     setShowOnboarding(false)
     const { settings } = useSettingsStore.getState()
     setSidebarWidth(settings.sidebar_width)
-    setRightPanelWidth(settings.graph_panel_width)
     await scanVault()
     await loadGraph()
   }, [])
 
   // ─── Sidebar resize ────────────────────────────────────────────────────
   const onLeftDividerMouseDown = () => { isDraggingLeft.current = true }
-  const onRightDividerMouseDown = () => { isDraggingRight.current = true }
   useEffect(() => {
     const onMouseMove = (e: MouseEvent) => {
       if (isDraggingLeft.current) setSidebarWidth(Math.max(180, Math.min(400, e.clientX - 40)))
-      if (isDraggingRight.current) setRightPanelWidth(Math.max(240, Math.min(480, window.innerWidth - e.clientX)))
     }
-    const onMouseUp = () => { isDraggingLeft.current = false; isDraggingRight.current = false }
+    const onMouseUp = () => { isDraggingLeft.current = false }
     window.addEventListener('mousemove', onMouseMove)
     window.addEventListener('mouseup', onMouseUp)
     return () => { window.removeEventListener('mousemove', onMouseMove); window.removeEventListener('mouseup', onMouseUp) }
@@ -689,7 +745,30 @@ export default function App() {
             }
           }}
         >
-          {renderPaneContent(leaf, isFocused, activePath)}
+          {/* Always-mounted Chat / LiveChat panels — hidden with display:none when not active */}
+          {leaf.tabs.filter(t => t.path === CHAT_TAB || t.path === LIVE_CHAT_TAB).map(t => (
+            <div key={t.id} style={{
+              display: t.id === leaf.activeTabId ? 'flex' : 'none',
+              flex: 1, flexDirection: 'column', height: '100%', overflow: 'hidden',
+            }}>
+              {t.path === CHAT_TAB && (
+                <ChatPanel
+                  liveChatActive={false}
+                  onActiveChange={active => { chatActiveRef.current.set(t.id, active) }}
+                />
+              )}
+              {t.path === LIVE_CHAT_TAB && (
+                <LiveChatPanel
+                  onOpenNote={openNote}
+                  onActiveChange={active => { chatActiveRef.current.set(t.id, active) }}
+                />
+              )}
+            </div>
+          ))}
+          {/* Regular content — only when active tab is not Chat/LiveChat */}
+          {(!activeTab || (activeTab.path !== CHAT_TAB && activeTab.path !== LIVE_CHAT_TAB)) && (
+            renderPaneContent(leaf, isFocused, activePath)
+          )}
           {isDraggingTab && dropZoneInfo?.paneId === leaf.id && (
             <div className={`dz-indicator dz-${dropZoneInfo.zone}`} style={{ pointerEvents: 'none' }} />
           )}
@@ -718,6 +797,16 @@ export default function App() {
 
         {/* ── 左側 Icon Menubar ── */}
         <div className="icon-menubar">
+          {/* 收合 / 展開 — 最上方 */}
+          <button
+            className="icon-menubar-btn"
+            title={leftPanel ? '收合側欄' : '展開側欄'}
+            onClick={() => setLeftPanel(p => p ? null : 'files')}
+          ><FontAwesomeIcon icon={leftPanel ? faChevronLeft : faChevronRight} /></button>
+
+          <div className="icon-menubar-sep" />
+
+          {/* 側欄面板切換 */}
           <button
             className={`icon-menubar-btn${leftPanel === 'files' ? ' active' : ''}`}
             title="檔案"
@@ -733,21 +822,15 @@ export default function App() {
             title="Debug"
             onClick={() => setLeftPanel(p => p === 'debug' ? null : 'debug')}
           ><FontAwesomeIcon icon={faBug} /></button>
-          <button
-            className="icon-menubar-btn"
-            title={leftPanel ? '收合側欄' : '展開側欄'}
-            onClick={() => setLeftPanel(p => p ? null : 'files')}
-          ><FontAwesomeIcon icon={leftPanel ? faChevronLeft : faChevronRight} /></button>
 
           <div className="icon-menubar-sep" />
 
+          {/* 特殊頁籤：圖譜 / Agent / Chat / Live Chat */}
           <button
             className={`icon-menubar-btn${currentPath === GRAPH_TAB ? ' active' : ''}`}
             title="圖譜"
             onClick={openGraphTab}
           ><FontAwesomeIcon icon={faSitemap} /></button>
-
-          <div className="icon-menubar-sep" />
 
           <button
             className={`icon-menubar-btn${currentPath === AGENT_TOOLS_TAB ? ' active' : ''}`}
@@ -755,7 +838,31 @@ export default function App() {
             onClick={() => openNote(AGENT_TOOLS_TAB)}
           ><FontAwesomeIcon icon={faBolt} /></button>
 
+          {settings.enable_chat && <>
+            <button
+              className="icon-menubar-btn"
+              title="Chat"
+              onClick={() => openNote(CHAT_TAB)}
+            ><FontAwesomeIcon icon={faComments} /></button>
+            <button
+              className="icon-menubar-btn"
+              title="Live Chat"
+              onClick={() => openNote(LIVE_CHAT_TAB)}
+            ><FontAwesomeIcon icon={faMicrophone} /></button>
+          </>}
+
           <div style={{ flex: 1 }} />
+
+          <button
+            className="icon-menubar-btn"
+            title="切換 Vault 資料夾"
+            onClick={handleSwitchVault}
+          ><FontAwesomeIcon icon={faArrowRightArrowLeft} /></button>
+          <button
+            className="icon-menubar-btn"
+            title="垃圾桶"
+            onClick={() => setShowTrash(true)}
+          ><FontAwesomeIcon icon={faTrash} /></button>
 
           <button
             className="icon-menubar-btn"
@@ -771,7 +878,7 @@ export default function App() {
         >
           <div style={{ display: leftPanel === 'files' ? 'flex' : 'none', flex: 1, flexDirection: 'column', overflow: 'hidden', minHeight: 0 }}>
             <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-              <FileTree onOpenNote={openNote} onOpenTrash={() => setShowTrash(true)} />
+              <FileTree onOpenNote={openNote} />
             </div>
           </div>
           <div style={{ display: leftPanel === 'search' ? 'flex' : 'none', flex: 1, flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
@@ -794,28 +901,6 @@ export default function App() {
           {renderPaneNode(paneRoot)}
         </div>
 
-        {/* 右側分隔線 */}
-        {settings.enable_chat && (
-          <div className="divider divider-right" onMouseDown={onRightDividerMouseDown} />
-        )}
-
-        {/* 右側欄 */}
-        {settings.enable_chat && (
-          <aside className="right-panel" style={{ width: rightPanelWidth }}>
-            <div className="right-panel-tabs">
-              <button className={`tab-btn ${rightTab === 'chat' ? 'active' : ''}`} onClick={() => setRightTab('chat')}>Chat</button>
-              <button className={`tab-btn ${rightTab === 'live_chat' ? 'active' : ''}`} onClick={() => setRightTab('live_chat')}>Live Chat</button>
-            </div>
-            <div className="right-panel-content">
-              <div style={{ display: rightTab === 'chat' ? 'contents' : 'none' }}>
-                <ChatPanel liveChatActive={liveChatActive} />
-              </div>
-              <div style={{ display: rightTab === 'live_chat' ? 'contents' : 'none' }}>
-                <LiveChatPanel onOpenNote={openNote} onActiveChange={setLiveChatActive} />
-              </div>
-            </div>
-          </aside>
-        )}
 
       </div>
 

@@ -7,12 +7,11 @@ import {
   faFileAudio, faFileVideo, faFilePdf, faFileZipper,
   faTrash, faPen,
   faChevronRight, faChevronDown, faEllipsisVertical,
-  faPlus, faFolderPlus, faArrowRightArrowLeft,
+  faPlus, faFolderPlus,
 } from '@fortawesome/free-solid-svg-icons'
 import { useVaultStore } from '../../stores/vaultStore'
 import { useEditorStore } from '../../stores/editorStore'
 import { useSettingsStore } from '../../stores/settingsStore'
-import { useGraphStore } from '../../stores/graphStore'
 import { FileTreeNode } from '../../types/models'
 import { toast } from '../common/Toast'
 import { ask } from '@tauri-apps/plugin-dialog'
@@ -249,14 +248,12 @@ async function performMove(draggedPath: string, targetFolder: string) {
 
 interface FileTreeProps {
   onOpenNote: (path: string) => void
-  onOpenTrash: () => void
 }
 
-export default function FileTree({ onOpenNote, onOpenTrash }: FileTreeProps) {
-  const { fileTree, createNote, createFolder, importImage, scanVault } = useVaultStore()
-  const { currentPath, setCurrentPath } = useEditorStore()
-  const { settings, save } = useSettingsStore()
-  const { load: loadGraph } = useGraphStore()
+export default function FileTree({ onOpenNote }: FileTreeProps) {
+  const { fileTree, createNote, createFolder, importImage } = useVaultStore()
+  const { currentPath } = useEditorStore()
+  const { settings } = useSettingsStore()
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false)
   const [showNoteInput, setShowNoteInput] = useState(false)
   const [noteInputTitle, setNoteInputTitle] = useState('')
@@ -302,22 +299,6 @@ export default function FileTree({ onOpenNote, onOpenTrash }: FileTreeProps) {
     setShowFolderInput(true); setFolderInputName('')
     setTimeout(() => folderInputRef.current?.focus(), 30)
   }
-  const handleSwitchVault = async () => {
-    setHeaderMenuOpen(false)
-    try {
-      const result = await openDialog({ directory: true, multiple: false })
-      if (!result) return
-      const newPath = typeof result === 'string' ? result : String(result)
-      await save({ vault_path: newPath })
-      setCurrentPath(null)
-      await scanVault()
-      await loadGraph()
-    } catch (e: any) {
-      const msg = e?.Settings ?? e?.message ?? '未知錯誤'
-      toast.error('切換 Vault 失敗：' + msg)
-    }
-  }
-
   const handleImportImage = async () => {
     setHeaderMenuOpen(false)
     try {
@@ -363,10 +344,6 @@ export default function FileTree({ onOpenNote, onOpenTrash }: FileTreeProps) {
               <MenuItem icon={faFolderPlus} label="新增資料夾" onClick={handleNewFolder} />
               <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
               <MenuItem icon={faFileImage} label="匯入檔案" onClick={handleImportImage} />
-              <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
-              <MenuItem icon={faArrowRightArrowLeft} label="切換 Vault 資料夾" onClick={handleSwitchVault} />
-              <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
-              <MenuItem icon={faTrash} label="垃圾桶" onClick={() => { setHeaderMenuOpen(false); onOpenTrash() }} />
             </div>
           )}
         </div>
@@ -473,8 +450,9 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
     const name = renameValue.trim()
     if (!name || name === node.name) return
     try {
-      await renameNote(node.path, name)
+      const result = await renameNote(node.path, name)
       toast.success(`已重新命名為「${name}」`)
+      window.dispatchEvent(new CustomEvent('note:renamed', { detail: { oldPath: node.path, newPath: result.new_path } }))
     } catch (e: any) { toast.error(e.message || '重新命名失敗') }
   }
 
