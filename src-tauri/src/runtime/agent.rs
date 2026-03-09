@@ -119,8 +119,32 @@ impl Agent {
 
                     match intent {
                         Intent::Confirm => {
-                            // 執行 deferred tools：重新走 streaming loop，但 messages 已包含計畫確認
-                            // 將 deferred tools 注入為工具呼叫提示讓 LLM 執行
+                            // note-open plan：emit agent:open_note + 確認文字，不啟動 LLM
+                            let is_note_open = pending.deferred_tools.first()
+                                .map(|t| t.name == "__open_note__")
+                                .unwrap_or(false);
+
+                            if is_note_open {
+                                let paths: Vec<Value> = pending.deferred_tools.iter()
+                                    .flat_map(|t| {
+                                        t.args["paths"].as_array()
+                                            .cloned()
+                                            .unwrap_or_default()
+                                    })
+                                    .collect();
+                                let note_name = paths.first()
+                                    .and_then(|p| p.as_str())
+                                    .and_then(|p| p.split('/').last())
+                                    .map(|n| n.trim_end_matches(".md").to_string())
+                                    .unwrap_or_else(|| "筆記".to_string());
+                                let confirm_text = format!("好的，已為你打開《{}》。", note_name);
+                                (self.emit)("agent:open_note".into(), Value::Array(paths));
+                                (self.emit)("llm:token".into(), Value::String(confirm_text.clone()));
+                                (self.emit)("llm:done".into(), Value::String(confirm_text.clone()));
+                                return Ok(confirm_text);
+                            }
+
+                            // 一般寫入計畫確認：重新走 streaming loop
                             let deferred_desc = pending.deferred_tools.iter()
                                 .map(|t| format!("- {} {:?}", t.name, t.args))
                                 .collect::<Vec<_>>().join("\n");
@@ -252,6 +276,10 @@ impl Agent {
         let mut committed_writes: Vec<(String, Value)> = Vec::new();
         // plan_announce retry 計數器（最多反問 1 次）
         let mut plan_announce_retried = false;
+        // 跨輪次收集所有 note refs（供 note-open pending plan 使用）
+        let mut all_note_refs: Vec<String> = Vec::new();
+        // plan_announce 是否已被呼叫（防止 note-open pending plan 覆蓋寫入 pending plan）
+        let mut plan_announced = false;
 
         'outer: for _round in 0..5 {
             // 每輪前檢查取消旗標
@@ -338,6 +366,7 @@ impl Agent {
                 }
 
                 if has_plan_announce {
+                    plan_announced = true;
                     // 找出 plan_announce tool call
                     let pa = round.tool_calls.iter().find(|(_, n, _)| n == "plan_announce");
                     if let Some((_, _, pa_args)) = pa {
@@ -463,7 +492,8 @@ impl Agent {
 
             // ── 發送 note_refs（每個工具分別檢查）────────────────────
             for ((_, tool_name, tool_args), result) in round.tool_calls.iter().zip(results.iter()) {
-                self.maybe_emit_note_refs(tool_name, tool_args, result.as_str().unwrap_or(""));
+                let refs = self.emit_note_refs(tool_name, tool_args, result.as_str().unwrap_or(""));
+                all_note_refs.extend(refs);
             }
 
             // ── 注入工具結果回 messages ────────────────────────────────
@@ -504,6 +534,42 @@ impl Agent {
                     "role": "user",
                     "content": format!("工具執行結果：\n\n{}", combined)
                 }));
+            }
+        }
+
+        // ── note-open pending plan（搜索/讀取後儲存，供下一輪「打開它」確認）─────
+        // 只在 conversation_id 模式下、且本輪無 plan_announce（避免覆蓋寫入計畫）
+        if !all_note_refs.is_empty() && !plan_announced {
+            if let Some(ref conv_id) = self.conversation_id {
+                all_note_refs.dedup();
+                let deferred = vec![DeferredTool {
+                    name: "__open_note__".into(),
+                    args: serde_json::json!({ "paths": all_note_refs }),
+                }];
+                // 使用較少短語減少嵌入延遲
+                let confirm_ph  = ["好", "要", "打開", "開啟", "確認", "可以"];
+                let cancel_ph   = ["不", "算了", "取消"];
+                let interrupt_ph = ["等等", "先停"];
+                let embed_batch = |phrases: &[&str]| {
+                    let ef = Arc::clone(&self.embed_fn);
+                    let ps: Vec<String> = phrases.iter().map(|p| p.to_string()).collect();
+                    async move {
+                        futures::future::join_all(ps.into_iter().map(|p| (ef)(p))).await
+                    }
+                };
+                let confirm_vecs   = embed_batch(&confirm_ph).await;
+                let cancel_vecs    = embed_batch(&cancel_ph).await;
+                let interrupt_vecs = embed_batch(&interrupt_ph).await;
+                let non_empty = |vecs: Vec<Vec<f32>>| -> Vec<Vec<f32>> {
+                    vecs.into_iter().filter(|v| !v.is_empty()).collect()
+                };
+                let c_confirm = compute_centroid(&non_empty(confirm_vecs));
+                let c_cancel  = compute_centroid(&non_empty(cancel_vecs));
+                let c_inter   = compute_centroid(&non_empty(interrupt_vecs));
+                let _ = save_pending_plan(
+                    &self.settings_db, conv_id, &deferred,
+                    &c_confirm, &c_cancel, &c_inter,
+                ).await;
             }
         }
 
@@ -586,9 +652,10 @@ impl Agent {
     }
 
     /// 發送 note_refs 事件（read_note / search_vault → 前端導航按鈕）
-    fn maybe_emit_note_refs(&self, tool_name: &str, tool_args: &Value, result: &str) {
+    /// 同時回傳路徑清單，供 run_streaming_loop 建立 note-open pending plan 使用
+    fn emit_note_refs(&self, tool_name: &str, tool_args: &Value, result: &str) -> Vec<String> {
         if self.vault_path.is_empty() {
-            return;
+            return vec![];
         }
         let paths: Vec<String> = match tool_name {
             "read_note" => {
@@ -623,8 +690,9 @@ impl Agent {
         if !paths.is_empty() {
             (self.emit)(
                 "agent:note_refs".into(),
-                serde_json::to_value(paths).unwrap_or(Value::Null),
+                serde_json::to_value(paths.clone()).unwrap_or(Value::Null),
             );
         }
+        paths
     }
 }

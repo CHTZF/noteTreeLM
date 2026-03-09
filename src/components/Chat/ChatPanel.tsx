@@ -14,9 +14,6 @@ interface Message {
   content: string
 }
 
-// Phrases that mean "yes, open that note" when there are pending note suggestions
-const CONFIRM_OPEN_RE = /^(要|好|是|好的|對|確認|打開|開啟|開一下|看一下|看看|幫我打開|請打開|好啊|可以|沒問題|就這個|開它|打開它|要看|我要看|行|ok|OK|好喔|沒錯)$/
-
 export default function ChatPanel({ liveChatActive = false, onActiveChange, onOpenNote }: { liveChatActive?: boolean; onActiveChange?: (active: boolean) => void; onOpenNote?: (path: string) => void }) {
   const { settings } = useSettingsStore()
   const { content: noteContent, currentPath } = useEditorStore()
@@ -276,22 +273,6 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     const text = input.trim()
     if (!text || isStreaming) return
 
-    // Shortcut: "打開它" style phrases when note suggestions are pending
-    const prevSuggestions = noteSuggestionsRef.current
-    if (prevSuggestions.length > 0 && CONFIRM_OPEN_RE.test(text) && onOpenNote) {
-      const note = prevSuggestions[0]
-      setNoteSuggestions([])
-      noteSuggestionsRef.current = []
-      setMessages(prev => [
-        ...prev,
-        { role: 'user', content: text },
-        { role: 'assistant', content: `已為你打開《${note.label}》` },
-      ])
-      setInput('')
-      onOpenNote(note.absPath)
-      return
-    }
-
     const userMsg: Message = { role: 'user', content: text }
     const allMessages = [...messages, userMsg]
     setMessages(allMessages)
@@ -314,6 +295,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     let unlistenToolCall: (() => void) | undefined
     let unlistenWriteReq: (() => void) | undefined
     let unlistenNoteRefs: (() => void) | undefined
+    let unlistenOpenNote: (() => void) | undefined
 
     // Clear previous suggestions at the start of each send
     setNoteSuggestions([])
@@ -334,7 +316,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         setMessages((prev) => [...prev, { role: 'tool', content: event.payload }])
       })
 
-      // 追蹤筆記建議（供「打開它」捷徑使用）
+      // 追蹤筆記建議（供 chip 按鈕顯示）
       unlistenNoteRefs = await listen<string[]>('agent:note_refs', (e) => {
         const suggestions = e.payload.map(absPath => ({
           absPath,
@@ -342,6 +324,13 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         }))
         setNoteSuggestions(suggestions)
         noteSuggestionsRef.current = suggestions
+      })
+
+      // 後端 pending_plan 確認後開啟筆記（embedding-based intent classify）
+      unlistenOpenNote = await listen<string[]>('agent:open_note', (e) => {
+        if (onOpenNote && e.payload.length > 0) {
+          onOpenNote(e.payload[0])
+        }
       })
 
       // 監聽寫入確認請求
@@ -397,6 +386,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       unlistenToolCall?.()
       unlistenWriteReq?.()
       unlistenNoteRefs?.()
+      unlistenOpenNote?.()
       setPendingWriteDisplay(null)
       setIsStreaming(false)
       setStreamingText('')

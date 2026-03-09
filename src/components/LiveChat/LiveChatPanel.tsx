@@ -51,10 +51,6 @@ const STATE_COLOR: Record<LiveChatState, string> = {
   speaking:     'var(--color-success, #22c55e)',
 }
 
-// Confirmation keywords recognized as "yes, open that note" when note suggestions
-// are pending. Bypasses the LLM entirely (local models hallucinate open_note calls).
-const VOICE_CONFIRM_RE = /^(要|好|是|好的|對|確認|打開|開啟|開一下|看一下|看看|幫我打開|請打開|好啊|可以|沒問題|就這個|開它|打開它|要看|我要看|行|ok|OK|好喔|沒錯)$/
-
 // ── Component ─────────────────────────────────────────────────────────────────
 
 interface LiveChatPanelProps {
@@ -222,38 +218,6 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
 
   // ── LLM streaming + chunked TTS ───────────────────────────────────────────
   const sendToLLM = useCallback(async (query: string) => {
-    // ── Voice shortcut check ──────────────────────────────────────────────────
-    // Must read ref before setNoteSuggestions([]) clears the state
-    const prevSuggestions = noteSuggestionsRef.current
-    if (prevSuggestions.length > 0 && VOICE_CONFIRM_RE.test(query.trim())) {
-      const note = prevSuggestions[0]
-      setNoteSuggestions([])
-      noteSuggestionsRef.current = []
-      onOpenNote(note.absPath)
-      const confirmText = `好的，已為你打開${note.label}筆記`
-      setMessages(prev => [...prev,
-        { role: 'user', content: query },
-        { role: 'assistant', content: confirmText },
-      ])
-      setStreamingText('')
-      setLiveChatState('speaking')
-      const utt = new SpeechSynthesisUtterance(confirmText)
-      utt.lang = 'zh-TW'
-      utt.rate = 1.15
-      utt.onend = () => {
-        setTimeout(() => {
-          if (liveChatStateRef.current === 'speaking') {
-            transcriptRef.current = ''
-            setDisplayTranscript('')
-            setLiveChatState('listening')
-            toggle()
-          }
-        }, 200)
-      }
-      window.speechSynthesis.speak(utt)
-      return  // skip LLM entirely
-    }
-
     setLiveChatState('thinking')
     setStreamingText('')
     setNoteSuggestions([])   // clear previous note suggestions
@@ -373,6 +337,11 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
       }
     })
 
+    // 後端 pending_plan CONFIRM → open note（embedding-based intent）
+    const unlistenOpenNote = await listen<string[]>('agent:open_note', (e) => {
+      if (e.payload.length > 0) onOpenNote(e.payload[0])
+    })
+
     const unlistenDone = await listen('llm:done', () => {
       llmDone = true
       flushBuffer(true)
@@ -380,6 +349,7 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
       unlistenToolCall()
       unlistenWriteReq()
       unlistenNoteRefs()
+      unlistenOpenNote()
       unlistenDone()
       // If TTS queue is empty and nothing is playing, transition now
       if (!ttsActive && ttsQueue.length === 0) {
