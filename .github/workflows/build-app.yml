@@ -1,0 +1,238 @@
+name: Build App
+
+# 觸發條件：
+#   - 推送 v*.*.* tag（正式發布）
+#   - 手動執行（workflow_dispatch）
+#
+# 前置作業：
+#   1. CHTZF/noteTreeLM-releases 需已有 whisper 的預建 binary
+#      （執行 build-whisper-server.yml 產生）
+#   2. 若要發布到 main repo 的 Release，確保 Actions 有 Contents: Write 權限
+#      Settings → Actions → General → Workflow permissions → Read and write permissions
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: "版本標籤（例如 v0.2.0），留空則使用 dev-{sha}"
+        required: false
+        default: ""
+
+env:
+  RELEASES_REPO: CHTZF/noteTreeLM-releases
+
+jobs:
+  # ─── macOS ARM64 ────────────────────────────────────────────────────────────
+  build-macos:
+    name: Build macOS (Apple Silicon)
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Determine version tag
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ github.event.inputs.version_tag }}" ]; then
+            echo "tag=${{ github.event.inputs.version_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=dev-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download whisper-cli binary (macOS ARM64)
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+        run: |
+          # 取最新一個 whisper-* release 的 macos-arm64 binary
+          LATEST_TAG=$(gh release list --repo "$RELEASES_REPO" \
+            --json tagName -q '[.[] | select(.tagName | startswith("whisper-"))][0].tagName')
+          echo "Using whisper release: $LATEST_TAG"
+          gh release download "$LATEST_TAG" \
+            --repo "$RELEASES_REPO" \
+            --pattern "whisper-server-macos-arm64" \
+            --output src-tauri/binaries/whisper-cli-aarch64-apple-darwin
+          chmod +x src-tauri/binaries/whisper-cli-aarch64-apple-darwin
+          file src-tauri/binaries/whisper-cli-aarch64-apple-darwin
+
+      - name: Build Tauri app (macOS)
+        run: npm run build -- --target aarch64-apple-darwin
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ""
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist-artifacts
+          find src-tauri/target/aarch64-apple-darwin/release/bundle -name "*.dmg" \
+            -exec cp {} dist-artifacts/ \; 2>/dev/null || true
+          find src-tauri/target/aarch64-apple-darwin/release/bundle -name "*.tar.gz" \
+            -exec cp {} dist-artifacts/ \; 2>/dev/null || true
+          # fallback: default target
+          find src-tauri/target/release/bundle -name "*.dmg" \
+            -exec cp {} dist-artifacts/ \; 2>/dev/null || true
+          ls -lh dist-artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: noteTreeLM-macOS-arm64
+          path: dist-artifacts/
+          if-no-files-found: error
+
+  # ─── Windows x64 ────────────────────────────────────────────────────────────
+  build-windows:
+    name: Build Windows (x64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Determine version tag
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ github.event.inputs.version_tag }}" ]; then
+            echo "tag=${{ github.event.inputs.version_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=dev-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download whisper-cli binary (Windows x64)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+        run: |
+          LATEST_TAG=$(gh release list --repo "$RELEASES_REPO" \
+            --json tagName -q '[.[] | select(.tagName | startswith("whisper-"))][0].tagName')
+          echo "Using whisper release: $LATEST_TAG"
+          gh release download "$LATEST_TAG" \
+            --repo "$RELEASES_REPO" \
+            --pattern "whisper-server-windows-x64.exe" \
+            --output "src-tauri/binaries/whisper-cli-x86_64-pc-windows-msvc.exe"
+          ls -lh "src-tauri/binaries/whisper-cli-x86_64-pc-windows-msvc.exe"
+
+      - name: Build Tauri app (Windows)
+        run: npm run build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ""
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir -p dist-artifacts
+          find src-tauri/target/release/bundle -name "*.msi" \
+            -exec cp {} dist-artifacts/ \; 2>/dev/null || true
+          find src-tauri/target/release/bundle -name "*-setup.exe" \
+            -exec cp {} dist-artifacts/ \; 2>/dev/null || true
+          ls -lh dist-artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: noteTreeLM-Windows-x64
+          path: dist-artifacts/
+          if-no-files-found: error
+
+  # ─── Create GitHub Release ──────────────────────────────────────────────────
+  release:
+    name: Publish Release
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    # 僅在 tag push 或手動指定版本時發布
+    if: github.event_name == 'push' || github.event.inputs.version_tag != ''
+    permissions:
+      contents: write
+    steps:
+      - name: Determine version tag
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.inputs.version_tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: noteTreeLM-macOS-arm64
+          path: release-files/macos/
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: noteTreeLM-Windows-x64
+          path: release-files/windows/
+
+      - name: List release files
+        run: find release-files -type f | sort
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          # 建立 Release（若已存在則略過）
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 || \
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "noteTreeLM $TAG" \
+            --notes "## noteTreeLM $TAG
+
+### 下載
+
+| 平台 | 檔案 |
+|------|------|
+| macOS (Apple Silicon M1+) | \`.dmg\` |
+| Windows 10/11 (x64) | \`.msi\` 或 \`-setup.exe\` |
+
+### 安裝說明
+
+**macOS**：下載 \`.dmg\`，拖曳 app 至 Applications，首次開啟如遇 Gatekeeper 警告，右鍵 → 開啟即可。
+
+**Windows**：下載 \`.msi\` 或 \`-setup.exe\` 直接安裝，如遇 SmartScreen 警告，點選「更多資訊」→「仍要執行」。
+"
+
+          # 上傳所有檔案
+          find release-files -type f | while read f; do
+            gh release upload "$TAG" "$f" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          done
+
+          echo "✅ Release $TAG published"
+          echo "🔗 https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
