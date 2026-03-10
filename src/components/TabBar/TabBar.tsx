@@ -4,6 +4,8 @@ import type { Tab } from '../../stores/tabStore'
 export const SPECIAL_NAMES: Record<string, string> = {
   '__graph__': '圖譜',
   '__agent_tools__': '工具測試台',
+  '__chat__': 'Chat',
+  '__live_chat__': 'Live Chat',
 }
 
 interface TabBarProps {

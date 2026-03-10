@@ -431,6 +431,18 @@ body.dragging-tab * {
 .preview-content img { max-width: 100%; border-radius: var(--radius-md); }
 .mermaid-diagram { text-align: center; margin: 1em 0; }
 
+/* Quick-copy inline badge */
+.quick-copy {
+  display: inline-block;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  padding: 1px 6px;
+  cursor: pointer;
+  user-select: none;
+  transition: opacity 0.12s;
+}
+.quick-copy:hover { opacity: 0.7; }
+
 /* Dividers */
 .divider {
   width: 4px;

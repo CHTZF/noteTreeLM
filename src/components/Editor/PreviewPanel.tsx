@@ -25,6 +25,19 @@ interface PreviewPanelProps {
   onAnchorScrolled?: () => void
   /** Called when user applies inline style via right-click menu */
   onTextStyle?: (text: string, styleStr: string, contextBefore: string) => void
+  /** Called when user edits a quick-copy span via right-click: (dataCopyDecoded, newHtml) */
+  onEditQuickCopy?: (dataCopyDecoded: string, newHtml: string) => void
+}
+
+// ─── Edit Quick-Copy modal state ─────────────────────────────────────────────
+interface EditQcState {
+  dataCopy: string   // original decoded data-copy value
+  displayText: string
+  color: string
+  fontSize: string
+  fontFamily: string
+  fontWeight: string
+  copyContent: string
 }
 
 // ─── Text-style context-menu state ───────────────────────────────────────────
@@ -85,9 +98,15 @@ function processHtmlForPreview(html: string): string {
   const tmp = document.createElement('div')
   tmp.innerHTML = html
 
-  // 為每個標題加上 id
+  // 為每個標題加上唯一 id（同名標題加 -1, -2 ... 後綴）
+  const usedIds = new Map<string, number>()
   tmp.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach((h) => {
-    if (!h.id) h.id = slugifyHeading(h.textContent || '')
+    if (!h.id) {
+      const base = slugifyHeading(h.textContent || '') || 'heading'
+      const count = usedIds.get(base) ?? 0
+      usedIds.set(base, count + 1)
+      h.id = count === 0 ? base : `${base}-${count}`
+    }
   })
 
   // 處理段落 block id
@@ -153,7 +172,7 @@ async function resolveImageSrc(src: string, vaultPath: string): Promise<string> 
   }
 }
 
-export default function PreviewPanel({ content, onWikilinkClick, onEdit, pendingAnchor, onAnchorScrolled, onTextStyle }: PreviewPanelProps) {
+export default function PreviewPanel({ content, onWikilinkClick, onEdit, pendingAnchor, onAnchorScrolled, onTextStyle, onEditQuickCopy }: PreviewPanelProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const { settings } = useSettingsStore()
 
@@ -165,6 +184,14 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit, pending
   const [textColor, setTextColor] = useState('#e03030')
   const menuRef = useRef<HTMLDivElement>(null)
 
+  // ─── Edit Quick-Copy modal ────────────────────────────────────────────────
+  const [editQcModal, setEditQcModal] = useState<EditQcState | null>(null)
+
+  // ─── TOC + Collapsible headings ───────────────────────────────────────────
+  const [tocItems, setTocItems] = useState<{ id: string; level: number; text: string }[]>([])
+  const [tocOpen, setTocOpen] = useState(true)
+  const [collapsedHeadings, setCollapsedHeadings] = useState<Set<string>>(new Set())
+
   // Close on outside click
   useEffect(() => {
     if (!ctxMenu) return
@@ -175,7 +202,39 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit, pending
     return () => window.removeEventListener('mousedown', close)
   }, [ctxMenu])
 
+  const confirmEditQc = useCallback(() => {
+    if (!editQcModal || !onEditQuickCopy) return
+    const parts: string[] = []
+    if (editQcModal.color) parts.push(`color:${editQcModal.color}`)
+    if (editQcModal.fontSize) parts.push(`font-size:${editQcModal.fontSize}px`)
+    if (editQcModal.fontFamily && editQcModal.fontFamily !== 'inherit') parts.push(`font-family:${editQcModal.fontFamily}`)
+    if (editQcModal.fontWeight && editQcModal.fontWeight !== 'inherit') parts.push(`font-weight:${editQcModal.fontWeight}`)
+    const styleAttr = parts.length ? ` style="${parts.join(';')}"` : ''
+    const escapedCopy = editQcModal.copyContent.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+    const displayText = editQcModal.displayText || editQcModal.copyContent
+    const newHtml = `<span class="quick-copy" data-copy="${escapedCopy}"${styleAttr}>${displayText}</span>`
+    onEditQuickCopy(editQcModal.dataCopy, newHtml)
+    setEditQcModal(null)
+  }, [editQcModal, onEditQuickCopy])
+
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
+    // Quick-copy right-click: open edit modal
+    const copyEl = (e.target as HTMLElement).closest('[data-copy]') as HTMLElement | null
+    if (copyEl && onEditQuickCopy) {
+      e.preventDefault()
+      const raw = copyEl.getAttribute('data-copy') ?? ''
+      setEditQcModal({
+        dataCopy: raw,
+        displayText: copyEl.textContent ?? '',
+        color: copyEl.style.color || '#2080e0',
+        fontSize: copyEl.style.fontSize ? copyEl.style.fontSize.replace('px', '') : '',
+        fontFamily: copyEl.style.fontFamily.replace(/['"]/g, '') || 'inherit',
+        fontWeight: copyEl.style.fontWeight || 'inherit',
+        copyContent: raw,
+      })
+      return
+    }
+
     if (!onTextStyle) return
     const selection = window.getSelection()
     const sel = selection?.toString()?.trim() ?? ''
@@ -194,7 +253,7 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit, pending
     } catch { /* ignore */ }
     setCtxMenu({ x: e.clientX, y: e.clientY, text: sel, contextBefore, mode: 'menu' })
     setFontFamily('inherit'); setFontSize(''); setFontWeight('inherit'); setTextColor('#e03030')
-  }, [onTextStyle])
+  }, [onTextStyle, onEditQuickCopy])
 
   const applyFont = useCallback(() => {
     if (!ctxMenu) return
@@ -219,7 +278,7 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit, pending
   const html = processHtmlForPreview(
     DOMPurify.sanitize(
       processWikilinks(md.render(preprocessImageUrls(content))),
-      { ADD_ATTR: ['data-wikilink', 'data-wikilink-anchor', 'class', 'data-img-size', 'style'] }
+      { ADD_ATTR: ['data-wikilink', 'data-wikilink-anchor', 'class', 'data-img-size', 'style', 'data-copy'] }
     )
   )
 
@@ -280,9 +339,21 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit, pending
       }
     })
 
-    // 處理連結點擊
+    // 處理連結點擊 & 快捷複製
     const handleClick = (e: MouseEvent) => {
-      const target = (e.target as HTMLElement).closest('a')
+      const el = e.target as HTMLElement
+
+      // Quick-copy: 點擊 [data-copy] 元素 → 複製內文到剪貼簿
+      const copyEl = el.closest('[data-copy]') as HTMLElement | null
+      if (copyEl) {
+        const copyText = copyEl.getAttribute('data-copy') ?? ''
+        navigator.clipboard.writeText(copyText).catch(() => {})
+        copyEl.style.opacity = '0.4'
+        setTimeout(() => { copyEl.style.opacity = '' }, 150)
+        return
+      }
+
+      const target = el.closest('a')
       if (!target) return
       e.preventDefault()
 
@@ -320,19 +391,95 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit, pending
     return () => clearTimeout(timer)
   }, [html, pendingAnchor])
 
+  // TOC 擷取 + 標題點擊收合
+  useEffect(() => {
+    if (!containerRef.current) return
+    const container = containerRef.current
+
+    // 擷取 TOC（先清空，避免前一篇殘留）
+    setTocItems([])
+    setCollapsedHeadings(new Set())
+    const items: { id: string; level: number; text: string }[] = []
+    container.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach((h) => {
+      const el = h as HTMLElement
+      if (!el.id) return
+      items.push({ id: el.id, level: parseInt(el.tagName[1]), text: el.textContent?.trim() ?? '' })
+      el.style.cursor = 'pointer'
+    })
+    setTocItems(items)
+
+    // 事件委派：標題點擊 → 收合
+    const handleHeadingClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement
+      if (target.closest('[data-copy]') || target.closest('a')) return
+      const heading = target.closest('h1,h2,h3,h4,h5,h6') as HTMLElement | null
+      if (!heading?.id) return
+      setCollapsedHeadings(prev => {
+        const next = new Set(prev)
+        if (next.has(heading.id)) next.delete(heading.id)
+        else next.add(heading.id)
+        return next
+      })
+    }
+    container.addEventListener('click', handleHeadingClick)
+    return () => container.removeEventListener('click', handleHeadingClick)
+  }, [html])
+
+  // 套用收合狀態到 DOM
+  useEffect(() => {
+    if (!containerRef.current) return
+    const container = containerRef.current
+    const children = Array.from(container.children) as HTMLElement[]
+
+    // 先全部重設
+    children.forEach(el => { el.style.display = '' })
+
+    // 依序套用收合（由上到下處理）
+    children.forEach((el, idx) => {
+      if (!/^H[1-6]$/.test(el.tagName) || !el.id) return
+      const isCollapsed = collapsedHeadings.has(el.id)
+      el.setAttribute('data-collapsed', String(isCollapsed))
+      if (!isCollapsed) return
+      const level = parseInt(el.tagName[1])
+      for (let i = idx + 1; i < children.length; i++) {
+        const child = children[i]
+        if (/^H[1-6]$/.test(child.tagName) && parseInt(child.tagName[1]) <= level) break
+        child.style.display = 'none'
+      }
+    })
+  }, [html, collapsedHeadings])
+
+  const scrollToHeading = useCallback((id: string) => {
+    const el = containerRef.current?.querySelector(`#${CSS.escape(id)}`)
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }, [])
+
   return (
     <div style={{ flex: 1, position: 'relative', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+      {/* 標題收合 CSS */}
+      <style>{`
+        .preview-content h1,.preview-content h2,.preview-content h3,
+        .preview-content h4,.preview-content h5,.preview-content h6 { cursor:pointer; }
+        .preview-content h1::before,.preview-content h2::before,.preview-content h3::before,
+        .preview-content h4::before,.preview-content h5::before,.preview-content h6::before
+          { content:'▼ '; font-size:0.6em; opacity:0.35; display:inline-block; width:14px; vertical-align:middle; }
+        .preview-content h1[data-collapsed="true"]::before,.preview-content h2[data-collapsed="true"]::before,
+        .preview-content h3[data-collapsed="true"]::before,.preview-content h4[data-collapsed="true"]::before,
+        .preview-content h5[data-collapsed="true"]::before,.preview-content h6[data-collapsed="true"]::before
+          { content:'▶ '; }
+      `}</style>
+
       {onEdit && (
         <button
           onClick={onEdit}
           title="開啟編輯器"
           style={{
-            position: 'absolute', top: '10px', right: '14px', zIndex: 10,
+            position: 'absolute', top: '10px', right: tocOpen ? '206px' : '46px', zIndex: 10,
             display: 'flex', alignItems: 'center', gap: '5px',
             padding: '5px 12px', borderRadius: '6px',
             background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)',
             color: 'var(--color-text-secondary)', fontSize: '12px',
-            cursor: 'pointer', transition: 'all 0.15s',
+            cursor: 'pointer', transition: 'right 0.2s, all 0.15s',
             boxShadow: 'var(--shadow-sm)',
           }}
           onMouseEnter={(e) => {
@@ -348,21 +495,92 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit, pending
           <span>編輯</span>
         </button>
       )}
-      <div
-        ref={containerRef}
-        className="preview-content"
-        dangerouslySetInnerHTML={{ __html: html }}
-        onContextMenu={handleContextMenu}
-        style={{
-          flex: 1,
-          overflowY: 'auto',
-          padding: '24px 32px',
-          fontFamily: "'Inter', sans-serif",
-          fontSize: '14px',
-          lineHeight: 1.7,
-          color: 'var(--color-text-primary)',
-        }}
-      />
+
+      {/* 主體：預覽 + TOC 側欄 */}
+      <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+        <div
+          ref={containerRef}
+          className="preview-content"
+          dangerouslySetInnerHTML={{ __html: html }}
+          onContextMenu={handleContextMenu}
+          style={{
+            flex: 1,
+            overflowY: 'auto',
+            padding: '24px 32px',
+            fontFamily: "'Inter', sans-serif",
+            fontSize: '14px',
+            lineHeight: 1.7,
+            color: 'var(--color-text-primary)',
+          }}
+        />
+
+        {/* TOC 側欄 */}
+        <div style={{
+          width: tocOpen ? '190px' : '28px',
+          flexShrink: 0,
+          borderLeft: '1px solid var(--color-border)',
+          background: 'var(--color-bg-base)',
+          display: 'flex',
+          flexDirection: 'column',
+          overflow: 'hidden',
+          transition: 'width 0.2s ease',
+        }}>
+          {/* 側欄標頭 */}
+          <div style={{
+            display: 'flex', alignItems: 'center',
+            padding: tocOpen ? '8px 10px' : '8px 4px',
+            borderBottom: '1px solid var(--color-border)',
+            flexShrink: 0, gap: '6px',
+          }}>
+            <button
+              onClick={() => setTocOpen(o => !o)}
+              title={tocOpen ? '收合大綱' : '展開大綱'}
+              style={{
+                flexShrink: 0, width: '20px', height: '20px',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                borderRadius: '4px', fontSize: '13px',
+                color: 'var(--color-text-secondary)',
+                background: 'transparent',
+              }}
+            >≡</button>
+            {tocOpen && <span style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-text-muted)', letterSpacing: '0.04em', whiteSpace: 'nowrap' }}>大綱</span>}
+          </div>
+
+          {/* TOC 條目 */}
+          {tocOpen && (
+            <div style={{ flex: 1, overflowY: 'auto', padding: '6px 4px' }}>
+              {tocItems.length === 0 ? (
+                <div style={{ fontSize: '11px', color: 'var(--color-text-muted)', padding: '8px 8px', fontStyle: 'italic' }}>無標題</div>
+              ) : tocItems.map((item, idx) => (
+                <div
+                  key={idx}
+                  onClick={() => scrollToHeading(item.id)}
+                  title={item.text}
+                  style={{
+                    paddingLeft: `${(item.level - 1) * 10 + 8}px`,
+                    paddingRight: '6px',
+                    paddingTop: '3px',
+                    paddingBottom: '3px',
+                    fontSize: '11.5px',
+                    lineHeight: 1.4,
+                    color: 'var(--color-text-secondary)',
+                    cursor: 'pointer',
+                    borderRadius: '4px',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    transition: 'background 0.1s',
+                  }}
+                  onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-bg-hover)')}
+                  onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+                >
+                  {item.text}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
 
       {/* ── Right-click style menu ── */}
       {ctxMenu && (
@@ -481,6 +699,101 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit, pending
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* ── Edit Quick-Copy Modal ── */}
+      {editQcModal && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 99999,
+          background: 'rgba(0,0,0,0.45)', display: 'flex',
+          alignItems: 'center', justifyContent: 'center',
+        }} onMouseDown={() => setEditQcModal(null)}>
+          <div style={{
+            background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)',
+            borderRadius: '10px', padding: '20px 24px', width: '360px',
+            display: 'flex', flexDirection: 'column', gap: '12px',
+          }} onMouseDown={(e) => e.stopPropagation()}>
+            <div style={{ fontSize: '15px', fontWeight: 600, color: 'var(--color-text-primary)' }}>編輯快捷複製</div>
+
+            <label style={{ display: 'flex', flexDirection: 'column', gap: '4px', fontSize: '13px', color: 'var(--color-text-secondary)' }}>
+              顯示文字
+              <input value={editQcModal.displayText}
+                onChange={(e) => setEditQcModal(m => m && ({ ...m, displayText: e.target.value }))}
+                style={{ padding: '5px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }} />
+            </label>
+
+            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: 'var(--color-text-secondary)' }}>
+              顯示文字顏色
+              <input type="color" value={editQcModal.color || '#2080e0'}
+                onChange={(e) => setEditQcModal(m => m && ({ ...m, color: e.target.value }))}
+                style={{ width: '36px', height: '28px', padding: '1px', border: '1px solid var(--color-border)', borderRadius: '4px', cursor: 'pointer', background: 'none' }} />
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: '12px', color: 'var(--color-text-muted)' }}>{editQcModal.color}</span>
+            </label>
+
+            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: 'var(--color-text-secondary)' }}>
+              顯示文字大小（px）
+              <input type="number" value={editQcModal.fontSize}
+                onChange={(e) => setEditQcModal(m => m && ({ ...m, fontSize: e.target.value }))}
+                placeholder="預設"
+                style={{ width: '80px', padding: '5px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }} />
+            </label>
+
+            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: 'var(--color-text-secondary)' }}>
+              顯示文字字型
+              <select value={editQcModal.fontFamily}
+                onChange={(e) => setEditQcModal(m => m && ({ ...m, fontFamily: e.target.value }))}
+                style={{ flex: 1, padding: '5px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }}>
+                <option value="inherit">預設</option>
+                <option value="serif">Serif</option>
+                <option value="sans-serif">Sans-serif</option>
+                <option value="monospace">Monospace</option>
+              </select>
+            </label>
+
+            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: 'var(--color-text-secondary)' }}>
+              顯示文字粗細
+              <select value={editQcModal.fontWeight}
+                onChange={(e) => setEditQcModal(m => m && ({ ...m, fontWeight: e.target.value }))}
+                style={{ flex: 1, padding: '5px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }}>
+                <option value="inherit">預設</option>
+                <option value="normal">Normal</option>
+                <option value="bold">Bold</option>
+                <option value="600">Semi-bold (600)</option>
+              </select>
+            </label>
+
+            <label style={{ display: 'flex', flexDirection: 'column', gap: '4px', fontSize: '13px', color: 'var(--color-text-secondary)' }}>
+              可複製的內文
+              <textarea value={editQcModal.copyContent}
+                onChange={(e) => setEditQcModal(m => m && ({ ...m, copyContent: e.target.value }))}
+                rows={3}
+                style={{ padding: '5px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px', resize: 'vertical', fontFamily: 'var(--font-mono)' }} />
+            </label>
+
+            <div style={{ fontSize: '12px', color: 'var(--color-text-muted)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+              預覽：
+              <span className="quick-copy" style={{
+                color: editQcModal.color || undefined,
+                fontSize: editQcModal.fontSize ? `${editQcModal.fontSize}px` : undefined,
+                fontFamily: editQcModal.fontFamily !== 'inherit' ? editQcModal.fontFamily : undefined,
+                fontWeight: editQcModal.fontWeight !== 'inherit' ? editQcModal.fontWeight : undefined,
+              }}>
+                {editQcModal.displayText || editQcModal.copyContent || '範例文字'}
+              </span>
+            </div>
+
+            <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '4px' }}>
+              <button onClick={() => setEditQcModal(null)}
+                style={{ padding: '6px 14px', borderRadius: '6px', fontSize: '13px', color: 'var(--color-text-secondary)', background: 'var(--color-bg-base)', border: '1px solid var(--color-border)' }}>
+                取消
+              </button>
+              <button onClick={confirmEditQc}
+                style={{ padding: '6px 14px', borderRadius: '6px', fontSize: '13px', color: '#fff', background: 'var(--color-accent)', border: 'none', cursor: 'pointer' }}>
+                確認
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

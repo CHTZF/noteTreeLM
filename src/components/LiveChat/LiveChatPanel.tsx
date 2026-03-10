@@ -94,7 +94,7 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
     onActiveChange?.(liveChatState !== 'idle')
   }, [liveChatState, onActiveChange])
 
-  // 初始化 conversation（live_chat mode）
+  // 初始化 conversation（live_chat mode）— 不自動建立新對話
   useEffect(() => {
     const saved = localStorage.getItem('live_chat_conversation_id')
     if (saved) {
@@ -102,17 +102,11 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
       invoke('get_conversation', { id: saved })
         .then(() => setConversationId(saved))
         .catch(() => {
-          invoke<string>('create_conversation', { mode: 'live_chat' }).then(id => {
-            setConversationId(id)
-            localStorage.setItem('live_chat_conversation_id', id)
-          }).catch(() => {})
+          // Stale ID — remove it and stay on empty screen
+          localStorage.removeItem('live_chat_conversation_id')
         })
-    } else {
-      invoke<string>('create_conversation', { mode: 'live_chat' }).then(id => {
-        setConversationId(id)
-        localStorage.setItem('live_chat_conversation_id', id)
-      }).catch(() => {})
     }
+    // No saved ID → conversationId stays null (show placeholder screen)
   }, [])
 
   const handleSelectConversation = useCallback((id: string) => {
@@ -120,14 +114,6 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
     localStorage.setItem('live_chat_conversation_id', id)
     setMessages([])
   }, [])
-
-  const handleNewConversation = useCallback((id: string) => {
-    if (!id) return
-    setConversationId(id)
-    localStorage.setItem('live_chat_conversation_id', id)
-    setMessages([])
-  }, [])
-
 
   // Auto-scroll to bottom when messages or streaming changes
   useEffect(() => {
@@ -147,6 +133,26 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
     5000,
     settings.whisper_language ?? 'auto',
   )
+
+  const handleNewConversation = useCallback((id: string) => {
+    if (!id) {
+      // Current conversation was deleted — stop recording and go to empty screen
+      window.speechSynthesis.cancel()
+      if (silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current = null }
+      if (voiceState === 'recording') toggle()
+      setLiveChatState('idle')
+      setConversationId(null)
+      localStorage.removeItem('live_chat_conversation_id')
+      setMessages([])
+      setDisplayTranscript('')
+      setStreamingText('')
+      transcriptRef.current = ''
+      return
+    }
+    setConversationId(id)
+    localStorage.setItem('live_chat_conversation_id', id)
+    setMessages([])
+  }, [voiceState, toggle])
 
   // ── startListening helper ─────────────────────────────────────────────────
   const startListening = useCallback(() => {
@@ -454,6 +460,17 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
 
       {/* Main live chat area */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minWidth: 0 }}>
+      {/* No conversation selected — placeholder */}
+      {!conversationId ? (
+        <div style={{
+          flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center',
+          justifyContent: 'center', color: 'var(--color-text-muted)', fontSize: '13px',
+          textAlign: 'center', lineHeight: 1.8, padding: '24px', gap: '12px',
+        }}>
+          <div>請選擇過去對話</div>
+          <div style={{ color: 'var(--color-text-muted)', fontSize: '11px' }}>或點擊側欄「＋ 新對話」開始</div>
+        </div>
+      ) : <>
       {/* Header */}
       <div style={{
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
@@ -672,6 +689,7 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
         @keyframes live-chat-bar3 { from { height: 8px; } to { height: 12px; } }
         @keyframes live-chat-bar4 { from { height: 4px; } to { height: 16px; } }
       `}</style>
+      </>}
       </div>{/* end main live chat area */}
     </div>
   )

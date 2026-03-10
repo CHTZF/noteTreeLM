@@ -169,9 +169,10 @@ export default function SearchPanel({ onOpenNote }: SearchPanelProps) {
   const btnStyle = (active: boolean): React.CSSProperties => ({
     display: 'flex', alignItems: 'center', justifyContent: 'center',
     width: 26, height: 26, borderRadius: 5, cursor: 'pointer', flexShrink: 0,
-    background: active ? 'var(--color-bg-elevated)' : 'transparent',
-    color: active ? 'var(--color-text-primary)' : 'var(--color-text-muted)',
-    border: active ? '1px solid var(--color-border)' : '1px solid transparent',
+    background: active ? 'var(--color-accent)' : 'var(--color-bg-elevated)',
+    color: active ? 'white' : 'var(--color-text-muted)',
+    border: '1px solid ' + (active ? 'var(--color-accent)' : 'var(--color-border)'),
+    transition: 'all 0.15s',
   })
 
   return (
@@ -190,10 +191,10 @@ export default function SearchPanel({ onOpenNote }: SearchPanelProps) {
             color: 'var(--color-text-primary)', fontSize: '13px', outline: 'none',
           }}
         />
-        <button style={btnStyle(viewMode === 'list')} title="條列顯示" onClick={() => setViewMode('list')}>
+        <button type="button" style={btnStyle(viewMode === 'list')} title="條列顯示" onClick={() => setViewMode('list')}>
           <ListViewIcon />
         </button>
-        <button style={btnStyle(viewMode === 'tree')} title="樹狀顯示" onClick={() => setViewMode('tree')}>
+        <button type="button" style={btnStyle(viewMode === 'tree')} title="樹狀顯示" onClick={() => setViewMode('tree')}>
           <TreeViewIcon />
         </button>
       </div>

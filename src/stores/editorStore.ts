@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 
-export type ViewMode = 'preview' | 'split' | 'editor'
+export type ViewMode = 'preview' | 'editor'
 
 interface EditorStore {
   currentPath: string | null

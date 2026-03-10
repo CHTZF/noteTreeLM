@@ -1,6 +1,6 @@
 import { useEditorStore } from '../../stores/editorStore'
 
-export type EditorAction = 'bold' | 'italic' | 'h1' | 'h2' | 'wikilink' | 'image'
+export type EditorAction = 'bold' | 'italic' | 'h1' | 'h2' | 'wikilink' | 'image' | 'quick_copy'
 
 interface ToolbarProps {
   canGoBack: boolean
@@ -32,7 +32,7 @@ export default function Toolbar({
     >{label}</button>
   )
 
-  const isEditing = viewMode === 'split' || viewMode === 'editor'
+  const isEditing = viewMode === 'editor'
 
   return (
     <div style={{
@@ -49,7 +49,7 @@ export default function Toolbar({
       <button onClick={onForward} disabled={!canGoForward} title="下一篇 (⌘])"
         style={{ color: canGoForward ? 'var(--color-text-secondary)' : 'var(--color-border)', fontSize: '16px', padding: '2px 4px' }}>›</button>
 
-      {/* 格式工具：僅在有編輯器時顯示 */}
+      {/* 格式工具：僅在編輯模式顯示 */}
       {isEditing && <>
         <div style={{ width: '1px', height: '20px', background: 'var(--color-border)', margin: '0 4px' }} />
         {btn('B', '粗體 (⌘B)', () => onAction('bold'))}
@@ -59,6 +59,7 @@ export default function Toolbar({
         <div style={{ width: '1px', height: '20px', background: 'var(--color-border)', margin: '0 4px' }} />
         {btn('[[', '插入 Wikilink', () => onAction('wikilink'))}
         {btn('🖼️', '插入圖片', () => onAction('image'))}
+        {btn('📋', '插入快捷複製', () => onAction('quick_copy'))}
       </>}
 
       <div style={{ flex: 1 }} />
@@ -72,12 +73,10 @@ export default function Toolbar({
       {isEditing && btn('儲存', '儲存 (⌘S)', onSave)}
 
       {/* 模式切換 */}
-      {viewMode === 'preview' && btn('◧ 分割', '展開編輯器（分割視圖）', () => setViewMode('split'))}
-      {viewMode === 'split' && <>
-        {btn('▣ 純編', '切換為純編輯器', () => setViewMode('editor'))}
-        {btn('✕ 關閉編輯器', '關閉編輯器，回到預覽', () => setViewMode('preview'))}
-      </>}
-      {viewMode === 'editor' && btn('◨ 分割預覽', '開啟預覽（分割視圖）', () => setViewMode('split'))}
+      {viewMode === 'editor'
+        ? btn('👁 預覽', '切換為預覽模式', () => setViewMode('preview'))
+        : btn('✎ 編輯', '切換為編輯模式', () => setViewMode('editor'))
+      }
     </div>
   )
 }
