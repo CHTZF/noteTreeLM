@@ -39,6 +39,9 @@ export interface Settings {
   memory_threshold: number
   write_confirm_mode: 'always' | 'once' | 'never'
   chat_auto_include_note: boolean
+  display_name: string
+  avatar_emoji: string
+  show_agent_tools: boolean
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -82,4 +85,7 @@ export const DEFAULT_SETTINGS: Settings = {
   memory_threshold: 20,
   write_confirm_mode: 'always',
   chat_auto_include_note: false,
+  display_name: '',
+  avatar_emoji: '',
+  show_agent_tools: true,
 }

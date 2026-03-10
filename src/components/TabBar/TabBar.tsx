@@ -6,6 +6,9 @@ export const SPECIAL_NAMES: Record<string, string> = {
   '__agent_tools__': '工具測試台',
   '__chat__': 'Chat',
   '__live_chat__': 'Live Chat',
+  '__settings__': '設定',
+  '__help__': '說明',
+  '__trash__': '垃圾桶',
 }
 
 interface TabBarProps {

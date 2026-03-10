@@ -38,7 +38,7 @@ export default function LoginScreen() {
 
   return (
     <div style={{
-      position: 'fixed', inset: 0,
+      flex: 1,
       background: 'var(--color-bg-base)',
       display: 'flex', alignItems: 'center', justifyContent: 'center',
     }}>
@@ -71,7 +71,7 @@ export default function LoginScreen() {
               type="text"
               value={username}
               onChange={e => setUsername(e.target.value)}
-              placeholder="admin"
+              placeholder="請輸入帳號"
               autoFocus
               autoComplete="username"
               style={inputStyle}

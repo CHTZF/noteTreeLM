@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import { useSettingsStore } from '../../stores/settingsStore'
+import { useAuthStore } from '../../stores/authStore'
 import { useVaultStore } from '../../stores/vaultStore'
 import { useGraphStore } from '../../stores/graphStore'
 import { useEditorStore } from '../../stores/editorStore'
@@ -23,7 +24,8 @@ function fmtSpeed(bps: number): string {
 }
 
 interface SettingsModalProps {
-  onClose: () => void
+  onClose?: () => void
+  inline?: boolean
 }
 
 interface MemoryRuleEntry {
@@ -39,7 +41,7 @@ interface IntentKeywordsRow {
   keywords: string[]
 }
 
-type Tab = 'general' | 'ai' | 'voice' | 'local' | 'advanced' | 'raw' | 'intent' | 'memory'
+type Tab = 'account' | 'general' | 'ai' | 'voice' | 'local' | 'advanced' | 'raw' | 'intent' | 'memory'
 type ServerStatus = 'unknown' | 'running' | 'loading' | 'stopped'
 
 // Provider → 預設模型清單
@@ -62,8 +64,9 @@ const labelStyle: React.CSSProperties = {
 }
 const fieldStyle: React.CSSProperties = { marginBottom: '18px' }
 
-export default function SettingsModal({ onClose }: SettingsModalProps) {
+export default function SettingsModal({ onClose, inline }: SettingsModalProps) {
   const { settings, save, getApiKey, setApiKey } = useSettingsStore()
+  const { session } = useAuthStore()
   const { scanVault } = useVaultStore()
   const { load: loadGraph } = useGraphStore()
   const { setCurrentPath } = useEditorStore()
@@ -109,6 +112,12 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   const [intentLoading, setIntentLoading] = useState(false)
   const [newKwInput, setNewKwInput] = useState<Record<string, string>>({})
   const [newIntentName, setNewIntentName] = useState('')
+
+  // Account tab state
+  const [currentPassword, setCurrentPassword] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [pwSaving, setPwSaving] = useState(false)
 
   const colorScheme = draft.theme === 'dark' ? 'dark' : 'light'
   const inputStyle: React.CSSProperties = {
@@ -376,7 +385,7 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
         await scanVault()
         await loadGraph()
       }
-      onClose()
+      onClose?.()
     } catch (err: any) {
       const msg = err?.Settings ?? err?.message ?? (typeof err === 'string' ? err : '未知錯誤')
       toast.error('設定儲存失敗：' + msg)
@@ -518,8 +527,29 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
   const modelIsCustom = hasProvider && !modelOptions.includes(draft.ai_model) && draft.ai_model
 
   const tabs: [Tab, string][] = [
-    ['general', '一般'], ['ai', '外部資源'], ['voice', 'Whisper'], ['local', 'Local LLM'], ['advanced', '進階'], ['intent', '意圖關鍵字'], ['memory', '記憶規則'], ['raw', '設定檔'],
+    ['account', '帳號'], ['general', '一般'], ['ai', '外部資源'], ['voice', 'Whisper'], ['local', 'Local LLM'], ['advanced', '進階'], ['intent', '意圖關鍵字'], ['memory', '記憶規則'], ['raw', '設定檔'],
   ]
+
+  const handleChangePassword = async () => {
+    if (!newPassword || newPassword !== confirmPassword) {
+      toast.error('新密碼與確認密碼不一致')
+      return
+    }
+    setPwSaving(true)
+    try {
+      await invoke('change_password', { currentPassword, newPassword })
+      toast.success('密碼已更新')
+      setCurrentPassword('')
+      setNewPassword('')
+      setConfirmPassword('')
+    } catch (e: any) {
+      toast.error(e.message || '密碼更新失敗')
+    } finally {
+      setPwSaving(false)
+    }
+  }
+
+  const avatarLabel = draft.avatar_emoji || (session?.username?.charAt(0).toUpperCase() ?? '?')
 
   const numInputStyle: React.CSSProperties = {
     ...inputStyle,
@@ -527,39 +557,22 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
     paddingRight: '4px',
   }
 
-  return (
-    <div
-      style={{
-        position: 'fixed', inset: 0, zIndex: 1000,
-        background: 'rgba(0,0,0,0.5)',
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-      }}
-      onClick={(e) => { if (e.target === e.currentTarget) onClose() }}
-    >
-      {/* Scope spin-button margin so it only affects this modal */}
-      <style>{`
-        #settings-modal input[type=number]::-webkit-inner-spin-button,
-        #settings-modal input[type=number]::-webkit-outer-spin-button {
-          margin-left: 4px;
-          opacity: 1;
-        }
-      `}</style>
-      <div id="settings-modal" style={{
-        width: 620, height: 540,
-        borderRadius: '12px',
-        background: 'var(--color-bg-surface)', border: '1px solid var(--color-border)',
-        boxShadow: 'var(--shadow-lg)',
-        display: 'flex', flexDirection: 'column',
-        overflow: 'hidden',
-      }}>
+  const modalInnerStyle: React.CSSProperties = inline
+    ? { flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', borderRadius: 0 }
+    : { width: 620, height: 540, borderRadius: '12px', background: 'var(--color-bg-surface)', border: '1px solid var(--color-border)', boxShadow: 'var(--shadow-lg)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }
+
+  const innerModal = (
+    <div id="settings-modal" style={modalInnerStyle}>
         {/* Header */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '14px 20px', borderBottom: '1px solid var(--color-border)', flexShrink: 0 }}>
           <span style={{ fontSize: '15px', fontWeight: 600, color: 'var(--color-text-primary)' }}>設定</span>
-          <button onClick={onClose}
-            style={{ color: 'var(--color-text-secondary)', fontSize: '20px', lineHeight: 1, width: '28px', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '4px' }}
-            onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--color-text-primary)')}
-            onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--color-text-secondary)')}
-          >×</button>
+          {!inline && onClose && (
+            <button onClick={onClose}
+              style={{ color: 'var(--color-text-secondary)', fontSize: '20px', lineHeight: 1, width: '28px', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '4px' }}
+              onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--color-text-primary)')}
+              onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--color-text-secondary)')}
+            >×</button>
+          )}
         </div>
 
         {/* Body */}
@@ -579,6 +592,47 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
 
           {/* Tab content */}
           <div style={{ flex: 1, overflowY: 'auto', padding: '20px 24px' }}>
+
+            {tab === 'account' && <>
+              {/* Avatar */}
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', marginBottom: '24px', paddingTop: '8px' }}>
+                <div style={{
+                  width: '72px', height: '72px', borderRadius: '50%',
+                  background: 'var(--color-accent)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: '32px', color: '#fff', fontWeight: 700, userSelect: 'none', marginBottom: '10px',
+                }}>
+                  {avatarLabel}
+                </div>
+                <div style={{ fontSize: '14px', fontWeight: 600, color: 'var(--color-text-primary)' }}>{session?.username ?? ''}</div>
+              </div>
+              <div style={fieldStyle}>
+                <label style={labelStyle}>顯示名稱</label>
+                <input value={draft.display_name ?? ''} onChange={(e) => up({ display_name: e.target.value })} placeholder={session?.username ?? ''} style={inputStyle} />
+              </div>
+              <div style={fieldStyle}>
+                <label style={labelStyle}>頭像 Emoji</label>
+                <input value={draft.avatar_emoji ?? ''} onChange={(e) => up({ avatar_emoji: e.target.value })} placeholder="例：😀 🐱 🦊" style={inputStyle} />
+              </div>
+              <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0 20px' }} />
+              <div style={{ fontSize: '12px', fontWeight: 600, letterSpacing: '0.07em', color: 'var(--color-text-secondary)', textTransform: 'uppercase', marginBottom: '12px' }}>變更密碼</div>
+              <div style={fieldStyle}>
+                <label style={labelStyle}>目前密碼</label>
+                <input type="password" value={currentPassword} onChange={(e) => setCurrentPassword(e.target.value)} style={inputStyle} />
+              </div>
+              <div style={fieldStyle}>
+                <label style={labelStyle}>新密碼</label>
+                <input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} style={inputStyle} />
+              </div>
+              <div style={fieldStyle}>
+                <label style={labelStyle}>確認新密碼</label>
+                <input type="password" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} style={inputStyle} />
+              </div>
+              <button
+                onClick={handleChangePassword}
+                disabled={pwSaving}
+                style={{ padding: '7px 20px', borderRadius: '6px', background: 'var(--color-accent)', color: '#fff', fontSize: '13px', fontWeight: 500, opacity: pwSaving ? 0.7 : 1, cursor: pwSaving ? 'not-allowed' : 'pointer' }}
+              >{pwSaving ? '儲存中…' : '更新密碼'}</button>
+            </>}
 
             {tab === 'general' && <>
               <div style={fieldStyle}>
@@ -1204,21 +1258,15 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
             </>}
 
             {tab === 'advanced' && <>
-              <div style={fieldStyle}>
-                <label style={labelStyle}>匯入最大深度</label>
-                <input type="number" min={1} max={10}
-                  value={draft.import_max_depth}
-                  onChange={(e) => up({ import_max_depth: Number(e.target.value) })}
-                  style={numInputStyle} />
-              </div>
-              <div style={fieldStyle}>
-                <label style={labelStyle}>匯入最大頁數</label>
-                <input type="number" min={1} max={200}
-                  value={draft.import_max_pages}
-                  onChange={(e) => up({ import_max_pages: Number(e.target.value) })}
-                  style={numInputStyle} />
-              </div>
               <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px', marginTop: '8px' }}>
+                <ToggleRow
+                  label="Agent tool 測試"
+                  value={draft.show_agent_tools ?? true}
+                  onChange={(v) => up({ show_agent_tools: v })}
+                />
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 16px 0', lineHeight: 1.5 }}>
+                  控制側欄是否顯示「Agent Tool 測試台」按鈕。
+                </p>
                 <ToggleRow
                   label="Debug 模式"
                   value={draft.debug_mode}
@@ -1417,7 +1465,7 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
           >還原預設</button>
           <div style={{ display: 'flex', gap: '8px' }}>
             <button
-              onClick={onClose}
+              onClick={() => onClose?.()}
               style={{ padding: '7px 16px', borderRadius: '6px', background: 'transparent', border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)', fontSize: '13px' }}
               onMouseEnter={(e) => (e.currentTarget.style.borderColor = 'var(--color-text-muted)')}
               onMouseLeave={(e) => (e.currentTarget.style.borderColor = 'var(--color-border)')}
@@ -1429,7 +1477,31 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
             >{isSaving ? '儲存中…' : '儲存設定'}</button>
           </div>
         </div>
-      </div>
+    </div>
+  )
+
+  if (inline) {
+    return innerModal
+  }
+
+  return (
+    <div
+      style={{
+        position: 'fixed', inset: 0, zIndex: 1000,
+        background: 'rgba(0,0,0,0.5)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+      }}
+      onClick={(e) => { if (e.target === e.currentTarget) onClose?.() }}
+    >
+      {/* Scope spin-button margin so it only affects this modal */}
+      <style>{`
+        #settings-modal input[type=number]::-webkit-inner-spin-button,
+        #settings-modal input[type=number]::-webkit-outer-spin-button {
+          margin-left: 4px;
+          opacity: 1;
+        }
+      `}</style>
+      {innerModal}
     </div>
   )
 }

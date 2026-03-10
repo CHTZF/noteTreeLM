@@ -1,44 +1,46 @@
 :root {
-  /* ── Colour Palette ── */
-  --color-bg-base:       #1a1b1e;
-  --color-bg-surface:    #25262b;
-  --color-bg-elevated:   #2c2e33;
-  --color-bg-overlay:    #373a40;
-  --color-bg-hover:      #3a3d44;
+  /* ─── Dark mode (default) — iOS / macOS Dark ─────────────────────────── */
+  --color-bg-base:        #000000;
+  --color-bg-surface:     #1c1c1e;
+  --color-bg-elevated:    #2c2c2e;
+  --color-bg-overlay:     #3a3a3c;
+  --color-bg-hover:       rgba(255, 255, 255, 0.07);
 
-  --color-border:        #373a40;
-  --color-border-subtle: #2c2e33;
+  --color-border:         rgba(84, 84, 88, 0.65);
+  --color-border-subtle:  rgba(84, 84, 88, 0.35);
 
-  --color-text-primary:  #c9cdd4;
-  --color-text-secondary:#8b8fa8;
-  --color-text-muted:    #5c6070;
-  --color-text-inverse:  #1a1b1e;
+  --color-text-primary:   #ffffff;
+  --color-text-secondary: rgba(235, 235, 245, 0.78);
+  --color-text-muted:     rgba(235, 235, 245, 0.50);
+  --color-text-inverse:   #000000;
 
-  --color-accent:        #7c8cf8;
-  --color-accent-hover:  #6370e8;
-  --color-accent-dim:    rgba(124, 140, 248, 0.15);
+  /* iOS System Blue (dark) */
+  --color-accent:         #0a84ff;
+  --color-accent-hover:   #409cff;
+  --color-accent-dim:     rgba(10, 132, 255, 0.18);
+  --color-accent-rgb:     10, 132, 255;
 
-  --color-success:       #4ec9b0;
-  --color-warning:       #d19a66;
-  --color-danger:        #e06c75;
-  --color-danger-dim:    rgba(224, 108, 117, 0.15);
+  --color-success:        #30d158;
+  --color-warning:        #ff9f0a;
+  --color-danger:         #ff453a;
+  --color-danger-dim:     rgba(255, 69, 58, 0.18);
 
-  --color-wikilink:      #7c8cf8;
-  --color-wikilink-dead: #e06c75;
+  --color-wikilink:       #0a84ff;
+  --color-wikilink-dead:  #ff453a;
 
-  /* ── Typography ── */
-  --font-sans:   'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  --font-mono:   'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  /* ─── Typography ──────────────────────────────────────────────────────── */
+  --font-sans:  -apple-system, 'SF Pro Text', BlinkMacSystemFont, 'Helvetica Neue', sans-serif;
+  --font-mono:  'SF Mono', 'JetBrains Mono', 'Fira Code', monospace;
   --font-size-editor: 14px;
-  --font-size-xs:   11px;
-  --font-size-sm:   12px;
-  --font-size-base: 14px;
-  --font-size-md:   15px;
-  --font-size-lg:   16px;
-  --font-size-xl:   20px;
-  --font-size-2xl:  24px;
+  --font-size-xs:    11px;
+  --font-size-sm:    12px;
+  --font-size-base:  14px;
+  --font-size-md:    15px;
+  --font-size-lg:    17px;
+  --font-size-xl:    20px;
+  --font-size-2xl:   28px;
 
-  /* ── Spacing ── */
+  /* ─── Spacing ─────────────────────────────────────────────────────────── */
   --space-1:  4px;
   --space-2:  8px;
   --space-3:  12px;
@@ -47,47 +49,62 @@
   --space-6:  24px;
   --space-8:  32px;
 
-  /* ── Border Radius ── */
-  --radius-sm: 4px;
-  --radius-md: 6px;
-  --radius-lg: 10px;
-  --radius-xl: 16px;
+  /* ─── Border Radius — iOS style ──────────────────────────────────────── */
+  --radius-sm:   6px;
+  --radius-md:   10px;
+  --radius-lg:   14px;
+  --radius-xl:   20px;
   --radius-full: 9999px;
 
-  /* ── Shadows ── */
-  --shadow-sm:  0 1px 3px rgba(0, 0, 0, 0.3);
-  --shadow-md:  0 4px 12px rgba(0, 0, 0, 0.4);
-  --shadow-lg:  0 8px 24px rgba(0, 0, 0, 0.5);
+  /* ─── Shadows (subtle, iOS-style) ────────────────────────────────────── */
+  --shadow-sm:  0 1px 3px rgba(0, 0, 0, 0.4);
+  --shadow-md:  0 4px 16px rgba(0, 0, 0, 0.35);
+  --shadow-lg:  0 10px 40px rgba(0, 0, 0, 0.5);
 
-  /* ── Transitions ── */
+  /* ─── Transitions ─────────────────────────────────────────────────────── */
   --transition-fast:   0.1s ease;
   --transition-normal: 0.2s ease;
   --transition-slow:   0.3s ease;
 
-  /* ── Layout ── */
+  /* ─── Layout ──────────────────────────────────────────────────────────── */
   --sidebar-min-width: 180px;
   --sidebar-max-width: 400px;
   --graph-min-width:   240px;
   --graph-max-width:   480px;
-  --titlebar-height:   0px;
+  --titlebar-height:   28px;
 }
 
-/* ── Light Theme (Apple HIG-inspired) ── */
+/* ─── Light Theme — iOS / macOS Light ───────────────────────────────────── */
 [data-theme="light"] {
-  --color-bg-base:       #ffffff;
-  --color-bg-surface:    #f2f2f7;
-  --color-bg-elevated:   #e8e8ed;
-  --color-bg-overlay:    #d8d8df;
-  --color-bg-hover:      #e3e3e9;
-  --color-border:        #c6c6cb;
-  --color-border-subtle: #e0e0e5;
-  --color-text-primary:  #1d1d1f;
-  --color-text-secondary:#6e6e73;
-  --color-text-muted:    #8e8e93;
-  --color-text-inverse:  #ffffff;
-  --color-accent-dim:    rgba(124, 140, 248, 0.12);
-  --color-danger-dim:    rgba(224, 108, 117, 0.12);
+  --color-bg-base:        #f2f2f7;
+  --color-bg-surface:     #ffffff;
+  --color-bg-elevated:    #efeff4;
+  --color-bg-overlay:     #e5e5ea;
+  --color-bg-hover:       rgba(0, 0, 0, 0.05);
+
+  --color-border:         rgba(60, 60, 67, 0.29);
+  --color-border-subtle:  rgba(60, 60, 67, 0.12);
+
+  --color-text-primary:   #1d1d1f;
+  --color-text-secondary: #515154;
+  --color-text-muted:     #8e8e93;
+  --color-text-inverse:   #ffffff;
+
+  /* iOS System Blue (light) */
+  --color-accent:         #007aff;
+  --color-accent-hover:   #0056cc;
+  --color-accent-dim:     rgba(0, 122, 255, 0.12);
+  --color-accent-rgb:     0, 122, 255;
+
+  --color-success:        #34c759;
+  --color-warning:        #ff9500;
+  --color-danger:         #ff3b30;
+  --color-danger-dim:     rgba(255, 59, 48, 0.12);
+
+  --color-wikilink:       #007aff;
+  --color-wikilink-dead:  #ff3b30;
+
   --shadow-sm:  0 1px 3px rgba(0, 0, 0, 0.06);
-  --shadow-md:  0 4px 12px rgba(0, 0, 0, 0.08);
-  --shadow-lg:  0 8px 24px rgba(0, 0, 0, 0.12);
+  --shadow-md:  0 4px 16px rgba(0, 0, 0, 0.08);
+  --shadow-lg:  0 10px 40px rgba(0, 0, 0, 0.12);
 }

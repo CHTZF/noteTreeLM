@@ -86,6 +86,15 @@ export const WHISPER_MODELS: ModelItem[] = [
     desc: '最高精度，需要較多記憶體',
     url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin',
   },
+  {
+    id: 'breeze-asr-25-q4',
+    filename: 'ggml-model-q4_k.bin',
+    name: 'MR Breeze ASR 25 (Q4)',
+    displaySize: '889 MB',
+    desc: '繁體中文優化，MediaTek Research 出品，中英混合辨識表現優異',
+    url: 'https://huggingface.co/alan314159/Breeze-ASR-25-whispercpp/resolve/main/ggml-model-q4_k.bin',
+    recommended: true,
+  },
 ]
 
 export const LLM_MODELS: ModelItem[] = [

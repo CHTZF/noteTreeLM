@@ -2,7 +2,7 @@ import { useEffect, useState, useRef, useCallback, Fragment } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
-import { faGear, faBolt, faChevronLeft, faChevronRight, faSitemap, faFolderTree, faMagnifyingGlass, faBug, faComments, faMicrophone, faArrowRightArrowLeft, faTrash } from '@fortawesome/free-solid-svg-icons'
+import { faGear, faBolt, faChevronLeft, faChevronRight, faSitemap, faFolderTree, faMagnifyingGlass, faBug, faComments, faMicrophone, faArrowRightArrowLeft, faTrash, faArrowRightFromBracket, faCircleQuestion } from '@fortawesome/free-solid-svg-icons'
 import { useSettingsStore } from './stores/settingsStore'
 import { useVaultStore } from './stores/vaultStore'
 import { useGraphStore } from './stores/graphStore'
@@ -25,10 +25,13 @@ import QuickOpen from './components/QuickOpen/QuickOpen'
 import SettingsModal from './components/Settings/SettingsModal'
 import { AgentToolContent } from './components/AgentTools/AgentToolPanel'
 import TrashPanel from './components/Trash/TrashPanel'
+import HelpPanel from './components/Help/HelpPanel'
 import Editor from './components/Editor/Editor'
 import FileTree from './components/FileTree/FileTree'
 import LoginScreen from './components/Auth/LoginScreen'
 import VaultManagerModal from './components/Vault/VaultManagerModal'
+import SetupWizard from './components/Setup/SetupWizard'
+import TitleBar from './components/TitleBar/TitleBar'
 import { useAuthStore } from './stores/authStore'
 import Toast, { toast } from './components/common/Toast'
 import './styles/App.css'
@@ -37,6 +40,9 @@ const GRAPH_TAB = '__graph__'
 const AGENT_TOOLS_TAB = '__agent_tools__'
 const CHAT_TAB = '__chat__'
 const LIVE_CHAT_TAB = '__live_chat__'
+const SETTINGS_TAB = '__settings__'
+const HELP_TAB = '__help__'
+const TRASH_TAB = '__trash__'
 
 // ─── Pane tree types ───────────────────────────────────────────────────────
 interface PaneLeaf {
@@ -107,14 +113,22 @@ export default function App() {
   // Auth loading splash
   if (authLoading) {
     return (
-      <div style={{ position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--color-bg-base)', color: 'var(--color-text-muted)', fontSize: '14px' }}>
-        載入中…
+      <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100vh', background: 'var(--color-bg-base)' }}>
+        <TitleBar />
+        <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--color-text-muted)', fontSize: '13px' }}>
+          載入中…
+        </div>
       </div>
     )
   }
 
   // Not authenticated — show login
-  if (!session) return <LoginScreen />
+  if (!session) return (
+    <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100vh' }}>
+      <TitleBar />
+      <LoginScreen />
+    </div>
+  )
 
   return <AppMain />
 }
@@ -128,10 +142,11 @@ function AppMain() {
   const { push: navPush, back: navBack, forward: navForward, canGoBack, canGoForward } = useNavigationStore()
 
   const [appReady, setAppReady] = useState(false)
+  const [showSetupWizard, setShowSetupWizard] = useState(false)
   const [showVaultManager, setShowVaultManager] = useState(false)
-  const [showSettings, setShowSettings] = useState(false)
-  const [showTrash, setShowTrash] = useState(false)
   const [showQuickOpen, setShowQuickOpen] = useState(false)
+  const [userMenuOpen, setUserMenuOpen] = useState(false)
+  const userMenuRef = useRef<HTMLDivElement>(null)
   const [sidebarWidth, setSidebarWidth] = useState(240)
   const [leftPanel, setLeftPanel] = useState<'files' | 'search' | 'debug' | null>('files')
 
@@ -230,7 +245,13 @@ function AppMain() {
       await loadSettings()
       const { settings } = useSettingsStore.getState()
       setSidebarWidth(settings.sidebar_width)
-      setShowVaultManager(true)
+      const needsSetup = !settings.whisper_cli_path || !settings.llama_cli_path ||
+        !settings.whisper_model_path || !settings.llm_model_path
+      if (needsSetup) {
+        setShowSetupWizard(true)
+      } else {
+        setShowVaultManager(true)
+      }
     }
     init()
   }, [])
@@ -382,7 +403,7 @@ function AppMain() {
     const handler = (e: KeyboardEvent) => {
       const meta = e.metaKey || e.ctrlKey
       if (meta && e.key === 'p' && !e.shiftKey) { e.preventDefault(); setShowQuickOpen(true) }
-      if (meta && e.key === ',') { e.preventDefault(); setShowSettings(true) }
+      if (meta && e.key === ',') { e.preventDefault(); openNote(SETTINGS_TAB) }
       if (meta && e.key === '[') {
         e.preventDefault()
         const prev = navBack()
@@ -524,7 +545,7 @@ function AppMain() {
   const onLeftDividerMouseDown = () => { isDraggingLeft.current = true }
   useEffect(() => {
     const onMouseMove = (e: MouseEvent) => {
-      if (isDraggingLeft.current) setSidebarWidth(Math.max(180, Math.min(400, e.clientX - 40)))
+      if (isDraggingLeft.current) setSidebarWidth(Math.max(180, Math.min(400, e.clientX - 44)))
     }
     const onMouseUp = () => { isDraggingLeft.current = false }
     window.addEventListener('mousemove', onMouseMove)
@@ -706,6 +727,21 @@ function AppMain() {
         <AgentToolContent />
       </div>
     )
+    if (activePath === SETTINGS_TAB) return (
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        <SettingsModal inline />
+      </div>
+    )
+    if (activePath === HELP_TAB) return (
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        <HelpPanel />
+      </div>
+    )
+    if (activePath === TRASH_TAB) return (
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        <TrashPanel inline />
+      </div>
+    )
     if (!/\.(md|markdown|mdx)$/i.test(activePath)) return <FileViewer path={activePath} />
     if (isFocused) return (
       <Editor
@@ -824,21 +860,40 @@ function AppMain() {
   }
 
   // ─── Early returns ─────────────────────────────────────────────────────
-  if (!appReady && !showVaultManager) {
+  if (!appReady && !showVaultManager && !showSetupWizard) {
     return (
-      <div className="app-loading">
-        <div className="app-loading-spinner" />
-        <span>載入中…</span>
+      <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100vh', background: 'var(--color-bg-base)' }}>
+        <TitleBar />
+        <div className="app-loading">
+          <div className="app-loading-spinner" />
+          <span>載入中…</span>
+        </div>
+      </div>
+    )
+  }
+  if (showSetupWizard && !appReady) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100vh', background: 'var(--color-bg-base)' }}>
+        <TitleBar />
+        <SetupWizard onDone={() => { setShowSetupWizard(false); setShowVaultManager(true) }} />
       </div>
     )
   }
   if (showVaultManager && !appReady) {
-    return <VaultManagerModal onSelect={handleVaultSelect} canClose={false} />
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100vh', background: 'var(--color-bg-base)' }}>
+        <TitleBar />
+        <VaultManagerModal onSelect={handleVaultSelect} canClose={false} />
+      </div>
+    )
   }
 
   // ─── Main render ───────────────────────────────────────────────────────
+  const vaultName = settings.vault_path ? settings.vault_path.split('/').pop() : undefined
+
   return (
     <div className="app-layout">
+      <TitleBar title={vaultName} />
       <div className="content-row">
 
         {/* ── 左側 Icon Menubar ── */}
@@ -878,11 +933,13 @@ function AppMain() {
             onClick={openGraphTab}
           ><FontAwesomeIcon icon={faSitemap} /></button>
 
-          <button
-            className={`icon-menubar-btn${currentPath === AGENT_TOOLS_TAB ? ' active' : ''}`}
-            title="Agent Tool 測試台"
-            onClick={() => openNote(AGENT_TOOLS_TAB)}
-          ><FontAwesomeIcon icon={faBolt} /></button>
+          {(settings.show_agent_tools ?? true) && (
+            <button
+              className={`icon-menubar-btn${currentPath === AGENT_TOOLS_TAB ? ' active' : ''}`}
+              title="Agent Tool 測試台"
+              onClick={() => openNote(AGENT_TOOLS_TAB)}
+            ><FontAwesomeIcon icon={faBolt} /></button>
+          )}
 
           {settings.enable_chat && <>
             <button
@@ -899,35 +956,104 @@ function AppMain() {
 
           <div style={{ flex: 1 }} />
 
-          <button
-            className="icon-menubar-btn"
-            title="工作區管理"
-            onClick={() => setShowVaultManager(true)}
-          ><FontAwesomeIcon icon={faArrowRightArrowLeft} /></button>
-          <button
-            className="icon-menubar-btn"
-            title="垃圾桶"
-            onClick={() => setShowTrash(true)}
-          ><FontAwesomeIcon icon={faTrash} /></button>
+          {/* User profile button */}
+          <div ref={userMenuRef} style={{ position: 'relative' }}>
+            <button
+              className="icon-menubar-btn"
+              title={session?.username ?? '帳號'}
+              onClick={() => setUserMenuOpen(v => !v)}
+              style={{
+                width: '32px', height: '32px', borderRadius: '50%',
+                background: 'var(--color-accent)', color: '#fff',
+                fontSize: settings.avatar_emoji ? '16px' : '13px',
+                fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                border: 'none', padding: 0, cursor: 'pointer', flexShrink: 0,
+              }}
+            >
+              {settings.avatar_emoji || (session?.username?.charAt(0).toUpperCase() ?? '?')}
+            </button>
 
-          <button
-            className="icon-menubar-btn"
-            title="設定 (⌘,)"
-            onClick={() => setShowSettings(true)}
-          ><FontAwesomeIcon icon={faGear} /></button>
+            {userMenuOpen && (
+              <div style={{
+                position: 'absolute', bottom: '40px', left: '0',
+                background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)',
+                borderRadius: '8px', boxShadow: '0 4px 20px rgba(0,0,0,0.35)',
+                zIndex: 300, minWidth: '180px', padding: '4px 0', overflow: 'hidden',
+              }}>
+                {/* User info header */}
+                <div style={{ padding: '10px 14px 8px', borderBottom: '1px solid var(--color-border)' }}>
+                  <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--color-text-primary)' }}>
+                    {settings.display_name || session?.username}
+                  </div>
+                  {settings.display_name && (
+                    <div style={{ fontSize: '11px', color: 'var(--color-text-muted)', marginTop: '2px' }}>
+                      @{session?.username}
+                    </div>
+                  )}
+                </div>
 
-          <button
-            className="icon-menubar-btn"
-            title={`登出 (${session?.username ?? ''})`}
-            onClick={() => authLogout()}
-            style={{ fontSize: '13px' }}
-          >⏏</button>
+                {/* Menu items */}
+                {([
+                  { icon: faGear, label: '設定', action: () => { openNote(SETTINGS_TAB); setUserMenuOpen(false) } },
+                  { icon: faCircleQuestion, label: '取得幫助', action: () => { openNote(HELP_TAB); setUserMenuOpen(false) } },
+                ] as const).map(item => (
+                  <button key={item.label} onClick={item.action} style={{
+                    display: 'flex', alignItems: 'center', gap: '10px',
+                    width: '100%', padding: '8px 14px', fontSize: '13px',
+                    color: 'var(--color-text-secondary)', background: 'transparent',
+                    cursor: 'pointer', textAlign: 'left',
+                  }}
+                    onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-bg-hover)')}
+                    onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+                  >
+                    <FontAwesomeIcon icon={item.icon} style={{ width: '14px', flexShrink: 0 }} />
+                    {item.label}
+                  </button>
+                ))}
+
+                <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
+
+                {([
+                  { icon: faArrowRightArrowLeft, label: '工作區管理', action: () => { setShowVaultManager(true); setUserMenuOpen(false) } },
+                  { icon: faTrash, label: '垃圾桶', action: () => { openNote(TRASH_TAB); setUserMenuOpen(false) } },
+                ] as const).map(item => (
+                  <button key={item.label} onClick={item.action} style={{
+                    display: 'flex', alignItems: 'center', gap: '10px',
+                    width: '100%', padding: '8px 14px', fontSize: '13px',
+                    color: 'var(--color-text-secondary)', background: 'transparent',
+                    cursor: 'pointer', textAlign: 'left',
+                  }}
+                    onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-bg-hover)')}
+                    onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+                  >
+                    <FontAwesomeIcon icon={item.icon} style={{ width: '14px', flexShrink: 0 }} />
+                    {item.label}
+                  </button>
+                ))}
+
+                <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
+
+                <button onClick={() => { authLogout(); setUserMenuOpen(false) }} style={{
+                  display: 'flex', alignItems: 'center', gap: '10px',
+                  width: '100%', padding: '8px 14px', fontSize: '13px',
+                  color: 'var(--color-danger, #e06c75)', background: 'transparent',
+                  cursor: 'pointer', textAlign: 'left',
+                }}
+                  onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-bg-hover)')}
+                  onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+                >
+                  <FontAwesomeIcon icon={faArrowRightFromBracket} style={{ width: '14px', flexShrink: 0 }} />
+                  登出
+                </button>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* ── 左側面板 ── */}
         <aside
           className="sidebar"
-          style={{ display: leftPanel ? undefined : 'none', width: sidebarWidth }}
+          style={{ width: leftPanel ? sidebarWidth : 0, minWidth: leftPanel ? 180 : 0, borderRight: leftPanel ? undefined : 'none' }}
         >
           <div style={{ display: leftPanel === 'files' ? 'flex' : 'none', flex: 1, flexDirection: 'column', overflow: 'hidden', minHeight: 0 }}>
             <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
@@ -945,7 +1071,7 @@ function AppMain() {
         {/* 左側分隔線 */}
         <div
           className="divider divider-left"
-          style={{ display: leftPanel ? undefined : 'none', cursor: 'col-resize' }}
+          style={{ opacity: leftPanel ? 1 : 0, pointerEvents: leftPanel ? undefined : 'none', transition: 'opacity 0.18s ease', cursor: 'col-resize' }}
           onMouseDown={onLeftDividerMouseDown}
         />
 
@@ -964,12 +1090,6 @@ function AppMain() {
           onClose={() => setShowQuickOpen(false)}
         />
       )}
-
-      {/* Settings */}
-      {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
-
-      {/* Trash */}
-      {showTrash && <TrashPanel onClose={() => setShowTrash(false)} />}
 
       {/* Vault Manager (switch vault overlay) */}
       {showVaultManager && appReady && (

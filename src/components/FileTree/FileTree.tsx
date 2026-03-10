@@ -6,7 +6,7 @@ import {
   faFolder, faFolderOpen, faFile, faFileLines, faFileImage, faFileCode,
   faFileAudio, faFileVideo, faFilePdf, faFileZipper,
   faTrash, faPen,
-  faChevronRight, faChevronDown, faEllipsisVertical,
+  faChevronRight, faEllipsisVertical,
   faPlus, faFolderPlus,
 } from '@fortawesome/free-solid-svg-icons'
 import { useVaultStore } from '../../stores/vaultStore'
@@ -491,8 +491,8 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
         onContextMenu={(e) => { if (isRenaming) return; e.preventDefault(); e.stopPropagation(); window.getSelection()?.removeAllRanges(); setMenuX(e.clientX); setMenuY(e.clientY); setMenuOpen(true) }}
         onMouseEnter={() => setIsHovered(true)}
         onMouseLeave={() => setIsHovered(false)}
-        style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '3px 8px 3px ' + (8 + depth * 16) + 'px', cursor: 'pointer', fontSize: '13px', color: 'var(--color-text-secondary)', background: isHovered ? 'var(--color-bg-hover)' : 'transparent', borderRadius: '4px', margin: '0 4px', transition: 'background 0.1s', userSelect: 'none' }}>
-        <FontAwesomeIcon icon={getFileIcon(node.name, true).icon} style={{ fontSize: '11px', flexShrink: 0, color: getFileIcon(node.name, true).color }} />
+        style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '3px 8px 3px ' + (8 + depth * 16) + 'px', cursor: 'pointer', fontSize: '13px', color: 'var(--color-text-secondary)', background: isHovered ? 'var(--color-bg-hover)' : 'transparent', borderRadius: '6px', margin: '0 4px', transition: 'background 0.1s', userSelect: 'none' }}>
+        <FontAwesomeIcon icon={getFileIcon(node.name, true).icon} style={{ fontSize: '13px', flexShrink: 0, color: getFileIcon(node.name, true).color }} />
         {isRenaming ? (
           <input
             ref={renameInputRef}
@@ -695,7 +695,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
     }
 
     return (
-      <div ref={folderWrapperRef} style={{ outline: 'none', outlineOffset: '-2px', borderRadius: '4px', margin: '0 4px', transition: 'outline 0.08s' }}>
+      <div ref={folderWrapperRef} style={{ outline: 'none', outlineOffset: '-2px', borderRadius: '6px', margin: '0 4px', transition: 'outline 0.08s' }}>
         {/* 資料夾 header（data-item-path 供排序識別） */}
         <div
           data-item-path={node.path}
@@ -706,8 +706,8 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
           onMouseEnter={() => setIsHovered(true)}
           onMouseLeave={() => setIsHovered(false)}
           style={{ display: 'flex', alignItems: 'center', gap: '4px', padding: '3px 8px 3px ' + (8 + depth * 16) + 'px', cursor: 'pointer', fontSize: '13px', color: 'var(--color-text-secondary)', userSelect: 'none', position: 'relative' }}>
-          <FontAwesomeIcon icon={isExpanded ? faChevronDown : faChevronRight} style={{ fontSize: '9px', width: '10px', flexShrink: 0, color: FOLDER_COLOR }} />
-          <FontAwesomeIcon icon={isExpanded ? faFolderOpen : faFolder} style={{ fontSize: '12px', flexShrink: 0, color: FOLDER_COLOR }} />
+          <FontAwesomeIcon icon={faChevronRight} style={{ fontSize: '10px', width: '10px', flexShrink: 0, color: FOLDER_COLOR, transform: isExpanded ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.18s ease' }} />
+          <FontAwesomeIcon icon={isExpanded ? faFolderOpen : faFolder} style={{ fontSize: '13px', flexShrink: 0, color: FOLDER_COLOR }} />
           {isRenaming ? (
             <input
               ref={renameInputRef}
@@ -734,8 +734,8 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
             <MenuItem icon={faTrash} label="刪除資料夾" danger onClick={handleDeleteFolder} />
           </div>
         )}
-        {isExpanded && (
-          <>
+        <div style={{ display: 'grid', gridTemplateRows: isExpanded ? '1fr' : '0fr', transition: 'grid-template-rows 0.18s ease', overflow: 'hidden' }}>
+          <div style={{ minHeight: 0 }}>
             {showSubInput && (
               <div style={{ padding: '4px 8px 4px ' + (16 + depth * 16) + 'px' }}>
                 <input ref={subInputRef} value={subInputName} onChange={(e) => setSubInputName(e.target.value)}
@@ -747,8 +747,8 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
             {node.children?.map((child) => (
               <TreeNode key={child.path} node={child} depth={depth + 1} currentPath={currentPath} vaultPath={vaultPath} onOpenNote={onOpenNote} />
             ))}
-          </>
-        )}
+          </div>
+        </div>
       </div>
     )
   }
@@ -888,10 +888,10 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
         cursor: 'pointer', fontSize: '13px',
         color: isActive ? 'var(--color-text-primary)' : 'var(--color-text-secondary)',
         background: isActive ? 'var(--color-accent-dim)' : isHovered ? 'var(--color-bg-hover)' : 'transparent',
-        borderRadius: '4px', margin: '0 4px',
+        borderRadius: '6px', margin: '0 4px',
         transition: 'background 0.1s', userSelect: 'none',
       }}>
-      <FontAwesomeIcon icon={getFileIcon(node.name).icon} style={{ fontSize: '11px', flexShrink: 0, color: getFileIcon(node.name).color }} />
+      <FontAwesomeIcon icon={getFileIcon(node.name).icon} style={{ fontSize: '13px', flexShrink: 0, color: getFileIcon(node.name).color }} />
       {isRenaming ? (
         <input
           ref={renameInputRef}

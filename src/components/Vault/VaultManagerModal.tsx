@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { useSettingsStore } from '../../stores/settingsStore'
 
@@ -9,6 +10,7 @@ interface Props {
 
 export default function VaultManagerModal({ onSelect, canClose, onClose }: Props) {
   const { settings } = useSettingsStore()
+  const [search, setSearch] = useState('')
 
   const recentVaults: string[] = settings.recent_vaults ?? []
   const currentVault = settings.vault_path
@@ -16,6 +18,13 @@ export default function VaultManagerModal({ onSelect, canClose, onClose }: Props
     ...recentVaults,
     ...(currentVault && !recentVaults.includes(currentVault) ? [currentVault] : []),
   ]
+  const filteredVaults = search.trim()
+    ? allVaults.filter(v => {
+        const name = v.split('/').pop() || v
+        return name.toLowerCase().includes(search.trim().toLowerCase()) ||
+          v.toLowerCase().includes(search.trim().toLowerCase())
+      })
+    : allVaults
 
   const handleSelectExisting = async () => {
     const result = await openDialog({ directory: true, multiple: false, title: '選擇工作區資料夾' })
@@ -29,7 +38,7 @@ export default function VaultManagerModal({ onSelect, canClose, onClose }: Props
 
   return (
     <div style={{
-      position: 'fixed', inset: 0,
+      position: 'fixed', inset: 0, top: 'var(--titlebar-height)',
       background: 'rgba(0,0,0,0.65)',
       display: 'flex', alignItems: 'center', justifyContent: 'center',
       zIndex: 1200,
@@ -77,10 +86,24 @@ export default function VaultManagerModal({ onSelect, canClose, onClose }: Props
             <div style={{
               fontSize: '11px', fontWeight: 600, color: 'var(--color-text-muted)',
               textTransform: 'uppercase', letterSpacing: '0.5px',
-              padding: '0 4px', marginBottom: '6px',
+              padding: '0 4px', marginBottom: '8px',
             }}>
               已有工作區
             </div>
+            {allVaults.length > 0 && (
+              <input
+                type="text"
+                placeholder="搜尋工作區名稱…"
+                value={search}
+                onChange={e => setSearch(e.target.value)}
+                style={{
+                  width: '100%', padding: '6px 10px', boxSizing: 'border-box',
+                  background: 'var(--color-bg-base)', border: '1px solid var(--color-border)',
+                  borderRadius: '6px', color: 'var(--color-text-primary)', fontSize: '13px',
+                  outline: 'none', marginBottom: '8px',
+                }}
+              />
+            )}
             {allVaults.length === 0 ? (
               <div style={{
                 color: 'var(--color-text-muted)', fontSize: '13px',
@@ -88,7 +111,11 @@ export default function VaultManagerModal({ onSelect, canClose, onClose }: Props
               }}>
                 尚無工作區記錄，請從右側新建或選擇資料夾。
               </div>
-            ) : allVaults.map(v => {
+            ) : filteredVaults.length === 0 ? (
+              <div style={{ color: 'var(--color-text-muted)', fontSize: '13px', padding: '12px 4px' }}>
+                無符合結果
+              </div>
+            ) : filteredVaults.map(v => {
               const name = v.split('/').pop() || v
               const isCurrent = v === currentVault
               return (
