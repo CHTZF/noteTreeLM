@@ -42,6 +42,7 @@ export interface Settings {
   display_name: string
   avatar_emoji: string
   show_agent_tools: boolean
+  file_sort_type: 'none' | 'asc' | 'desc'
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -88,4 +89,5 @@ export const DEFAULT_SETTINGS: Settings = {
   display_name: '',
   avatar_emoji: '',
   show_agent_tools: true,
+  file_sort_type: 'none',
 }

@@ -150,6 +150,11 @@ function AppMain() {
   const [sidebarWidth, setSidebarWidth] = useState(240)
   const [leftPanel, setLeftPanel] = useState<'files' | 'search' | 'debug' | null>('files')
 
+  // Auto-close debug panel when debug_mode is turned off
+  useEffect(() => {
+    if (!settings.debug_mode && leftPanel === 'debug') setLeftPanel('files')
+  }, [settings.debug_mode])
+
   // Tracks whether each chat/livechat tab (by tab id) is currently "active"
   // (streaming or recording) — used for close confirmation
   const chatActiveRef = useRef<Map<string, boolean>>(new Map())
@@ -922,11 +927,13 @@ function AppMain() {
             title="搜尋"
             onClick={() => setLeftPanel(p => p === 'search' ? null : 'search')}
           ><FontAwesomeIcon icon={faMagnifyingGlass} /></button>
-          <button
-            className={`icon-menubar-btn${leftPanel === 'debug' ? ' active' : ''}`}
-            title="Debug"
-            onClick={() => setLeftPanel(p => p === 'debug' ? null : 'debug')}
-          ><FontAwesomeIcon icon={faBug} /></button>
+          {settings.debug_mode && (
+            <button
+              className={`icon-menubar-btn${leftPanel === 'debug' ? ' active' : ''}`}
+              title="Debug"
+              onClick={() => setLeftPanel(p => p === 'debug' ? null : 'debug')}
+            ><FontAwesomeIcon icon={faBug} /></button>
+          )}
 
           <div className="icon-menubar-sep" />
 

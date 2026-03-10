@@ -189,7 +189,7 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit, pending
 
   // ─── TOC + Collapsible headings ───────────────────────────────────────────
   const [tocItems, setTocItems] = useState<{ id: string; level: number; text: string }[]>([])
-  const [tocOpen, setTocOpen] = useState(true)
+  const [tocOpen, setTocOpen] = useState(false)
   const [collapsedHeadings, setCollapsedHeadings] = useState<Set<string>>(new Set())
 
   // Close on outside click
@@ -538,11 +538,11 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit, pending
               style={{
                 flexShrink: 0, width: '20px', height: '20px',
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
-                borderRadius: '4px', fontSize: '13px',
+                borderRadius: '4px', fontSize: '12px',
                 color: 'var(--color-text-secondary)',
                 background: 'transparent',
               }}
-            >≡</button>
+            >{tocOpen ? '›' : '☰'}</button>
             {tocOpen && <span style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-text-muted)', letterSpacing: '0.04em', whiteSpace: 'nowrap' }}>大綱</span>}
           </div>
 

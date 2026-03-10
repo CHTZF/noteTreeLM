@@ -391,7 +391,8 @@ fn binaries_dir(app: &AppHandle) -> Result<std::path::PathBuf, AppError> {
 /// Returns the absolute path to the downloaded whisper-server binary, or None if not installed.
 #[tauri::command]
 pub async fn get_whisper_binary_path(app: AppHandle) -> Result<Option<String>, AppError> {
-    let path = binaries_dir(&app)?.join("whisper-server");
+    let name = if cfg!(windows) { "whisper-server.exe" } else { "whisper-server" };
+    let path = binaries_dir(&app)?.join(name);
     if path.exists() {
         Ok(Some(path.to_string_lossy().into_owned()))
     } else {
@@ -546,8 +547,9 @@ async fn download_single_binary(
 
     let total_bytes = resp.content_length().unwrap_or(0);
     let bin_dir = binaries_dir(app)?;
-    let dest = bin_dir.join("whisper-server");
-    let part = bin_dir.join("whisper-server.part");
+    let bin_name = if cfg!(windows) { "whisper-server.exe" } else { "whisper-server" };
+    let dest = bin_dir.join(bin_name);
+    let part = bin_dir.join(format!("{}.part", bin_name));
 
     let mut file = std::fs::File::create(&part)?;
     let mut downloaded = 0u64;

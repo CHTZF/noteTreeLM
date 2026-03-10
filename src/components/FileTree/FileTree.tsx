@@ -8,6 +8,7 @@ import {
   faTrash, faPen,
   faChevronRight, faEllipsisVertical,
   faPlus, faFolderPlus,
+  faArrowDownAZ, faArrowUpZA,
 } from '@fortawesome/free-solid-svg-icons'
 import { useVaultStore } from '../../stores/vaultStore'
 import { useEditorStore } from '../../stores/editorStore'
@@ -75,6 +76,18 @@ interface ActiveDrag {
 }
 let activeDrag: ActiveDrag | null = null
 let dragJustEnded = false // 防止 drag 結束後觸發 onClick
+
+// ── 依名稱排序（升序/降序），資料夾永遠置頂 ──────────────────────────────
+function sortNodesByName(nodes: FileTreeNode[], direction: 'asc' | 'desc'): FileTreeNode[] {
+  const sorted = [...nodes].sort((a, b) => {
+    if (a.isFolder !== b.isFolder) return a.isFolder ? -1 : 1
+    const cmp = a.name.localeCompare(b.name, 'zh-TW', { sensitivity: 'base' })
+    return direction === 'asc' ? cmp : -cmp
+  })
+  return sorted.map(node =>
+    node.children ? { ...node, children: sortNodesByName(node.children, direction) } : node
+  )
+}
 
 // ── 排序輔助 ──────────────────────────────────────────────────────────────
 async function saveSortOrder(folderPath: string, orderedPaths: string[]) {
@@ -253,7 +266,7 @@ interface FileTreeProps {
 export default function FileTree({ onOpenNote }: FileTreeProps) {
   const { fileTree, createNote, createFolder, importImage } = useVaultStore()
   const { currentPath } = useEditorStore()
-  const { settings } = useSettingsStore()
+  const { settings, save: saveSettings } = useSettingsStore()
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false)
   const [showNoteInput, setShowNoteInput] = useState(false)
   const [noteInputTitle, setNoteInputTitle] = useState('')
@@ -339,11 +352,30 @@ export default function FileTree({ onOpenNote }: FileTreeProps) {
             <FontAwesomeIcon icon={faEllipsisVertical} />
           </button>
           {headerMenuOpen && (
-            <div style={{ position: 'absolute', top: '100%', right: 0, background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)', borderRadius: '6px', boxShadow: '0 4px 16px rgba(0,0,0,0.35)', zIndex: 200, minWidth: '148px', overflow: 'hidden', padding: '4px 0' }}>
+            <div style={{ position: 'absolute', top: '100%', right: 0, background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)', borderRadius: '6px', boxShadow: '0 4px 16px rgba(0,0,0,0.35)', zIndex: 200, minWidth: '160px', overflow: 'hidden', padding: '4px 0' }}>
               <MenuItem icon={faPlus} label="新增筆記" onClick={handleNewNote} />
               <MenuItem icon={faFolderPlus} label="新增資料夾" onClick={handleNewFolder} />
               <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
               <MenuItem icon={faFileImage} label="匯入檔案" onClick={handleImportImage} />
+              <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
+              <MenuItem
+                icon={faArrowDownAZ}
+                label="依名稱升序（A→Z）"
+                active={settings.file_sort_type === 'asc'}
+                onClick={() => {
+                  saveSettings({ file_sort_type: settings.file_sort_type === 'asc' ? 'none' : 'asc' })
+                  setHeaderMenuOpen(false)
+                }}
+              />
+              <MenuItem
+                icon={faArrowUpZA}
+                label="依名稱降序（Z→A）"
+                active={settings.file_sort_type === 'desc'}
+                onClick={() => {
+                  saveSettings({ file_sort_type: settings.file_sort_type === 'desc' ? 'none' : 'desc' })
+                  setHeaderMenuOpen(false)
+                }}
+              />
             </div>
           )}
         </div>
@@ -374,7 +406,10 @@ export default function FileTree({ onOpenNote }: FileTreeProps) {
             <p>還沒有筆記</p><p style={{ marginTop: '8px' }}>點擊 ••• 新增第一篇</p>
           </div>
         ) : (
-          fileTree.map((node) => (
+          (settings.file_sort_type && settings.file_sort_type !== 'none'
+            ? sortNodesByName(fileTree, settings.file_sort_type as 'asc' | 'desc')
+            : fileTree
+          ).map((node) => (
             <TreeNode key={node.path} node={node} depth={0} currentPath={currentPath} vaultPath={settings.vault_path} onOpenNote={onOpenNote} />
           ))
         )}
@@ -479,8 +514,8 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
     } catch (e: any) { toast.error(e.message || '重新命名失敗') }
   }
 
-  // ── 圖片節點 ──────────────────────────────────────────────
-  if (node.isImage) {
+  // ── 資產節點（圖片、PDF、音訊、影片等所有非筆記檔案）──────────────────
+  if (!node.isFolder && !node.note) {
     const parentEncoded = node.path.includes('/') ? node.path.split('/').slice(0, -1).join('/') : '__root__'
     const displayName = node.path.split('/').pop() ?? node.name
     return (
@@ -492,7 +527,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
         onMouseEnter={() => setIsHovered(true)}
         onMouseLeave={() => setIsHovered(false)}
         style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '3px 8px 3px ' + (8 + depth * 16) + 'px', cursor: 'pointer', fontSize: '13px', color: 'var(--color-text-secondary)', background: isHovered ? 'var(--color-bg-hover)' : 'transparent', borderRadius: '6px', margin: '0 4px', transition: 'background 0.1s', userSelect: 'none' }}>
-        <FontAwesomeIcon icon={getFileIcon(node.name, true).icon} style={{ fontSize: '13px', flexShrink: 0, color: getFileIcon(node.name, true).color }} />
+        <FontAwesomeIcon icon={getFileIcon(node.name, node.isImage).icon} style={{ fontSize: '13px', flexShrink: 0, color: getFileIcon(node.name, node.isImage).color }} />
         {isRenaming ? (
           <input
             ref={renameInputRef}
@@ -926,13 +961,18 @@ function countDescendantNotes(node: FileTreeNode): number {
 
 interface MenuItemProps {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  icon: any; label: string; danger?: boolean; onClick: (e: React.MouseEvent) => void
+  icon: any; label: string; danger?: boolean; active?: boolean; onClick: (e: React.MouseEvent) => void
 }
-function MenuItem({ icon, label, danger, onClick }: MenuItemProps) {
+function MenuItem({ icon, label, danger, active, onClick }: MenuItemProps) {
   const [hovered, setHovered] = useState(false)
+  const color = danger
+    ? (hovered ? '#e06c75' : 'var(--color-text-secondary)')
+    : active
+    ? 'var(--color-accent)'
+    : 'var(--color-text-secondary)'
   return (
     <button onClick={onClick} onMouseEnter={() => setHovered(true)} onMouseLeave={() => setHovered(false)}
-      style={{ display: 'flex', alignItems: 'center', gap: '8px', width: '100%', padding: '6px 12px', fontSize: '13px', textAlign: 'left', color: danger ? (hovered ? '#e06c75' : 'var(--color-text-secondary)') : 'var(--color-text-secondary)', background: hovered ? 'var(--color-bg-hover)' : 'transparent', cursor: 'pointer' }}>
+      style={{ display: 'flex', alignItems: 'center', gap: '8px', width: '100%', padding: '6px 12px', fontSize: '13px', textAlign: 'left', color, background: hovered ? 'var(--color-bg-hover)' : 'transparent', cursor: 'pointer', fontWeight: active ? 600 : 400 }}>
       <FontAwesomeIcon icon={icon} style={{ fontSize: '11px', width: '12px' }} />{label}
     </button>
   )

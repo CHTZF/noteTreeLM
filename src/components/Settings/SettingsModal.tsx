@@ -668,6 +668,9 @@ export default function SettingsModal({ onClose, inline }: SettingsModalProps) {
                   <option value="'-apple-system', 'Helvetica Neue', sans-serif">macOS 系統字型</option>
                   <option value="'Segoe UI', sans-serif">Segoe UI（Windows）</option>
                   <option value="'Georgia', serif">Georgia（襯線）</option>
+                  <option value="'Noto Sans TC', sans-serif">Noto Sans TC（繁體中文）</option>
+                  <option value="'Noto Serif TC', serif">Noto Serif TC（繁體中文 襯線）</option>
+                  <option value="'LXGW WenKai TC', cursive">霞鶩文楷 TC（繁體中文 手寫風）</option>
                 </select>
               </div>
               <div style={fieldStyle}>
@@ -679,6 +682,9 @@ export default function SettingsModal({ onClose, inline }: SettingsModalProps) {
                   <option value="'Fira Code', monospace">Fira Code</option>
                   <option value="'Cascadia Code', monospace">Cascadia Code</option>
                   <option value="'Courier New', monospace">Courier New</option>
+                  <option value="'Noto Sans TC', sans-serif">Noto Sans TC（繁體中文）</option>
+                  <option value="'Noto Serif TC', serif">Noto Serif TC（繁體中文 襯線）</option>
+                  <option value="'LXGW WenKai TC', cursive">霞鶩文楷 TC（繁體中文 手寫風）</option>
                 </select>
               </div>
               <div style={fieldStyle}>

@@ -197,13 +197,15 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
       parent.children.push({ name: note.title, path: note.path, isFolder: false, note })
     }
 
+    const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'avif', 'ico', 'tiff', 'tif', 'svg'])
     for (const assetPath of assets) {
       const parts = assetPath.split('/')
       const filename = parts[parts.length - 1]
+      const ext = filename.split('.').pop()?.toLowerCase() ?? ''
       const parentPath = parts.slice(0, -1).join('/')
       const parent = folderMap.get(parentPath) || root
       parent.children = parent.children || []
-      parent.children.push({ name: filename, path: assetPath, isFolder: false, isImage: true })
+      parent.children.push({ name: filename, path: assetPath, isFolder: false, isImage: IMAGE_EXTS.has(ext) })
     }
 
     const sortChildren = (node: FileTreeNode) => {
