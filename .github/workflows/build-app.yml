@@ -206,26 +206,28 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.ver.outputs.tag }}
         run: |
+          # 建立 release notes 檔案（避免 YAML 多行字串解析問題）
+          cat > release-notes.md << 'NOTES_EOF'
+          ## 下載
+
+          | 平台 | 檔案 |
+          |------|------|
+          | macOS (Apple Silicon M1+) | `.dmg` |
+          | Windows 10/11 (x64) | `.msi` 或 `-setup.exe` |
+
+          ## 安裝說明
+
+          **macOS**：下載 `.dmg`，拖曳 app 至 Applications，首次開啟如遇 Gatekeeper 警告，右鍵選「開啟」即可。
+
+          **Windows**：下載 `.msi` 或 `-setup.exe` 直接安裝，如遇 SmartScreen 警告，點選「更多資訊」→「仍要執行」。
+          NOTES_EOF
+
           # 建立 Release（若已存在則略過）
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 || \
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "noteTreeLM $TAG" \
-            --notes "## noteTreeLM $TAG
-
-### 下載
-
-| 平台 | 檔案 |
-|------|------|
-| macOS (Apple Silicon M1+) | \`.dmg\` |
-| Windows 10/11 (x64) | \`.msi\` 或 \`-setup.exe\` |
-
-### 安裝說明
-
-**macOS**：下載 \`.dmg\`，拖曳 app 至 Applications，首次開啟如遇 Gatekeeper 警告，右鍵 → 開啟即可。
-
-**Windows**：下載 \`.msi\` 或 \`-setup.exe\` 直接安裝，如遇 SmartScreen 警告，點選「更多資訊」→「仍要執行」。
-"
+            --notes-file release-notes.md
 
           # 上傳所有檔案
           find release-files -type f | while read f; do
