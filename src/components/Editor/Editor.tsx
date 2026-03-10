@@ -1,6 +1,6 @@
 import { useEffect, useRef, useCallback, useState } from 'react'
 import { EditorView, basicSetup } from 'codemirror'
-import { EditorState } from '@codemirror/state'
+import { EditorState, Compartment } from '@codemirror/state'
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { languages } from '@codemirror/language-data'
 import { keymap } from '@codemirror/view'
@@ -10,6 +10,7 @@ import { useEditorStore } from '../../stores/editorStore'
 import { useVaultStore } from '../../stores/vaultStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { wikilinkPlugin } from './plugins/wikilinks'
+import { livePreviewPlugin, livePreviewTheme } from './plugins/livePreview'
 import type { EditorAction } from './Toolbar'
 import PreviewPanel from './PreviewPanel'
 import BacklinksPanel from '../BacklinksPanel/BacklinksPanel'
@@ -40,6 +41,8 @@ export default function Editor({ onOpenNote }: EditorProps) {
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Ref so the CM6 updateListener always calls the latest version (avoids stale closure)
   const triggerAutoSaveRef = useRef<(content: string) => void>(() => {})
+  // Compartment to toggle live preview extension dynamically
+  const liveCompartment = useRef(new Compartment())
 
   const { currentPath, content, isDirty, viewMode, setContent, setDirty, setViewMode,
           pendingContent, clearPendingContent } = useEditorStore()
@@ -109,7 +112,9 @@ export default function Editor({ onOpenNote }: EditorProps) {
           history(),
           markdown({ base: markdownLanguage, codeLanguages: languages }),
           editorTheme,
+          livePreviewTheme,
           wikilinkPlugin,
+          liveCompartment.current.of([]), // initially no live preview
           keymap.of([...defaultKeymap, ...historyKeymap]),
           EditorView.updateListener.of((update) => {
             if (update.docChanged) {
@@ -126,6 +131,21 @@ export default function Editor({ onOpenNote }: EditorProps) {
     viewRef.current = view
     return () => { view.destroy(); viewRef.current = null }
   }, [])
+
+  // Toggle live preview plugin when viewMode changes
+  useEffect(() => {
+    const view = viewRef.current
+    if (!view) return
+    try {
+      view.dispatch({
+        effects: liveCompartment.current.reconfigure(
+          viewMode === 'live' ? [livePreviewPlugin] : []
+        ),
+      })
+    } catch (e) {
+      console.error('livePreview reconfigure error:', e)
+    }
+  }, [viewMode])
 
   const triggerAutoSave = useCallback((newContent: string) => {
     if (settings.auto_save_mode !== 'afterDelay') return
@@ -486,33 +506,57 @@ export default function Editor({ onOpenNote }: EditorProps) {
       )}
 
       <div style={{ flex: 1, overflow: 'hidden', position: 'relative', display: 'flex', flexDirection: 'column' }}>
-        {/* CM6 Editor */}
+        {/* CM6 Editor (editor + live modes) */}
         <div
           ref={editorRef}
           onContextMenu={(e) => { if (!currentPath) return; e.preventDefault(); setCmCtxMenu({ x: e.clientX, y: e.clientY }) }}
           style={{
-            display: viewMode === 'editor' ? 'block' : 'none',
+            display: (viewMode === 'editor' || viewMode === 'live') ? 'block' : 'none',
             width: '100%', height: '100%',
           }}
         />
 
-        {/* 編輯模式下浮動切換按鈕 */}
-        {viewMode === 'editor' && currentPath && (
-          <button
-            onClick={() => setViewMode('preview')}
-            title="切換為預覽模式"
-            style={{
-              position: 'absolute', top: '10px', right: '16px', zIndex: 10,
-              padding: '4px 10px', borderRadius: '6px', fontSize: '12px',
-              background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)',
-              color: 'var(--color-text-secondary)', cursor: 'pointer', opacity: 0.75,
-              transition: 'opacity 0.15s',
-            }}
-            onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
-            onMouseLeave={e => (e.currentTarget.style.opacity = '0.75')}
-          >
-            👁 預覽
-          </button>
+        {/* 浮動模式切換按鈕 */}
+        {(viewMode === 'editor' || viewMode === 'live') && currentPath && (
+          <div style={{ position: 'absolute', top: '10px', right: '16px', zIndex: 10, display: 'flex', gap: '6px' }}>
+            {viewMode === 'editor' && (
+              <button
+                onClick={() => setViewMode('live')}
+                title="切換為即時預覽模式"
+                style={{
+                  padding: '4px 10px', borderRadius: '6px', fontSize: '12px',
+                  background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)',
+                  color: 'var(--color-text-secondary)', cursor: 'pointer', opacity: 0.75,
+                  transition: 'opacity 0.15s',
+                }}
+                onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
+                onMouseLeave={e => (e.currentTarget.style.opacity = '0.75')}
+              >✦ 即時</button>
+            )}
+            {viewMode === 'live' && (
+              <button
+                onClick={() => setViewMode('editor')}
+                title="切換為純文字編輯模式"
+                style={{
+                  padding: '3px 9px', borderRadius: '6px', fontSize: '11px',
+                  background: 'var(--color-accent-dim)', border: '1px solid var(--color-accent)',
+                  color: 'var(--color-accent)', cursor: 'pointer', opacity: 0.85,
+                }}
+              >✦ 即時</button>
+            )}
+            <button
+              onClick={() => setViewMode('preview')}
+              title="切換為預覽模式"
+              style={{
+                padding: '4px 10px', borderRadius: '6px', fontSize: '12px',
+                background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)',
+                color: 'var(--color-text-secondary)', cursor: 'pointer', opacity: 0.75,
+                transition: 'opacity 0.15s',
+              }}
+              onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
+              onMouseLeave={e => (e.currentTarget.style.opacity = '0.75')}
+            >👁 預覽</button>
+          </div>
         )}
 
         {/* Preview Panel */}

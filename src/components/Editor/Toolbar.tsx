@@ -32,7 +32,7 @@ export default function Toolbar({
     >{label}</button>
   )
 
-  const isEditing = viewMode === 'editor'
+  const isEditing = viewMode === 'editor' || viewMode === 'live'
 
   return (
     <div style={{
@@ -73,10 +73,15 @@ export default function Toolbar({
       {isEditing && btn('儲存', '儲存 (⌘S)', onSave)}
 
       {/* 模式切換 */}
-      {viewMode === 'editor'
-        ? btn('👁 預覽', '切換為預覽模式', () => setViewMode('preview'))
-        : btn('✎ 編輯', '切換為編輯模式', () => setViewMode('editor'))
-      }
+      {viewMode === 'editor' && <>
+        {btn('✦ 即時', '切換為即時預覽模式', () => setViewMode('live'))}
+        {btn('👁 預覽', '切換為預覽模式', () => setViewMode('preview'))}
+      </>}
+      {viewMode === 'live' && <>
+        {btn('✎ 原始', '切換為純文字編輯模式', () => setViewMode('editor'), true)}
+        {btn('👁 預覽', '切換為預覽模式', () => setViewMode('preview'))}
+      </>}
+      {viewMode === 'preview' && btn('✎ 編輯', '切換為編輯模式', () => setViewMode('editor'))}
     </div>
   )
 }
