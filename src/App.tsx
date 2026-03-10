@@ -727,11 +727,15 @@ function AppMain() {
         <AgentToolContent />
       </div>
     )
-    if (activePath === SETTINGS_TAB) return (
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-        <SettingsModal inline />
-      </div>
-    )
+    if (activePath === SETTINGS_TAB) {
+      const settingsTab = leaf.tabs.find(t => t.path === SETTINGS_TAB)
+      const closeSettings = settingsTab ? () => closeTabInPane(leaf.id, settingsTab.id) : undefined
+      return (
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+          <SettingsModal inline onClose={closeSettings} />
+        </div>
+      )
+    }
     if (activePath === HELP_TAB) return (
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         <HelpPanel />

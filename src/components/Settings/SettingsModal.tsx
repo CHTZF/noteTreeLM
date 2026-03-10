@@ -385,7 +385,8 @@ export default function SettingsModal({ onClose, inline }: SettingsModalProps) {
         await scanVault()
         await loadGraph()
       }
-      onClose?.()
+      toast.success('設定已儲存')
+      if (!inline) onClose?.()
     } catch (err: any) {
       const msg = err?.Settings ?? err?.message ?? (typeof err === 'string' ? err : '未知錯誤')
       toast.error('設定儲存失敗：' + msg)
