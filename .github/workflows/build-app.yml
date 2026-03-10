@@ -203,10 +203,12 @@ jobs:
 
       - name: Create or update GitHub Release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
           TAG: ${{ steps.ver.outputs.tag }}
         run: |
-          # 建立 release notes 檔案（避免 YAML 多行字串解析問題）
+          # 發布到 public releases repo，讓任何人都能下載
+          TARGET_REPO="${{ env.RELEASES_REPO }}"
+
           cat > release-notes.md << 'NOTES_EOF'
           ## 下載
 
@@ -223,18 +225,18 @@ jobs:
           NOTES_EOF
 
           # 建立 Release（若已存在則略過）
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 || \
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
+          gh release view "app-$TAG" --repo "$TARGET_REPO" > /dev/null 2>&1 || \
+          gh release create "app-$TAG" \
+            --repo "$TARGET_REPO" \
             --title "noteTreeLM $TAG" \
             --notes-file release-notes.md
 
           # 上傳所有檔案
           find release-files -type f | while read f; do
-            gh release upload "$TAG" "$f" \
-              --repo "$GITHUB_REPOSITORY" \
+            gh release upload "app-$TAG" "$f" \
+              --repo "$TARGET_REPO" \
               --clobber
           done
 
-          echo "✅ Release $TAG published"
-          echo "🔗 https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+          echo "✅ Release published"
+          echo "🔗 https://github.com/$TARGET_REPO/releases/tag/app-$TAG"
