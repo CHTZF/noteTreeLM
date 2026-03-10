@@ -1,7 +1,6 @@
 import { useEffect, useState, useRef, useCallback, Fragment } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
-import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
 import { faGear, faBolt, faChevronLeft, faChevronRight, faSitemap, faFolderTree, faMagnifyingGlass, faBug, faComments, faMicrophone, faArrowRightArrowLeft, faTrash } from '@fortawesome/free-solid-svg-icons'
 import { useSettingsStore } from './stores/settingsStore'
@@ -28,7 +27,9 @@ import { AgentToolContent } from './components/AgentTools/AgentToolPanel'
 import TrashPanel from './components/Trash/TrashPanel'
 import Editor from './components/Editor/Editor'
 import FileTree from './components/FileTree/FileTree'
-import Onboarding from './components/Onboarding/Onboarding'
+import LoginScreen from './components/Auth/LoginScreen'
+import VaultManagerModal from './components/Vault/VaultManagerModal'
+import { useAuthStore } from './stores/authStore'
 import Toast, { toast } from './components/common/Toast'
 import './styles/App.css'
 
@@ -98,6 +99,28 @@ function reorderInLeaf(root: PaneNode, paneId: string, fromId: string, toId: str
 
 // ─── App ───────────────────────────────────────────────────────────────────
 export default function App() {
+  const { session, isLoading: authLoading, checkSession } = useAuthStore()
+
+  // 首次掛載驗證 session
+  useEffect(() => { checkSession() }, [])
+
+  // Auth loading splash
+  if (authLoading) {
+    return (
+      <div style={{ position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--color-bg-base)', color: 'var(--color-text-muted)', fontSize: '14px' }}>
+        載入中…
+      </div>
+    )
+  }
+
+  // Not authenticated — show login
+  if (!session) return <LoginScreen />
+
+  return <AppMain />
+}
+
+function AppMain() {
+  const { session, logout: authLogout } = useAuthStore()
   const { load: loadSettings, settings, save: saveSettings } = useSettingsStore()
   const { scanVault, setupWatchers, readNote } = useVaultStore()
   const { load: loadGraph } = useGraphStore()
@@ -105,7 +128,7 @@ export default function App() {
   const { push: navPush, back: navBack, forward: navForward, canGoBack, canGoForward } = useNavigationStore()
 
   const [appReady, setAppReady] = useState(false)
-  const [showOnboarding, setShowOnboarding] = useState(false)
+  const [showVaultManager, setShowVaultManager] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [showTrash, setShowTrash] = useState(false)
   const [showQuickOpen, setShowQuickOpen] = useState(false)
@@ -206,27 +229,38 @@ export default function App() {
     const init = async () => {
       await loadSettings()
       const { settings } = useSettingsStore.getState()
-      if (!settings.onboarding_done || !settings.vault_path) {
-        setShowOnboarding(true)
-      } else {
-        setSidebarWidth(settings.sidebar_width)
-        await scanVault()
-        await loadGraph()
-        const lastNote = await invoke<string | null>('get_vault_last_note', { vaultPath: settings.vault_path }).catch(() => null)
-        if (lastNote) {
-          const tabId = crypto.randomUUID()
-          const leafId = initialLeafIdRef.current
-          setPaneRoot(prev => mapLeaf(prev, leafId, l => ({
-            ...l, tabs: [{ id: tabId, path: lastNote }], activeTabId: tabId,
-          })))
-          useEditorStore.getState().setCurrentPath(lastNote)
-          navPush(lastNote)
-        }
-      }
-      setAppReady(true)
+      setSidebarWidth(settings.sidebar_width)
+      setShowVaultManager(true)
     }
     init()
   }, [])
+
+  // ─── Vault select (from VaultManagerModal) ─────────────────────────────
+  const handleVaultSelect = useCallback(async (newVaultPath: string) => {
+    const { settings } = useSettingsStore.getState()
+    const recentVaults = [
+      newVaultPath,
+      ...(settings.recent_vaults ?? []).filter(v => v !== newVaultPath),
+    ].slice(0, 10)
+    await saveSettings({ vault_path: newVaultPath, onboarding_done: true, recent_vaults: recentVaults })
+    useEditorStore.getState().setCurrentPath(null)
+    // Reset pane tree to single empty leaf
+    const newLeafId = crypto.randomUUID()
+    initialLeafIdRef.current = newLeafId
+    setPaneRoot({ kind: 'leaf', id: newLeafId, tabs: [], activeTabId: null })
+    setFocusedPaneId(newLeafId)
+    await scanVault()
+    await loadGraph()
+    const lastNote = await invoke<string | null>('get_vault_last_note', { vaultPath: newVaultPath }).catch(() => null)
+    if (lastNote) {
+      const tabId = crypto.randomUUID()
+      setPaneRoot({ kind: 'leaf', id: newLeafId, tabs: [{ id: tabId, path: lastNote }], activeTabId: tabId })
+      useEditorStore.getState().setCurrentPath(lastNote)
+      navPush(lastNote)
+    }
+    setShowVaultManager(false)
+    setAppReady(true)
+  }, [saveSettings, scanVault, loadGraph, navPush])
 
   // ─── Save last open note ───────────────────────────────────────────────
   useEffect(() => {
@@ -276,7 +310,7 @@ export default function App() {
 
   // ─── FileWatcher + graph sync ──────────────────────────────────────────
   useEffect(() => {
-    if (!appReady || showOnboarding) return
+    if (!appReady) return
     let cleanup: (() => void) | undefined
     const setup = async () => {
       const vaultCleanup = await setupWatchers()
@@ -297,7 +331,8 @@ export default function App() {
         }
       )
       const openNoteUnlisten = await listen<string>('ui:open_note', e => {
-        if (e.payload) openNote(e.payload)
+        console.log('[ui:open_note] received:', e.payload)
+        if (e.payload) openNoteFromChat(e.payload)
       })
       const noteDeletedUnlisten = await listen<string[]>('vault:note-deleted', e => {
         const vaultPath = useSettingsStore.getState().settings.vault_path
@@ -340,7 +375,7 @@ export default function App() {
     }
     setup()
     return () => cleanup?.()
-  }, [appReady, showOnboarding])
+  }, [appReady])
 
   // ─── Keyboard shortcuts ────────────────────────────────────────────────
   useEffect(() => {
@@ -368,6 +403,7 @@ export default function App() {
     const root = paneRootRef.current
     const leafId = focusedPaneIdRef.current
     const leaf = findLeaf(root, leafId)
+    console.log('[openNote] path:', path, 'leafId:', leafId, 'leaf:', leaf?.id ?? 'null')
     if (!leaf) return
     const existing = leaf.tabs.find(t => t.path === path)
     if (existing) {
@@ -381,6 +417,36 @@ export default function App() {
     useEditorStore.getState().setCurrentPath(path)
     navPush(path)
   }, [navPush])
+
+  // ─── Open a note from Chat/LiveChat in a non-focused pane ──────────────
+  // Keeps the focused editor intact so the user can continue chatting.
+  // If there's already a second pane, opens there; otherwise splits the
+  // focused pane horizontally to create one.
+  const openNoteFromChat = useCallback((path: string) => {
+    const root = paneRootRef.current
+    const focusedId = focusedPaneIdRef.current
+    const otherLeaf = getAllLeaves(root).find(l => l.id !== focusedId)
+
+    if (otherLeaf) {
+      // Re-use existing non-focused pane
+      const existing = otherLeaf.tabs.find(t => t.path === path)
+      if (existing) {
+        setPaneRoot(prev => mapLeaf(prev, otherLeaf.id, l => ({ ...l, activeTabId: existing.id })))
+      } else {
+        const id = crypto.randomUUID()
+        setPaneRoot(prev => mapLeaf(prev, otherLeaf.id, l => ({
+          ...l, tabs: [...l.tabs, { id, path }], activeTabId: id,
+        })))
+      }
+    } else {
+      // Only one pane — split it and open note in the new pane
+      const newLeafId = crypto.randomUUID()
+      const tabId = crypto.randomUUID()
+      const newLeaf: PaneLeaf = { kind: 'leaf', id: newLeafId, tabs: [{ id: tabId, path }], activeTabId: tabId }
+      setPaneRoot(prev => splitLeaf(prev, focusedId, 'h', newLeaf))
+      // focusedPaneId intentionally unchanged — user stays in the current pane
+    }
+  }, [])
 
   // ─── Update active tab path in focused pane (back/forward nav) ─────────
   const setActiveTabPath = useCallback((path: string) => {
@@ -453,27 +519,6 @@ export default function App() {
 
   const openGraphTab = useCallback(() => openNote(GRAPH_TAB), [openNote])
 
-  const handleSwitchVault = useCallback(async () => {
-    try {
-      const result = await openDialog({ directory: true, multiple: false })
-      if (!result) return
-      const newPath = typeof result === 'string' ? result : String(result)
-      await saveSettings({ vault_path: newPath })
-      useEditorStore.getState().setCurrentPath(null)
-      await scanVault()
-      await useGraphStore.getState().load()
-    } catch (e: any) {
-      toast.error('切換 Vault 失敗：' + (e?.message ?? e))
-    }
-  }, [saveSettings, scanVault])
-
-  const handleOnboardingComplete = useCallback(async () => {
-    setShowOnboarding(false)
-    const { settings } = useSettingsStore.getState()
-    setSidebarWidth(settings.sidebar_width)
-    await scanVault()
-    await loadGraph()
-  }, [])
 
   // ─── Sidebar resize ────────────────────────────────────────────────────
   const onLeftDividerMouseDown = () => { isDraggingLeft.current = true }
@@ -755,12 +800,12 @@ export default function App() {
                 <ChatPanel
                   liveChatActive={false}
                   onActiveChange={active => { chatActiveRef.current.set(t.id, active) }}
-                  onOpenNote={openNote}
+                  onOpenNote={openNoteFromChat}
                 />
               )}
               {t.path === LIVE_CHAT_TAB && (
                 <LiveChatPanel
-                  onOpenNote={openNote}
+                  onOpenNote={openNoteFromChat}
                   onActiveChange={active => { chatActiveRef.current.set(t.id, active) }}
                 />
               )}
@@ -779,7 +824,7 @@ export default function App() {
   }
 
   // ─── Early returns ─────────────────────────────────────────────────────
-  if (!appReady) {
+  if (!appReady && !showVaultManager) {
     return (
       <div className="app-loading">
         <div className="app-loading-spinner" />
@@ -787,8 +832,8 @@ export default function App() {
       </div>
     )
   }
-  if (showOnboarding) {
-    return <Onboarding onComplete={handleOnboardingComplete} />
+  if (showVaultManager && !appReady) {
+    return <VaultManagerModal onSelect={handleVaultSelect} canClose={false} />
   }
 
   // ─── Main render ───────────────────────────────────────────────────────
@@ -856,8 +901,8 @@ export default function App() {
 
           <button
             className="icon-menubar-btn"
-            title="切換 Vault 資料夾"
-            onClick={handleSwitchVault}
+            title="工作區管理"
+            onClick={() => setShowVaultManager(true)}
           ><FontAwesomeIcon icon={faArrowRightArrowLeft} /></button>
           <button
             className="icon-menubar-btn"
@@ -870,6 +915,13 @@ export default function App() {
             title="設定 (⌘,)"
             onClick={() => setShowSettings(true)}
           ><FontAwesomeIcon icon={faGear} /></button>
+
+          <button
+            className="icon-menubar-btn"
+            title={`登出 (${session?.username ?? ''})`}
+            onClick={() => authLogout()}
+            style={{ fontSize: '13px' }}
+          >⏏</button>
         </div>
 
         {/* ── 左側面板 ── */}
@@ -918,6 +970,15 @@ export default function App() {
 
       {/* Trash */}
       {showTrash && <TrashPanel onClose={() => setShowTrash(false)} />}
+
+      {/* Vault Manager (switch vault overlay) */}
+      {showVaultManager && appReady && (
+        <VaultManagerModal
+          onSelect={handleVaultSelect}
+          canClose={true}
+          onClose={() => setShowVaultManager(false)}
+        />
+      )}
 
       {/* Drag ghost */}
       {isDraggingTab && dragPos && dragStateRef.current && (() => {
