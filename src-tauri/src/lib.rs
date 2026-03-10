@@ -6,6 +6,7 @@ mod state;
 pub mod tools;
 mod vault;
 
+use commands::auth::{login, logout, get_session, change_password};
 use commands::{
     ai::{stream_chat_external, process_with_llm, stop_llama_server, warmup_llama_server,
          get_llama_server_status, start_llama_server, restart_llama_server,
@@ -103,6 +104,11 @@ pub fn run() {
             handle_vault_protocol(ctx.app_handle(), request)
         })
         .invoke_handler(generate_handler![
+            // Auth
+            login,
+            logout,
+            get_session,
+            change_password,
             // Settings
             get_settings,
             save_settings,

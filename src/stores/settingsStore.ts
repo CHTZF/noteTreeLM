@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { invoke } from '@tauri-apps/api/core'
 import { Settings, DEFAULT_SETTINGS } from '../types/settings'
+import { useAuthStore } from './authStore'
 
 interface SettingsStore {
   settings: Settings
@@ -17,7 +18,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   load: async () => {
     try {
-      const raw = await invoke<any>('get_settings')
+      const username = useAuthStore.getState().session?.username ?? ''
+      const raw = await invoke<any>('get_settings', { username })
       // 合併 DEFAULT_SETTINGS 以補齊新增欄位；sort_orders 由 JSON 字串轉物件
       const settings: Settings = {
         ...DEFAULT_SETTINGS,
@@ -43,7 +45,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         ...updated,
         sort_orders: JSON.stringify(updated.sort_orders ?? {}),
       }
-      await invoke('save_settings', { settings: rustSettings })
+      const username = useAuthStore.getState().session?.username ?? ''
+      await invoke('save_settings', { username, settings: rustSettings })
     } catch (err) {
       console.error('儲存設定失敗：', err)
       throw err

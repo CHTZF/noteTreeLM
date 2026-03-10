@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
 import { faPlus, faTrash, faClock } from '@fortawesome/free-solid-svg-icons'
 import { toast } from '../common/Toast'
+import { useAuthStore } from '../../stores/authStore'
 
 export interface ConversationSummary {
   id: string
@@ -54,7 +55,9 @@ export default function ConversationList({ mode, selectedId, onSelect, onNew }: 
     setLoading(true)
     try {
       const newOffset = reset ? 0 : offset
+      const username = useAuthStore.getState().session?.username ?? ''
       const list: ConversationSummary[] = await invoke('list_conversations', {
+        username,
         mode,
         limit: PAGE_SIZE,
         offset: newOffset,
@@ -77,7 +80,8 @@ export default function ConversationList({ mode, selectedId, onSelect, onNew }: 
 
   const handleNew = async () => {
     try {
-      const id: string = await invoke('create_conversation', { mode })
+      const username = useAuthStore.getState().session?.username ?? ''
+      const id: string = await invoke('create_conversation', { username, mode })
       setConvs(prev => [{ id, mode, title: '新對話', updated_at: Date.now() / 1000, has_pending_plan: false }, ...prev])
       onNew(id)
     } catch (e) {

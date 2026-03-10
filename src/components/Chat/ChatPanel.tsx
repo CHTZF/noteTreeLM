@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useSettingsStore } from '../../stores/settingsStore'
+import { useAuthStore } from '../../stores/authStore'
 import { useEditorStore } from '../../stores/editorStore'
 import { useDebugStore } from '../../stores/debugStore'
 import { toast } from '../common/Toast'
@@ -57,17 +58,16 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const log = useCallback((msg: string) => addLog('chat', 'info', msg), [addLog])
   const err = useCallback((msg: string) => addLog('chat', 'error', msg), [addLog])
 
-  // 初始化：建立第一個對話（或從 localStorage 恢復上次選中的 conversation）
+  // 初始化：從 localStorage 恢復上次對話（不自動建立新對話）
   useEffect(() => {
     const saved = localStorage.getItem('chat_conversation_id')
     if (saved) {
-      setConversationId(saved)
-      loadConversationMessages(saved)
-    } else {
-      invoke<string>('create_conversation', { mode: 'chat' }).then(id => {
-        setConversationId(id)
-        localStorage.setItem('chat_conversation_id', id)
-      }).catch(() => {})
+      invoke('get_conversation', { id: saved })
+        .then(() => { setConversationId(saved); loadConversationMessages(saved) })
+        .catch(() => {
+          // Stale ID — remove it and stay on empty screen
+          localStorage.removeItem('chat_conversation_id')
+        })
     }
   }, [])
 
@@ -80,7 +80,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     } catch {
       // Conversation not found in DB (stale localStorage ID) — create a fresh one
       try {
-        const newId = await invoke<string>('create_conversation', { mode: 'chat' })
+        const username = useAuthStore.getState().session?.username ?? ''
+        const newId = await invoke<string>('create_conversation', { username, mode: 'chat' })
         setConversationId(newId)
         localStorage.setItem('chat_conversation_id', newId)
       } catch {}
@@ -99,7 +100,16 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   }, [isStreaming, loadConversationMessages])
 
   const handleNewConversation = useCallback((id: string) => {
-    if (!id) return
+    if (!id) {
+      // Current conversation was deleted — reset to empty screen
+      setConversationId(null)
+      localStorage.removeItem('chat_conversation_id')
+      setMessages([])
+      setError('')
+      setStreamingText('')
+      streamingRef.current = ''
+      return
+    }
     setConversationId(id)
     localStorage.setItem('chat_conversation_id', id)
     setMessages([])
@@ -534,6 +544,18 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
 
       {/* Main chat area */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minWidth: 0 }}>
+      {/* No conversation selected — placeholder */}
+      {!conversationId && (
+        <div style={{
+          flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center',
+          justifyContent: 'center', color: 'var(--color-text-muted)', fontSize: '13px',
+          textAlign: 'center', lineHeight: 1.8, padding: '24px', gap: '12px',
+        }}>
+          <div>請選擇過去對話</div>
+          <div style={{ color: 'var(--color-text-muted)', fontSize: '11px' }}>或點擊側欄「＋ 新對話」開始</div>
+        </div>
+      )}
+      {conversationId && <>
       {/* Voice Overlay */}
       {showVoiceOverlay && (
         <VoiceOverlay
@@ -809,6 +831,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
           </button>
         </div>
       </div>
+      </>}{/* end conversationId guard */}
       </div>{/* end main chat area */}
     </div>
   )

@@ -11,6 +11,8 @@ pub async fn init_settings_db(app_data_dir: &Path) -> crate::error::Result<Sqlit
     let pool = connect(db_url).await?;
     run_migrations(&pool, include_str!("../../migrations/settings_001.sql")).await?;
     run_migrations(&pool, include_str!("../../migrations/settings_002.sql")).await?;
+    run_migrations(&pool, include_str!("../../migrations/settings_003.sql")).await?;
+    run_migrations(&pool, include_str!("../../migrations/settings_004.sql")).await?;
     Ok(pool)
 }
 

@@ -47,12 +47,12 @@ pub struct Settings {
 }
 
 #[tauri::command]
-pub async fn get_settings(state: State<'_, AppState>) -> Result<Settings, AppError> {
+pub async fn get_settings(state: State<'_, AppState>, username: String) -> Result<Settings, AppError> {
     let pool = &state.settings_db;
 
     macro_rules! get {
         ($key:expr, $default:expr) => {
-            queries::get_setting(pool, $key)
+            queries::get_user_setting(pool, &username, $key)
                 .await?
                 .unwrap_or_else(|| $default.to_string())
         };
@@ -110,13 +110,14 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<Settings, AppErr
 pub async fn save_settings(
     app: AppHandle,
     state: State<'_, AppState>,
+    username: String,
     settings: Settings,
 ) -> Result<(), AppError> {
     let pool = state.settings_db.clone();
 
     macro_rules! save {
         ($key:expr, $value:expr) => {
-            queries::set_setting(&pool, $key, &$value.to_string()).await?
+            queries::set_user_setting(&pool, &username, $key, &$value.to_string()).await?
         };
     }
 
@@ -162,7 +163,7 @@ pub async fn save_settings(
 
     let recent_json = serde_json::to_string(&settings.recent_vaults)
         .map_err(|e| AppError::Settings(e.to_string()))?;
-    queries::set_setting(&pool, "recent_vaults", &recent_json).await?;
+    queries::set_user_setting(&pool, &username, "recent_vaults", &recent_json).await?;
 
     // 更新記憶體中的 vault_path，並在切換 vault 時重啟 FileWatcher
     if !settings.vault_path.is_empty() {

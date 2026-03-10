@@ -34,6 +34,7 @@ pub struct ConversationSnapshot {
 #[tauri::command]
 pub async fn create_conversation(
     state: State<'_, AppState>,
+    username: String,
     mode: String,
     title: Option<String>,
 ) -> Result<String, AppError> {
@@ -41,9 +42,10 @@ pub async fn create_conversation(
     let id = Uuid::new_v4().to_string();
     let title = title.unwrap_or_default();
     sqlx::query(
-        "INSERT INTO conversations(id, mode, title) VALUES (?, ?, ?)"
+        "INSERT INTO conversations(id, account_id, mode, title) VALUES (?, ?, ?, ?)"
     )
     .bind(&id)
+    .bind(&username)
     .bind(&mode)
     .bind(&title)
     .execute(db)
@@ -56,6 +58,7 @@ pub async fn create_conversation(
 #[tauri::command]
 pub async fn list_conversations(
     state: State<'_, AppState>,
+    username: String,
     mode: String,
     limit: Option<i64>,
     offset: Option<i64>,
@@ -68,11 +71,12 @@ pub async fn list_conversations(
         "SELECT c.id, c.mode, c.title, c.updated_at,
                 (SELECT 1 FROM pending_plans p WHERE p.conversation_id = c.id) AS has_plan
          FROM conversations c
-         WHERE c.mode = ?
+         WHERE c.mode = ? AND c.account_id = ?
          ORDER BY c.updated_at DESC
          LIMIT ? OFFSET ?"
     )
     .bind(&mode)
+    .bind(&username)
     .bind(limit)
     .bind(offset)
     .fetch_all(db)
