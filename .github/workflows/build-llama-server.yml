@@ -179,7 +179,9 @@ jobs:
           cmake -S llama-src -B llama-build ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DBUILD_SHARED_LIBS=OFF ^
-            -DLLAMA_BUILD_TESTS=OFF
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_CURL=OFF ^
+            -DGGML_CURL=OFF
 
           cmake --build llama-build ^
             --target llama-server ^
@@ -198,6 +200,11 @@ jobs:
           fi
           cp "$BINARY" llama-server-windows-x64.exe
           ls -lh llama-server-windows-x64.exe
+
+      - name: Verify DLL dependencies (should only list system DLLs)
+        if: steps.check.outputs.exists == '0'
+        shell: cmd
+        run: dumpbin /dependents llama-server-windows-x64.exe
 
       - name: Upload to public releases repo
         if: steps.check.outputs.exists == '0'

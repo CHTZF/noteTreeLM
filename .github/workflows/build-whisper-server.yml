@@ -186,7 +186,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release ^
             -DWHISPER_BUILD_SERVER=ON ^
             -DWHISPER_BUILD_TESTS=OFF ^
-            -DBUILD_SHARED_LIBS=OFF
+            -DBUILD_SHARED_LIBS=OFF ^
+            -DGGML_CURL=OFF
 
           cmake --build whisper-build ^
             --target whisper-server ^
@@ -205,6 +206,11 @@ jobs:
           fi
           cp "$BINARY" whisper-server-windows-x64.exe
           ls -lh whisper-server-windows-x64.exe
+
+      - name: Verify DLL dependencies (should only list system DLLs)
+        if: steps.check.outputs.exists == '0'
+        shell: cmd
+        run: dumpbin /dependents whisper-server-windows-x64.exe
 
       - name: Upload to public releases repo
         if: steps.check.outputs.exists == '0'
