@@ -390,13 +390,26 @@ class ImageWidget extends WidgetType {
   }
 }
 
+// ── QuickCopy right-click edit callback ──────────────────────────────────────
+// Editor.tsx registers this so live-mode right-click on a span opens the modal.
+export interface QuickCopyEditData {
+  from: number; to: number
+  dataCopy: string; displayText: string; style: string
+}
+let _onLiveEditQuickCopy: ((data: QuickCopyEditData) => void) | null = null
+export function setLiveEditQuickCopyHandler(fn: typeof _onLiveEditQuickCopy) {
+  _onLiveEditQuickCopy = fn
+}
+
 // ── QuickCopyWidget: renders <span class="quick-copy" ...> with live styling ──
-// Replaces raw HTML span text with a properly styled, clickable widget.
+// Always rendered (no cursorIn toggle). Left-click copies; right-click opens editor.
 class QuickCopyWidget extends WidgetType {
   constructor(
     private dataCopy: string,
     private displayText: string,
     private style: string,
+    private docFrom: number,
+    private docTo: number,
   ) { super() }
 
   toDOM(): HTMLElement {
@@ -410,11 +423,19 @@ class QuickCopyWidget extends WidgetType {
       span.style.opacity = '0.4'
       setTimeout(() => { span.style.opacity = '' }, 800)
     })
+    span.addEventListener('contextmenu', (e) => {
+      e.preventDefault()
+      e.stopPropagation()
+      _onLiveEditQuickCopy?.({
+        from: this.docFrom, to: this.docTo,
+        dataCopy: this.dataCopy, displayText: this.displayText, style: this.style,
+      })
+    })
     return span
   }
 
   ignoreEvent(e: Event): boolean {
-    return ['click', 'mousedown', 'mouseup'].includes(e.type)
+    return ['click', 'mousedown', 'mouseup', 'contextmenu'].includes(e.type)
   }
 
   eq(other: WidgetType): boolean {
@@ -535,23 +556,6 @@ function buildInlineDecos(view: EditorView): DecorationSet {
 
         // Block elements handled by StateField
         if (name === 'Table' || name === 'FencedCode' || name === 'HorizontalRule') return false
-
-        // ── Image ![alt](url) ──────────────────────────────────────────
-        if (name === 'Image') {
-          if (!cursorIn(from, to)) {
-            let src = ''
-            let child = node.node.firstChild
-            while (child) {
-              if (child.name === 'URL') { src = doc.sliceString(child.from, child.to) }
-              child = child.nextSibling
-            }
-            const raw = doc.sliceString(from, to)
-            const altMatch = raw.match(/^!\[([^\]]*)\]/)
-            const alt = altMatch ? altMatch[1] : ''
-            if (src) add(from, to, Decoration.replace({ widget: new ImageWidget(src, alt) }))
-          }
-          return false
-        }
 
         // ── ATX Headings ──────────────────────────────────────────────
         if (name.startsWith('ATXHeading')) {
@@ -706,9 +710,25 @@ function buildInlineDecos(view: EditorView): DecorationSet {
     })
   }
 
+  // ── Image syntax scan ─────────────────────────────────────────────────────
+  // Regex-based (more reliable than syntax tree for ![alt|size](url) variants).
+  const imageRe = /!\[([^\]]*)\]\(([^)]+)\)/g
+  for (const { from: vpFrom, to: vpTo } of view.visibleRanges) {
+    const text = doc.sliceString(vpFrom, vpTo)
+    let m: RegExpExecArray | null
+    imageRe.lastIndex = 0
+    while ((m = imageRe.exec(text)) !== null) {
+      const mFrom = vpFrom + m.index
+      const mTo = mFrom + m[0].length
+      if (!cursorIn(mFrom, mTo)) {
+        const src = m[2].trim()
+        if (src) add(mFrom, mTo, Decoration.replace({ widget: new ImageWidget(src, m[1]) }))
+      }
+    }
+  }
+
   // ── Quick-copy HTML spans ──────────────────────────────────────────────────
-  // Scan visible text for <span class="quick-copy" data-copy="...">...</span>
-  // and replace them with styled, clickable QuickCopyWidget elements.
+  // Always rendered (no cursorIn check). Right-click opens the edit modal.
   const quickCopyRe = /<span class="quick-copy" data-copy="([^"]*)"([^>]*)>(.*?)<\/span>/g
   for (const { from: vpFrom, to: vpTo } of view.visibleRanges) {
     const text = doc.sliceString(vpFrom, vpTo)
@@ -717,12 +737,10 @@ function buildInlineDecos(view: EditorView): DecorationSet {
     while ((m = quickCopyRe.exec(text)) !== null) {
       const mFrom = vpFrom + m.index
       const mTo = mFrom + m[0].length
-      if (!cursorIn(mFrom, mTo)) {
-        const dataCopy = m[1].replace(/&quot;/g, '"').replace(/&amp;/g, '&')
-        const styleMatch = m[2].match(/style="([^"]*)"/)
-        const style = styleMatch ? styleMatch[1] : ''
-        add(mFrom, mTo, Decoration.replace({ widget: new QuickCopyWidget(dataCopy, m[3], style) }))
-      }
+      const dataCopy = m[1].replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+      const styleMatch = m[2].match(/style="([^"]*)"/)
+      const style = styleMatch ? styleMatch[1] : ''
+      add(mFrom, mTo, Decoration.replace({ widget: new QuickCopyWidget(dataCopy, m[3], style, mFrom, mTo) }))
     }
   }
 

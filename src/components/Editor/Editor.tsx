@@ -10,7 +10,7 @@ import { useEditorStore } from '../../stores/editorStore'
 import { useVaultStore } from '../../stores/vaultStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { wikilinkPlugin } from './plugins/wikilinks'
-import { livePreviewPlugin, livePreviewTheme } from './plugins/livePreview'
+import { livePreviewPlugin, livePreviewTheme, setLiveEditQuickCopyHandler } from './plugins/livePreview'
 import type { EditorAction } from './Toolbar'
 import PreviewPanel from './PreviewPanel'
 import BacklinksPanel from '../BacklinksPanel/BacklinksPanel'
@@ -370,6 +370,25 @@ export default function Editor({ onOpenNote }: EditorProps) {
     setQuickCopyModal(null)
     view.focus()
   }, [quickCopyModal, qcDisplayText, qcColor, qcFontSize, qcFontFamily, qcFontWeight, qcCopyContent])
+
+  // Register live-mode right-click edit handler for quick-copy widgets
+  useEffect(() => {
+    setLiveEditQuickCopyHandler((data) => {
+      // Parse existing style back into individual fields
+      const get = (prop: string) => {
+        const m = data.style.match(new RegExp(prop + ':([^;]+)'))
+        return m ? m[1].trim() : ''
+      }
+      setQcCopyContent(data.dataCopy)
+      setQcDisplayText(data.displayText)
+      setQcColor(get('color') || '#2080e0')
+      setQcFontSize(get('font-size').replace('px', ''))
+      setQcFontFamily(get('font-family') || 'inherit')
+      setQcFontWeight(get('font-weight') || 'inherit')
+      setQuickCopyModal({ from: data.from, to: data.to })
+    })
+    return () => setLiveEditQuickCopyHandler(null)
+  }, [])
 
   const pickImageFile = useCallback(async () => {
     try {
