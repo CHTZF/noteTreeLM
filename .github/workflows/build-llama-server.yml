@@ -203,8 +203,11 @@ jobs:
 
       - name: Verify DLL dependencies (should only list system DLLs)
         if: steps.check.outputs.exists == '0'
-        shell: cmd
-        run: dumpbin /dependents llama-server-windows-x64.exe
+        shell: bash
+        run: |
+          echo "=== DLL dependencies ==="
+          "C:/Program Files/Git/usr/bin/objdump.exe" -p llama-server-windows-x64.exe \
+            | grep "DLL Name:" | sort -u
 
       - name: Upload to public releases repo
         if: steps.check.outputs.exists == '0'
