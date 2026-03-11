@@ -125,8 +125,10 @@ pub async fn save_settings(
     save!("theme", settings.theme);
     save!("auto_save_mode", settings.auto_save_mode);
     save!("auto_save_delay", settings.auto_save_delay);
-    save!("whisper_cli_path", settings.whisper_cli_path);
-    save!("whisper_model_path", settings.whisper_model_path);
+    // Binary paths and model paths are machine-level settings shared across users on the same machine.
+    // Store in the global `settings` table so server startup code (which uses get_setting) can read them.
+    queries::set_setting(&pool, "whisper_cli_path", settings.whisper_cli_path.trim()).await?;
+    queries::set_setting(&pool, "whisper_model_path", settings.whisper_model_path.trim()).await?;
     save!("whisper_language", settings.whisper_language);
     save!("whisper_threads", settings.whisper_threads);
     save!("whisper_auto_insert", settings.whisper_auto_insert);
@@ -138,8 +140,8 @@ pub async fn save_settings(
     save!("ai_enable_topics", settings.ai_enable_topics);
     save!("ai_enable_summary", settings.ai_enable_summary);
     save!("ai_enable_vision", settings.ai_enable_vision);
-    save!("llm_model_path", settings.llm_model_path);
-    save!("llama_cli_path", settings.llama_cli_path);
+    queries::set_setting(&pool, "llm_model_path", settings.llm_model_path.trim()).await?;
+    queries::set_setting(&pool, "llama_cli_path", settings.llama_cli_path.trim()).await?;
     save!("last_open_note", settings.last_open_note);
     save!("onboarding_done", settings.onboarding_done);
     save!("sidebar_width", settings.sidebar_width);

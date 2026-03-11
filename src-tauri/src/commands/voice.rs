@@ -32,9 +32,14 @@ async fn resolve_whisper_server_config(
     let server_path = queries::get_setting(pool, "whisper_cli_path")
         .await?
         .unwrap_or_default();
+    // Trim whitespace and surrounding quotes (users sometimes paste quoted paths from terminal)
+    let server_path = server_path.trim().trim_matches('"').trim_matches('\'').to_string();
+
     let model_path = queries::get_setting(pool, "whisper_model_path")
         .await?
         .unwrap_or_default();
+    let model_path = model_path.trim().trim_matches('"').trim_matches('\'').to_string();
+
     let threads: u32 = queries::get_setting(pool, "whisper_threads")
         .await?
         .unwrap_or_default()
@@ -52,7 +57,13 @@ async fn resolve_whisper_server_config(
         ));
     }
 
-    let bin = PathBuf::from(&server_path);
+    let mut bin = PathBuf::from(&server_path);
+    // On Windows, auto-append .exe if the path has no extension and the bare path doesn't exist.
+    #[cfg(windows)]
+    if !bin.exists() && bin.extension().is_none() {
+        let candidate = bin.with_extension("exe");
+        if candidate.exists() { bin = candidate; }
+    }
     if !bin.exists() {
         return Err(AppError::Voice(format!(
             "找不到 whisper-server：{}，請到 Settings > Voice 更新路徑。",
@@ -177,14 +188,17 @@ async fn ensure_whisper_server_running(
                 &format!("[server] 啟動 whisper-server（port {}）…", port),
             );
 
-            let mut child = tokio::process::Command::new(&bin)
-                .args([
-                    "--model", &model_path,
-                    "--port", &port.to_string(),
-                    "--host", "127.0.0.1",
-                    "--threads", &threads.to_string(),
-                    "--flash-attn",   // Metal flash attention：加速自注意力計算（~20-30%）
-                ])
+            let mut cmd = tokio::process::Command::new(&bin);
+            cmd.args([
+                "--model", &model_path,
+                "--port", &port.to_string(),
+                "--host", "127.0.0.1",
+                "--threads", &threads.to_string(),
+            ]);
+            // --flash-attn is a Metal-only flag; passing it on Windows causes the server to exit immediately.
+            #[cfg(target_os = "macos")]
+            cmd.arg("--flash-attn");
+            let mut child = cmd
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped())
                 .kill_on_drop(false)

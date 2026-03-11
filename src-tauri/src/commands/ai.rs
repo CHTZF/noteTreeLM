@@ -40,9 +40,13 @@ async fn resolve_server_config(state: &AppState) -> Result<(PathBuf, String), Ap
     let server_path = queries::get_setting(pool, "llama_cli_path")
         .await?
         .unwrap_or_default();
+    // Trim whitespace and surrounding quotes (users sometimes paste quoted paths from terminal)
+    let server_path = server_path.trim().trim_matches('"').trim_matches('\'').to_string();
+
     let model_path = queries::get_setting(pool, "llm_model_path")
         .await?
         .unwrap_or_default();
+    let model_path = model_path.trim().trim_matches('"').trim_matches('\'').to_string();
 
     if server_path.is_empty() {
         return Err(AppError::AI(
@@ -55,7 +59,13 @@ async fn resolve_server_config(state: &AppState) -> Result<(PathBuf, String), Ap
         ));
     }
 
-    let bin = PathBuf::from(&server_path);
+    let mut bin = PathBuf::from(&server_path);
+    // On Windows, auto-append .exe if the path has no extension and the bare path doesn't exist.
+    #[cfg(windows)]
+    if !bin.exists() && bin.extension().is_none() {
+        let candidate = bin.with_extension("exe");
+        if candidate.exists() { bin = candidate; }
+    }
     if !bin.exists() {
         return Err(AppError::AI(format!(
             "找不到 llama-server：{}",

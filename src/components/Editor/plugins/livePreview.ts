@@ -401,7 +401,9 @@ class ImageWidget extends WidgetType {
       const vaultPath = settings.vault_path
       let decoded = rawSrc
       try { decoded = decodeURI(rawSrc) } catch { /* keep original */ }
-      const absolutePath = decoded.startsWith('/') ? decoded : `${vaultPath}/${decoded}`
+      // Detect absolute paths: Unix (/...) and Windows (C:\... or C:/...)
+      const isAbsolute = decoded.startsWith('/') || /^[A-Za-z]:[/\\]/.test(decoded)
+      const absolutePath = isAbsolute ? decoded : `${vaultPath}/${decoded}`
       invoke<string>('read_file_base64', { path: absolutePath }).then(base64 => {
         const ext = absolutePath.split('.').pop()?.toLowerCase() ?? ''
         const mimeMap: Record<string, string> = {

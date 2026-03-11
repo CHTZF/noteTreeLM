@@ -339,7 +339,7 @@ export default function FileTree({ onOpenNote }: FileTreeProps) {
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 12px 8px', borderBottom: '1px solid var(--color-border)' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '6px', overflow: 'hidden' }}>
-          <FontAwesomeIcon icon={faFolder} style={{ fontSize: '13px', flexShrink: 0, color: FOLDER_COLOR }} />
+          <FontAwesomeIcon icon={faFolder} style={{ fontSize: '13px', width: '13px', height: '13px', flexShrink: 0, color: FOLDER_COLOR }} />
           <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {vaultName}
           </span>
@@ -527,7 +527,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
         onMouseEnter={() => setIsHovered(true)}
         onMouseLeave={() => setIsHovered(false)}
         style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '3px 8px 3px ' + (8 + depth * 16) + 'px', cursor: 'pointer', fontSize: '13px', color: 'var(--color-text-secondary)', background: isHovered ? 'var(--color-bg-hover)' : 'transparent', borderRadius: '6px', margin: '0 4px', transition: 'background 0.1s', userSelect: 'none' }}>
-        <FontAwesomeIcon icon={getFileIcon(node.name, node.isImage).icon} style={{ fontSize: '13px', flexShrink: 0, color: getFileIcon(node.name, node.isImage).color }} />
+        <FontAwesomeIcon icon={getFileIcon(node.name, node.isImage).icon} style={{ fontSize: '13px', width: '13px', height: '13px', flexShrink: 0, color: getFileIcon(node.name, node.isImage).color }} />
         {isRenaming ? (
           <input
             ref={renameInputRef}
@@ -741,8 +741,8 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
           onMouseEnter={() => setIsHovered(true)}
           onMouseLeave={() => setIsHovered(false)}
           style={{ display: 'flex', alignItems: 'center', gap: '4px', padding: '3px 8px 3px ' + (8 + depth * 16) + 'px', cursor: 'pointer', fontSize: '13px', color: 'var(--color-text-secondary)', userSelect: 'none', position: 'relative' }}>
-          <FontAwesomeIcon icon={faChevronRight} style={{ fontSize: '10px', width: '10px', flexShrink: 0, color: FOLDER_COLOR, transform: isExpanded ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.18s ease' }} />
-          <FontAwesomeIcon icon={isExpanded ? faFolderOpen : faFolder} style={{ fontSize: '13px', flexShrink: 0, color: FOLDER_COLOR }} />
+          <FontAwesomeIcon icon={faChevronRight} style={{ fontSize: '10px', width: '10px', height: '10px', flexShrink: 0, color: FOLDER_COLOR, transform: isExpanded ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.18s ease' }} />
+          <FontAwesomeIcon icon={isExpanded ? faFolderOpen : faFolder} style={{ fontSize: '13px', width: '13px', height: '13px', flexShrink: 0, color: FOLDER_COLOR }} />
           {isRenaming ? (
             <input
               ref={renameInputRef}
@@ -926,7 +926,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
         borderRadius: '6px', margin: '0 4px',
         transition: 'background 0.1s', userSelect: 'none',
       }}>
-      <FontAwesomeIcon icon={getFileIcon(node.name).icon} style={{ fontSize: '13px', flexShrink: 0, color: getFileIcon(node.name).color }} />
+      <FontAwesomeIcon icon={getFileIcon(node.name).icon} style={{ fontSize: '13px', width: '13px', height: '13px', flexShrink: 0, color: getFileIcon(node.name).color }} />
       {isRenaming ? (
         <input
           ref={renameInputRef}
@@ -973,7 +973,7 @@ function MenuItem({ icon, label, danger, active, onClick }: MenuItemProps) {
   return (
     <button onClick={onClick} onMouseEnter={() => setHovered(true)} onMouseLeave={() => setHovered(false)}
       style={{ display: 'flex', alignItems: 'center', gap: '8px', width: '100%', padding: '6px 12px', fontSize: '13px', textAlign: 'left', color, background: hovered ? 'var(--color-bg-hover)' : 'transparent', cursor: 'pointer', fontWeight: active ? 600 : 400 }}>
-      <FontAwesomeIcon icon={icon} style={{ fontSize: '11px', width: '12px' }} />{label}
+      <FontAwesomeIcon icon={icon} style={{ fontSize: '11px', width: '11px', height: '11px', flexShrink: 0 }} />{label}
     </button>
   )
 }
