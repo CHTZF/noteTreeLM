@@ -72,16 +72,19 @@ export default function Toolbar({
       {/* 儲存（編輯模式才有意義） */}
       {isEditing && btn('儲存', '儲存 (⌘S)', onSave)}
 
-      {/* 模式切換 */}
-      {viewMode === 'editor' && <>
-        {btn('✦ 即時', '切換為即時預覽模式', () => setViewMode('live'))}
-        {btn('👁 預覽', '切換為預覽模式', () => setViewMode('preview'))}
-      </>}
+      {/* 模式切換：主要 toggle 是「預覽 ↔ 編輯(live)」，Source 為次要 */}
       {viewMode === 'live' && <>
-        {btn('✎ 原始', '切換為純文字編輯模式', () => setViewMode('editor'), true)}
+        {btn('👁 預覽', '切換為預覽模式', () => setViewMode('preview'))}
+        {btn('Source', '切換為原始碼模式', () => setViewMode('editor'))}
+      </>}
+      {viewMode === 'preview' && <>
+        {btn('✎ 編輯', '切換為編輯模式', () => setViewMode('live'))}
+        {btn('Source', '切換為原始碼模式', () => setViewMode('editor'))}
+      </>}
+      {viewMode === 'editor' && <>
+        {btn('✎ 編輯', '切換為即時編輯模式', () => setViewMode('live'))}
         {btn('👁 預覽', '切換為預覽模式', () => setViewMode('preview'))}
       </>}
-      {viewMode === 'preview' && btn('✎ 編輯', '切換為編輯模式', () => setViewMode('editor'))}
     </div>
   )
 }

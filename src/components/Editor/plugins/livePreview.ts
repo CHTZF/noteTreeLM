@@ -1,6 +1,6 @@
 import { ViewPlugin, ViewUpdate, Decoration, DecorationSet, WidgetType, EditorView } from '@codemirror/view'
 import { syntaxTree } from '@codemirror/language'
-import { RangeSetBuilder, Text, StateField, Transaction, EditorState } from '@codemirror/state'
+import { RangeSetBuilder, StateField, Transaction, EditorState } from '@codemirror/state'
 import type { Extension } from '@codemirror/state'
 import type { SyntaxNodeRef } from '@lezer/common'
 import MarkdownIt from 'markdown-it'
@@ -148,30 +148,101 @@ class TableWidget extends WidgetType {
   }
 }
 
-// ── Block Widget (FencedCode, HR) ─────────────────────────────────────────────
-class BlockWidget extends WidgetType {
-  constructor(private raw: string) { super() }
+// ── CodeWidget: interactive textarea-based code block ────────────────────────
+// Always renders. User edits raw code in a styled textarea; on blur the fenced
+// block is written back to the markdown source via _view.dispatch.
+class CodeWidget extends WidgetType {
+  constructor(
+    private raw: string,       // full fenced code block markdown (no trailing \n)
+    private codeFrom: number,  // doc position of first char (start of opening fence line)
+  ) { super() }
 
   toDOM(): HTMLElement {
-    const div = document.createElement('div')
-    div.className = 'preview-content cm-live-block-widget'
-    div.style.cssText = 'padding:0;margin:0;cursor:text;'
-    try {
-      const html = DOMPurify.sanitize(
-        mdBlock.render(this.raw),
-        { ADD_ATTR: ['class', 'style', 'data-copy'] }
-      )
-      div.innerHTML = html || this.raw
-    } catch {
-      div.style.cssText += ';white-space:pre-wrap;'
-      div.textContent = this.raw
-    }
-    return div
+    const lines = this.raw.split('\n')
+    const fence = lines[0]                        // e.g. "```rust" or "~~~"
+    const lang  = fence.replace(/^[`~]+/, '').trim()
+    const codeContent = lines.slice(1, -1).join('\n')  // between fences
+    const closeFence  = lines[lines.length - 1]
+
+    const wrapper = document.createElement('div')
+    wrapper.className = 'preview-content cm-live-block-widget'
+    wrapper.style.cssText = 'padding:0;margin:0 0 4px;border-radius:6px;overflow:hidden;border:1px solid var(--color-border);'
+
+    // Header bar
+    const header = document.createElement('div')
+    header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:3px 10px;background:var(--color-bg-hover);border-bottom:1px solid var(--color-border);'
+    const badge = document.createElement('span')
+    badge.textContent = lang || 'code'
+    badge.style.cssText = 'font-size:11px;font-family:var(--font-mono);color:var(--color-text-muted);'
+    header.appendChild(badge)
+    wrapper.appendChild(header)
+
+    const textarea = document.createElement('textarea')
+    textarea.value   = codeContent
+    textarea.rows    = Math.max(1, lines.length - 2) + 1
+    textarea.spellcheck = false
+    textarea.style.cssText = [
+      'width:100%;padding:10px 14px;',
+      'font-family:var(--font-mono);font-size:0.88em;line-height:1.6;',
+      'background:var(--color-bg-base);color:var(--color-text-primary);',
+      'border:none;outline:none;resize:none;box-sizing:border-box;display:block;',
+      'white-space:pre;overflow-x:auto;tab-size:2;',
+    ].join('')
+
+    let originalContent = codeContent
+
+    textarea.addEventListener('focus', () => {
+      originalContent = textarea.value
+      wrapper.style.borderColor = 'var(--color-accent)'
+    })
+    textarea.addEventListener('blur', () => {
+      wrapper.style.borderColor = 'var(--color-border)'
+      if (textarea.value !== originalContent) {
+        this.applyChange(textarea.value, fence, closeFence)
+      }
+    })
+    textarea.addEventListener('input', () => {
+      textarea.rows = Math.max(1, textarea.value.split('\n').length) + 1
+    })
+    textarea.addEventListener('keydown', (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        textarea.value = originalContent
+        textarea.blur()
+      }
+      if (e.key === 'Tab') {
+        e.preventDefault()
+        const { selectionStart: ss, selectionEnd: se } = textarea
+        textarea.value = textarea.value.slice(0, ss) + '  ' + textarea.value.slice(se)
+        textarea.selectionStart = textarea.selectionEnd = ss + 2
+      }
+    })
+
+    wrapper.appendChild(textarea)
+    return wrapper
   }
 
-  ignoreEvent(): boolean { return false }
+  private applyChange(newContent: string, fence: string, closeFence: string) {
+    if (!_view) return
+    const newRaw = `${fence}\n${newContent}\n${closeFence}`
+    if (newRaw === this.raw) return
+    const lineTo = this.codeFrom + this.raw.length
+    if (this.codeFrom < 0 || lineTo > _view.state.doc.length) return
+    _view.dispatch({ changes: { from: this.codeFrom, to: lineTo, insert: newRaw } })
+  }
+
+  ignoreEvent(e: Event): boolean {
+    return ['mousedown', 'mouseup', 'click',
+            'keydown', 'keyup', 'keypress',
+            'input', 'focus', 'blur',
+            'compositionstart', 'compositionend',
+            'paste', 'cut', 'copy'].includes(e.type)
+  }
+
   eq(other: WidgetType): boolean {
-    return other instanceof BlockWidget && (other as BlockWidget).raw === this.raw
+    return other instanceof CodeWidget &&
+      (other as CodeWidget).raw === this.raw &&
+      (other as CodeWidget).codeFrom === this.codeFrom
   }
 }
 
@@ -190,18 +261,6 @@ class HRWidget extends WidgetType {
 const hrWidget = new HRWidget()
 
 type DecoEntry = { from: number; to: number; deco: Decoration }
-
-// ── Helper: line-boundary-aligned block replace widget ────────────────────────
-function addBlockWidget(decos: DecoEntry[], doc: Text, nodeFrom: number, nodeTo: number, raw: string) {
-  if (nodeFrom >= nodeTo) return
-  const fromLine = doc.lineAt(nodeFrom)
-  const lastPos  = (nodeTo > nodeFrom && doc.lineAt(nodeTo).from === nodeTo) ? nodeTo - 1 : nodeTo
-  const toLine   = doc.lineAt(lastPos)
-  const blockFrom = fromLine.from
-  const blockTo   = toLine.to < doc.length ? toLine.to + 1 : doc.length
-  if (blockFrom >= blockTo) return
-  decos.push({ from: blockFrom, to: blockTo, deco: Decoration.replace({ widget: new BlockWidget(raw), block: true }) })
-}
 
 // ── Block decoration builder ──────────────────────────────────────────────────
 function buildBlockDecos(state: EditorState): DecorationSet {
@@ -231,13 +290,20 @@ function buildBlockDecos(state: EditorState): DecorationSet {
         return false
       }
 
-      // ── FencedCode: block widget when cursor is outside ────────────────
+      // ── FencedCode: always rendered as interactive CodeWidget ──────────
       if (name === 'FencedCode') {
-        if (!cursorIn(from, to)) {
-          const effTo = to > from && doc.lineAt(to).from === to ? to - 1 : to
-          const raw = doc.sliceString(doc.lineAt(from).from, doc.lineAt(effTo).to)
-          addBlockWidget(decos, doc, from, to, raw)
-        }
+        const fenceFirstLine = doc.lineAt(from)
+        const effTo          = to > from && doc.lineAt(to).from === to ? to - 1 : to
+        const fenceLastLine  = doc.lineAt(effTo)
+        const fenceBlockTo   = fenceLastLine.to < doc.length ? fenceLastLine.to + 1 : doc.length
+        const raw = doc.sliceString(fenceFirstLine.from, fenceLastLine.to)
+        decos.push({
+          from: fenceFirstLine.from, to: fenceBlockTo,
+          deco: Decoration.replace({
+            widget: new CodeWidget(raw, fenceFirstLine.from),
+            block: true,
+          }),
+        })
         return false
       }
 
