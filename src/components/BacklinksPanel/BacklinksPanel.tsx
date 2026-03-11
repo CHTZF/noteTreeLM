@@ -9,19 +9,25 @@ interface BacklinksPanelProps {
 }
 
 export default function BacklinksPanel({ onOpenNote }: BacklinksPanelProps) {
-  const { currentPath } = useEditorStore()
+  const { currentPath, viewMode } = useEditorStore()
   const { notes } = useVaultStore()
   const [backlinks, setBacklinks] = useState<Link[]>([])
-  const [isExpanded, setIsExpanded] = useState(true)
+  const [isExpanded, setIsExpanded] = useState(false)
 
   const currentTitle = notes.find((n) => n.path === currentPath)?.title || ''
+
+  // live 模式隱藏；切換到 preview 預設收起，切換到 editor/source 預設展開
+  useEffect(() => {
+    if (viewMode === 'preview') setIsExpanded(false)
+    else if (viewMode === 'editor') setIsExpanded(true)
+  }, [viewMode])
 
   useEffect(() => {
     if (!currentTitle) { setBacklinks([]); return }
     invoke<Link[]>('get_backlinks', { title: currentTitle }).then(setBacklinks)
   }, [currentTitle])
 
-  if (!currentPath) return null
+  if (!currentPath || viewMode === 'live') return null
 
   return (
     <div style={{ borderTop: '1px solid var(--color-border)', background: 'var(--color-bg-base)', flexShrink: 0 }}>
