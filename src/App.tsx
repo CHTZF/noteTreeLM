@@ -974,14 +974,19 @@ function AppMain() {
               title={session?.username ?? '帳號'}
               onClick={() => setUserMenuOpen(v => !v)}
               style={{
-                width: '32px', height: '32px', borderRadius: '50%',
-                background: 'var(--color-accent)', color: '#fff',
-                fontSize: settings.avatar_emoji ? '16px' : '13px',
-                fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                width: '32px', height: '32px', borderRadius: '50%', overflow: 'hidden',
+                background: settings.avatar_type === 'image' && settings.avatar_image
+                  ? 'transparent'
+                  : (settings.avatar_color || 'var(--color-accent)'),
+                color: '#fff',
+                fontSize: '13px', fontWeight: 700,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
                 border: 'none', padding: 0, cursor: 'pointer', flexShrink: 0,
               }}
             >
-              {settings.avatar_emoji || (session?.username?.charAt(0).toUpperCase() ?? '?')}
+              {settings.avatar_type === 'image' && settings.avatar_image
+                ? <img src={settings.avatar_image} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                : (settings.display_name?.slice(0, 2).toUpperCase() || session?.username?.charAt(0).toUpperCase() || '?')}
             </button>
 
             {userMenuOpen && (

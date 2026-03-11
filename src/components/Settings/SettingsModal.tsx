@@ -550,7 +550,42 @@ export default function SettingsModal({ onClose, inline }: SettingsModalProps) {
     }
   }
 
-  const avatarLabel = draft.avatar_emoji || (session?.username?.charAt(0).toUpperCase() ?? '?')
+  const avatarInitials = draft.display_name?.slice(0, 2).toUpperCase() || session?.username?.charAt(0).toUpperCase() || '?'
+  const avatarBg = draft.avatar_type === 'image' && draft.avatar_image ? 'transparent' : (draft.avatar_color || '#0a84ff')
+
+  const AVATAR_PRESET_COLORS = [
+    '#0a84ff', '#30d158', '#ff9f0a', '#ff453a', '#bf5af2',
+    '#64d2ff', '#ff6961', '#ffd60a', '#34c759', '#5e5ce6',
+    '#8e8e93', '#636366', '#3a3a3c', '#a2845e', '#e17055',
+  ]
+
+  function handleAvatarImagePick() {
+    const input = document.createElement('input')
+    input.type = 'file'
+    input.accept = 'image/*'
+    input.onchange = () => {
+      const file = input.files?.[0]
+      if (!file) return
+      const reader = new FileReader()
+      reader.onload = () => {
+        const dataUrl = reader.result as string
+        // Resize to 256px max via canvas
+        const img = new Image()
+        img.onload = () => {
+          const size = 256
+          const canvas = document.createElement('canvas')
+          const scale = Math.min(1, size / Math.max(img.width, img.height))
+          canvas.width = Math.round(img.width * scale)
+          canvas.height = Math.round(img.height * scale)
+          canvas.getContext('2d')!.drawImage(img, 0, 0, canvas.width, canvas.height)
+          up({ avatar_image: canvas.toDataURL('image/jpeg', 0.85), avatar_type: 'image' })
+        }
+        img.src = dataUrl
+      }
+      reader.readAsDataURL(file)
+    }
+    input.click()
+  }
 
   const numInputStyle: React.CSSProperties = {
     ...inputStyle,
@@ -596,23 +631,72 @@ export default function SettingsModal({ onClose, inline }: SettingsModalProps) {
 
             {tab === 'account' && <>
               {/* Avatar */}
-              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', marginBottom: '24px', paddingTop: '8px' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', marginBottom: '24px', paddingTop: '8px', gap: '10px' }}>
+                {/* Preview */}
                 <div style={{
-                  width: '72px', height: '72px', borderRadius: '50%',
-                  background: 'var(--color-accent)', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  fontSize: '32px', color: '#fff', fontWeight: 700, userSelect: 'none', marginBottom: '10px',
+                  width: '72px', height: '72px', borderRadius: '50%', overflow: 'hidden',
+                  background: avatarBg, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: '28px', color: '#fff', fontWeight: 700, userSelect: 'none', flexShrink: 0,
                 }}>
-                  {avatarLabel}
+                  {draft.avatar_type === 'image' && draft.avatar_image
+                    ? <img src={draft.avatar_image} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                    : avatarInitials}
                 </div>
                 <div style={{ fontSize: '14px', fontWeight: 600, color: 'var(--color-text-primary)' }}>{session?.username ?? ''}</div>
+
+                {/* Mode toggle */}
+                <div style={{ display: 'flex', gap: '6px', background: 'var(--color-bg-elevated)', borderRadius: '8px', padding: '3px' }}>
+                  {(['initials', 'image'] as const).map(mode => (
+                    <button key={mode}
+                      onClick={() => up({ avatar_type: mode })}
+                      style={{
+                        padding: '4px 14px', borderRadius: '6px', border: 'none', cursor: 'pointer',
+                        fontSize: '12px', fontWeight: 500,
+                        background: draft.avatar_type === mode ? 'var(--color-bg-surface)' : 'transparent',
+                        color: draft.avatar_type === mode ? 'var(--color-text-primary)' : 'var(--color-text-muted)',
+                        boxShadow: draft.avatar_type === mode ? '0 1px 3px rgba(0,0,0,0.15)' : 'none',
+                        transition: 'all 0.15s',
+                      }}>
+                      {mode === 'initials' ? '縮寫' : '圖片'}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Initials: color picker */}
+                {draft.avatar_type === 'initials' && (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', justifyContent: 'center', maxWidth: '200px' }}>
+                    {AVATAR_PRESET_COLORS.map(c => (
+                      <button key={c} onClick={() => up({ avatar_color: c })}
+                        style={{
+                          width: '24px', height: '24px', borderRadius: '50%', border: 'none', cursor: 'pointer',
+                          background: c, padding: 0,
+                          boxShadow: draft.avatar_color === c ? `0 0 0 2px var(--color-bg-surface), 0 0 0 4px ${c}` : 'none',
+                          transition: 'box-shadow 0.12s',
+                        }} />
+                    ))}
+                  </div>
+                )}
+
+                {/* Image: upload button */}
+                {draft.avatar_type === 'image' && (
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <button onClick={handleAvatarImagePick}
+                      style={{ padding: '5px 14px', borderRadius: '6px', border: '1px solid var(--color-border)', background: 'var(--color-bg-elevated)', color: 'var(--color-text-primary)', fontSize: '12px', cursor: 'pointer' }}>
+                      選擇圖片
+                    </button>
+                    {draft.avatar_image && (
+                      <button onClick={() => up({ avatar_image: '', avatar_type: 'initials' })}
+                        style={{ padding: '5px 14px', borderRadius: '6px', border: '1px solid var(--color-border)', background: 'transparent', color: 'var(--color-text-muted)', fontSize: '12px', cursor: 'pointer' }}>
+                        移除
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
+
               <div style={fieldStyle}>
                 <label style={labelStyle}>顯示名稱</label>
                 <input value={draft.display_name ?? ''} onChange={(e) => up({ display_name: e.target.value })} placeholder={session?.username ?? ''} style={inputStyle} />
-              </div>
-              <div style={fieldStyle}>
-                <label style={labelStyle}>頭像 Emoji</label>
-                <input value={draft.avatar_emoji ?? ''} onChange={(e) => up({ avatar_emoji: e.target.value })} placeholder="例：😀 🐱 🦊" style={inputStyle} />
               </div>
               <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0 20px' }} />
               <div style={{ fontSize: '12px', fontWeight: 600, letterSpacing: '0.07em', color: 'var(--color-text-secondary)', textTransform: 'uppercase', marginBottom: '12px' }}>變更密碼</div>
@@ -626,12 +710,27 @@ export default function SettingsModal({ onClose, inline }: SettingsModalProps) {
               </div>
               <div style={fieldStyle}>
                 <label style={labelStyle}>確認新密碼</label>
-                <input type="password" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} style={inputStyle} />
+                <input
+                  type="password"
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  style={{
+                    ...inputStyle,
+                    ...(confirmPassword && newPassword !== confirmPassword
+                      ? { borderColor: 'var(--color-danger)', outline: 'none' }
+                      : confirmPassword && newPassword === confirmPassword
+                      ? { borderColor: 'var(--color-success)' }
+                      : {}),
+                  }}
+                />
+                {confirmPassword && newPassword !== confirmPassword && (
+                  <div style={{ fontSize: '11px', color: 'var(--color-danger)', marginTop: '4px' }}>密碼不一致</div>
+                )}
               </div>
               <button
                 onClick={handleChangePassword}
-                disabled={pwSaving}
-                style={{ padding: '7px 20px', borderRadius: '6px', background: 'var(--color-accent)', color: '#fff', fontSize: '13px', fontWeight: 500, opacity: pwSaving ? 0.7 : 1, cursor: pwSaving ? 'not-allowed' : 'pointer' }}
+                disabled={pwSaving || (!!confirmPassword && newPassword !== confirmPassword)}
+                style={{ padding: '7px 20px', borderRadius: '6px', background: 'var(--color-accent)', color: '#fff', fontSize: '13px', fontWeight: 500, opacity: (pwSaving || (!!confirmPassword && newPassword !== confirmPassword)) ? 0.5 : 1, cursor: (pwSaving || (!!confirmPassword && newPassword !== confirmPassword)) ? 'not-allowed' : 'pointer' }}
               >{pwSaving ? '儲存中…' : '更新密碼'}</button>
             </>}
 

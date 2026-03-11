@@ -76,14 +76,14 @@
 
 /* ─── Light Theme — iOS / macOS Light ───────────────────────────────────── */
 [data-theme="light"] {
-  --color-bg-base:        #f2f2f7;
-  --color-bg-surface:     #ffffff;
-  --color-bg-elevated:    #efeff4;
-  --color-bg-overlay:     #e5e5ea;
-  --color-bg-hover:       rgba(0, 0, 0, 0.05);
+  --color-bg-base:        #f4f1eb;
+  --color-bg-surface:     #f9f7f3;
+  --color-bg-elevated:    #ede9e1;
+  --color-bg-overlay:     #e2ddd4;
+  --color-bg-hover:       rgba(0, 0, 0, 0.04);
 
-  --color-border:         rgba(60, 60, 67, 0.29);
-  --color-border-subtle:  rgba(60, 60, 67, 0.12);
+  --color-border:         rgba(75, 65, 50, 0.22);
+  --color-border-subtle:  rgba(75, 65, 50, 0.10);
 
   --color-text-primary:   #1d1d1f;
   --color-text-secondary: #515154;

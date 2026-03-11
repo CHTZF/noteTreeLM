@@ -41,6 +41,9 @@ export interface Settings {
   chat_auto_include_note: boolean
   display_name: string
   avatar_emoji: string
+  avatar_type: 'initials' | 'image'
+  avatar_color: string
+  avatar_image: string
   show_agent_tools: boolean
   file_sort_type: 'none' | 'asc' | 'desc'
 }
@@ -88,6 +91,9 @@ export const DEFAULT_SETTINGS: Settings = {
   chat_auto_include_note: false,
   display_name: '',
   avatar_emoji: '',
+  avatar_type: 'initials',
+  avatar_color: '#0a84ff',
+  avatar_image: '',
   show_agent_tools: true,
   file_sort_type: 'none',
 }

@@ -348,15 +348,53 @@ class ImageWidget extends WidgetType {
     private docTo: number,
   ) { super() }
 
+  private deleteBlock() {
+    if (!_view) return
+    _view.dispatch({ changes: { from: this.docFrom, to: this.docTo, insert: '' } })
+  }
+
   toDOM(): HTMLElement {
-    const img = document.createElement('img')
-    img.alt = this.alt
-    img.style.cssText = 'max-width:100%;border-radius:var(--radius-md);vertical-align:middle;display:inline-block;cursor:default;'
-    img.addEventListener('contextmenu', (e) => {
+    // Parse optional |size from alt: "name|300" or "name|300x200"
+    const barIdx = this.alt.lastIndexOf('|')
+    const hasSize = barIdx !== -1 && /^\d/.test(this.alt.slice(barIdx + 1))
+    const sizeStr = hasSize ? this.alt.slice(barIdx + 1) : ''
+    let sizeW = '', sizeH = ''
+    if (sizeStr) {
+      const parts = sizeStr.split('x')
+      sizeW = parts[0] ?? ''
+      sizeH = parts[1] ?? ''
+    }
+
+    // Container
+    const container = document.createElement('span')
+    container.style.cssText = 'display:inline-block;position:relative;line-height:0;'
+    container.addEventListener('contextmenu', (e) => {
       e.preventDefault()
       e.stopPropagation()
       _onLiveEditImage?.({ from: this.docFrom, to: this.docTo, src: this.src, alt: this.alt })
     })
+
+    // Delete button
+    const delBtn = document.createElement('button')
+    delBtn.textContent = '×'
+    delBtn.style.cssText = [
+      'position:absolute;top:4px;right:4px;',
+      'width:20px;height:20px;padding:0;border-radius:50%;',
+      'background:rgba(0,0,0,0.55);color:#fff;border:none;',
+      'font-size:14px;line-height:1;cursor:pointer;',
+      'opacity:0;transition:opacity 0.15s;z-index:10;',
+    ].join('')
+    container.addEventListener('mouseenter', () => { delBtn.style.opacity = '1' })
+    container.addEventListener('mouseleave', () => { delBtn.style.opacity = '0' })
+    delBtn.addEventListener('mousedown', (e) => { e.preventDefault(); e.stopPropagation() })
+    delBtn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); this.deleteBlock() })
+
+    const img = document.createElement('img')
+    img.alt = hasSize ? this.alt.slice(0, barIdx) : this.alt
+    img.style.cssText = 'border-radius:var(--radius-md);vertical-align:middle;cursor:default;display:block;'
+    if (sizeW) img.style.width = `${sizeW}px`
+    if (sizeH) img.style.height = `${sizeH}px`
+    if (!sizeW && !sizeH) img.style.maxWidth = '100%'
 
     const loadLocal = (rawSrc: string) => {
       const { settings } = useSettingsStore.getState()
@@ -388,10 +426,14 @@ class ImageWidget extends WidgetType {
       loadLocal(this.src)
     }
 
-    return img
+    container.appendChild(img)
+    container.appendChild(delBtn)
+    return container
   }
 
-  ignoreEvent(e: Event): boolean { return e.type === 'contextmenu' }
+  ignoreEvent(e: Event): boolean {
+    return ['contextmenu', 'mousedown', 'mouseup', 'click'].includes(e.type)
+  }
 
   eq(other: WidgetType): boolean {
     return other instanceof ImageWidget &&
@@ -429,7 +471,15 @@ class QuickCopyWidget extends WidgetType {
     private docTo: number,
   ) { super() }
 
+  private deleteBlock() {
+    if (!_view) return
+    _view.dispatch({ changes: { from: this.docFrom, to: this.docTo, insert: '' } })
+  }
+
   toDOM(): HTMLElement {
+    const container = document.createElement('span')
+    container.style.cssText = 'display:inline-flex;align-items:center;gap:2px;'
+
     const span = document.createElement('span')
     span.className = 'quick-copy'
     span.setAttribute('data-copy', this.dataCopy)
@@ -448,7 +498,23 @@ class QuickCopyWidget extends WidgetType {
         dataCopy: this.dataCopy, displayText: this.displayText, style: this.style,
       })
     })
-    return span
+
+    const delBtn = document.createElement('button')
+    delBtn.textContent = '×'
+    delBtn.style.cssText = [
+      'width:16px;height:16px;padding:0;border-radius:50%;',
+      'background:var(--color-border);color:var(--color-text-muted);border:none;',
+      'font-size:12px;line-height:1;cursor:pointer;',
+      'opacity:0;transition:opacity 0.15s;flex-shrink:0;',
+    ].join('')
+    container.addEventListener('mouseenter', () => { delBtn.style.opacity = '1' })
+    container.addEventListener('mouseleave', () => { delBtn.style.opacity = '0' })
+    delBtn.addEventListener('mousedown', (e) => { e.preventDefault(); e.stopPropagation() })
+    delBtn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); this.deleteBlock() })
+
+    container.appendChild(span)
+    container.appendChild(delBtn)
+    return container
   }
 
   ignoreEvent(e: Event): boolean {
