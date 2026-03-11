@@ -563,5 +563,19 @@ export const livePreviewTheme = EditorView.theme({
     padding: '1px 4px', color: 'var(--color-accent)',
   },
   '.cm-live-link': { color: 'var(--color-accent)', textDecoration: 'underline', cursor: 'text' },
-  '.cm-live-block-widget': { display: 'block', width: '100%', boxSizing: 'border-box' },
+  // Block widget container — overflow:hidden creates a BFC so that child margins
+  // (e.g. .preview-content table/hr/p have margin:1em 0) do NOT collapse outside
+  // the widget div. Without this, those margins are excluded from offsetHeight,
+  // causing CM6 to underestimate widget height and mismap click positions.
+  '.cm-live-block-widget': {
+    display: 'block', width: '100%', boxSizing: 'border-box', overflow: 'hidden',
+  },
+  // Reset margins for all block-level elements rendered inside live-preview widgets.
+  // These elements normally get margin from .preview-content rules (App.css),
+  // which would escape the widget container and throw off CM6's height map.
+  '.cm-live-block-widget table': { margin: '0' },
+  '.cm-live-block-widget hr':    { margin: '0' },
+  '.cm-live-block-widget pre':   { margin: '0' },
+  '.cm-live-block-widget p':     { margin: '0' },
+  '.cm-live-block-widget blockquote': { margin: '0' },
 })
