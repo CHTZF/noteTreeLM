@@ -48,10 +48,7 @@
     "macOS": {
       "minimumSystemVersion": "11.0"
     },
-    "windows": {
-      "nsis": {
-        "preinstallSection": "nsis/vcredist.nsh"
-      }
-    }
+    "windows": {}
+
   }
 }
