@@ -48,7 +48,20 @@ class TableWidget extends WidgetType {
       )
       div.innerHTML = html
       const table = div.querySelector('table')
-      if (table) this.attachEditing(table)
+      if (table) {
+        const hdr = document.createElement('div')
+        hdr.style.cssText = 'display:flex;justify-content:flex-end;padding:2px 4px;'
+        const delBtn = document.createElement('button')
+        delBtn.textContent = '×'
+        delBtn.title = '刪除表格'
+        delBtn.style.cssText = 'background:transparent;border:none;color:var(--color-text-muted);cursor:pointer;font-size:14px;padding:0 2px;'
+        delBtn.addEventListener('mouseenter', () => { delBtn.style.color = 'var(--color-danger)' })
+        delBtn.addEventListener('mouseleave', () => { delBtn.style.color = 'var(--color-text-muted)' })
+        delBtn.addEventListener('click', () => this.deleteBlock())
+        hdr.appendChild(delBtn)
+        div.insertBefore(hdr, table)
+        this.attachEditing(table)
+      }
     } catch {
       div.textContent = this.raw
     }
@@ -145,6 +158,18 @@ class TableWidget extends WidgetType {
             'paste', 'cut', 'copy'].includes(e.type)
   }
 
+  private deleteBlock() {
+    if (!_view) return
+    const doc = _view.state.doc
+    let pos = this.tableFrom
+    if (doc.sliceString(pos, pos + this.raw.length) !== this.raw) {
+      pos = doc.toString().indexOf(this.raw)
+      if (pos < 0) return
+    }
+    const endPos = Math.min(pos + this.raw.length + 1, doc.length)
+    _view.dispatch({ changes: { from: pos, to: endPos, insert: '' } })
+  }
+
   // estimatedHeight: gives CM6 a good initial height estimate before DOM measurement,
   // preventing click-position offset during the first render cycle.
   get estimatedHeight(): number {
@@ -187,7 +212,15 @@ class CodeWidget extends WidgetType {
     const badge = document.createElement('span')
     badge.textContent = lang || 'code'
     badge.style.cssText = 'font-size:11px;font-family:var(--font-mono);color:var(--color-text-muted);'
+    const delBtn = document.createElement('button')
+    delBtn.textContent = '×'
+    delBtn.title = '刪除程式碼區塊'
+    delBtn.style.cssText = 'background:transparent;border:none;color:var(--color-text-muted);cursor:pointer;font-size:14px;padding:0 2px;'
+    delBtn.addEventListener('mouseenter', () => { delBtn.style.color = 'var(--color-danger)' })
+    delBtn.addEventListener('mouseleave', () => { delBtn.style.color = 'var(--color-text-muted)' })
+    delBtn.addEventListener('click', () => this.deleteBlock())
     header.appendChild(badge)
+    header.appendChild(delBtn)
     wrapper.appendChild(header)
 
     const textarea = document.createElement('textarea')
@@ -229,6 +262,10 @@ class CodeWidget extends WidgetType {
         textarea.value = textarea.value.slice(0, ss) + '  ' + textarea.value.slice(se)
         textarea.selectionStart = textarea.selectionEnd = ss + 2
       }
+      if (e.key === 'Backspace' && textarea.value === '') {
+        e.preventDefault()
+        this.deleteBlock()
+      }
     })
 
     wrapper.appendChild(textarea)
@@ -257,6 +294,18 @@ class CodeWidget extends WidgetType {
             'input', 'focus', 'blur',
             'compositionstart', 'compositionend',
             'paste', 'cut', 'copy'].includes(e.type)
+  }
+
+  private deleteBlock() {
+    if (!_view) return
+    const doc = _view.state.doc
+    let pos = this.codeFrom
+    if (doc.sliceString(pos, pos + this.raw.length) !== this.raw) {
+      pos = doc.toString().indexOf(this.raw)
+      if (pos < 0) return
+    }
+    const endPos = Math.min(pos + this.raw.length + 1, doc.length)
+    _view.dispatch({ changes: { from: pos, to: endPos, insert: '' } })
   }
 
   get estimatedHeight(): number {
@@ -375,6 +424,14 @@ function buildInlineDecos(view: EditorView): DecorationSet {
   const doc    = view.state.doc
   const decos: DecoEntry[] = []
 
+  // lineDecoMap: lineFrom → [class names]; deduplicated by line position
+  const lineDecoMap = new Map<number, string[]>()
+  const addLine = (lineFrom: number, cls: string) => {
+    const arr = lineDecoMap.get(lineFrom) ?? []
+    arr.push(cls)
+    lineDecoMap.set(lineFrom, arr)
+  }
+
   const add     = (from: number, to: number, deco: Decoration) => { if (from < to) decos.push({ from, to, deco }) }
   const addMark = (from: number, to: number, cls: string) => add(from, to, Decoration.mark({ class: cls }))
   const cursorIn = (from: number, to: number) => cursor >= from && cursor <= to
@@ -471,6 +528,33 @@ function buildInlineDecos(view: EditorView): DecorationSet {
           return false
         }
 
+        // ── Blockquote line styling ────────────────────────────────────
+        if (name === 'Blockquote') {
+          const effTo = to > from && doc.lineAt(to).from === to ? to - 1 : to
+          const startLine = doc.lineAt(from)
+          const endLine   = doc.lineAt(effTo)
+          for (let n = startLine.number; n <= endLine.number; n++) {
+            addLine(doc.line(n).from, 'cm-live-blockquote-line')
+          }
+          // Don't return false — QuoteMark inside will hide '>'
+        }
+
+        // ── List item styling ──────────────────────────────────────────
+        if (name === 'ListItem') {
+          const isOrdered = node.node.parent?.name === 'OrderedList'
+          addLine(doc.lineAt(from).from, isOrdered ? 'cm-live-ol-item' : 'cm-live-ul-item')
+          if (!isOrdered && !cursorIn(from, to)) {
+            let child = node.node.firstChild
+            while (child) {
+              if (child.name === 'ListMark') {
+                addMark(child.from, child.to, 'cm-live-hidden')
+                break
+              }
+              child = child.nextSibling
+            }
+          }
+        }
+
         // ── Blockquote > text ──────────────────────────────────────────
         if (name === 'QuoteMark') {
           const parentFrom = node.node.parent?.from ?? from
@@ -516,8 +600,23 @@ function buildInlineDecos(view: EditorView): DecorationSet {
   }
 
   decos.sort((a, b) => a.from !== b.from ? a.from - b.from : b.to - a.to)
+  // Build sorted line-decoration entries (one per line, merging multiple classes)
+  const lineDecoArr: DecoEntry[] = Array.from(lineDecoMap.entries())
+    .map(([lf, classes]) => ({ from: lf, to: lf, deco: Decoration.line({ class: classes.join(' ') }) }))
+    .sort((a, b) => a.from - b.from)
+  // Merge: line decos before marks at the same position (CM6 requirement)
+  const allDecos: DecoEntry[] = []
+  let di = 0, li = 0
+  while (di < decos.length || li < lineDecoArr.length) {
+    const d = decos[di], l = lineDecoArr[li]
+    if (!d)                   { allDecos.push(l); li++ }
+    else if (!l)              { allDecos.push(d); di++ }
+    else if (l.from < d.from) { allDecos.push(l); li++ }
+    else if (l.from > d.from) { allDecos.push(d); di++ }
+    else                      { allDecos.push(l); li++ } // same from → line deco first
+  }
   const builder = new RangeSetBuilder<Decoration>()
-  for (const { from, to, deco } of decos) {
+  for (const { from, to, deco } of allDecos) {
     try { builder.add(from, to, deco) } catch { /* skip */ }
   }
   return builder.finish()
@@ -558,9 +657,9 @@ export const livePreviewTheme = EditorView.theme({
   '.cm-live-italic': { fontStyle: 'italic' },
   '.cm-live-strike': { textDecoration: 'line-through', opacity: '0.7' },
   '.cm-live-code': {
-    fontFamily: 'var(--font-mono)', fontSize: '0.88em',
-    background: 'var(--color-bg-hover)', borderRadius: '3px',
-    padding: '1px 4px', color: 'var(--color-accent)',
+    fontFamily: 'var(--font-mono)', fontSize: '0.85em',
+    background: 'var(--color-bg-elevated)', borderRadius: 'var(--radius-sm)',
+    padding: '0.1em 0.4em', color: 'var(--color-danger)',
   },
   '.cm-live-link': { color: 'var(--color-accent)', textDecoration: 'underline', cursor: 'text' },
   // Block widget container — overflow:hidden creates a BFC so that child margins
@@ -578,4 +677,17 @@ export const livePreviewTheme = EditorView.theme({
   '.cm-live-block-widget pre':   { margin: '0' },
   '.cm-live-block-widget p':     { margin: '0' },
   '.cm-live-block-widget blockquote': { margin: '0' },
+  // Blockquote line styling — matches .preview-content blockquote
+  '.cm-line.cm-live-blockquote-line': {
+    borderLeft: '3px solid var(--color-accent)',
+    paddingLeft: '1em',
+    color: 'var(--color-text-secondary)',
+    background: 'var(--color-accent-dim)',
+    borderRadius: '0 var(--radius-sm) var(--radius-sm) 0',
+  },
+  // Unordered list items — hide `- ` marker, show • via ::before
+  '.cm-line.cm-live-ul-item': { paddingLeft: '1.6em', position: 'relative' },
+  '.cm-line.cm-live-ul-item::before': { content: "'•'", position: 'absolute', left: '0.4em' },
+  // Ordered list items — keep numbers visible, add hanging indent
+  '.cm-line.cm-live-ol-item': { paddingLeft: '0.4em' },
 })
