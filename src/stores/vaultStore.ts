@@ -144,7 +144,7 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
     const orders = { ...(store.settings.sort_orders || {}) }
     const existing = orders[targetFolder] || []
     orders[targetFolder] = [newPath, ...existing.filter(p => p !== newPath)]
-    await store.save({ sort_orders: orders })
+    await store.savePersonal({ sort_orders: orders })
     await get().loadNotes()
     return newPath
   },

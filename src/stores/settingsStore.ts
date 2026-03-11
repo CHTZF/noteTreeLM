@@ -3,11 +3,22 @@ import { invoke } from '@tauri-apps/api/core'
 import { Settings, DEFAULT_SETTINGS } from '../types/settings'
 import { useAuthStore } from './authStore'
 
+export const SYSTEM_KEYS = ['system_current_vault_path', 'ai_provider', 'ai_model', 'ai_base_url',
+  'ai_enable_topics', 'ai_enable_summary', 'ai_enable_vision',
+  'whisper_cli_path', 'whisper_model_path', 'whisper_language', 'whisper_threads', 'whisper_auto_insert',
+  'llm_model_path', 'llama_cli_path'] as const
+
+export type SystemSettingsKey = typeof SYSTEM_KEYS[number]
+export type SystemSettings = Pick<Settings, SystemSettingsKey>
+
 interface SettingsStore {
   settings: Settings
   isLoaded: boolean
+  systemSettings: SystemSettings | null
   load: () => Promise<void>
-  save: (partial: Partial<Settings>) => Promise<void>
+  loadSystem: () => Promise<void>
+  savePersonal: (partial: Partial<Settings>) => Promise<void>
+  saveSystem: (partial: SystemSettings) => Promise<void>
   getApiKey: (provider: string) => Promise<string | null>
   setApiKey: (provider: string, key: string) => Promise<void>
 }
@@ -15,12 +26,12 @@ interface SettingsStore {
 export const useSettingsStore = create<SettingsStore>((set, get) => ({
   settings: DEFAULT_SETTINGS,
   isLoaded: false,
+  systemSettings: null,
 
   load: async () => {
     try {
       const username = useAuthStore.getState().session?.username ?? ''
       const raw = await invoke<any>('get_settings', { username })
-      // 合併 DEFAULT_SETTINGS 以補齊新增欄位；sort_orders 由 JSON 字串轉物件
       const settings: Settings = {
         ...DEFAULT_SETTINGS,
         ...raw,
@@ -35,20 +46,43 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     }
   },
 
-  save: async (partial) => {
+  loadSystem: async () => {
+    try {
+      const raw = await invoke<SystemSettings>('get_system_settings')
+      set({ systemSettings: raw })
+    } catch (err) {
+      console.error('載入系統設定失敗：', err)
+    }
+  },
+
+  savePersonal: async (partial) => {
     const current = get().settings
     const updated = { ...current, ...partial }
     set({ settings: updated })
     try {
-      // sort_orders 序列化為 JSON 字串傳給 Rust
       const rustSettings = {
         ...updated,
         sort_orders: JSON.stringify(updated.sort_orders ?? {}),
       }
       const username = useAuthStore.getState().session?.username ?? ''
-      await invoke('save_settings', { username, settings: rustSettings })
+      await invoke('save_personal_settings', { username, settings: rustSettings })
     } catch (err) {
-      console.error('儲存設定失敗：', err)
+      console.error('儲存個人設定失敗：', err)
+      throw err
+    }
+  },
+
+  saveSystem: async (partial) => {
+    try {
+      // Rust expects the full SystemSettings struct — load current values first if not available
+      if (!get().systemSettings) {
+        await get().loadSystem()
+      }
+      const merged = { ...(get().systemSettings ?? {} as SystemSettings), ...partial } as SystemSettings
+      await invoke('save_system_settings', { settings: merged })
+      set({ systemSettings: merged })
+    } catch (err) {
+      console.error('儲存系統設定失敗：', err)
       throw err
     }
   },

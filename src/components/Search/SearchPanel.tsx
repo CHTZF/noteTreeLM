@@ -176,16 +176,16 @@ export default function SearchPanel({ onOpenNote }: SearchPanelProps) {
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minWidth: 0, overflow: 'hidden' }}>
       {/* Search input + view toggle */}
-      <div style={{ padding: '8px', display: 'flex', gap: 6, alignItems: 'center' }}>
+      <div style={{ padding: '8px', display: 'flex', gap: 6, alignItems: 'center', minWidth: 0 }}>
         <input
           type="text"
           placeholder="搜索筆記…"
           value={query}
           onChange={(e) => handleChange(e.target.value)}
           style={{
-            flex: 1, padding: '6px 10px', boxSizing: 'border-box',
+            flex: 1, minWidth: 0, padding: '6px 10px', boxSizing: 'border-box',
             background: 'var(--color-bg-elevated)', borderRadius: '6px',
             border: '1px solid var(--color-border)',
             color: 'var(--color-text-primary)', fontSize: '13px', outline: 'none',
@@ -203,7 +203,7 @@ export default function SearchPanel({ onOpenNote }: SearchPanelProps) {
       </div>
 
       {/* Results */}
-      <div style={{ flex: 1, overflowY: 'auto', padding: '4px 0' }}>
+      <div style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: '4px 0', minWidth: 0 }}>
         {isSearching && (
           <div style={{ padding: '16px', color: 'var(--color-text-secondary)', fontSize: '13px', textAlign: 'center' }}>搜索中…</div>
         )}
@@ -218,11 +218,11 @@ export default function SearchPanel({ onOpenNote }: SearchPanelProps) {
           <div
             key={r.path}
             onClick={() => onOpenNote(r.path)}
-            style={{ padding: '8px 12px', cursor: 'pointer', borderBottom: '1px solid var(--color-border-subtle)' }}
+            style={{ padding: '8px 12px', cursor: 'pointer', borderBottom: '1px solid var(--color-border-subtle)', minWidth: 0, overflow: 'hidden' }}
             onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--color-bg-hover)')}
             onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
           >
-            <div style={{ fontSize: '13px', color: 'var(--color-text-primary)', fontWeight: 500 }}>{r.title}</div>
+            <div style={{ fontSize: '13px', color: 'var(--color-text-primary)', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.title}</div>
             <div style={{ fontSize: '12px', color: 'var(--color-text-muted)', marginTop: '3px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.snippet}</div>
           </div>
         ))}

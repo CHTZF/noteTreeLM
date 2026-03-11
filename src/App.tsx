@@ -2,7 +2,7 @@ import { useEffect, useState, useRef, useCallback, Fragment } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
-import { faGear, faBolt, faChevronLeft, faChevronRight, faSitemap, faFolderTree, faMagnifyingGlass, faBug, faComments, faMicrophone, faArrowRightArrowLeft, faTrash, faArrowRightFromBracket, faCircleQuestion } from '@fortawesome/free-solid-svg-icons'
+import { faGear, faBolt, faChevronLeft, faChevronRight, faSitemap, faFolderTree, faMagnifyingGlass, faBug, faComments, faMicrophone, faArrowRightArrowLeft, faTrash, faArrowRightFromBracket, faCircleQuestion, faUser } from '@fortawesome/free-solid-svg-icons'
 import { useSettingsStore } from './stores/settingsStore'
 import { useVaultStore } from './stores/vaultStore'
 import { useGraphStore } from './stores/graphStore'
@@ -41,6 +41,7 @@ const AGENT_TOOLS_TAB = '__agent_tools__'
 const CHAT_TAB = '__chat__'
 const LIVE_CHAT_TAB = '__live_chat__'
 const SETTINGS_TAB = '__settings__'
+const SYSTEM_SETTINGS_TAB = '__system_settings__'
 const HELP_TAB = '__help__'
 const TRASH_TAB = '__trash__'
 
@@ -135,7 +136,7 @@ export default function App() {
 
 function AppMain() {
   const { session, logout: authLogout } = useAuthStore()
-  const { load: loadSettings, settings, save: saveSettings } = useSettingsStore()
+  const { load: loadSettings, settings, savePersonal: saveSettings, saveSystem } = useSettingsStore()
   const { scanVault, setupWatchers, readNote } = useVaultStore()
   const { load: loadGraph } = useGraphStore()
   const { currentPath } = useEditorStore()
@@ -254,6 +255,8 @@ function AppMain() {
         !settings.whisper_model_path || !settings.llm_model_path
       if (needsSetup) {
         setShowSetupWizard(true)
+      } else if (settings.personal_current_vault_path) {
+        await handleVaultSelect(settings.personal_current_vault_path)
       } else {
         setShowVaultManager(true)
       }
@@ -268,7 +271,8 @@ function AppMain() {
       newVaultPath,
       ...(settings.recent_vaults ?? []).filter(v => v !== newVaultPath),
     ].slice(0, 10)
-    await saveSettings({ vault_path: newVaultPath, onboarding_done: true, recent_vaults: recentVaults })
+    await saveSystem({ system_current_vault_path: newVaultPath } as any)
+    await saveSettings({ onboarding_done: true, recent_vaults: recentVaults, personal_current_vault_path: newVaultPath })
     useEditorStore.getState().setCurrentPath(null)
     // Reset pane tree to single empty leaf
     const newLeafId = crypto.randomUUID()
@@ -290,9 +294,9 @@ function AppMain() {
 
   // ─── Save last open note ───────────────────────────────────────────────
   useEffect(() => {
-    if (!currentPath || !settings.vault_path || currentPath === GRAPH_TAB) return
-    invoke('set_vault_last_note', { vaultPath: settings.vault_path, notePath: currentPath }).catch(() => {})
-  }, [currentPath, settings.vault_path])
+    if (!currentPath || !settings.system_current_vault_path || currentPath === GRAPH_TAB) return
+    invoke('set_vault_last_note', { vaultPath: settings.system_current_vault_path, notePath: currentPath }).catch(() => {})
+  }, [currentPath, settings.system_current_vault_path])
 
   // ─── whisper-server status toasts ─────────────────────────────────────
   useEffect(() => {
@@ -361,7 +365,7 @@ function AppMain() {
         if (e.payload) openNoteFromChat(e.payload)
       })
       const noteDeletedUnlisten = await listen<string[]>('vault:note-deleted', e => {
-        const vaultPath = useSettingsStore.getState().settings.vault_path
+        const vaultPath = useSettingsStore.getState().settings.system_current_vault_path
         const deletedRelPaths = e.payload
           .filter(abs => abs.startsWith(vaultPath + '/'))
           .map(abs => abs.slice(vaultPath.length + 1))
@@ -737,7 +741,16 @@ function AppMain() {
       const closeSettings = settingsTab ? () => closeTabInPane(leaf.id, settingsTab.id) : undefined
       return (
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-          <SettingsModal inline onClose={closeSettings} />
+          <SettingsModal inline mode="personal" onClose={closeSettings} />
+        </div>
+      )
+    }
+    if (activePath === SYSTEM_SETTINGS_TAB) {
+      const settingsTab = leaf.tabs.find(t => t.path === SYSTEM_SETTINGS_TAB)
+      const closeSettings = settingsTab ? () => closeTabInPane(leaf.id, settingsTab.id) : undefined
+      return (
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+          <SettingsModal inline mode="system" onClose={closeSettings} />
         </div>
       )
     }
@@ -815,7 +828,7 @@ function AppMain() {
               className="icon-menubar-btn"
               title="關閉此面板"
               onClick={() => closePane(leaf.id)}
-              style={{ fontSize: '16px' }}
+              style={{ fontSize: '16px', width: '19px', flexShrink: 0 }}
             >×</button>
           }
         />
@@ -898,7 +911,7 @@ function AppMain() {
   }
 
   // ─── Main render ───────────────────────────────────────────────────────
-  const vaultName = settings.vault_path ? settings.vault_path.split('/').pop() : undefined
+  const vaultName = settings.system_current_vault_path ? settings.system_current_vault_path.split('/').pop() : undefined
 
   return (
     <div className="app-layout">
@@ -1010,7 +1023,8 @@ function AppMain() {
 
                 {/* Menu items */}
                 {([
-                  { icon: faGear, label: '設定', action: () => { openNote(SETTINGS_TAB); setUserMenuOpen(false) } },
+                  { icon: faUser, label: '個人化設定', action: () => { openNote(SETTINGS_TAB); setUserMenuOpen(false) } },
+                  { icon: faGear, label: '系統設定', action: () => { openNote(SYSTEM_SETTINGS_TAB); setUserMenuOpen(false) } },
                   { icon: faCircleQuestion, label: '取得幫助', action: () => { openNote(HELP_TAB); setUserMenuOpen(false) } },
                 ] as const).map(item => (
                   <button key={item.label} onClick={item.action} style={{

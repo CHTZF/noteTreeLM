@@ -6,7 +6,8 @@ export const SPECIAL_NAMES: Record<string, string> = {
   '__agent_tools__': '工具測試台',
   '__chat__': 'Chat',
   '__live_chat__': 'Live Chat',
-  '__settings__': '設定',
+  '__settings__': '個人化設定',
+  '__system_settings__': '系統設定',
   '__help__': '說明',
   '__trash__': '垃圾桶',
 }

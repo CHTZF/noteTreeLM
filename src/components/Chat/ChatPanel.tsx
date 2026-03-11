@@ -120,7 +120,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
 
   const isConfigured = !!settings.llama_cli_path && !!settings.llm_model_path
   const whisperConfigured = !!settings.whisper_cli_path && !!settings.whisper_model_path
-  const vaultConfigured = !!settings.vault_path
+  const vaultConfigured = !!settings.system_current_vault_path
 
   // 語音轉文字：逐字累積到 overlay buffer（不直接寫入輸入框）
   const handleTranscript = useCallback((text: string) => {
@@ -256,7 +256,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages.length, streamingText])
 
-  // vault_path 變化時（包含首次設定、切換 vault）重置 lastMemoryPath 並重新查詢
+  // system_current_vault_path 變化時（包含首次設定、切換 vault）重置 lastMemoryPath 並重新查詢
   // 確保切換 vault 後不會帶入舊 vault 的記憶路徑
   useEffect(() => {
     if (!vaultConfigured) {
@@ -269,7 +269,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         if (results.length > 0) setLastMemoryPath(results[0].path)
       })
       .catch(() => {})
-  }, [settings.vault_path])
+  }, [settings.system_current_vault_path])
 
   const handleWriteConfirm = useCallback(async (approved: boolean) => {
     if (approved && writeConfirmMode === 'once') {

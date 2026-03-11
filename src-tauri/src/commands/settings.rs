@@ -4,7 +4,8 @@ use tauri::{AppHandle, State};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Settings {
-    pub vault_path: String,
+    pub system_current_vault_path: String,
+    pub personal_current_vault_path: String,
     pub theme: String,
     pub auto_save_mode: String,
     pub auto_save_delay: u32,
@@ -50,9 +51,19 @@ pub struct Settings {
 pub async fn get_settings(state: State<'_, AppState>, username: String) -> Result<Settings, AppError> {
     let pool = &state.settings_db;
 
+    // 個人設定：只查 user_settings，不 fallback
     macro_rules! get {
         ($key:expr, $default:expr) => {
             queries::get_user_setting(pool, &username, $key)
+                .await?
+                .unwrap_or_else(|| $default.to_string())
+        };
+    }
+
+    // 系統設定：只查全域 settings
+    macro_rules! gget {
+        ($key:expr, $default:expr) => {
+            queries::get_setting(pool, $key)
                 .await?
                 .unwrap_or_else(|| $default.to_string())
         };
@@ -63,25 +74,28 @@ pub async fn get_settings(state: State<'_, AppState>, username: String) -> Resul
         serde_json::from_str(&recent_vaults_json).unwrap_or_default();
 
     Ok(Settings {
-        vault_path: get!("vault_path", ""),
+        system_current_vault_path: gget!("system_current_vault_path", ""),
+        personal_current_vault_path: get!("personal_current_vault_path", ""),
         theme: get!("theme", "dark"),
         auto_save_mode: get!("auto_save_mode", "afterDelay"),
         auto_save_delay: get!("auto_save_delay", "1000").parse().unwrap_or(1000),
-        whisper_cli_path: get!("whisper_cli_path", ""),
-        whisper_model_path: get!("whisper_model_path", ""),
-        whisper_language: get!("whisper_language", "auto"),
-        whisper_threads: get!("whisper_threads", "4").parse().unwrap_or(4),
-        whisper_auto_insert: get!("whisper_auto_insert", "true") == "true",
+        // System keys — read from global settings only
+        whisper_cli_path: gget!("whisper_cli_path", ""),
+        whisper_model_path: gget!("whisper_model_path", ""),
+        whisper_language: gget!("whisper_language", "auto"),
+        whisper_threads: gget!("whisper_threads", "4").parse().unwrap_or(4),
+        whisper_auto_insert: gget!("whisper_auto_insert", "true") == "true",
         import_max_depth: get!("import_max_depth", "3").parse().unwrap_or(3),
         import_max_pages: get!("import_max_pages", "50").parse().unwrap_or(50),
-        ai_provider: get!("ai_provider", ""),
-        ai_model: get!("ai_model", "gpt-4o"),
-        ai_base_url: get!("ai_base_url", "https://api.openai.com/v1"),
-        ai_enable_topics: get!("ai_enable_topics", "true") == "true",
-        ai_enable_summary: get!("ai_enable_summary", "true") == "true",
-        ai_enable_vision: get!("ai_enable_vision", "true") == "true",
-        llm_model_path: get!("llm_model_path", ""),
-        llama_cli_path: get!("llama_cli_path", ""),
+        ai_provider: gget!("ai_provider", ""),
+        ai_model: gget!("ai_model", "gpt-4o"),
+        ai_base_url: gget!("ai_base_url", "https://api.openai.com/v1"),
+        ai_enable_topics: gget!("ai_enable_topics", "true") == "true",
+        ai_enable_summary: gget!("ai_enable_summary", "true") == "true",
+        ai_enable_vision: gget!("ai_enable_vision", "true") == "true",
+        llm_model_path: gget!("llm_model_path", ""),
+        llama_cli_path: gget!("llama_cli_path", ""),
+        // Personal keys — read from user_settings
         last_open_note: get!("last_open_note", ""),
         onboarding_done: get!("onboarding_done", "false") == "true",
         recent_vaults,
@@ -107,8 +121,92 @@ pub async fn get_settings(state: State<'_, AppState>, username: String) -> Resul
 }
 
 #[tauri::command]
-pub async fn save_settings(
+pub async fn get_system_settings(state: State<'_, AppState>) -> Result<SystemSettings, AppError> {
+    let pool = &state.settings_db;
+
+    macro_rules! gget {
+        ($key:expr, $default:expr) => {
+            queries::get_setting(pool, $key)
+                .await?
+                .unwrap_or_else(|| $default.to_string())
+        };
+    }
+
+    Ok(SystemSettings {
+        system_current_vault_path: gget!("system_current_vault_path", ""),
+        ai_provider: gget!("ai_provider", ""),
+        ai_model: gget!("ai_model", "gpt-4o"),
+        ai_base_url: gget!("ai_base_url", "https://api.openai.com/v1"),
+        ai_enable_topics: gget!("ai_enable_topics", "true") == "true",
+        ai_enable_summary: gget!("ai_enable_summary", "true") == "true",
+        ai_enable_vision: gget!("ai_enable_vision", "true") == "true",
+        whisper_cli_path: gget!("whisper_cli_path", ""),
+        whisper_model_path: gget!("whisper_model_path", ""),
+        whisper_language: gget!("whisper_language", "auto"),
+        whisper_threads: gget!("whisper_threads", "4").parse().unwrap_or(4),
+        whisper_auto_insert: gget!("whisper_auto_insert", "true") == "true",
+        llm_model_path: gget!("llm_model_path", ""),
+        llama_cli_path: gget!("llama_cli_path", ""),
+    })
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SystemSettings {
+    pub system_current_vault_path: String,
+    pub ai_provider: String,
+    pub ai_model: String,
+    pub ai_base_url: String,
+    pub ai_enable_topics: bool,
+    pub ai_enable_summary: bool,
+    pub ai_enable_vision: bool,
+    pub whisper_cli_path: String,
+    pub whisper_model_path: String,
+    pub whisper_language: String,
+    pub whisper_threads: u32,
+    pub whisper_auto_insert: bool,
+    pub llm_model_path: String,
+    pub llama_cli_path: String,
+}
+
+#[tauri::command]
+pub async fn save_system_settings(
     app: AppHandle,
+    state: State<'_, AppState>,
+    settings: SystemSettings,
+) -> Result<(), AppError> {
+    let pool = &state.settings_db;
+
+    macro_rules! gsave {
+        ($key:expr, $value:expr) => {
+            queries::set_setting(pool, $key, &$value.to_string()).await?
+        };
+    }
+
+    gsave!("system_current_vault_path", settings.system_current_vault_path);
+    gsave!("ai_provider", settings.ai_provider);
+    gsave!("ai_model", settings.ai_model);
+    gsave!("ai_base_url", settings.ai_base_url);
+    gsave!("ai_enable_topics", settings.ai_enable_topics);
+    gsave!("ai_enable_summary", settings.ai_enable_summary);
+    gsave!("ai_enable_vision", settings.ai_enable_vision);
+    gsave!("whisper_cli_path", settings.whisper_cli_path.trim());
+    gsave!("whisper_model_path", settings.whisper_model_path.trim());
+    gsave!("whisper_language", settings.whisper_language);
+    gsave!("whisper_threads", settings.whisper_threads);
+    gsave!("whisper_auto_insert", settings.whisper_auto_insert);
+    gsave!("llm_model_path", settings.llm_model_path.trim());
+    gsave!("llama_cli_path", settings.llama_cli_path.trim());
+
+    // 切換 vault（非空時）
+    if !settings.system_current_vault_path.is_empty() {
+        handle_vault_switch(app, state.inner().clone(), settings.system_current_vault_path).await;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn save_personal_settings(
     state: State<'_, AppState>,
     username: String,
     settings: Settings,
@@ -121,27 +219,14 @@ pub async fn save_settings(
         };
     }
 
-    save!("vault_path", settings.vault_path);
+    // vault_path is a system setting — managed by save_system_settings only.
     save!("theme", settings.theme);
     save!("auto_save_mode", settings.auto_save_mode);
     save!("auto_save_delay", settings.auto_save_delay);
-    // Binary paths and model paths are machine-level settings shared across users on the same machine.
-    // Store in the global `settings` table so server startup code (which uses get_setting) can read them.
-    queries::set_setting(&pool, "whisper_cli_path", settings.whisper_cli_path.trim()).await?;
-    queries::set_setting(&pool, "whisper_model_path", settings.whisper_model_path.trim()).await?;
-    save!("whisper_language", settings.whisper_language);
-    save!("whisper_threads", settings.whisper_threads);
-    save!("whisper_auto_insert", settings.whisper_auto_insert);
+    // System keys (ai_*, whisper_*, llm_model_path, llama_cli_path) are managed exclusively
+    // by save_system_settings → global settings table only. Never written here.
     save!("import_max_depth", settings.import_max_depth);
     save!("import_max_pages", settings.import_max_pages);
-    save!("ai_provider", settings.ai_provider);
-    save!("ai_model", settings.ai_model);
-    save!("ai_base_url", settings.ai_base_url);
-    save!("ai_enable_topics", settings.ai_enable_topics);
-    save!("ai_enable_summary", settings.ai_enable_summary);
-    save!("ai_enable_vision", settings.ai_enable_vision);
-    queries::set_setting(&pool, "llm_model_path", settings.llm_model_path.trim()).await?;
-    queries::set_setting(&pool, "llama_cli_path", settings.llama_cli_path.trim()).await?;
     save!("last_open_note", settings.last_open_note);
     save!("onboarding_done", settings.onboarding_done);
     save!("sidebar_width", settings.sidebar_width);
@@ -162,17 +247,11 @@ pub async fn save_settings(
     save!("memory_threshold", settings.memory_threshold);
     save!("write_confirm_mode", settings.write_confirm_mode);
     save!("chat_auto_include_note", settings.chat_auto_include_note);
+    save!("personal_current_vault_path", settings.personal_current_vault_path);
 
     let recent_json = serde_json::to_string(&settings.recent_vaults)
         .map_err(|e| AppError::Settings(e.to_string()))?;
     queries::set_user_setting(&pool, &username, "recent_vaults", &recent_json).await?;
-
-    // 更新記憶體中的 vault_path，並在切換 vault 時重啟 FileWatcher
-    if !settings.vault_path.is_empty() {
-        let app_state = state.inner().clone();
-        let new_path = settings.vault_path;
-        handle_vault_switch(app, app_state, new_path).await;
-    }
 
     Ok(())
 }

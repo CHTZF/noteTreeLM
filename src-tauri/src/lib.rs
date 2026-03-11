@@ -17,7 +17,7 @@ use commands::{
     conversation::{create_conversation, list_conversations, get_conversation,
                    delete_conversation, update_conversation_title},
     download::*, graph::*, import::*, search::*,
-    settings::{get_settings, save_settings, get_api_key, set_api_key,
+    settings::{get_settings, save_personal_settings, get_system_settings, save_system_settings, get_api_key, set_api_key,
                get_vault_last_note, set_vault_last_note},
     vault::*,
     voice::{transcribe_audio, stop_whisper_server, warmup_whisper_server,
@@ -63,8 +63,8 @@ pub fn run() {
 
                 let state = AppState::new(settings_pool);
 
-                // 載入已設定的 vault_path，並初始化 vault DB
-                if let Ok(Some(vp)) = db::queries::get_setting(&state.settings_db, "vault_path").await {
+                // 載入已設定的 system_current_vault_path，並初始化 vault DB
+                if let Ok(Some(vp)) = db::queries::get_setting(&state.settings_db, "system_current_vault_path").await {
                     if !vp.is_empty() {
                         state.set_vault_path(vp.clone()).await;
                         let path = std::path::PathBuf::from(&vp);
@@ -111,7 +111,9 @@ pub fn run() {
             change_password,
             // Settings
             get_settings,
-            save_settings,
+            save_personal_settings,
+            get_system_settings,
+            save_system_settings,
             get_api_key,
             set_api_key,
             get_vault_last_note,

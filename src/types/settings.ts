@@ -1,5 +1,6 @@
 export interface Settings {
-  vault_path: string
+  system_current_vault_path: string
+  personal_current_vault_path: string
   theme: 'dark' | 'light'
   auto_save_mode: 'off' | 'afterDelay' | 'onFocusChange' | 'onWindowChange'
   auto_save_delay: number
@@ -49,7 +50,8 @@ export interface Settings {
 }
 
 export const DEFAULT_SETTINGS: Settings = {
-  vault_path: '',
+  system_current_vault_path: '',
+  personal_current_vault_path: '',
   theme: 'dark',
   auto_save_mode: 'afterDelay',
   auto_save_delay: 1000,
@@ -94,6 +96,6 @@ export const DEFAULT_SETTINGS: Settings = {
   avatar_type: 'initials',
   avatar_color: '#0a84ff',
   avatar_image: '',
-  show_agent_tools: true,
+  show_agent_tools: false,
   file_sort_type: 'none',
 }

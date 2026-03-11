@@ -2,11 +2,8 @@ import { useState, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
-import { useSettingsStore } from '../../stores/settingsStore'
+import { useSettingsStore, SYSTEM_KEYS, SystemSettings } from '../../stores/settingsStore'
 import { useAuthStore } from '../../stores/authStore'
-import { useVaultStore } from '../../stores/vaultStore'
-import { useGraphStore } from '../../stores/graphStore'
-import { useEditorStore } from '../../stores/editorStore'
 import { Settings, DEFAULT_SETTINGS } from '../../types/settings'
 import ModelDownloader, { WHISPER_MODELS, LLM_MODELS } from './ModelDownloader'
 import { toast } from '../common/Toast'
@@ -26,6 +23,7 @@ function fmtSpeed(bps: number): string {
 interface SettingsModalProps {
   onClose?: () => void
   inline?: boolean
+  mode?: 'system' | 'personal'
 }
 
 interface MemoryRuleEntry {
@@ -64,15 +62,16 @@ const labelStyle: React.CSSProperties = {
 }
 const fieldStyle: React.CSSProperties = { marginBottom: '18px' }
 
-export default function SettingsModal({ onClose, inline }: SettingsModalProps) {
-  const { settings, save, getApiKey, setApiKey } = useSettingsStore()
+export default function SettingsModal({ onClose, inline, mode = 'personal' }: SettingsModalProps) {
+  const { settings, savePersonal, saveSystem, loadSystem, systemSettings, getApiKey, setApiKey } = useSettingsStore()
   const { session } = useAuthStore()
-  const { scanVault } = useVaultStore()
-  const { load: loadGraph } = useGraphStore()
-  const { setCurrentPath } = useEditorStore()
 
-  const [tab, setTab] = useState<Tab>('general')
-  const [draft, setDraft] = useState<Settings>({ ...settings })
+  const [tab, setTab] = useState<Tab>(mode === 'system' ? 'ai' : 'general')
+  const [draft, setDraft] = useState<Settings>(() =>
+    mode === 'system'
+      ? { ...DEFAULT_SETTINGS, ...(systemSettings ?? {}) }
+      : { ...settings }
+  )
   const [apiKey, setApiKeyLocal] = useState('')
   const [apiKeySaved, setApiKeySaved] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
@@ -129,6 +128,16 @@ export default function SettingsModal({ onClose, inline }: SettingsModalProps) {
   const disabledStyle: React.CSSProperties = {
     ...inputStyle, opacity: 0.4, cursor: 'not-allowed', pointerEvents: 'none',
   }
+
+  // 系統設定模式：掛載時拉取 global settings，並在資料回來後同步 draft
+  useEffect(() => {
+    if (mode === 'system') loadSystem()
+  }, [mode])
+
+  useEffect(() => {
+    if (mode === 'system' && systemSettings)
+      setDraft(prev => ({ ...prev, ...systemSettings }))
+  }, [systemSettings])
 
   useEffect(() => {
     if (draft.ai_provider)
@@ -367,23 +376,24 @@ export default function SettingsModal({ onClose, inline }: SettingsModalProps) {
   const handleSave = async () => {
     setIsSaving(true)
     try {
-      const vaultChanged = draft.vault_path !== settings.vault_path
-      await save(draft)
-      document.documentElement.setAttribute('data-theme', draft.theme)
-      if (draft.font_sans)
-        document.documentElement.style.setProperty('--font-sans', draft.font_sans)
-      else
-        document.documentElement.style.removeProperty('--font-sans')
-      document.documentElement.style.setProperty(
-        '--font-mono',
-        draft.font_mono || "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace"
-      )
-      document.documentElement.style.setProperty('--font-size-editor', `${draft.editor_font_size || 14}px`)
-      document.documentElement.style.zoom = String((draft.ui_font_size || 14) / 14)
-      if (vaultChanged) {
-        setCurrentPath('')  // 關閉目前開啟的筆記，避免對新 vault 執行舊路徑操作
-        await scanVault()
-        await loadGraph()
+      if (mode === 'system') {
+        const systemDraft = Object.fromEntries(
+          SYSTEM_KEYS.map(k => [k, draft[k]])
+        ) as unknown as SystemSettings
+        await saveSystem(systemDraft)
+      } else {
+        await savePersonal(draft)
+        document.documentElement.setAttribute('data-theme', draft.theme)
+        if (draft.font_sans)
+          document.documentElement.style.setProperty('--font-sans', draft.font_sans)
+        else
+          document.documentElement.style.removeProperty('--font-sans')
+        document.documentElement.style.setProperty(
+          '--font-mono',
+          draft.font_mono || "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace"
+        )
+        document.documentElement.style.setProperty('--font-size-editor', `${draft.editor_font_size || 14}px`)
+        document.documentElement.style.zoom = String((draft.ui_font_size || 14) / 14)
       }
       toast.success('設定已儲存')
       if (!inline) onClose?.()
@@ -398,7 +408,7 @@ export default function SettingsModal({ onClose, inline }: SettingsModalProps) {
   const handleReset = () => {
     setDraft({
       ...DEFAULT_SETTINGS,
-      vault_path: settings.vault_path,
+      system_current_vault_path: systemSettings?.system_current_vault_path ?? settings.system_current_vault_path,
       onboarding_done: settings.onboarding_done,
       last_open_note: settings.last_open_note,
       recent_vaults: settings.recent_vaults,
@@ -527,9 +537,10 @@ export default function SettingsModal({ onClose, inline }: SettingsModalProps) {
   const modelOptions = MODEL_OPTIONS[draft.ai_provider] ?? []
   const modelIsCustom = hasProvider && !modelOptions.includes(draft.ai_model) && draft.ai_model
 
-  const tabs: [Tab, string][] = [
-    ['account', '帳號'], ['general', '一般'], ['ai', '外部資源'], ['voice', 'Whisper'], ['local', 'Local LLM'], ['advanced', '進階'], ['intent', '意圖關鍵字'], ['memory', '記憶規則'], ['raw', '設定檔'],
-  ]
+
+  const tabs: [Tab, string][] = mode === 'system'
+    ? [['ai', '外部 AI'], ['voice', 'Whisper'], ['local', 'Local LLM'], ['raw', '設定檔']]
+    : [['account', '帳號'], ['general', '一般'], ['advanced', '進階'], ['intent', '意圖關鍵字'], ['memory', '記憶規則'], ['raw', '設定檔']]
 
   const handleChangePassword = async () => {
     if (!newPassword || newPassword !== confirmPassword) {
@@ -601,7 +612,7 @@ export default function SettingsModal({ onClose, inline }: SettingsModalProps) {
     <div id="settings-modal" style={modalInnerStyle}>
         {/* Header */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '14px 20px', borderBottom: '1px solid var(--color-border)', flexShrink: 0 }}>
-          <span style={{ fontSize: '15px', fontWeight: 600, color: 'var(--color-text-primary)' }}>設定</span>
+          <span style={{ fontSize: '15px', fontWeight: 600, color: 'var(--color-text-primary)' }}>{mode === 'system' ? '系統設定' : '個人化設定'}</span>
           {!inline && onClose && (
             <button onClick={onClose}
               style={{ color: 'var(--color-text-secondary)', fontSize: '20px', lineHeight: 1, width: '28px', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '4px' }}
@@ -1540,35 +1551,44 @@ export default function SettingsModal({ onClose, inline }: SettingsModalProps) {
               </div>
             </>}
 
-            {tab === 'raw' && (
-              <div>
-                <p style={{ fontSize: '12px', color: 'var(--color-text-muted)', marginBottom: '12px' }}>
-                  目前 draft 設定（未儲存的變更）— 僅供檢閱，不可直接編輯。
-                </p>
-                <pre style={{
-                  background: 'var(--color-bg-base)', border: '1px solid var(--color-border)',
-                  borderRadius: '6px', padding: '14px 16px',
-                  fontSize: '11.5px', color: 'var(--color-text-primary)',
-                  fontFamily: "'JetBrains Mono', monospace",
-                  overflowX: 'auto', whiteSpace: 'pre',
-                  margin: 0, lineHeight: 1.6,
-                }}>
-                  {JSON.stringify({ ...draft, _note: 'API Key 儲存於系統 Keychain，不顯示於此' }, null, 2)}
-                </pre>
-              </div>
-            )}
+            {tab === 'raw' && (() => {
+              const rawEntries = mode === 'system'
+                ? Object.fromEntries(SYSTEM_KEYS.map(k => [k, draft[k]]))
+                : Object.fromEntries(Object.entries(draft).filter(([k]) => !(SYSTEM_KEYS as readonly string[]).includes(k)))
+              const label = mode === 'system' ? '機器層級設定（全域）' : '個人設定（user_settings）'
+              return (
+                <div>
+                  <p style={{ fontSize: '12px', color: 'var(--color-text-muted)', marginBottom: '12px' }}>
+                    {label} — 未儲存的 draft 值，僅供檢閱，不可直接編輯。
+                  </p>
+                  <pre style={{
+                    background: 'var(--color-bg-base)', border: '1px solid var(--color-border)',
+                    borderRadius: '6px', padding: '14px 16px',
+                    fontSize: '11.5px', color: 'var(--color-text-primary)',
+                    fontFamily: "'JetBrains Mono', monospace",
+                    overflowX: 'auto', whiteSpace: 'pre',
+                    margin: 0, lineHeight: 1.6,
+                  }}>
+                    {JSON.stringify(mode === 'system' ? rawEntries : { ...rawEntries, _note: 'API Key 儲存於系統 Keychain，不顯示於此' }, null, 2)}
+                  </pre>
+                </div>
+              )
+            })()}
 
           </div>
         </div>
 
         {/* Footer */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 20px', borderTop: '1px solid var(--color-border)', flexShrink: 0 }}>
-          <button
-            onClick={handleReset}
-            style={{ padding: '7px 16px', borderRadius: '6px', background: 'transparent', border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)', fontSize: '13px' }}
-            onMouseEnter={(e) => (e.currentTarget.style.borderColor = 'var(--color-text-muted)')}
-            onMouseLeave={(e) => (e.currentTarget.style.borderColor = 'var(--color-border)')}
-          >還原預設</button>
+          {mode !== 'system' && (
+            <button
+              onClick={handleReset}
+              style={{ padding: '7px 16px', borderRadius: '6px', background: 'transparent', border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)', fontSize: '13px' }}
+              onMouseEnter={(e) => (e.currentTarget.style.borderColor = 'var(--color-text-muted)')}
+              onMouseLeave={(e) => (e.currentTarget.style.borderColor = 'var(--color-border)')}
+            >還原預設</button>
+          )}
+          {mode === 'system' && <div />}
           <div style={{ display: 'flex', gap: '8px' }}>
             <button
               onClick={() => onClose?.()}

@@ -13,7 +13,7 @@ export default function VaultManagerModal({ onSelect, canClose, onClose }: Props
   const [search, setSearch] = useState('')
 
   const recentVaults: string[] = settings.recent_vaults ?? []
-  const currentVault = settings.vault_path
+  const currentVault = settings.system_current_vault_path
   const allVaults = [
     ...recentVaults,
     ...(currentVault && !recentVaults.includes(currentVault) ? [currentVault] : []),

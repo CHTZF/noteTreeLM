@@ -6,8 +6,8 @@ import {
   faFolder, faFolderOpen, faFile, faFileLines, faFileImage, faFileCode,
   faFileAudio, faFileVideo, faFilePdf, faFileZipper,
   faTrash, faPen,
-  faChevronRight, faEllipsisVertical,
-  faPlus, faFolderPlus,
+  faChevronRight,
+  faPlus, faFolderPlus, faFileArrowUp,
   faArrowDownAZ, faArrowUpZA,
 } from '@fortawesome/free-solid-svg-icons'
 import { useVaultStore } from '../../stores/vaultStore'
@@ -77,23 +77,32 @@ interface ActiveDrag {
 let activeDrag: ActiveDrag | null = null
 let dragJustEnded = false // 防止 drag 結束後觸發 onClick
 
-// ── 依名稱排序（升序/降序），資料夾永遠置頂 ──────────────────────────────
-function sortNodesByName(nodes: FileTreeNode[], direction: 'asc' | 'desc'): FileTreeNode[] {
-  const sorted = [...nodes].sort((a, b) => {
-    if (a.isFolder !== b.isFolder) return a.isFolder ? -1 : 1
-    const cmp = a.name.localeCompare(b.name, 'zh-TW', { sensitivity: 'base' })
-    return direction === 'asc' ? cmp : -cmp
-  })
-  return sorted.map(node =>
-    node.children ? { ...node, children: sortNodesByName(node.children, direction) } : node
-  )
+// ── 依名稱排序並寫入 sort_orders（與拖曳排序相同機制）─────────────────────
+async function applySortByName(nodes: FileTreeNode[], direction: 'asc' | 'desc') {
+  const allOrders: Record<string, string[]> = {}
+  function process(folderPath: string, children: FileTreeNode[]) {
+    const sorted = [...children].sort((a, b) => {
+      if (a.isFolder !== b.isFolder) return a.isFolder ? -1 : 1
+      const cmp = a.name.localeCompare(b.name, 'zh-TW', { sensitivity: 'base' })
+      return direction === 'asc' ? cmp : -cmp
+    })
+    allOrders[folderPath] = sorted.map(n => n.path)
+    for (const node of sorted) {
+      if (node.isFolder && node.children) process(node.path, node.children)
+    }
+  }
+  process('', nodes)
+  const store = useSettingsStore.getState()
+  await store.savePersonal({ sort_orders: { ...(store.settings.sort_orders || {}), ...allOrders } })
+  // Rebuild fileTree with the new sort_orders
+  await useVaultStore.getState().loadNotes()
 }
 
 // ── 排序輔助 ──────────────────────────────────────────────────────────────
 async function saveSortOrder(folderPath: string, orderedPaths: string[]) {
   const store = useSettingsStore.getState()
   const current = store.settings.sort_orders || {}
-  await store.save({ sort_orders: { ...current, [folderPath]: orderedPaths } })
+  await store.savePersonal({ sort_orders: { ...current, [folderPath]: orderedPaths } })
 }
 
 // 讀取某資料夾下所有 data-item-path 元素，按其螢幕位置排序
@@ -207,7 +216,7 @@ async function performMoveFolder(srcFolderPath: string, targetParent: string) {
     if (newOrders[currentParent]) {
       newOrders[currentParent] = newOrders[currentParent].filter(p => p !== srcFolderPath)
     }
-    await store.save({ sort_orders: newOrders })
+    await store.savePersonal({ sort_orders: newOrders })
 
     await useVaultStore.getState().loadNotes()
     toast.success(`已移至「${targetParent || '根目錄'}」`)
@@ -248,7 +257,7 @@ async function performMove(draggedPath: string, targetFolder: string) {
     if (orders[currentFolder]) {
       orders[currentFolder] = orders[currentFolder].filter(p => p !== draggedPath)
     }
-    await store.save({ sort_orders: orders })
+    await store.savePersonal({ sort_orders: orders })
 
     await loadNotes()
     const editorState = useEditorStore.getState()
@@ -266,20 +275,14 @@ interface FileTreeProps {
 export default function FileTree({ onOpenNote }: FileTreeProps) {
   const { fileTree, createNote, createFolder, importImage } = useVaultStore()
   const { currentPath } = useEditorStore()
-  const { settings, save: saveSettings } = useSettingsStore()
-  const [headerMenuOpen, setHeaderMenuOpen] = useState(false)
+  const { settings } = useSettingsStore()
   const [showNoteInput, setShowNoteInput] = useState(false)
   const [noteInputTitle, setNoteInputTitle] = useState('')
   const [showFolderInput, setShowFolderInput] = useState(false)
   const [folderInputName, setFolderInputName] = useState('')
-  const headerMenuRef = useRef<HTMLDivElement>(null)
   const treeRef = useRef<HTMLDivElement>(null)
   const noteInputRef = useRef<HTMLInputElement>(null)
   const folderInputRef = useRef<HTMLInputElement>(null)
-
-  const vaultName = settings.vault_path
-    ? settings.vault_path.replace(/\/+$/, '').split('/').pop() || 'Vault'
-    : 'Vault'
 
   // 根容器登記為 drop target（path = ''）
   useEffect(() => {
@@ -290,36 +293,15 @@ export default function FileTree({ onOpenNote }: FileTreeProps) {
     }
   }, [])
 
-  // 點選 header 選單外部時關閉
-  useEffect(() => {
-    if (!headerMenuOpen) return
-    const handler = (e: MouseEvent) => {
-      if (headerMenuRef.current && !headerMenuRef.current.contains(e.target as Node)) {
-        setHeaderMenuOpen(false)
-      }
-    }
-    document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [headerMenuOpen])
-
   const handleNewNote = () => {
-    setHeaderMenuOpen(false); setShowFolderInput(false)
+    setShowFolderInput(false)
     setShowNoteInput(true); setNoteInputTitle('')
     setTimeout(() => noteInputRef.current?.focus(), 30)
   }
   const handleNewFolder = () => {
-    setHeaderMenuOpen(false); setShowNoteInput(false)
+    setShowNoteInput(false)
     setShowFolderInput(true); setFolderInputName('')
     setTimeout(() => folderInputRef.current?.focus(), 30)
-  }
-  const handleImportImage = async () => {
-    setHeaderMenuOpen(false)
-    try {
-      const file = await openDialog({ multiple: false })
-      if (!file) return
-      const filePath = typeof file === 'string' ? file : (file as any).path ?? String(file)
-      await importImage(filePath); toast.success('檔案已匯入 Vault')
-    } catch (e: any) { toast.error(e.message || '匯入檔案失敗') }
   }
   const handleNoteSubmit = async () => {
     const title = noteInputTitle.trim(); setShowNoteInput(false); setNoteInputTitle('')
@@ -334,51 +316,33 @@ export default function FileTree({ onOpenNote }: FileTreeProps) {
     catch (e: any) { toast.error(e.message || '建立資料夾失敗') }
   }
 
+  const handleImportFile = async () => {
+    const result = await openDialog({ multiple: true, directory: false })
+    if (!result) return
+    const files = Array.isArray(result) ? result : [result]
+    for (const file of files) {
+      try { await importImage(file as string) } catch {}
+    }
+  }
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 12px 8px', borderBottom: '1px solid var(--color-border)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', overflow: 'hidden' }}>
-          <FontAwesomeIcon icon={faFolder} style={{ fontSize: '13px', width: '13px', height: '13px', flexShrink: 0, color: FOLDER_COLOR }} />
-          <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {vaultName}
-          </span>
-        </div>
-        <div ref={headerMenuRef} style={{ position: 'relative', flexShrink: 0 }}>
-          <button onClick={() => setHeaderMenuOpen((v) => !v)} title="選單"
-            style={{ color: 'var(--color-text-secondary)', fontSize: '13px', padding: '2px 6px', opacity: 0.6, display: 'flex', alignItems: 'center' }}
-            onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.opacity = '1' }}
-            onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = '0.6' }}>
-            <FontAwesomeIcon icon={faEllipsisVertical} />
+      {/* Header — icon buttons only */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', padding: '4px 6px', borderBottom: '1px solid var(--color-border)', gap: '1px' }}>
+        {([
+          { icon: faPlus,        title: '新增筆記',         onClick: handleNewNote },
+          { icon: faFolderPlus,  title: '新增資料夾',       onClick: handleNewFolder },
+          { icon: faFileArrowUp, title: '匯入檔案',         onClick: handleImportFile },
+          { icon: faArrowDownAZ, title: '依名稱升序（A→Z）', onClick: () => applySortByName(fileTree, 'asc') },
+          { icon: faArrowUpZA,   title: '依名稱降序（Z→A）', onClick: () => applySortByName(fileTree, 'desc') },
+        ] as const).map(btn => (
+          <button key={btn.title} onClick={btn.onClick} title={btn.title}
+            style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-text-secondary)', fontSize: '15px', width: '28px', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '5px', opacity: 0.65, flexShrink: 0 }}
+            onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.opacity = '1'; (e.currentTarget as HTMLElement).style.background = 'var(--color-bg-hover)' }}
+            onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = '0.65'; (e.currentTarget as HTMLElement).style.background = 'none' }}>
+            <FontAwesomeIcon icon={btn.icon} />
           </button>
-          {headerMenuOpen && (
-            <div style={{ position: 'absolute', top: '100%', right: 0, background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)', borderRadius: '6px', boxShadow: '0 4px 16px rgba(0,0,0,0.35)', zIndex: 200, minWidth: '160px', overflow: 'hidden', padding: '4px 0' }}>
-              <MenuItem icon={faPlus} label="新增筆記" onClick={handleNewNote} />
-              <MenuItem icon={faFolderPlus} label="新增資料夾" onClick={handleNewFolder} />
-              <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
-              <MenuItem icon={faFileImage} label="匯入檔案" onClick={handleImportImage} />
-              <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
-              <MenuItem
-                icon={faArrowDownAZ}
-                label="依名稱升序（A→Z）"
-                active={settings.file_sort_type === 'asc'}
-                onClick={() => {
-                  saveSettings({ file_sort_type: settings.file_sort_type === 'asc' ? 'none' : 'asc' })
-                  setHeaderMenuOpen(false)
-                }}
-              />
-              <MenuItem
-                icon={faArrowUpZA}
-                label="依名稱降序（Z→A）"
-                active={settings.file_sort_type === 'desc'}
-                onClick={() => {
-                  saveSettings({ file_sort_type: settings.file_sort_type === 'desc' ? 'none' : 'desc' })
-                  setHeaderMenuOpen(false)
-                }}
-              />
-            </div>
-          )}
-        </div>
+        ))}
       </div>
 
       {showNoteInput && (
@@ -403,16 +367,11 @@ export default function FileTree({ onOpenNote }: FileTreeProps) {
       <div ref={treeRef} style={{ flex: 1, overflowY: 'auto', padding: '4px 0', outline: 'none', outlineOffset: '-2px', transition: 'outline 0.08s', borderRadius: '4px' }}>
         {fileTree.length === 0 ? (
           <div style={{ padding: '20px 12px', color: 'var(--color-text-muted)', fontSize: '13px', textAlign: 'center' }}>
-            <p>還沒有筆記</p><p style={{ marginTop: '8px' }}>點擊 ••• 新增第一篇</p>
+            <p>還沒有筆記</p><p style={{ marginTop: '8px' }}>點擊 + 新增第一篇</p>
           </div>
-        ) : (
-          (settings.file_sort_type && settings.file_sort_type !== 'none'
-            ? sortNodesByName(fileTree, settings.file_sort_type as 'asc' | 'desc')
-            : fileTree
-          ).map((node) => (
-            <TreeNode key={node.path} node={node} depth={0} currentPath={currentPath} vaultPath={settings.vault_path} onOpenNote={onOpenNote} />
-          ))
-        )}
+        ) : fileTree.map((node) => (
+          <TreeNode key={node.path} node={node} depth={0} currentPath={currentPath} vaultPath={settings.system_current_vault_path} onOpenNote={onOpenNote} />
+        ))}
       </div>
     </div>
   )

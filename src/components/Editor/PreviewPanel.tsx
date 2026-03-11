@@ -285,7 +285,7 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit, pending
   // 圖片後處理：套用尺寸 + 解析圖片路徑為 data URL
   useEffect(() => {
     if (!containerRef.current) return
-    const vaultPath = settings.vault_path
+    const vaultPath = settings.system_current_vault_path
 
     const processImages = async () => {
       const imgs = Array.from(containerRef.current!.querySelectorAll('img'))
@@ -317,7 +317,7 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit, pending
     }
 
     processImages()
-  }, [html, settings.vault_path])
+  }, [html, settings.system_current_vault_path])
 
   useEffect(() => {
     if (!containerRef.current) return

@@ -22,19 +22,17 @@ pub async fn set_setting(pool: &SqlitePool, key: &str, value: &str) -> crate::er
     Ok(())
 }
 
-/// 讀取 per-user 設定；若無 user 覆寫則 fallback 到全域 settings
+/// 讀取 per-user 設定；只查 user_settings，不 fallback 到全域。
+/// 需要全域值請直接呼叫 get_setting。
 pub async fn get_user_setting(pool: &SqlitePool, username: &str, key: &str) -> crate::error::Result<Option<String>> {
-    let user_val = sqlx::query_scalar::<_, String>(
+    let row = sqlx::query_scalar::<_, String>(
         "SELECT value FROM user_settings WHERE username = ? AND key = ?"
     )
     .bind(username)
     .bind(key)
     .fetch_optional(pool)
     .await?;
-    if user_val.is_some() {
-        return Ok(user_val);
-    }
-    get_setting(pool, key).await
+    Ok(row)
 }
 
 /// 寫入 per-user 設定
@@ -50,6 +48,7 @@ pub async fn set_user_setting(pool: &SqlitePool, username: &str, key: &str, valu
     .await?;
     Ok(())
 }
+
 
 pub async fn get_vault_last_note(pool: &SqlitePool, vault_path: &str) -> crate::error::Result<Option<String>> {
     let note = sqlx::query_scalar::<_, String>(

@@ -22,7 +22,7 @@ interface Props {
 }
 
 export default function SetupWizard({ onDone }: Props) {
-  const { settings, save: saveSettings } = useSettingsStore()
+  const { settings, saveSystem } = useSettingsStore()
 
   const [whisperModel, setWhisperModel] = useState(settings.whisper_model_path)
   const [llamaModel, setLlamaModel] = useState(settings.llm_model_path)
@@ -110,25 +110,25 @@ export default function SetupWizard({ onDone }: Props) {
 
   const handleSave = useCallback(async () => {
     setSaving(true)
-    await saveSettings({
+    await saveSystem({
       whisper_cli_path: whisperCli,
       whisper_model_path: whisperModel,
       llama_cli_path: llamaCli,
       llm_model_path: llamaModel,
-    })
+    } as any)
     setSaving(false)
     onDone()
-  }, [whisperCli, whisperModel, llamaCli, llamaModel, saveSettings, onDone])
+  }, [whisperCli, whisperModel, llamaCli, llamaModel, saveSystem, onDone])
 
   const handleSkip = useCallback(async () => {
-    await saveSettings({
+    await saveSystem({
       whisper_cli_path: whisperCli,
       whisper_model_path: whisperModel,
       llama_cli_path: llamaCli,
       llm_model_path: llamaModel,
-    })
+    } as any)
     onDone()
-  }, [whisperCli, whisperModel, llamaCli, llamaModel, saveSettings, onDone])
+  }, [whisperCli, whisperModel, llamaCli, llamaModel, saveSystem, onDone])
 
   // ── Styles ─────────────────────────────────────────────────────────────────
   const sectionTitle: React.CSSProperties = {

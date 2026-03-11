@@ -398,7 +398,7 @@ class ImageWidget extends WidgetType {
 
     const loadLocal = (rawSrc: string) => {
       const { settings } = useSettingsStore.getState()
-      const vaultPath = settings.vault_path
+      const vaultPath = settings.system_current_vault_path
       let decoded = rawSrc
       try { decoded = decodeURI(rawSrc) } catch { /* keep original */ }
       // Detect absolute paths: Unix (/...) and Windows (C:\... or C:/...)

@@ -31,7 +31,7 @@ export default function FileViewer({ path }: FileViewerProps) {
   const ext = filename.split('.').pop()?.toLowerCase() ?? ''
   // Normalize backslashes to forward slashes (Windows vault paths use backslashes,
   // but convertFileSrc requires a URL-friendly path)
-  const absPath = settings.vault_path.replace(/\\/g, '/').replace(/\/+$/, '') + '/' + path
+  const absPath = settings.system_current_vault_path.replace(/\\/g, '/').replace(/\/+$/, '') + '/' + path
 
   const isImage = IMAGE_EXTS.includes(ext)
   const isAudio = AUDIO_EXTS.includes(ext)

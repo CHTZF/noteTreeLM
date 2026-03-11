@@ -10,7 +10,7 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
   const [step, setStep] = useState(1)
   const [vaultPath, setVaultPath] = useState('')
   const [error, setError] = useState('')
-  const { save } = useSettingsStore()
+  const { saveSystem, savePersonal } = useSettingsStore()
 
   const selectVault = async () => {
     const selected = await open({
@@ -23,7 +23,8 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
 
   const handleComplete = async () => {
     if (!vaultPath) { setError('請選擇 Vault 資料夾'); return }
-    await save({ vault_path: vaultPath, onboarding_done: true })
+    await saveSystem({ system_current_vault_path: vaultPath } as any)
+    await savePersonal({ onboarding_done: true, personal_current_vault_path: vaultPath })
     onComplete()
   }
 
