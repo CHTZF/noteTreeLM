@@ -7,6 +7,8 @@ import MarkdownIt from 'markdown-it'
 import mk from 'markdown-it-texmath'
 import katex from 'katex'
 import DOMPurify from 'dompurify'
+import { invoke } from '@tauri-apps/api/core'
+import { useSettingsStore } from '../../../stores/settingsStore'
 
 // ── Shared markdown renderer ──────────────────────────────────────────────────
 const mdBlock = new MarkdownIt({ html: true, linkify: true, typographer: true, breaks: true })
@@ -335,6 +337,94 @@ class HRWidget extends WidgetType {
 }
 const hrWidget = new HRWidget()
 
+// ── ImageWidget: renders ![alt](url) as an actual <img> element ───────────────
+// For HTTP/data URLs, sets src synchronously.
+// For local file paths, resolves asynchronously via Tauri read_file_base64.
+class ImageWidget extends WidgetType {
+  constructor(private src: string, private alt: string) { super() }
+
+  toDOM(): HTMLElement {
+    const img = document.createElement('img')
+    img.alt = this.alt
+    img.style.cssText = 'max-width:100%;border-radius:var(--radius-md);vertical-align:middle;display:inline-block;cursor:default;'
+
+    const loadLocal = (rawSrc: string) => {
+      const { settings } = useSettingsStore.getState()
+      const vaultPath = settings.vault_path
+      let decoded = rawSrc
+      try { decoded = decodeURI(rawSrc) } catch { /* keep original */ }
+      const absolutePath = decoded.startsWith('/') ? decoded : `${vaultPath}/${decoded}`
+      invoke<string>('read_file_base64', { path: absolutePath }).then(base64 => {
+        const ext = absolutePath.split('.').pop()?.toLowerCase() ?? ''
+        const mimeMap: Record<string, string> = {
+          png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+          gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
+          bmp: 'image/bmp', ico: 'image/x-icon',
+        }
+        img.src = `data:${mimeMap[ext] ?? 'image/png'};base64,${base64}`
+      }).catch(() => {
+        img.title = `無法載入: ${absolutePath}`
+        img.style.border = '1px dashed var(--color-border)'
+        img.style.padding = '4px'
+        img.style.minWidth = '60px'
+        img.style.minHeight = '24px'
+      })
+    }
+
+    if (this.src.startsWith('http') || this.src.startsWith('data:') ||
+        this.src.startsWith('asset:') || this.src.startsWith('vault:')) {
+      img.src = this.src
+    } else {
+      loadLocal(this.src)
+    }
+
+    return img
+  }
+
+  ignoreEvent(): boolean { return false }
+
+  eq(other: WidgetType): boolean {
+    return other instanceof ImageWidget &&
+      (other as ImageWidget).src === this.src &&
+      (other as ImageWidget).alt === this.alt
+  }
+}
+
+// ── QuickCopyWidget: renders <span class="quick-copy" ...> with live styling ──
+// Replaces raw HTML span text with a properly styled, clickable widget.
+class QuickCopyWidget extends WidgetType {
+  constructor(
+    private dataCopy: string,
+    private displayText: string,
+    private style: string,
+  ) { super() }
+
+  toDOM(): HTMLElement {
+    const span = document.createElement('span')
+    span.className = 'quick-copy'
+    span.setAttribute('data-copy', this.dataCopy)
+    span.textContent = this.displayText
+    if (this.style) span.setAttribute('style', this.style)
+    span.addEventListener('click', () => {
+      navigator.clipboard.writeText(this.dataCopy).catch(() => {})
+      span.style.opacity = '0.4'
+      setTimeout(() => { span.style.opacity = '' }, 800)
+    })
+    return span
+  }
+
+  ignoreEvent(e: Event): boolean {
+    return ['click', 'mousedown', 'mouseup'].includes(e.type)
+  }
+
+  eq(other: WidgetType): boolean {
+    return other instanceof QuickCopyWidget &&
+      (other as QuickCopyWidget).dataCopy === this.dataCopy &&
+      (other as QuickCopyWidget).displayText === this.displayText &&
+      (other as QuickCopyWidget).style === this.style
+  }
+}
+
 type DecoEntry = { from: number; to: number; deco: Decoration }
 
 // ── Block decoration builder ──────────────────────────────────────────────────
@@ -445,6 +535,23 @@ function buildInlineDecos(view: EditorView): DecorationSet {
 
         // Block elements handled by StateField
         if (name === 'Table' || name === 'FencedCode' || name === 'HorizontalRule') return false
+
+        // ── Image ![alt](url) ──────────────────────────────────────────
+        if (name === 'Image') {
+          if (!cursorIn(from, to)) {
+            let src = ''
+            let child = node.node.firstChild
+            while (child) {
+              if (child.name === 'URL') { src = doc.sliceString(child.from, child.to) }
+              child = child.nextSibling
+            }
+            const raw = doc.sliceString(from, to)
+            const altMatch = raw.match(/^!\[([^\]]*)\]/)
+            const alt = altMatch ? altMatch[1] : ''
+            if (src) add(from, to, Decoration.replace({ widget: new ImageWidget(src, alt) }))
+          }
+          return false
+        }
 
         // ── ATX Headings ──────────────────────────────────────────────
         if (name.startsWith('ATXHeading')) {
@@ -597,6 +704,26 @@ function buildInlineDecos(view: EditorView): DecorationSet {
         }
       },
     })
+  }
+
+  // ── Quick-copy HTML spans ──────────────────────────────────────────────────
+  // Scan visible text for <span class="quick-copy" data-copy="...">...</span>
+  // and replace them with styled, clickable QuickCopyWidget elements.
+  const quickCopyRe = /<span class="quick-copy" data-copy="([^"]*)"([^>]*)>(.*?)<\/span>/g
+  for (const { from: vpFrom, to: vpTo } of view.visibleRanges) {
+    const text = doc.sliceString(vpFrom, vpTo)
+    let m: RegExpExecArray | null
+    quickCopyRe.lastIndex = 0
+    while ((m = quickCopyRe.exec(text)) !== null) {
+      const mFrom = vpFrom + m.index
+      const mTo = mFrom + m[0].length
+      if (!cursorIn(mFrom, mTo)) {
+        const dataCopy = m[1].replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+        const styleMatch = m[2].match(/style="([^"]*)"/)
+        const style = styleMatch ? styleMatch[1] : ''
+        add(mFrom, mTo, Decoration.replace({ widget: new QuickCopyWidget(dataCopy, m[3], style) }))
+      }
+    }
   }
 
   decos.sort((a, b) => a.from !== b.from ? a.from - b.from : b.to - a.to)
