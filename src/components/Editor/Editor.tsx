@@ -10,7 +10,7 @@ import { useEditorStore } from '../../stores/editorStore'
 import { useVaultStore } from '../../stores/vaultStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { wikilinkPlugin } from './plugins/wikilinks'
-import { livePreviewPlugin, livePreviewTheme, setLiveEditQuickCopyHandler } from './plugins/livePreview'
+import { livePreviewPlugin, livePreviewTheme, setLiveEditQuickCopyHandler, setLiveEditImageHandler } from './plugins/livePreview'
 import type { EditorAction } from './Toolbar'
 import PreviewPanel from './PreviewPanel'
 import BacklinksPanel from '../BacklinksPanel/BacklinksPanel'
@@ -388,6 +388,26 @@ export default function Editor({ onOpenNote }: EditorProps) {
       setQuickCopyModal({ from: data.from, to: data.to })
     })
     return () => setLiveEditQuickCopyHandler(null)
+  }, [])
+
+  // Register live-mode right-click edit handler for image widgets
+  useEffect(() => {
+    setLiveEditImageHandler((data) => {
+      // Parse alt — may contain |size suffix, e.g. "photo|300" or "photo|300x200"
+      const barIdx = data.alt.lastIndexOf('|')
+      const hasSize = barIdx !== -1 && /^\d/.test(data.alt.slice(barIdx + 1))
+      const altClean = hasSize ? data.alt.slice(0, barIdx) : data.alt
+      const size     = hasSize ? data.alt.slice(barIdx + 1) : ''
+      const isUrl = data.src.startsWith('http') || data.src.startsWith('data:')
+      setImgSource(isUrl ? 'url' : 'file')
+      if (isUrl) { setImgUrl(data.src); setImgFilePath('') }
+      else       { setImgFilePath(data.src); setImgUrl('') }
+      setImgAlt(altClean)
+      setImgSize(size)
+      setImgUrlError('')
+      setImageModal({ from: data.from, to: data.to })
+    })
+    return () => setLiveEditImageHandler(null)
   }, [])
 
   const pickImageFile = useCallback(async () => {

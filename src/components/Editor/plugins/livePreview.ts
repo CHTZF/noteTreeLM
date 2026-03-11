@@ -341,12 +341,22 @@ const hrWidget = new HRWidget()
 // For HTTP/data URLs, sets src synchronously.
 // For local file paths, resolves asynchronously via Tauri read_file_base64.
 class ImageWidget extends WidgetType {
-  constructor(private src: string, private alt: string) { super() }
+  constructor(
+    private src: string,
+    private alt: string,
+    private docFrom: number,
+    private docTo: number,
+  ) { super() }
 
   toDOM(): HTMLElement {
     const img = document.createElement('img')
     img.alt = this.alt
     img.style.cssText = 'max-width:100%;border-radius:var(--radius-md);vertical-align:middle;display:inline-block;cursor:default;'
+    img.addEventListener('contextmenu', (e) => {
+      e.preventDefault()
+      e.stopPropagation()
+      _onLiveEditImage?.({ from: this.docFrom, to: this.docTo, src: this.src, alt: this.alt })
+    })
 
     const loadLocal = (rawSrc: string) => {
       const { settings } = useSettingsStore.getState()
@@ -381,13 +391,20 @@ class ImageWidget extends WidgetType {
     return img
   }
 
-  ignoreEvent(): boolean { return false }
+  ignoreEvent(e: Event): boolean { return e.type === 'contextmenu' }
 
   eq(other: WidgetType): boolean {
     return other instanceof ImageWidget &&
       (other as ImageWidget).src === this.src &&
       (other as ImageWidget).alt === this.alt
   }
+}
+
+// ── Image right-click edit callback ──────────────────────────────────────────
+export interface ImageEditData { from: number; to: number; src: string; alt: string }
+let _onLiveEditImage: ((data: ImageEditData) => void) | null = null
+export function setLiveEditImageHandler(fn: typeof _onLiveEditImage) {
+  _onLiveEditImage = fn
 }
 
 // ── QuickCopy right-click edit callback ──────────────────────────────────────
@@ -720,10 +737,8 @@ function buildInlineDecos(view: EditorView): DecorationSet {
     while ((m = imageRe.exec(text)) !== null) {
       const mFrom = vpFrom + m.index
       const mTo = mFrom + m[0].length
-      if (!cursorIn(mFrom, mTo)) {
-        const src = m[2].trim()
-        if (src) add(mFrom, mTo, Decoration.replace({ widget: new ImageWidget(src, m[1]) }))
-      }
+      const src = m[2].trim()
+      if (src) add(mFrom, mTo, Decoration.replace({ widget: new ImageWidget(src, m[1], mFrom, mTo) }))
     }
   }
 
