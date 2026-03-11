@@ -516,34 +516,21 @@ export default function Editor({ onOpenNote }: EditorProps) {
           }}
         />
 
-        {/* 浮動模式切換按鈕 */}
-        {(viewMode === 'editor' || viewMode === 'live') && currentPath && (
+        {/* 浮動模式切換按鈕（Source 模式下提示切回編輯） */}
+        {viewMode === 'editor' && currentPath && (
           <div style={{ position: 'absolute', top: '10px', right: '16px', zIndex: 10, display: 'flex', gap: '6px' }}>
-            {viewMode === 'editor' && (
-              <button
-                onClick={() => setViewMode('live')}
-                title="切換為即時預覽模式"
-                style={{
-                  padding: '4px 10px', borderRadius: '6px', fontSize: '12px',
-                  background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)',
-                  color: 'var(--color-text-secondary)', cursor: 'pointer', opacity: 0.75,
-                  transition: 'opacity 0.15s',
-                }}
-                onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
-                onMouseLeave={e => (e.currentTarget.style.opacity = '0.75')}
-              >✦ 即時</button>
-            )}
-            {viewMode === 'live' && (
-              <button
-                onClick={() => setViewMode('editor')}
-                title="切換為純文字編輯模式"
-                style={{
-                  padding: '3px 9px', borderRadius: '6px', fontSize: '11px',
-                  background: 'var(--color-accent-dim)', border: '1px solid var(--color-accent)',
-                  color: 'var(--color-accent)', cursor: 'pointer', opacity: 0.85,
-                }}
-              >✦ 即時</button>
-            )}
+            <button
+              onClick={() => setViewMode('live')}
+              title="切換為編輯模式"
+              style={{
+                padding: '4px 10px', borderRadius: '6px', fontSize: '12px',
+                background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)',
+                color: 'var(--color-text-secondary)', cursor: 'pointer', opacity: 0.75,
+                transition: 'opacity 0.15s',
+              }}
+              onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
+              onMouseLeave={e => (e.currentTarget.style.opacity = '0.75')}
+            >✎ 編輯</button>
             <button
               onClick={() => setViewMode('preview')}
               title="切換為預覽模式"
@@ -564,7 +551,7 @@ export default function Editor({ onOpenNote }: EditorProps) {
           <PreviewPanel
             content={content}
             onWikilinkClick={wikilinkHandler}
-            onEdit={() => setViewMode('editor')}
+            onEdit={() => setViewMode('live')}
             pendingAnchor={pendingAnchor}
             onAnchorScrolled={() => setPendingAnchor(undefined)}
             onTextStyle={handleTextStyle}
