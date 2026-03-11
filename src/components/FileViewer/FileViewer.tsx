@@ -4,6 +4,15 @@ import { convertFileSrc } from '@tauri-apps/api/core'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useVaultStore } from '../../stores/vaultStore'
 
+const MIME_MAP: Record<string, string> = {
+  jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
+  webp: 'image/webp', svg: 'image/svg+xml', bmp: 'image/bmp', ico: 'image/x-icon',
+  tiff: 'image/tiff', tif: 'image/tiff', avif: 'image/avif',
+}
+function guessMime(ext: string): string {
+  return MIME_MAP[ext] ?? 'image/png'
+}
+
 interface FileViewerProps {
   path: string  // relative path from vault root
 }
@@ -26,6 +35,7 @@ export default function FileViewer({ path }: FileViewerProps) {
   const [textContent, setTextContent] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [imageSrc, setImageSrc] = useState<string | null>(null)
 
   const filename = path.split('/').pop() ?? path
   const ext = filename.split('.').pop()?.toLowerCase() ?? ''
@@ -40,6 +50,14 @@ export default function FileViewer({ path }: FileViewerProps) {
   const isText = TEXT_EXTS.includes(ext)
 
   const assetUrl = convertFileSrc(absPath)
+
+  // 圖片：用 read_file_base64 → data URL（相容 Windows，不依賴 asset:// CSP）
+  useEffect(() => {
+    if (!isImage) { setImageSrc(null); return }
+    invoke<string>('read_file_base64', { path: absPath })
+      .then((b64) => setImageSrc(`data:${guessMime(ext)};base64,${b64}`))
+      .catch(() => setImageSrc(assetUrl)) // fallback
+  }, [absPath, isImage])
 
   useEffect(() => {
     if (!isText) { setTextContent(null); return }
@@ -89,9 +107,9 @@ export default function FileViewer({ path }: FileViewerProps) {
         flexDirection: 'column',
         padding: isText ? 0 : 16,
       }}>
-        {isImage && (
+        {isImage && imageSrc && (
           <img
-            src={assetUrl}
+            src={imageSrc}
             alt={filename}
             style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }}
           />

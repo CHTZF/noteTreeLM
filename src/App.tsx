@@ -108,6 +108,13 @@ function reorderInLeaf(root: PaneNode, paneId: string, fromId: string, toId: str
 export default function App() {
   const { session, isLoading: authLoading, checkSession } = useAuthStore()
 
+  // Windows platform detection — adds data-platform="windows" to body for CSS targeting
+  useEffect(() => {
+    if (navigator.userAgent.includes('Windows')) {
+      document.body.dataset.platform = 'windows'
+    }
+  }, [])
+
   // 首次掛載驗證 session
   useEffect(() => { checkSession() }, [])
 

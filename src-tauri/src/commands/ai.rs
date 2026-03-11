@@ -197,9 +197,16 @@ async fn ensure_server_running(
                 Some(child) => {
                     if let Ok(Some(status)) = child.try_wait() {
                         *guard = None;
+                        let hint = match status.code() {
+                            // 0xC0000135 = STATUS_DLL_NOT_FOUND (Windows)
+                            Some(-1073741515) => " 缺少必要的 DLL，請安裝 Visual C++ Redistributable (x64) 或確認 llama-server 版本與 CPU/CUDA 相容。",
+                            // 0xC000007B = STATUS_INVALID_IMAGE_FORMAT (架構不符)
+                            Some(-1073741701) => " 二進位格式不符，請確認 llama-server 為 64-bit Windows 版本。",
+                            _ => "",
+                        };
                         return Err(AppError::AI(format!(
-                            "llama-server 意外退出（code: {:?}），請確認模型路徑與二進位設定。",
-                            status.code()
+                            "llama-server 意外退出（code: {:?}），請確認模型路徑與二進位設定。{}",
+                            status.code(), hint
                         )));
                     }
                 }

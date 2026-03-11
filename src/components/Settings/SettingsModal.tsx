@@ -1245,6 +1245,16 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                 <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '4px 0 0', lineHeight: 1.5 }}>
                   請指向 <code>llama-server</code> 二進位檔（非 llama-cli）
                 </p>
+                <p style={{ fontSize: '11px', color: 'var(--color-warning, #f59e0b)', margin: '6px 0 0', lineHeight: 1.6, padding: '6px 8px', background: 'rgba(245,158,11,0.08)', borderRadius: '5px', borderLeft: '2px solid var(--color-warning, #f59e0b)' }}>
+                  <strong>Windows 用戶：</strong>若啟動失敗（exit code -1073741515），請先安裝{' '}
+                  <a href="https://aka.ms/vs/17/release/vc_redist.x64.exe" target="_blank" rel="noreferrer"
+                    style={{ color: 'var(--color-accent)' }}>Visual C++ Redistributable 2022 (x64)</a>。
+                  <br />
+                  <strong>CUDA 用戶：</strong>自動下載為 CPU 版本。若需 GPU 加速，請至{' '}
+                  <a href="https://github.com/ggml-org/llama.cpp/releases" target="_blank" rel="noreferrer"
+                    style={{ color: 'var(--color-accent)' }}>llama.cpp Releases</a>{' '}
+                  手動下載對應 CUDA 版本（需另安裝 CUDA Toolkit）。
+                </p>
               </div>
               <div style={fieldStyle}>
                 <label style={labelStyle}>自動下載</label>

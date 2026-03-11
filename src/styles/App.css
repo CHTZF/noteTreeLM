@@ -86,6 +86,16 @@
   flex-shrink: 0;
 }
 
+/* Windows renders fonts slightly larger — scale down icon menubar */
+[data-platform="windows"] .icon-menubar {
+  width: 36px;
+}
+[data-platform="windows"] .icon-menubar-btn {
+  width: 20px;
+  height: 20px;
+  font-size: 10px;
+}
+
 /* ─── Loading screen ──────────────────────────────────────────────────────── */
 .app-loading {
   display: flex;

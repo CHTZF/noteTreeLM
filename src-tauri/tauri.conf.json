@@ -29,7 +29,7 @@
         "enable": true,
         "scope": ["**"]
       },
-      "csp": "default-src 'self' asset: vault: data: blob:; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; script-src 'self' 'unsafe-eval'; img-src 'self' asset: vault: data: https: blob:; font-src 'self' data: https://cdn.jsdelivr.net https://fonts.gstatic.com"
+      "csp": "default-src 'self' asset: http://asset.localhost http://vault.localhost vault: data: blob:; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; script-src 'self' 'unsafe-eval'; img-src 'self' asset: http://asset.localhost http://vault.localhost vault: data: https: blob:; media-src 'self' asset: http://asset.localhost http://vault.localhost vault: blob:; font-src 'self' data: https://cdn.jsdelivr.net https://fonts.gstatic.com"
     }
   },
   "bundle": {
@@ -47,6 +47,11 @@
     ],
     "macOS": {
       "minimumSystemVersion": "11.0"
+    },
+    "windows": {
+      "nsis": {
+        "preinstallSection": "nsis/vcredist.nsh"
+      }
     }
   }
 }
