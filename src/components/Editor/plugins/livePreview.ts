@@ -263,34 +263,33 @@ const hrWidget = new HRWidget()
 type DecoEntry = { from: number; to: number; deco: Decoration }
 
 // ── Block decoration builder ──────────────────────────────────────────────────
+// NOTE: no cursor/selection dependency — block widgets are always shown.
+// This allows CM6 to reuse widget DOM nodes across cursor movements and keep
+// accurate height measurements, preventing the "cursor lands 2 lines below
+// click" issue caused by repeated widget recreation + height re-estimation.
 function buildBlockDecos(state: EditorState): DecorationSet {
-  const cursor   = state.selection.main.head
-  const doc      = state.doc
+  const doc   = state.doc
   const decos: DecoEntry[] = []
-  const cursorIn = (from: number, to: number) => cursor >= from && cursor <= to
 
   syntaxTree(state).iterate({
     enter(node: SyntaxNodeRef) {
       const { from, to, name } = node
 
-      // ── Table: always rendered as interactive TableWidget ──────────────
+      // ── Table ─────────────────────────────────────────────────────────
       if (name === 'Table') {
         const tableFirstLine = doc.lineAt(from)
-        const effTo = to > from && doc.lineAt(to).from === to ? to - 1 : to
-        const tableLastLine = doc.lineAt(effTo)
-        const tableBlockTo  = tableLastLine.to < doc.length ? tableLastLine.to + 1 : doc.length
+        const effTo          = to > from && doc.lineAt(to).from === to ? to - 1 : to
+        const tableLastLine  = doc.lineAt(effTo)
+        const tableBlockTo   = tableLastLine.to < doc.length ? tableLastLine.to + 1 : doc.length
         const raw = doc.sliceString(tableFirstLine.from, tableLastLine.to)
         decos.push({
           from: tableFirstLine.from, to: tableBlockTo,
-          deco: Decoration.replace({
-            widget: new TableWidget(raw, tableFirstLine.from),
-            block: true,
-          }),
+          deco: Decoration.replace({ widget: new TableWidget(raw, tableFirstLine.from), block: true }),
         })
         return false
       }
 
-      // ── FencedCode: always rendered as interactive CodeWidget ──────────
+      // ── FencedCode ────────────────────────────────────────────────────
       if (name === 'FencedCode') {
         const fenceFirstLine = doc.lineAt(from)
         const effTo          = to > from && doc.lineAt(to).from === to ? to - 1 : to
@@ -299,25 +298,20 @@ function buildBlockDecos(state: EditorState): DecorationSet {
         const raw = doc.sliceString(fenceFirstLine.from, fenceLastLine.to)
         decos.push({
           from: fenceFirstLine.from, to: fenceBlockTo,
-          deco: Decoration.replace({
-            widget: new CodeWidget(raw, fenceFirstLine.from),
-            block: true,
-          }),
+          deco: Decoration.replace({ widget: new CodeWidget(raw, fenceFirstLine.from), block: true }),
         })
         return false
       }
 
       // ── HorizontalRule ────────────────────────────────────────────────
       if (name === 'HorizontalRule') {
-        if (!cursorIn(from, to)) {
-          const hrFromLine = doc.lineAt(from)
-          const hrLastPos  = (to > from && doc.lineAt(to).from === to) ? to - 1 : to
-          const hrToLine   = doc.lineAt(hrLastPos)
-          const hrFrom = hrFromLine.from
-          const hrTo   = hrToLine.to < doc.length ? hrToLine.to + 1 : doc.length
-          if (hrFrom < hrTo) {
-            decos.push({ from: hrFrom, to: hrTo, deco: Decoration.replace({ widget: hrWidget, block: true }) })
-          }
+        const hrFromLine = doc.lineAt(from)
+        const hrLastPos  = (to > from && doc.lineAt(to).from === to) ? to - 1 : to
+        const hrToLine   = doc.lineAt(hrLastPos)
+        const hrFrom = hrFromLine.from
+        const hrTo   = hrToLine.to < doc.length ? hrToLine.to + 1 : doc.length
+        if (hrFrom < hrTo) {
+          decos.push({ from: hrFrom, to: hrTo, deco: Decoration.replace({ widget: hrWidget, block: true }) })
         }
         return false
       }
@@ -333,12 +327,15 @@ function buildBlockDecos(state: EditorState): DecorationSet {
 }
 
 // ── StateField for block decorations ─────────────────────────────────────────
+// Only rebuild on docChanged — NOT on selection/cursor movement.
+// This keeps CM6's height map stable across cursor movements, fixing the
+// click-position offset caused by widget height re-estimation.
 const liveBlockField = StateField.define<DecorationSet>({
   create(state) {
     try { return buildBlockDecos(state) } catch { return Decoration.none }
   },
   update(decos, tr: Transaction) {
-    if (tr.docChanged || tr.selection) {
+    if (tr.docChanged) {
       try { return buildBlockDecos(tr.state) } catch { return Decoration.none }
     }
     return decos.map(tr.changes)
