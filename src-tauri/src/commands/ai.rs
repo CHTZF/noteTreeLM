@@ -138,8 +138,8 @@ async fn ensure_server_running(
         ),
     );
 
-    let mut child = tokio::process::Command::new(&bin)
-        .args([
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.args([
             "--model",
             &model_path,
             "--port",
@@ -154,7 +154,14 @@ async fn ensure_server_running(
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Windows: CREATE_NO_WINDOW (0x08000000) — prevent console window from appearing
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| AppError::AI(format!("llama-server 啟動失敗：{}", e)))?;
 

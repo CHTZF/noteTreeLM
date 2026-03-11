@@ -325,3 +325,32 @@ pub async fn set_api_key(provider: String, key: String) -> Result<(), AppError> 
     }
     Ok(())
 }
+
+/// 檢查 Windows 是否已安裝 Visual C++ Redistributable 2015-2022 (x64)。
+/// 非 Windows 平台永遠回傳 true（不需要）。
+#[tauri::command]
+pub fn check_vcredist() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        // 用 reg query 查詢 registry，不需要額外 crate
+        let installed = std::process::Command::new("reg")
+            .args([
+                "query",
+                "HKLM\\SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64",
+                "/v", "Installed",
+            ])
+            .output()
+            .ok()
+            .map(|o| {
+                let out = String::from_utf8_lossy(&o.stdout);
+                // 輸出格式：Installed    REG_DWORD    0x1
+                out.contains("0x1")
+            })
+            .unwrap_or(false);
+        installed
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        true
+    }
+}

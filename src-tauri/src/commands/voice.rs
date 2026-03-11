@@ -198,10 +198,16 @@ async fn ensure_whisper_server_running(
             // --flash-attn is a Metal-only flag; passing it on Windows causes the server to exit immediately.
             #[cfg(target_os = "macos")]
             cmd.arg("--flash-attn");
-            let mut child = cmd
-                .stdout(std::process::Stdio::null())
+            cmd.stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped())
-                .kill_on_drop(false)
+                .kill_on_drop(false);
+            // Windows: CREATE_NO_WINDOW (0x08000000) — prevent console window from appearing
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000);
+            }
+            let mut child = cmd
                 .spawn()
                 .map_err(|e| AppError::Voice(format!("無法啟動 whisper-server：{}", e)))?;
 

@@ -18,7 +18,7 @@ use commands::{
                    delete_conversation, update_conversation_title},
     download::*, graph::*, import::*, search::*,
     settings::{get_settings, save_personal_settings, get_system_settings, save_system_settings, get_api_key, set_api_key,
-               get_vault_last_note, set_vault_last_note},
+               get_vault_last_note, set_vault_last_note, check_vcredist},
     vault::*,
     voice::{transcribe_audio, stop_whisper_server, warmup_whisper_server,
             get_whisper_server_status, start_whisper_server, restart_whisper_server},
@@ -118,6 +118,7 @@ pub fn run() {
             set_api_key,
             get_vault_last_note,
             set_vault_last_note,
+            check_vcredist,
             // Vault
             create_note,
             read_note,

@@ -153,6 +153,7 @@ function AppMain() {
   const [showSetupWizard, setShowSetupWizard] = useState(false)
   const [showVaultManager, setShowVaultManager] = useState(false)
   const [showQuickOpen, setShowQuickOpen] = useState(false)
+  const [showVcredistWarning, setShowVcredistWarning] = useState(false)
   const [userMenuOpen, setUserMenuOpen] = useState(false)
   const userMenuRef = useRef<HTMLDivElement>(null)
   const [sidebarWidth, setSidebarWidth] = useState(240)
@@ -162,6 +163,15 @@ function AppMain() {
   useEffect(() => {
     if (!settings.debug_mode && leftPanel === 'debug') setLeftPanel('files')
   }, [settings.debug_mode])
+
+  // Windows: check VC++ Redist and show warning if missing
+  useEffect(() => {
+    if (navigator.userAgent.includes('Windows')) {
+      invoke<boolean>('check_vcredist').then(installed => {
+        if (!installed) setShowVcredistWarning(true)
+      }).catch(() => {})
+    }
+  }, [])
 
   // Tracks whether each chat/livechat tab (by tab id) is currently "active"
   // (streaming or recording) — used for close confirmation
@@ -923,6 +933,13 @@ function AppMain() {
   return (
     <div className="app-layout">
       <TitleBar title={vaultName} />
+      {showVcredistWarning && (
+        <div style={{ background: '#7c3a00', color: '#ffd7a0', fontSize: '12px', padding: '6px 12px', display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+          <span style={{ flex: 1 }}>未偵測到 Visual C++ 2015-2022 Redistributable (x64)，llama-server 可能無法啟動。</span>
+          <a href="https://aka.ms/vs/17/release/vc_redist.x64.exe" target="_blank" rel="noreferrer" style={{ color: '#ffd7a0', textDecoration: 'underline', flexShrink: 0 }}>下載安裝</a>
+          <button onClick={() => setShowVcredistWarning(false)} style={{ background: 'none', border: 'none', color: '#ffd7a0', cursor: 'pointer', padding: '0 4px', fontSize: '14px', flexShrink: 0 }}>✕</button>
+        </div>
+      )}
       <div className="content-row">
 
         {/* ── 左側 Icon Menubar ── */}
