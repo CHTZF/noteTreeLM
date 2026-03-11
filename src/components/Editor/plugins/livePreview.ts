@@ -110,8 +110,6 @@ class TableWidget extends WidgetType {
     if (!_view) return
     const doc = _view.state.doc
     const lines = this.raw.split('\n')
-    // HTML table rows: 0 = header (→ markdown lines[0])
-    //                  1+ = body rows (→ markdown lines[rowIndex + 1], skipping delimiter line)
     const markdownLineIndex = rowIndex === 0 ? 0 : rowIndex + 1
     if (markdownLineIndex >= lines.length) return
 
@@ -123,16 +121,22 @@ class TableWidget extends WidgetType {
     const newLine = buildTableRow(cells)
     if (newLine === oldLine) return
 
-    // Compute doc position: tableFrom + byte offset to this line within raw
+    // Resolve current position: try stored tableFrom first; fall back to full-doc search.
+    // This handles the case where text was inserted before the table (shifting tableFrom).
+    let tablePos = this.tableFrom
+    if (doc.sliceString(tablePos, tablePos + this.raw.length) !== this.raw) {
+      tablePos = doc.toString().indexOf(this.raw)
+      if (tablePos < 0) return
+    }
+
     const lineOffset = lines.slice(0, markdownLineIndex).reduce((s, l) => s + l.length + 1, 0)
-    const lineFrom = this.tableFrom + lineOffset
+    const lineFrom = tablePos + lineOffset
     const lineTo   = lineFrom + oldLine.length
     if (lineFrom < 0 || lineTo > doc.length) return
 
     _view.dispatch({ changes: { from: lineFrom, to: lineTo, insert: newLine } })
   }
 
-  // Return true = the widget handles the event; CM6 does NOT move cursor into the widget range.
   ignoreEvent(e: Event): boolean {
     return ['mousedown', 'mouseup', 'click',
             'keydown', 'keyup', 'keypress',
@@ -141,10 +145,19 @@ class TableWidget extends WidgetType {
             'paste', 'cut', 'copy'].includes(e.type)
   }
 
+  // estimatedHeight: gives CM6 a good initial height estimate before DOM measurement,
+  // preventing click-position offset during the first render cycle.
+  get estimatedHeight(): number {
+    // Visible rows = all markdown lines with '|', minus the delimiter row
+    const visibleRows = Math.max(1, this.raw.split('\n').length - 1)
+    return visibleRows * 37 + 8
+  }
+
+  // eq() does NOT compare tableFrom — position shifts are handled in applyChange.
+  // This allows CM6 to reuse the widget DOM when only the position shifts
+  // (e.g. text inserted before the table), keeping the height map stable.
   eq(other: WidgetType): boolean {
-    return other instanceof TableWidget &&
-      (other as TableWidget).raw === this.raw &&
-      (other as TableWidget).tableFrom === this.tableFrom
+    return other instanceof TableWidget && (other as TableWidget).raw === this.raw
   }
 }
 
@@ -226,9 +239,16 @@ class CodeWidget extends WidgetType {
     if (!_view) return
     const newRaw = `${fence}\n${newContent}\n${closeFence}`
     if (newRaw === this.raw) return
-    const lineTo = this.codeFrom + this.raw.length
-    if (this.codeFrom < 0 || lineTo > _view.state.doc.length) return
-    _view.dispatch({ changes: { from: this.codeFrom, to: lineTo, insert: newRaw } })
+
+    const doc = _view.state.doc
+    // Resolve current position: try stored codeFrom first; fall back to full-doc search.
+    let codePos = this.codeFrom
+    if (doc.sliceString(codePos, codePos + this.raw.length) !== this.raw) {
+      codePos = doc.toString().indexOf(this.raw)
+      if (codePos < 0) return
+    }
+    if (codePos + this.raw.length > doc.length) return
+    _view.dispatch({ changes: { from: codePos, to: codePos + this.raw.length, insert: newRaw } })
   }
 
   ignoreEvent(e: Event): boolean {
@@ -239,10 +259,15 @@ class CodeWidget extends WidgetType {
             'paste', 'cut', 'copy'].includes(e.type)
   }
 
+  get estimatedHeight(): number {
+    const codeLines = Math.max(1, this.raw.split('\n').length - 2)
+    // header(28) + wrapper-border(2) + bottom-margin(4) + textarea-padding(20) + lines
+    return 28 + 2 + 4 + 20 + codeLines * 22
+  }
+
+  // eq() does NOT compare codeFrom — position shifts handled in applyChange.
   eq(other: WidgetType): boolean {
-    return other instanceof CodeWidget &&
-      (other as CodeWidget).raw === this.raw &&
-      (other as CodeWidget).codeFrom === this.codeFrom
+    return other instanceof CodeWidget && (other as CodeWidget).raw === this.raw
   }
 }
 
@@ -256,6 +281,7 @@ class HRWidget extends WidgetType {
     return div
   }
   ignoreEvent(): boolean { return false }
+  get estimatedHeight(): number { return 21 }
   eq(_: WidgetType): boolean { return true }
 }
 const hrWidget = new HRWidget()
