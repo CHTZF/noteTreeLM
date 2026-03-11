@@ -516,7 +516,23 @@ export default function Editor({ onOpenNote }: EditorProps) {
           }}
         />
 
-        {/* 浮動模式切換按鈕（Source 模式下提示切回編輯） */}
+        {/* 浮動模式切換按鈕（live 模式右上角顯示「預覽」，Source 模式顯示「編輯」+「預覽」） */}
+        {viewMode === 'live' && currentPath && (
+          <div style={{ position: 'absolute', top: '10px', right: '16px', zIndex: 10 }}>
+            <button
+              onClick={() => setViewMode('preview')}
+              title="切換為預覽模式"
+              style={{
+                padding: '4px 10px', borderRadius: '6px', fontSize: '12px',
+                background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)',
+                color: 'var(--color-text-secondary)', cursor: 'pointer', opacity: 0.75,
+                transition: 'opacity 0.15s',
+              }}
+              onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
+              onMouseLeave={e => (e.currentTarget.style.opacity = '0.75')}
+            >👁 預覽</button>
+          </div>
+        )}
         {viewMode === 'editor' && currentPath && (
           <div style={{ position: 'absolute', top: '10px', right: '16px', zIndex: 10, display: 'flex', gap: '6px' }}>
             <button
