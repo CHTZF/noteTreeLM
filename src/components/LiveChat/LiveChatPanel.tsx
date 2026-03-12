@@ -51,6 +51,32 @@ const STATE_COLOR: Record<LiveChatState, string> = {
   speaking:     'var(--color-success, #22c55e)',
 }
 
+// ── Vault image parsing ───────────────────────────────────────────────────────
+
+const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'avif'])
+
+type ContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image'; name: string; url: string }
+
+function parseContentParts(content: string): ContentPart[] {
+  const parts = content.split(/!\[\[([^\]]+)\]\]/g)
+  const result: ContentPart[] = []
+  parts.forEach((part, i) => {
+    if (i % 2 === 0) {
+      if (part) result.push({ type: 'text', text: part })
+    } else {
+      const ext = part.split('.').pop()?.toLowerCase() ?? ''
+      if (IMAGE_EXTS.has(ext)) {
+        result.push({ type: 'image', name: part, url: `vault://localhost/${part}` })
+      } else {
+        result.push({ type: 'text', text: `![[${part}]]` })
+      }
+    }
+  })
+  return result
+}
+
 // ── Component ─────────────────────────────────────────────────────────────────
 
 interface LiveChatPanelProps {
@@ -521,7 +547,14 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
               borderBottomRightRadius: msg.role === 'user' ? '4px' : '12px',
               borderBottomLeftRadius: msg.role === 'assistant' ? '4px' : '12px',
             }}>
-              {msg.content}
+              {parseContentParts(msg.content).map((part, idx) =>
+                part.type === 'text'
+                  ? <span key={idx}>{part.text}</span>
+                  : <img key={idx} src={part.url} alt={part.name}
+                      style={{ maxWidth: '100%', borderRadius: '6px', marginTop: '6px', display: 'block' }}
+                      onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none' }}
+                    />
+              )}
               {msg.wikilinks && msg.wikilinks.length > 0 && (
                 <div style={{ marginTop: '6px', display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
                   {msg.wikilinks.map((wl, j) => (

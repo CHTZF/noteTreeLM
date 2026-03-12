@@ -830,6 +830,47 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                   <option value={14}>14px</option>
                 </select>
               </div>
+
+              {/* ── Chat 功能 ────────────────────────────────────────────────── */}
+              <SectionDivider />
+              <SectionHeader label="Chat 功能" />
+              <ToggleRow label="啟用 Chat 功能" value={draft.enable_chat} onChange={(v) => up({ enable_chat: v })} />
+              {draft.enable_chat && (
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 16px 0', lineHeight: 1.5 }}>
+                  開啟後右側面板會新增 Chat 分頁，可與本地 llama LLM 進行對話。需先至系統設定設定 llama 執行檔路徑。
+                </p>
+              )}
+              <ToggleRow label="Chat 自動帶入當前筆記" value={draft.chat_auto_include_note} onChange={(v) => up({ chat_auto_include_note: v })} />
+              {draft.chat_auto_include_note && (
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 16px 0', lineHeight: 1.5 }}>
+                  開啟筆記時，Chat 會自動將目前編輯中的筆記內容注入為 system context，讓 LLM 可直接針對筆記回答。
+                </p>
+              )}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
+                <div>
+                  <span style={{ fontSize: '13px', color: 'var(--color-text-primary)' }}>Vault 寫入確認</span>
+                  <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '3px 0 0', lineHeight: 1.4 }}>
+                    LLM 呼叫寫入工具（新增/更新筆記、新增資料夾）時的確認方式
+                  </p>
+                </div>
+                <div style={{ display: 'flex', gap: '4px', flexShrink: 0, marginLeft: '12px' }}>
+                  {(['always', 'once', 'never'] as const).map((m) => (
+                    <button
+                      key={m}
+                      onClick={() => up({ write_confirm_mode: m })}
+                      style={{
+                        padding: '3px 10px', borderRadius: '4px', fontSize: '12px',
+                        border: '1px solid var(--color-border)',
+                        background: draft.write_confirm_mode === m ? 'var(--color-accent)' : 'transparent',
+                        color: draft.write_confirm_mode === m ? '#fff' : 'var(--color-text-muted)',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      {m === 'always' ? '每次' : m === 'once' ? '本次' : '關閉'}
+                    </button>
+                  ))}
+                </div>
+              </div>
             </>}
 
             {tab === 'ai' && <>
@@ -1028,7 +1069,6 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                   <option value="de">Deutsch</option>
                 </select>
               </div>
-              <ToggleRow label="辨識完成後自動插入編輯器" value={draft.whisper_auto_insert} onChange={(v) => up({ whisper_auto_insert: v })} />
               <ToggleRow
                 label="錄音時顯示即時預覽（定期送 Whisper 預測）"
                 value={draft.voice_preview_enabled ?? true}
@@ -1300,24 +1340,6 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                 </p>
               </div>
 
-              {/* ── AI Features ────────────────────────────────────────────── */}
-              <SectionDivider />
-              <SectionHeader label="AI 功能" />
-              <ToggleRow label="啟用智慧摘要" value={draft.ai_enable_summary} onChange={(v) => up({ ai_enable_summary: v })} />
-              <ToggleRow label="啟用主題分析" value={draft.ai_enable_topics} onChange={(v) => up({ ai_enable_topics: v })} />
-              <ToggleRow label="啟用圖片辨識" value={draft.ai_enable_vision} onChange={(v) => up({ ai_enable_vision: v })} />
-              <ToggleRow label="啟用 Chat 功能" value={draft.enable_chat} onChange={(v) => up({ enable_chat: v })} />
-              {draft.enable_chat && (
-                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 16px 0', lineHeight: 1.5 }}>
-                  開啟後右側面板會新增 Chat 分頁，可與本地 llama LLM 進行對話。需先設定上方的 llama CLI 路徑。
-                </p>
-              )}
-              <ToggleRow label="Chat 自動帶入當前筆記" value={draft.chat_auto_include_note} onChange={(v) => up({ chat_auto_include_note: v })} />
-              {draft.chat_auto_include_note && (
-                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 16px 0', lineHeight: 1.5 }}>
-                  開啟筆記時，Chat 會自動將目前編輯中的筆記內容注入為 system context，讓 LLM 可直接針對筆記回答。
-                </p>
-              )}
 
               {/* ── Chat & Memory ──────────────────────────────────────────── */}
               <SectionDivider />
@@ -1344,32 +1366,6 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                   </div>
                 </>
               )}
-              {/* 寫入確認模式 */}
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
-                <div>
-                  <span style={{ fontSize: '13px', color: 'var(--color-text-primary)' }}>Vault 寫入確認</span>
-                  <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '3px 0 0', lineHeight: 1.4 }}>
-                    LLM 呼叫寫入工具（新增/更新筆記、新增資料夾）時的確認方式
-                  </p>
-                </div>
-                <div style={{ display: 'flex', gap: '4px', flexShrink: 0, marginLeft: '12px' }}>
-                  {(['always', 'once', 'never'] as const).map((mode) => (
-                    <button
-                      key={mode}
-                      onClick={() => up({ write_confirm_mode: mode })}
-                      style={{
-                        padding: '3px 10px', borderRadius: '4px', fontSize: '12px',
-                        border: '1px solid var(--color-border)',
-                        background: draft.write_confirm_mode === mode ? 'var(--color-accent)' : 'transparent',
-                        color: draft.write_confirm_mode === mode ? '#fff' : 'var(--color-text-muted)',
-                        cursor: 'pointer',
-                      }}
-                    >
-                      {mode === 'always' ? '每次' : mode === 'once' ? '本次' : '關閉'}
-                    </button>
-                  ))}
-                </div>
-              </div>
 
               {/* ── Model Management ───────────────────────────────────────── */}
               <SectionDivider />
