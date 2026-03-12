@@ -181,13 +181,17 @@ jobs:
       - name: Build whisper-server (Windows, static)
         if: steps.check.outputs.exists == '0'
         shell: cmd
+        env:
+          OPENSSL_ROOT_DIR: ""
+          OPENSSL_DIR: ""
         run: |
           cmake -S whisper-src -B whisper-build ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DWHISPER_BUILD_SERVER=ON ^
             -DWHISPER_BUILD_TESTS=OFF ^
             -DBUILD_SHARED_LIBS=OFF ^
-            -DGGML_CURL=OFF
+            -DGGML_CURL=OFF ^
+            -DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=TRUE
 
           cmake --build whisper-build ^
             --target whisper-server ^
