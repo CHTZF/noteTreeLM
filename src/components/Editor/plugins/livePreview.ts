@@ -810,6 +810,29 @@ function buildInlineDecos(view: EditorView): DecorationSet {
     }
   }
 
+  // ── Obsidian-style vault embed: ![[path]] or ![[path|size]] ───────────────
+  const vaultImgRe = /!\[\[([^\]]+)\]\]/g
+  for (const { from: vpFrom, to: vpTo } of view.visibleRanges) {
+    const text = doc.sliceString(vpFrom, vpTo)
+    let m: RegExpExecArray | null
+    vaultImgRe.lastIndex = 0
+    while ((m = vaultImgRe.exec(text)) !== null) {
+      const inner = m[1] // e.g. "assets/photo.png" or "assets/photo.png|300"
+      const parts = inner.split('|')
+      const relPath = parts[0].trim()
+      const ext = relPath.split('.').pop()?.toLowerCase() ?? ''
+      if (!['png','jpg','jpeg','gif','webp','svg','bmp','avif'].includes(ext)) continue
+      const mFrom = vpFrom + m.index
+      const mTo = mFrom + m[0].length
+      const src = `vault://localhost/${relPath}`
+      const suffix = parts.slice(1).join('|') // e.g. "300" or "name|300" or ""
+      // ImageWidget parses alt as "name|size" — if suffix starts with a digit it's a bare
+      // size (no name), so prepend | so the last-|index logic picks it up correctly.
+      const alt = suffix && /^\d/.test(suffix) ? `|${suffix}` : suffix
+      add(mFrom, mTo, Decoration.replace({ widget: new ImageWidget(src, alt, mFrom, mTo) }))
+    }
+  }
+
   // ── Quick-copy HTML spans ──────────────────────────────────────────────────
   // Always rendered (no cursorIn check). Right-click opens the edit modal.
   const quickCopyRe = /<span class="quick-copy" data-copy="([^"]*)"([^>]*)>(.*?)<\/span>/g

@@ -75,6 +75,31 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
   const [apiKey, setApiKeyLocal] = useState('')
   const [apiKeySaved, setApiKeySaved] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
+  const [recordingKey, setRecordingKey] = useState<string | null>(null)
+
+  const isMac = navigator.platform.startsWith('Mac')
+  const displayHotkey = (combo: string) => {
+    if (!combo) return '未設定'
+    return combo.split('+').map(p => {
+      if (p === 'mod') return isMac ? '⌘' : 'Ctrl'
+      if (p === 'ctrl') return '⌃'
+      if (p === 'alt') return isMac ? '⌥' : 'Alt'
+      if (p === 'shift') return '⇧'
+      return p.length === 1 ? p.toUpperCase() : p
+    }).join(isMac ? '' : '+')
+  }
+  const captureKey = (e: React.KeyboardEvent, field: keyof Settings) => {
+    e.preventDefault()
+    e.stopPropagation()
+    if (['Meta', 'Control', 'Alt', 'Shift'].includes(e.key)) return
+    const parts: string[] = []
+    if (e.metaKey || e.ctrlKey) parts.push('mod')
+    if (e.shiftKey) parts.push('shift')
+    if (e.altKey) parts.push('alt')
+    parts.push(e.key.toLowerCase())
+    up({ [field]: parts.join('+') } as any)
+    setRecordingKey(null)
+  }
 
   const [whisperStatus, setWhisperStatus] = useState<ServerStatus>('unknown')
   const [llamaStatus, setLlamaStatus] = useState<ServerStatus>('unknown')
@@ -871,6 +896,46 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                   ))}
                 </div>
               </div>
+
+              {/* ── 快捷鍵 ────────────────────────────────────────────────── */}
+              <SectionDivider />
+              <SectionHeader label="快捷鍵" />
+              {([
+                ['hotkey_toggle_view', '切換即時／預覽'],
+                ['hotkey_save',        '儲存'],
+                ['hotkey_bold',        '粗體'],
+                ['hotkey_italic',      '斜體'],
+              ] as [keyof Settings, string][]).map(([field, label]) => {
+                const isRecording = recordingKey === field
+                return (
+                  <div key={field} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
+                    <span style={{ fontSize: '13px', color: 'var(--color-text-primary)' }}>{label}</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <button
+                        onKeyDown={isRecording ? (e) => captureKey(e, field) : undefined}
+                        onBlur={() => { if (isRecording) setRecordingKey(null) }}
+                        onClick={() => setRecordingKey(isRecording ? null : field)}
+                        style={{
+                          minWidth: '90px', padding: '3px 10px', borderRadius: '5px', fontSize: '13px',
+                          border: `1px solid ${isRecording ? 'var(--color-accent)' : 'var(--color-border)'}`,
+                          background: isRecording ? 'var(--color-accent-dim, rgba(10,132,255,0.08))' : 'var(--color-bg-base)',
+                          color: isRecording ? 'var(--color-accent)' : 'var(--color-text-primary)',
+                          cursor: 'pointer', textAlign: 'center' as const, fontFamily: 'monospace',
+                          outline: 'none',
+                        }}
+                        autoFocus={isRecording}
+                      >
+                        {isRecording ? '按下快捷鍵…' : displayHotkey(String(draft[field] ?? ''))}
+                      </button>
+                      {draft[field] && (
+                        <button onClick={() => up({ [field]: '' } as any)}
+                          style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-text-muted)', fontSize: '14px', lineHeight: 1, padding: '2px 4px' }}
+                          title="清除">×</button>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
             </>}
 
             {tab === 'ai' && <>

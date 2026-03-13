@@ -21,6 +21,40 @@
   pointer-events: none;
 }
 
+/* Windows 視窗控制按鈕 */
+.app-titlebar-controls {
+  display: flex;
+  align-items: stretch;
+  position: absolute;
+  right: 0;
+  top: 0;
+  height: 100%;
+  -webkit-app-region: no-drag;
+}
+
+.titlebar-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 46px;
+  height: 100%;
+  background: transparent;
+  border: none;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+
+.titlebar-btn:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+
+.titlebar-btn-close:hover {
+  background: #c42b1c;
+  color: #fff;
+}
+
 /* ─── App Layout ──────────────────────────────────────────────────────────── */
 .app-layout {
   display: flex;
@@ -45,7 +79,7 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  width: 44px;
+  width: var(--icon-menubar-width);
   flex-shrink: 0;
   padding: 6px 0;
   gap: 2px;
@@ -57,14 +91,13 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 34px;
-  height: 34px;
+  width: var(--icon-menubar-btn-size);
+  height: var(--icon-menubar-btn-size);
   border-radius: var(--radius-md);
   border: none;
   background: transparent;
-  /* iOS inactive icon: "tertiary label" — more visible than muted */
   color: var(--color-text-secondary);
-  font-size: 17px;
+  font-size: var(--icon-menubar-btn-font);
   cursor: pointer;
   transition: background 0.12s, color 0.12s;
   -webkit-app-region: no-drag;
@@ -86,15 +119,6 @@
   flex-shrink: 0;
 }
 
-/* Windows renders fonts slightly larger — scale down icon menubar */
-[data-platform="windows"] .icon-menubar {
-  width: 36px;
-}
-[data-platform="windows"] .icon-menubar-btn {
-  width: 20px;
-  height: 20px;
-  font-size: 10px;
-}
 
 /* ─── Loading screen ──────────────────────────────────────────────────────── */
 .app-loading {

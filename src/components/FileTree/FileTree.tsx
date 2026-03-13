@@ -337,7 +337,7 @@ export default function FileTree({ onOpenNote }: FileTreeProps) {
           { icon: faArrowUpZA,   title: '依名稱降序（Z→A）', onClick: () => applySortByName(fileTree, 'desc') },
         ] as const).map(btn => (
           <button key={btn.title} onClick={btn.onClick} title={btn.title}
-            style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-text-secondary)', fontSize: '15px', width: '28px', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '5px', opacity: 0.65, flexShrink: 0 }}
+            style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-text-secondary)', fontSize: 'var(--icon-tree-btn-font)', width: 'var(--icon-tree-btn-size)', height: 'var(--icon-tree-btn-size)', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '5px', opacity: 0.65, flexShrink: 0 }}
             onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.opacity = '1'; (e.currentTarget as HTMLElement).style.background = 'var(--color-bg-hover)' }}
             onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = '0.65'; (e.currentTarget as HTMLElement).style.background = 'none' }}>
             <FontAwesomeIcon icon={btn.icon} />
@@ -486,7 +486,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
         onMouseEnter={() => setIsHovered(true)}
         onMouseLeave={() => setIsHovered(false)}
         style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '3px 8px 3px ' + (8 + depth * 16) + 'px', cursor: 'pointer', fontSize: '13px', color: 'var(--color-text-secondary)', background: isHovered ? 'var(--color-bg-hover)' : 'transparent', borderRadius: '6px', margin: '0 4px', transition: 'background 0.1s', userSelect: 'none' }}>
-        <FontAwesomeIcon icon={getFileIcon(node.name, node.isImage).icon} style={{ fontSize: '13px', width: '13px', height: '13px', flexShrink: 0, color: getFileIcon(node.name, node.isImage).color }} />
+        <FontAwesomeIcon icon={getFileIcon(node.name, node.isImage).icon} style={{ fontSize: 'var(--icon-tree-item-font)', width: 'var(--icon-tree-item-font)', height: 'var(--icon-tree-item-font)', flexShrink: 0, color: getFileIcon(node.name, node.isImage).color }} />
         {isRenaming ? (
           <input
             ref={renameInputRef}
@@ -700,8 +700,8 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
           onMouseEnter={() => setIsHovered(true)}
           onMouseLeave={() => setIsHovered(false)}
           style={{ display: 'flex', alignItems: 'center', gap: '4px', padding: '3px 8px 3px ' + (8 + depth * 16) + 'px', cursor: 'pointer', fontSize: '13px', color: 'var(--color-text-secondary)', userSelect: 'none', position: 'relative' }}>
-          <FontAwesomeIcon icon={faChevronRight} style={{ fontSize: '10px', width: '10px', height: '10px', flexShrink: 0, color: FOLDER_COLOR, transform: isExpanded ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.18s ease' }} />
-          <FontAwesomeIcon icon={isExpanded ? faFolderOpen : faFolder} style={{ fontSize: '13px', width: '13px', height: '13px', flexShrink: 0, color: FOLDER_COLOR }} />
+          <FontAwesomeIcon icon={faChevronRight} style={{ fontSize: 'var(--icon-tree-chevron)', width: 'var(--icon-tree-chevron)', height: 'var(--icon-tree-chevron)', flexShrink: 0, color: FOLDER_COLOR, transform: isExpanded ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.18s ease' }} />
+          <FontAwesomeIcon icon={isExpanded ? faFolderOpen : faFolder} style={{ fontSize: 'var(--icon-tree-item-font)', width: 'var(--icon-tree-item-font)', height: 'var(--icon-tree-item-font)', flexShrink: 0, color: FOLDER_COLOR }} />
           {isRenaming ? (
             <input
               ref={renameInputRef}
@@ -885,7 +885,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
         borderRadius: '6px', margin: '0 4px',
         transition: 'background 0.1s', userSelect: 'none',
       }}>
-      <FontAwesomeIcon icon={getFileIcon(node.name).icon} style={{ fontSize: '13px', width: '13px', height: '13px', flexShrink: 0, color: getFileIcon(node.name).color }} />
+      <FontAwesomeIcon icon={getFileIcon(node.name).icon} style={{ fontSize: 'var(--icon-tree-item-font)', width: 'var(--icon-tree-item-font)', height: 'var(--icon-tree-item-font)', flexShrink: 0, color: getFileIcon(node.name).color }} />
       {isRenaming ? (
         <input
           ref={renameInputRef}
@@ -932,7 +932,7 @@ function MenuItem({ icon, label, danger, active, onClick }: MenuItemProps) {
   return (
     <button onClick={onClick} onMouseEnter={() => setHovered(true)} onMouseLeave={() => setHovered(false)}
       style={{ display: 'flex', alignItems: 'center', gap: '8px', width: '100%', padding: '6px 12px', fontSize: '13px', textAlign: 'left', color, background: hovered ? 'var(--color-bg-hover)' : 'transparent', cursor: 'pointer', fontWeight: active ? 600 : 400 }}>
-      <FontAwesomeIcon icon={icon} style={{ fontSize: '11px', width: '11px', height: '11px', flexShrink: 0 }} />{label}
+      <FontAwesomeIcon icon={icon} style={{ fontSize: 'var(--icon-ctx-font)', width: 'var(--icon-ctx-font)', height: 'var(--icon-ctx-font)', flexShrink: 0 }} />{label}
     </button>
   )
 }

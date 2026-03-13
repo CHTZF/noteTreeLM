@@ -72,6 +72,28 @@
   --graph-min-width:   240px;
   --graph-max-width:   480px;
   --titlebar-height:   28px;
+
+  /* Icon sizes — overridden per platform below */
+  --icon-menubar-btn-size: 34px;
+  --icon-menubar-btn-font: 17px;
+  --icon-menubar-width:    44px;
+  --icon-tree-btn-size:    28px;
+  --icon-tree-btn-font:    15px;
+  --icon-tree-item-font:   13px;
+  --icon-tree-chevron:     10px;
+  --icon-ctx-font:         11px;
+}
+
+/* Windows: scale all icons down for consistent, compact look */
+[data-platform="windows"] {
+  --icon-menubar-btn-size: 28px;
+  --icon-menubar-btn-font: 14px;
+  --icon-menubar-width:    30px;
+  --icon-tree-btn-size:    24px;
+  --icon-tree-btn-font:    13px;
+  --icon-tree-item-font:   12px;
+  --icon-tree-chevron:     9px;
+  --icon-ctx-font:         10px;
 }
 
 /* ─── Light Theme — iOS / macOS Light ───────────────────────────────────── */

@@ -802,15 +802,31 @@ pub async fn import_image(
     state: State<'_, AppState>,
     source_path: String,
     folder: Option<String>,
+    new_name: Option<String>,
 ) -> Result<String, AppError> {
     let vault_path = state.get_vault_path().await;
     if vault_path.is_empty() {
         return Err(AppError::Vault("尚未設定 Vault 路徑".to_string()));
     }
-    let filename = PathBuf::from(&source_path)
+    let orig_filename = PathBuf::from(&source_path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .ok_or_else(|| AppError::Vault("無效的檔案路徑".to_string()))?;
+    // If new_name provided, use it; preserve original extension if new_name has no extension
+    let filename = if let Some(name) = new_name.filter(|n| !n.trim().is_empty()) {
+        let name = name.trim().to_string();
+        if PathBuf::from(&name).extension().is_some() {
+            name
+        } else {
+            let orig_ext = PathBuf::from(&orig_filename)
+                .extension()
+                .map(|e| e.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if orig_ext.is_empty() { name } else { format!("{}.{}", name, orig_ext) }
+        }
+    } else {
+        orig_filename
+    };
     let folder = folder.unwrap_or_default();
     let rel_path = if folder.is_empty() {
         filename.clone()
@@ -875,6 +891,7 @@ async fn collect_assets(
 pub async fn download_asset_to_vault(
     state: State<'_, AppState>,
     url: String,
+    new_name: Option<String>,
 ) -> Result<String, AppError> {
     let vault_path = state.get_vault_path().await;
     if vault_path.is_empty() {
@@ -900,16 +917,32 @@ pub async fn download_asset_to_vault(
         return Err(AppError::Vault(format!("URL 回應不是圖片（Content-Type: {}）", content_type)));
     }
 
-    // 從 URL 取得檔名（去除 query string）
+    // 從 URL 取得副檔名
     let raw_name = url.split('?').next().unwrap_or(&url)
         .split('/').last().unwrap_or("image");
-    // 若沒有副檔名，從 Content-Type 補上
-    let filename = if raw_name.contains('.') {
+    let url_ext = if raw_name.contains('.') {
+        raw_name.split('.').last().unwrap_or("").to_string()
+    } else {
+        String::new()
+    };
+    let ct_ext = {
+        let e = content_type.split('/').nth(1).unwrap_or("png");
+        e.split(';').next().unwrap_or("png").to_string()
+    };
+
+    // 決定最終檔名：優先使用 new_name（保留副檔名邏輯）
+    let filename = if let Some(name) = new_name.filter(|n| !n.trim().is_empty()) {
+        let name = name.trim().to_string();
+        if PathBuf::from(&name).extension().is_some() {
+            name
+        } else {
+            let ext = if !url_ext.is_empty() { url_ext } else { ct_ext };
+            format!("{}.{}", name, ext)
+        }
+    } else if raw_name.contains('.') {
         raw_name.to_string()
     } else {
-        let ext = content_type.split('/').nth(1).unwrap_or("png");
-        let ext = ext.split(';').next().unwrap_or("png");
-        format!("{}.{}", raw_name, ext)
+        format!("{}.{}", raw_name, ct_ext)
     };
 
     let bytes = resp.bytes().await

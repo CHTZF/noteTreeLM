@@ -50,8 +50,10 @@ pub fn run() {
             app.manage(commands::download::DownloadState::new());
 
             let app_handle = app.handle().clone();
-            tauri::async_runtime::block_on(async move {
-                // 初始化資料庫
+
+            // 只同步完成最小必要初始化：settings DB + manage state
+            // 其餘（vault DB、FileWatcher、server warmup）移至背景，讓視窗盡快顯示
+            let state = tauri::async_runtime::block_on(async {
                 let app_data_dir = app_handle
                     .path()
                     .app_data_dir()
@@ -61,41 +63,42 @@ pub fn run() {
                     .await
                     .expect("設定資料庫初始化失敗");
 
-                let state = AppState::new(settings_pool);
+                AppState::new(settings_pool)
+            });
 
-                // 載入已設定的 system_current_vault_path，並初始化 vault DB
+            app_handle.manage(state);
+
+            // Windows：移除原生 title bar，改用自訂 TitleBar 元件
+            #[cfg(target_os = "windows")]
+            if let Some(window) = app_handle.get_webview_window("main") {
+                let _ = window.set_decorations(false);
+            }
+
+            // 背景完成 vault DB 初始化、FileWatcher、server warmup
+            tauri::async_runtime::spawn(async move {
+                let state = app_handle.state::<AppState>();
+
+                // 載入已設定的 vault 路徑
                 if let Ok(Some(vp)) = db::queries::get_setting(&state.settings_db, "system_current_vault_path").await {
                     if !vp.is_empty() {
                         state.set_vault_path(vp.clone()).await;
                         let path = std::path::PathBuf::from(&vp);
                         if path.exists() {
-                            // 初始化 vault DB
                             if let Ok(vault_pool) = db::init_vault_db(&path).await {
                                 state.set_vault_db(Some(vault_pool)).await;
                             }
-                            // 啟動 FileWatcher
                             let stop_tx = vault::watcher::start_watcher(app_handle.clone(), path);
                             *state.watcher_stop.lock().await = Some(stop_tx);
                         }
                     }
                 }
 
-                app_handle.manage(state);
-
-                // 背景預熱 whisper-server 與 llama-server（若已設定路徑）
-                // 延遲 2 秒讓前端 React app 完成掛載並 register 事件監聽器，
-                // 確保 whisper:stderr / llm:stderr 事件能被捕獲
-                let warmup_app = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    if let Some(state) = warmup_app.try_state::<AppState>() {
-                        // 並行預熱兩個 server，互不阻塞
-                        tokio::join!(
-                            warmup_whisper_server(&state, &warmup_app),
-                            warmup_llama_server(&state, &warmup_app),
-                        );
-                    }
-                });
+                // 預熱 whisper-server 與 llama-server（延遲 2 秒等前端 register 監聽器）
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::join!(
+                    warmup_whisper_server(&state, &app_handle),
+                    warmup_llama_server(&state, &app_handle),
+                );
             });
 
             Ok(())

@@ -47,6 +47,10 @@ export interface Settings {
   avatar_image: string
   show_agent_tools: boolean
   file_sort_type: 'none' | 'asc' | 'desc'
+  hotkey_toggle_view: string
+  hotkey_save: string
+  hotkey_bold: string
+  hotkey_italic: string
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -98,4 +102,8 @@ export const DEFAULT_SETTINGS: Settings = {
   avatar_image: '',
   show_agent_tools: false,
   file_sort_type: 'none',
+  hotkey_toggle_view: 'mod+e',
+  hotkey_save: 'mod+s',
+  hotkey_bold: 'mod+b',
+  hotkey_italic: 'mod+i',
 }

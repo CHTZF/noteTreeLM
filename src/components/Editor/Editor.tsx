@@ -42,6 +42,7 @@ export default function Editor({ onOpenNote }: EditorProps) {
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Ref so the CM6 updateListener always calls the latest version (avoids stale closure)
   const triggerAutoSaveRef = useRef<(content: string) => void>(() => {})
+  const handleActionRef = useRef<(action: EditorAction) => void>(() => {})
   // Compartment to toggle live preview extension dynamically
   const liveCompartment = useRef(new Compartment())
 
@@ -63,7 +64,6 @@ export default function Editor({ onOpenNote }: EditorProps) {
   // ── Image modal state ─────────────────────────────────────────────────────
   const [imageModal, setImageModal] = useState<{ from: number; to: number } | null>(null)
   const [imgSize, setImgSize] = useState('')
-  const [imgAlt, setImgAlt] = useState('')
   const [vaultImages, setVaultImages] = useState<string[]>([])
   const [vaultImgFilter, setVaultImgFilter] = useState('')
   const [vaultImgSelected, setVaultImgSelected] = useState('')
@@ -74,6 +74,8 @@ export default function Editor({ onOpenNote }: EditorProps) {
   const [importUrlError, setImportUrlError] = useState('')
   const [importBusy, setImportBusy] = useState(false)
   const [importError, setImportError] = useState('')
+  const [importName, setImportName] = useState('')
+  const [importFilePath, setImportFilePath] = useState('')
 
   const openNote = useCallback((path: string) => {
     onOpenNote(path)
@@ -181,14 +183,41 @@ export default function Editor({ onOpenNote }: EditorProps) {
     }
   }, [currentPath, content, isDirty])
 
-  // Cmd+S 儲存
+  // 全域快捷鍵（依設定）
   useEffect(() => {
+    const matchHotkey = (e: KeyboardEvent, combo: string) => {
+      if (!combo) return false
+      const parts = combo.split('+')
+      const key = parts[parts.length - 1]
+      const needMod   = parts.includes('mod')
+      const needShift = parts.includes('shift')
+      const needAlt   = parts.includes('alt')
+      const needCtrl  = parts.includes('ctrl')
+      if ((e.metaKey || e.ctrlKey) !== needMod) return false
+      if (e.shiftKey !== needShift) return false
+      if (e.altKey   !== needAlt)   return false
+      if (needCtrl && !e.ctrlKey)   return false
+      return e.key.toLowerCase() === key
+    }
     const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); save() }
+      if (matchHotkey(e, settings.hotkey_save ?? 'mod+s')) {
+        e.preventDefault(); save(); return
+      }
+      if (matchHotkey(e, settings.hotkey_toggle_view ?? 'mod+e')) {
+        e.preventDefault()
+        setViewMode(viewMode === 'live' ? 'preview' : 'live')
+        return
+      }
+      if (matchHotkey(e, settings.hotkey_bold ?? 'mod+b')) {
+        e.preventDefault(); handleActionRef.current('bold'); return
+      }
+      if (matchHotkey(e, settings.hotkey_italic ?? 'mod+i')) {
+        e.preventDefault(); handleActionRef.current('italic'); return
+      }
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [save])
+  }, [save, settings.hotkey_save, settings.hotkey_toggle_view, settings.hotkey_bold, settings.hotkey_italic, viewMode, setViewMode])
 
   // 外部寫入同步：ChatPanel 等外部呼叫 applyExternalWrite 後，把新內容同步到 CM6 視圖
   useEffect(() => {
@@ -270,7 +299,6 @@ export default function Editor({ onOpenNote }: EditorProps) {
       }
       case 'image': {
         setImgSize('')
-        setImgAlt(selected)
         setVaultImgFilter('')
         setVaultImgSelected('')
         setImportPage(false)
@@ -278,6 +306,8 @@ export default function Editor({ onOpenNote }: EditorProps) {
         setImportUrl('')
         setImportUrlError('')
         setImportError('')
+        setImportName('')
+        setImportFilePath('')
         setImageModal({ from, to })
         loadVaultImages()
         return
@@ -416,9 +446,7 @@ export default function Editor({ onOpenNote }: EditorProps) {
       // Parse alt — may contain |size suffix, e.g. "photo|300"
       const barIdx = data.alt.lastIndexOf('|')
       const hasSize = barIdx !== -1 && /^\d/.test(data.alt.slice(barIdx + 1))
-      const altClean = hasSize ? data.alt.slice(0, barIdx) : data.alt
-      const size     = hasSize ? data.alt.slice(barIdx + 1) : ''
-      setImgAlt(altClean)
+      const size     = hasSize ? data.alt.slice(barIdx + 1) : data.alt
       setImgSize(size)
       // If the src is a vault:// URL, pre-select the vault image
       const vaultPrefix = 'vault://localhost/'
@@ -434,13 +462,15 @@ export default function Editor({ onOpenNote }: EditorProps) {
       setImportUrl('')
       setImportUrlError('')
       setImportError('')
+      setImportName('')
+      setImportFilePath('')
       setImageModal({ from: data.from, to: data.to })
       loadVaultImages()
     })
     return () => setLiveEditImageHandler(null)
   }, [loadVaultImages])
 
-  const handleImportFile = useCallback(async () => {
+  const handlePickFile = useCallback(async () => {
     try {
       const file = await openDialog({
         multiple: false,
@@ -448,19 +478,38 @@ export default function Editor({ onOpenNote }: EditorProps) {
       })
       if (!file) return
       const srcPath = typeof file === 'string' ? file : (file as any).path ?? String(file)
-      setImportBusy(true)
+      const basename = srcPath.split(/[\\/]/).pop() ?? ''
+      setImportFilePath(srcPath)
+      setImportName(basename)
+      setImportMode('file')
       setImportError('')
-      const relPath = await invoke<string>('import_image', { sourcePath: srcPath, folder: 'assets' })
+    } catch (e: any) {
+      setImportError(e?.message ?? String(e))
+    }
+  }, [])
+
+  const handleConfirmFileCopy = useCallback(async () => {
+    if (!importFilePath) return
+    setImportBusy(true)
+    setImportError('')
+    try {
+      const relPath = await invoke<string>('import_image', {
+        sourcePath: importFilePath,
+        folder: 'assets',
+        newName: importName.trim() || null,
+      })
       await loadVaultImages()
       setVaultImgSelected(relPath)
       setImportPage(false)
       setImportMode(null)
+      setImportFilePath('')
+      setImportName('')
     } catch (e: any) {
       setImportError(e?.message ?? String(e))
     } finally {
       setImportBusy(false)
     }
-  }, [loadVaultImages])
+  }, [importFilePath, importName, loadVaultImages])
 
   const handleImportUrl = useCallback(async () => {
     const url = importUrl.trim()
@@ -473,26 +522,29 @@ export default function Editor({ onOpenNote }: EditorProps) {
     setImportError('')
     setImportUrlError('')
     try {
-      const relPath = await invoke<string>('download_asset_to_vault', { url })
+      const relPath = await invoke<string>('download_asset_to_vault', {
+        url,
+        newName: importName.trim() || null,
+      })
       await loadVaultImages()
       setVaultImgSelected(relPath)
       setImportPage(false)
       setImportMode(null)
       setImportUrl('')
+      setImportName('')
     } catch (e: any) {
       setImportError(e?.message ?? String(e))
     } finally {
       setImportBusy(false)
     }
-  }, [importUrl, loadVaultImages])
+  }, [importUrl, importName, loadVaultImages])
 
   const confirmImageInsert = useCallback(() => {
     if (!imageModal || !vaultImgSelected) return
     const view = viewRef.current
     if (!view) return
-    const name = imgAlt.trim()
     const size = imgSize.trim()
-    const suffix = name && size ? `|${name}|${size}` : name ? `|${name}` : size ? `|${size}` : ''
+    const suffix = size ? `|${size}` : ''
     const insert = `![[${vaultImgSelected}${suffix}]]`
     view.dispatch({
       changes: { from: imageModal.from, to: imageModal.to, insert },
@@ -500,7 +552,10 @@ export default function Editor({ onOpenNote }: EditorProps) {
     })
     setImageModal(null)
     view.focus()
-  }, [imageModal, vaultImgSelected, imgAlt, imgSize])
+  }, [imageModal, vaultImgSelected, imgSize])
+
+  // 每次 handleAction 更新時同步給 ref（供 keydown handler 使用）
+  useEffect(() => { handleActionRef.current = handleAction }, [handleAction])
 
   const applyCmAction = useCallback((action: string) => {
     setCmCtxMenu(null)
@@ -866,23 +921,17 @@ export default function Editor({ onOpenNote }: EditorProps) {
                     ))}
                   </div>
 
-                  {/* 大小 / 顯示名稱 */}
-                  <div style={{ display: 'flex', gap: '8px' }}>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', color: 'var(--color-text-secondary)', flex: 1 }}>
-                      大小
-                      <input value={imgSize} onChange={e => setImgSize(e.target.value)} placeholder="300 或 50%" style={{ flex: 1, padding: '4px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }} />
-                    </label>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', color: 'var(--color-text-secondary)', flex: 1 }}>
-                      名稱
-                      <input value={imgAlt} onChange={e => setImgAlt(e.target.value)} placeholder="（選填）" style={{ flex: 1, padding: '4px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }} />
-                    </label>
-                  </div>
+                  {/* 大小 */}
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', color: 'var(--color-text-secondary)' }}>
+                    大小
+                    <input value={imgSize} onChange={e => setImgSize(e.target.value)} placeholder="300 或 50%" style={{ flex: 1, padding: '4px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }} />
+                  </label>
 
                   {/* 預覽格式 */}
                   {vaultImgSelected && (
                     <div style={{ fontSize: '11px', color: 'var(--color-text-muted)', lineHeight: 1.4 }}>
                       插入：<code style={{ color: 'var(--color-accent)' }}>
-                        {`![[${vaultImgSelected}${imgAlt.trim() && imgSize.trim() ? `|${imgAlt.trim()}|${imgSize.trim()}` : imgAlt.trim() ? `|${imgAlt.trim()}` : imgSize.trim() ? `|${imgSize.trim()}` : ''}]]`}
+                        {`![[${vaultImgSelected}${imgSize.trim() ? `|${imgSize.trim()}` : ''}]]`}
                       </code>
                     </div>
                   )}
@@ -920,7 +969,7 @@ export default function Editor({ onOpenNote }: EditorProps) {
                   {importMode === null && (
                     <div style={{ display: 'flex', gap: '12px' }}>
                       <button
-                        onClick={handleImportFile}
+                        onClick={handlePickFile}
                         style={btnBase}
                         onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--color-accent)'; e.currentTarget.style.background = 'var(--color-accent-dim, rgba(10,132,255,0.08))' }}
                         onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--color-border)'; e.currentTarget.style.background = 'var(--color-bg-base)' }}
@@ -930,7 +979,7 @@ export default function Editor({ onOpenNote }: EditorProps) {
                         <span style={{ fontSize: '11px', color: 'var(--color-text-muted)', textAlign: 'center' }}>從本機選取並複製到工作區</span>
                       </button>
                       <button
-                        onClick={() => setImportMode('url')}
+                        onClick={() => { setImportMode('url'); setImportName(''); setImportUrl(''); setImportUrlError('') }}
                         style={btnBase}
                         onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--color-accent)'; e.currentTarget.style.background = 'var(--color-accent-dim, rgba(10,132,255,0.08))' }}
                         onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--color-border)'; e.currentTarget.style.background = 'var(--color-bg-base)' }}
@@ -939,6 +988,36 @@ export default function Editor({ onOpenNote }: EditorProps) {
                         <span style={{ fontWeight: 500 }}>網址圖片</span>
                         <span style={{ fontSize: '11px', color: 'var(--color-text-muted)', textAlign: 'center' }}>下載網路圖片到工作區</span>
                       </button>
+                    </div>
+                  )}
+
+                  {/* 系統圖片：選好檔案後顯示表單 */}
+                  {importMode === 'file' && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      <div style={{ fontSize: '12px', color: 'var(--color-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={importFilePath}>
+                        {importFilePath.split(/[\\/]/).pop()}
+                      </div>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', color: 'var(--color-text-secondary)' }}>
+                        名稱
+                        <input
+                          value={importName}
+                          onChange={e => setImportName(e.target.value)}
+                          placeholder="（選填）"
+                          autoFocus
+                          style={{ flex: 1, padding: '4px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }}
+                          onKeyDown={e => { if (e.key === 'Enter') handleConfirmFileCopy() }}
+                        />
+                      </label>
+                      <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+                        <button onClick={() => { setImportMode(null); setImportFilePath(''); setImportName('') }}
+                          style={{ padding: '6px 14px', borderRadius: '6px', fontSize: '13px', color: 'var(--color-text-secondary)', background: 'var(--color-bg-base)', border: '1px solid var(--color-border)', cursor: 'pointer' }}>
+                          返回
+                        </button>
+                        <button onClick={handleConfirmFileCopy} disabled={importBusy}
+                          style={{ padding: '6px 14px', borderRadius: '6px', fontSize: '13px', color: '#fff', background: 'var(--color-accent)', border: 'none', cursor: importBusy ? 'not-allowed' : 'pointer', opacity: importBusy ? 0.5 : 1 }}>
+                          {importBusy ? '複製中…' : '複製'}
+                        </button>
+                      </div>
                     </div>
                   )}
 
@@ -951,9 +1030,18 @@ export default function Editor({ onOpenNote }: EditorProps) {
                         placeholder="https://example.com/image.png"
                         autoFocus
                         style={{ padding: '7px 10px', borderRadius: '6px', border: `1px solid ${importUrlError ? 'var(--color-error, #e04040)' : 'var(--color-border)'}`, background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }}
-                        onKeyDown={e => { if (e.key === 'Enter') handleImportUrl() }}
                       />
                       {importUrlError && <span style={{ fontSize: '11px', color: 'var(--color-error, #e04040)' }}>{importUrlError}</span>}
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', color: 'var(--color-text-secondary)' }}>
+                        名稱
+                        <input
+                          value={importName}
+                          onChange={e => setImportName(e.target.value)}
+                          placeholder="（選填）"
+                          style={{ flex: 1, padding: '4px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }}
+                          onKeyDown={e => { if (e.key === 'Enter') handleImportUrl() }}
+                        />
+                      </label>
                       <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
                         <button onClick={() => setImportMode(null)}
                           style={{ padding: '6px 14px', borderRadius: '6px', fontSize: '13px', color: 'var(--color-text-secondary)', background: 'var(--color-bg-base)', border: '1px solid var(--color-border)', cursor: 'pointer' }}>
@@ -965,10 +1053,6 @@ export default function Editor({ onOpenNote }: EditorProps) {
                         </button>
                       </div>
                     </div>
-                  )}
-
-                  {importBusy && importMode === null && (
-                    <div style={{ fontSize: '12px', color: 'var(--color-text-muted)', textAlign: 'center' }}>處理中…</div>
                   )}
                   {importError && (
                     <div style={{ fontSize: '12px', color: 'var(--color-error, #e04040)', lineHeight: 1.5 }}>{importError}</div>

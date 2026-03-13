@@ -332,22 +332,15 @@ pub async fn set_api_key(provider: String, key: String) -> Result<(), AppError> 
 pub fn check_vcredist() -> bool {
     #[cfg(target_os = "windows")]
     {
-        // 用 reg query 查詢 registry，不需要額外 crate
-        let installed = std::process::Command::new("reg")
-            .args([
-                "query",
-                "HKLM\\SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64",
-                "/v", "Installed",
-            ])
-            .output()
-            .ok()
-            .map(|o| {
-                let out = String::from_utf8_lossy(&o.stdout);
-                // 輸出格式：Installed    REG_DWORD    0x1
-                out.contains("0x1")
-            })
-            .unwrap_or(false);
-        installed
+        // 直接讀 Registry，避免啟動子 process（reg.exe 啟動 + AV 掃描很慢）
+        use winreg::{RegKey, enums::HKEY_LOCAL_MACHINE};
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+        hklm.open_subkey(
+            "SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64"
+        )
+        .and_then(|key| key.get_value::<u32, _>("Installed"))
+        .map(|v: u32| v == 1)
+        .unwrap_or(false)
     }
     #[cfg(not(target_os = "windows"))]
     {

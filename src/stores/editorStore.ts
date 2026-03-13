@@ -7,6 +7,7 @@ interface EditorStore {
   content: string
   isDirty: boolean
   viewMode: ViewMode
+  viewModes: Record<string, ViewMode>
   /** 外部寫入後通知 Editor 同步視圖：null = 無待更新 */
   pendingContent: string | null
   setCurrentPath: (path: string | null) => void
@@ -23,12 +24,22 @@ export const useEditorStore = create<EditorStore>((set) => ({
   content: '',
   isDirty: false,
   viewMode: 'preview',
+  viewModes: {},
   pendingContent: null,
 
-  setCurrentPath: (path) => set({ currentPath: path, isDirty: false }),
+  setCurrentPath: (path) => set((s) => ({
+    currentPath: path,
+    isDirty: false,
+    viewMode: path ? (s.viewModes[path] ?? 'preview') : 'preview',
+  })),
   setContent: (content) => set({ content, isDirty: true }),
   setDirty: (dirty) => set({ isDirty: dirty }),
-  setViewMode: (viewMode) => set({ viewMode }),
+  setViewMode: (viewMode) => set((s) => ({
+    viewMode,
+    viewModes: s.currentPath
+      ? { ...s.viewModes, [s.currentPath]: viewMode }
+      : s.viewModes,
+  })),
   applyExternalWrite: (content) => set({ pendingContent: content }),
   clearPendingContent: () => set({ pendingContent: null }),
 }))
