@@ -66,9 +66,11 @@ function parseContentParts(content: string): ContentPart[] {
     if (i % 2 === 0) {
       if (part) result.push({ type: 'text', text: part })
     } else {
-      const ext = part.split('.').pop()?.toLowerCase() ?? ''
+      // Strip optional |name or |name|size suffix → actual path
+      const actualPath = part.split('|')[0].trim()
+      const ext = actualPath.split('.').pop()?.toLowerCase() ?? ''
       if (IMAGE_EXTS.has(ext)) {
-        result.push({ type: 'image', name: part, url: `vault://localhost/${part}` })
+        result.push({ type: 'image', name: actualPath, url: `vault://localhost/${actualPath}` })
       } else {
         result.push({ type: 'text', text: `![[${part}]]` })
       }

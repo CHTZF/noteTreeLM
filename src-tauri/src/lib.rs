@@ -137,6 +137,7 @@ pub fn run() {
             delete_folder,
             import_image,
             list_assets,
+            download_asset_to_vault,
             delete_asset,
             rename_asset,
             open_path_externally,

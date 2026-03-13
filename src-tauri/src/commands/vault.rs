@@ -870,6 +870,80 @@ async fn collect_assets(
     Ok(())
 }
 
+/// 從 URL 下載圖片到 vault/assets/ 資料夾，回傳相對路徑
+#[tauri::command]
+pub async fn download_asset_to_vault(
+    state: State<'_, AppState>,
+    url: String,
+) -> Result<String, AppError> {
+    let vault_path = state.get_vault_path().await;
+    if vault_path.is_empty() {
+        return Err(AppError::Vault("尚未設定 Vault 路徑".to_string()));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("noteTreeLM/1.0")
+        .build()
+        .map_err(|e| AppError::Import(e.to_string()))?;
+
+    let resp = client.get(&url).send().await
+        .map_err(|e| AppError::Import(format!("下載失敗：{}", e)))?;
+
+    // 驗證 Content-Type 為圖片
+    let content_type = resp.headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !content_type.starts_with("image/") {
+        return Err(AppError::Vault(format!("URL 回應不是圖片（Content-Type: {}）", content_type)));
+    }
+
+    // 從 URL 取得檔名（去除 query string）
+    let raw_name = url.split('?').next().unwrap_or(&url)
+        .split('/').last().unwrap_or("image");
+    // 若沒有副檔名，從 Content-Type 補上
+    let filename = if raw_name.contains('.') {
+        raw_name.to_string()
+    } else {
+        let ext = content_type.split('/').nth(1).unwrap_or("png");
+        let ext = ext.split(';').next().unwrap_or("png");
+        format!("{}.{}", raw_name, ext)
+    };
+
+    let bytes = resp.bytes().await
+        .map_err(|e| AppError::Import(format!("讀取內容失敗：{}", e)))?;
+
+    let assets_dir = PathBuf::from(&vault_path).join("assets");
+    tokio::fs::create_dir_all(&assets_dir).await
+        .map_err(|e| AppError::Io(e.to_string()))?;
+
+    // 避免覆蓋同名檔案：加上數字後綴
+    let dest_path = PathBuf::from(&assets_dir).join(&filename);
+    let final_path = if dest_path.exists() {
+        let stem = PathBuf::from(&filename)
+            .file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let ext = PathBuf::from(&filename)
+            .extension().unwrap_or_default().to_string_lossy().to_string();
+        let mut i = 1u32;
+        loop {
+            let candidate = assets_dir.join(format!("{}_{}.{}", stem, i, ext));
+            if !candidate.exists() { break candidate; }
+            i += 1;
+        }
+    } else {
+        dest_path
+    };
+
+    let rel_filename = final_path.file_name()
+        .unwrap_or_default().to_string_lossy().to_string();
+    tokio::fs::write(&final_path, &bytes).await
+        .map_err(|e| AppError::Io(e.to_string()))?;
+
+    Ok(format!("assets/{}", rel_filename))
+}
+
 /// 刪除 Vault 中的圖片資源
 #[tauri::command]
 pub async fn delete_asset(

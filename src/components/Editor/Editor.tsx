@@ -62,15 +62,18 @@ export default function Editor({ onOpenNote }: EditorProps) {
 
   // ── Image modal state ─────────────────────────────────────────────────────
   const [imageModal, setImageModal] = useState<{ from: number; to: number } | null>(null)
-  const [imgSource, setImgSource] = useState<'file' | 'url' | 'vault'>('file')
-  const [imgFilePath, setImgFilePath] = useState('')
-  const [imgUrl, setImgUrl] = useState('')
   const [imgSize, setImgSize] = useState('')
   const [imgAlt, setImgAlt] = useState('')
-  const [imgUrlError, setImgUrlError] = useState('')
   const [vaultImages, setVaultImages] = useState<string[]>([])
   const [vaultImgFilter, setVaultImgFilter] = useState('')
   const [vaultImgSelected, setVaultImgSelected] = useState('')
+  // import sub-page state
+  const [importPage, setImportPage] = useState(false)
+  const [importMode, setImportMode] = useState<'file' | 'url' | null>(null)
+  const [importUrl, setImportUrl] = useState('')
+  const [importUrlError, setImportUrlError] = useState('')
+  const [importBusy, setImportBusy] = useState(false)
+  const [importError, setImportError] = useState('')
 
   const openNote = useCallback((path: string) => {
     onOpenNote(path)
@@ -266,13 +269,17 @@ export default function Editor({ onOpenNote }: EditorProps) {
         break
       }
       case 'image': {
-        setImgSource('file')
-        setImgFilePath('')
-        setImgUrl('')
         setImgSize('')
         setImgAlt(selected)
-        setImgUrlError('')
+        setVaultImgFilter('')
+        setVaultImgSelected('')
+        setImportPage(false)
+        setImportMode(null)
+        setImportUrl('')
+        setImportUrlError('')
+        setImportError('')
         setImageModal({ from, to })
+        loadVaultImages()
         return
       }
       case 'quick_copy': {
@@ -394,76 +401,106 @@ export default function Editor({ onOpenNote }: EditorProps) {
     return () => setLiveEditQuickCopyHandler(null)
   }, [])
 
+  const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'avif']
+
+  const loadVaultImages = useCallback(async () => {
+    try {
+      const all = await invoke<string[]>('list_assets')
+      setVaultImages(all.filter(p => IMAGE_EXTENSIONS.includes(p.split('.').pop()?.toLowerCase() ?? '')))
+    } catch {}
+  }, [])
+
   // Register live-mode right-click edit handler for image widgets
   useEffect(() => {
     setLiveEditImageHandler((data) => {
-      // Parse alt — may contain |size suffix, e.g. "photo|300" or "photo|300x200"
+      // Parse alt — may contain |size suffix, e.g. "photo|300"
       const barIdx = data.alt.lastIndexOf('|')
       const hasSize = barIdx !== -1 && /^\d/.test(data.alt.slice(barIdx + 1))
       const altClean = hasSize ? data.alt.slice(0, barIdx) : data.alt
       const size     = hasSize ? data.alt.slice(barIdx + 1) : ''
-      const isUrl = data.src.startsWith('http') || data.src.startsWith('data:')
-      setImgSource(isUrl ? 'url' : 'file')
-      if (isUrl) { setImgUrl(data.src); setImgFilePath('') }
-      else       { setImgFilePath(data.src); setImgUrl('') }
       setImgAlt(altClean)
       setImgSize(size)
-      setImgUrlError('')
+      // If the src is a vault:// URL, pre-select the vault image
+      const vaultPrefix = 'vault://localhost/'
+      if (data.src.startsWith(vaultPrefix)) {
+        const relPath = decodeURIComponent(data.src.slice(vaultPrefix.length))
+        setVaultImgSelected(relPath)
+      } else {
+        setVaultImgSelected('')
+      }
+      setVaultImgFilter('')
+      setImportPage(false)
+      setImportMode(null)
+      setImportUrl('')
+      setImportUrlError('')
+      setImportError('')
       setImageModal({ from: data.from, to: data.to })
+      loadVaultImages()
     })
     return () => setLiveEditImageHandler(null)
-  }, [])
+  }, [loadVaultImages])
 
-  const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'avif']
-
-  const pickImageFile = useCallback(async () => {
+  const handleImportFile = useCallback(async () => {
     try {
       const file = await openDialog({
         multiple: false,
         filters: [{ name: 'Images', extensions: IMAGE_EXTENSIONS }],
       })
       if (!file) return
-      const path = typeof file === 'string' ? file : (file as any).path ?? String(file)
-      setImgFilePath(path)
-      setImgAlt(prev => prev || (path.split('/').pop()?.replace(/\.[^.]+$/, '') ?? ''))
-    } catch {}
-  }, [])
+      const srcPath = typeof file === 'string' ? file : (file as any).path ?? String(file)
+      setImportBusy(true)
+      setImportError('')
+      const relPath = await invoke<string>('import_image', { sourcePath: srcPath, folder: 'assets' })
+      await loadVaultImages()
+      setVaultImgSelected(relPath)
+      setImportPage(false)
+      setImportMode(null)
+    } catch (e: any) {
+      setImportError(e?.message ?? String(e))
+    } finally {
+      setImportBusy(false)
+    }
+  }, [loadVaultImages])
 
-  const loadVaultImages = useCallback(async () => {
+  const handleImportUrl = useCallback(async () => {
+    const url = importUrl.trim()
+    if (!url) return
+    if (!/^https?:\/\/.+/.test(url)) {
+      setImportUrlError('請輸入有效的 http/https 網址')
+      return
+    }
+    setImportBusy(true)
+    setImportError('')
+    setImportUrlError('')
     try {
-      const all = await invoke<string[]>('list_assets')
-      const imgs = all.filter(p => {
-        const ext = p.split('.').pop()?.toLowerCase() ?? ''
-        return IMAGE_EXTENSIONS.includes(ext)
-      })
-      setVaultImages(imgs)
-    } catch {}
-  }, [])
+      const relPath = await invoke<string>('download_asset_to_vault', { url })
+      await loadVaultImages()
+      setVaultImgSelected(relPath)
+      setImportPage(false)
+      setImportMode(null)
+      setImportUrl('')
+    } catch (e: any) {
+      setImportError(e?.message ?? String(e))
+    } finally {
+      setImportBusy(false)
+    }
+  }, [importUrl, loadVaultImages])
 
   const confirmImageInsert = useCallback(() => {
-    if (!imageModal) return
+    if (!imageModal || !vaultImgSelected) return
     const view = viewRef.current
     if (!view) return
-    let insert: string
-    if (imgSource === 'vault') {
-      if (!vaultImgSelected) return
-      insert = `![[${vaultImgSelected}]]`
-    } else {
-      const src = (imgSource === 'file' ? imgFilePath : imgUrl).trim()
-      if (!src) return
-      const sizeStr = imgSize.trim() ? `|${imgSize.trim()}` : ''
-      const alt = imgAlt.trim() || (imgSource === 'file'
-        ? (imgFilePath.split('/').pop()?.replace(/\.[^.]+$/, '') ?? 'image')
-        : 'image')
-      insert = `![${alt}${sizeStr}](${src})`
-    }
+    const name = imgAlt.trim()
+    const size = imgSize.trim()
+    const suffix = name && size ? `|${name}|${size}` : name ? `|${name}` : size ? `|${size}` : ''
+    const insert = `![[${vaultImgSelected}${suffix}]]`
     view.dispatch({
       changes: { from: imageModal.from, to: imageModal.to, insert },
       selection: { anchor: imageModal.from + insert.length },
     })
     setImageModal(null)
     view.focus()
-  }, [imageModal, imgSource, imgFilePath, imgUrl, imgAlt, imgSize, vaultImgSelected])
+  }, [imageModal, vaultImgSelected, imgAlt, imgSize])
 
   const applyCmAction = useCallback((action: string) => {
     setCmCtxMenu(null)
@@ -764,84 +801,54 @@ export default function Editor({ onOpenNote }: EditorProps) {
       )}
 
       {/* Image Modal */}
-      {imageModal && (
-        <div style={{
-          position: 'fixed', inset: 0, zIndex: 9999,
-          background: 'rgba(0,0,0,0.45)', display: 'flex',
-          alignItems: 'center', justifyContent: 'center',
-        }} onClick={() => setImageModal(null)}>
+      {imageModal && (() => {
+        const filtered = vaultImages.filter(p => p.toLowerCase().includes(vaultImgFilter.toLowerCase()))
+        const btnBase: React.CSSProperties = {
+          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+          gap: '8px', padding: '20px 16px', borderRadius: '10px', cursor: 'pointer',
+          border: '1px solid var(--color-border)', background: 'var(--color-bg-base)',
+          color: 'var(--color-text-primary)', fontSize: '13px', flex: 1,
+          transition: 'border-color 0.15s, background 0.15s',
+        }
+        return (
           <div style={{
-            background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)',
-            borderRadius: '10px', padding: '20px 24px', width: '380px',
-            display: 'flex', flexDirection: 'column', gap: '12px',
-          }} onClick={(e) => e.stopPropagation()}>
-            <div style={{ fontSize: '15px', fontWeight: 600, color: 'var(--color-text-primary)' }}>插入圖片</div>
+            position: 'fixed', inset: 0, zIndex: 9999,
+            background: 'rgba(0,0,0,0.45)', display: 'flex',
+            alignItems: 'center', justifyContent: 'center',
+          }} onClick={() => setImageModal(null)}>
+            <div style={{
+              background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)',
+              borderRadius: '10px', width: '420px', overflow: 'hidden',
+            }} onClick={e => e.stopPropagation()}>
 
-            {/* 來源選擇 */}
-            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: 'var(--color-text-secondary)' }}>
-              來源
-              <select value={imgSource} onChange={e => {
-                const v = e.target.value as 'file' | 'url' | 'vault'
-                setImgSource(v)
-                setImgUrlError('')
-                if (v === 'vault') { setVaultImgSelected(''); loadVaultImages() }
-              }}
-                style={{ flex: 1, padding: '5px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }}>
-                <option value="file">系統圖片</option>
-                <option value="url">使用網址</option>
-                <option value="vault">工作區圖片</option>
-              </select>
-            </label>
+              {/* Slide container */}
+              <div style={{
+                display: 'flex',
+                transform: importPage ? 'translateX(-420px)' : 'translateX(0)',
+                transition: 'transform 0.22s ease',
+                width: '840px',
+              }}>
 
-            {/* 系統圖片 picker */}
-            {imgSource === 'file' && (
-              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                <button onClick={pickImageFile}
-                  style={{ padding: '5px 12px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px', cursor: 'pointer', flexShrink: 0 }}>
-                  選擇圖片…
-                </button>
-                <span style={{ fontSize: '12px', color: 'var(--color-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
-                  {imgFilePath || '尚未選擇'}
-                </span>
-              </div>
-            )}
+                {/* ── Panel A: 工作區圖片（主畫面）──────────────────────── */}
+                <div style={{ width: '420px', flexShrink: 0, padding: '20px 20px 16px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                  <div style={{ fontSize: '15px', fontWeight: 600, color: 'var(--color-text-primary)' }}>插入圖片</div>
 
-            {/* 網址輸入 */}
-            {imgSource === 'url' && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                <input value={imgUrl} onChange={e => { setImgUrl(e.target.value); setImgUrlError('') }}
-                  placeholder="https://example.com/image.png"
-                  style={{ padding: '5px 8px', borderRadius: '5px', border: `1px solid ${imgUrlError ? 'var(--color-error, #e04040)' : 'var(--color-border)'}`, background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }} />
-                {imgUrlError && <span style={{ fontSize: '11px', color: 'var(--color-error, #e04040)' }}>{imgUrlError}</span>}
-              </div>
-            )}
-
-            {/* 工作區圖片 picker */}
-            {imgSource === 'vault' && (() => {
-              const filtered = vaultImages.filter(p =>
-                p.toLowerCase().includes(vaultImgFilter.toLowerCase())
-              )
-              return (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                  {/* 搜尋框 */}
                   <input
                     value={vaultImgFilter}
                     onChange={e => setVaultImgFilter(e.target.value)}
-                    placeholder="搜尋圖片檔名…"
+                    placeholder="搜尋工作區圖片…"
                     style={{ padding: '5px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }}
                   />
-                  <div style={{
-                    maxHeight: '180px', overflowY: 'auto',
-                    border: '1px solid var(--color-border)', borderRadius: '5px',
-                    background: 'var(--color-bg-base)',
-                  }}>
+
+                  {/* 圖片列表 */}
+                  <div style={{ height: '180px', overflowY: 'auto', border: '1px solid var(--color-border)', borderRadius: '6px', background: 'var(--color-bg-base)' }}>
                     {filtered.length === 0 ? (
-                      <div style={{ padding: '12px', fontSize: '12px', color: 'var(--color-text-muted)', textAlign: 'center' }}>
-                        {vaultImages.length === 0 ? '工作區內沒有圖片' : '無符合結果'}
+                      <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '12px', color: 'var(--color-text-muted)' }}>
+                        {vaultImages.length === 0 ? '工作區內沒有圖片，請先匯入' : '無符合結果'}
                       </div>
                     ) : filtered.map(p => (
-                      <div
-                        key={p}
-                        onClick={() => setVaultImgSelected(p)}
+                      <div key={p} onClick={() => setVaultImgSelected(p)}
                         style={{
                           display: 'flex', alignItems: 'center', gap: '8px',
                           padding: '6px 10px', cursor: 'pointer', fontSize: '12px',
@@ -851,68 +858,128 @@ export default function Editor({ onOpenNote }: EditorProps) {
                         onMouseEnter={e => { if (vaultImgSelected !== p) e.currentTarget.style.background = 'var(--color-bg-hover)' }}
                         onMouseLeave={e => { if (vaultImgSelected !== p) e.currentTarget.style.background = 'transparent' }}
                       >
-                        <img
-                          src={`vault://localhost/${p}`}
-                          alt=""
-                          style={{ width: '28px', height: '28px', objectFit: 'cover', borderRadius: '3px', flexShrink: 0 }}
-                          onError={e => { (e.currentTarget as HTMLImageElement).style.visibility = 'hidden' }}
-                        />
-                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                          {p.split('/').pop()}
-                        </span>
-                        <span style={{ marginLeft: 'auto', opacity: 0.5, flexShrink: 0, fontSize: '11px' }}>
-                          {p.includes('/') ? p.substring(0, p.lastIndexOf('/')) : ''}
-                        </span>
+                        <img src={`vault://localhost/${p}`} alt="" style={{ width: '28px', height: '28px', objectFit: 'cover', borderRadius: '3px', flexShrink: 0 }}
+                          onError={e => { (e.currentTarget as HTMLImageElement).style.visibility = 'hidden' }} />
+                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{p.split('/').pop()}</span>
+                        <span style={{ opacity: 0.45, flexShrink: 0, fontSize: '11px' }}>{p.includes('/') ? p.substring(0, p.lastIndexOf('/')) : ''}</span>
                       </div>
                     ))}
                   </div>
+
+                  {/* 大小 / 顯示名稱 */}
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', color: 'var(--color-text-secondary)', flex: 1 }}>
+                      大小
+                      <input value={imgSize} onChange={e => setImgSize(e.target.value)} placeholder="300 或 50%" style={{ flex: 1, padding: '4px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }} />
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', color: 'var(--color-text-secondary)', flex: 1 }}>
+                      名稱
+                      <input value={imgAlt} onChange={e => setImgAlt(e.target.value)} placeholder="（選填）" style={{ flex: 1, padding: '4px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }} />
+                    </label>
+                  </div>
+
+                  {/* 預覽格式 */}
                   {vaultImgSelected && (
-                    <div style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>
-                      將插入：<code style={{ color: 'var(--color-accent)' }}>![[{vaultImgSelected}]]</code>
+                    <div style={{ fontSize: '11px', color: 'var(--color-text-muted)', lineHeight: 1.4 }}>
+                      插入：<code style={{ color: 'var(--color-accent)' }}>
+                        {`![[${vaultImgSelected}${imgAlt.trim() && imgSize.trim() ? `|${imgAlt.trim()}|${imgSize.trim()}` : imgAlt.trim() ? `|${imgAlt.trim()}` : imgSize.trim() ? `|${imgSize.trim()}` : ''}]]`}
+                      </code>
                     </div>
                   )}
+
+                  {/* 底部按鈕 */}
+                  <div style={{ display: 'flex', alignItems: 'center', marginTop: '2px' }}>
+                    <button onClick={() => { setImportPage(true); setImportMode(null); setImportError('') }}
+                      style={{ padding: '6px 14px', borderRadius: '6px', fontSize: '13px', color: 'var(--color-text-secondary)', background: 'var(--color-bg-base)', border: '1px solid var(--color-border)', cursor: 'pointer' }}>
+                      匯入
+                    </button>
+                    <div style={{ flex: 1 }} />
+                    <button onClick={() => setImageModal(null)}
+                      style={{ padding: '6px 14px', borderRadius: '6px', fontSize: '13px', color: 'var(--color-text-secondary)', background: 'var(--color-bg-base)', border: '1px solid var(--color-border)', cursor: 'pointer', marginRight: '8px' }}>
+                      取消
+                    </button>
+                    <button onClick={confirmImageInsert} disabled={!vaultImgSelected}
+                      style={{ padding: '6px 14px', borderRadius: '6px', fontSize: '13px', color: '#fff', background: 'var(--color-accent)', border: 'none', cursor: vaultImgSelected ? 'pointer' : 'not-allowed', opacity: vaultImgSelected ? 1 : 0.5 }}>
+                      確認
+                    </button>
+                  </div>
                 </div>
-              )
-            })()}
 
-            {/* 圖片大小 / 顯示名稱（vault 模式不適用） */}
-            {imgSource !== 'vault' && <>
-              <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: 'var(--color-text-secondary)' }}>
-                大小（px 或 %）
-                <input value={imgSize} onChange={e => setImgSize(e.target.value)}
-                  placeholder="例：300 或 50%"
-                  style={{ flex: 1, padding: '5px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }} />
-              </label>
-              <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: 'var(--color-text-secondary)' }}>
-                顯示名稱
-                <input value={imgAlt} onChange={e => setImgAlt(e.target.value)}
-                  placeholder="（選填）"
-                  style={{ flex: 1, padding: '5px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }} />
-              </label>
-            </>}
+                {/* ── Panel B: 匯入（子畫面）───────────────────────────── */}
+                <div style={{ width: '420px', flexShrink: 0, padding: '20px 20px 16px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                  {/* 標題列 */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <button onClick={() => { setImportPage(false); setImportMode(null); setImportError('') }}
+                      style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-text-muted)', fontSize: '18px', lineHeight: 1, padding: '0 4px 0 0' }}>
+                      ←
+                    </button>
+                    <span style={{ fontSize: '15px', fontWeight: 600, color: 'var(--color-text-primary)' }}>匯入圖片</span>
+                  </div>
 
-            {/* 按鈕 */}
-            <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '4px' }}>
-              <button onClick={() => setImageModal(null)}
-                style={{ padding: '6px 14px', borderRadius: '6px', fontSize: '13px', color: 'var(--color-text-secondary)', background: 'var(--color-bg-base)', border: '1px solid var(--color-border)', cursor: 'pointer' }}>
-                取消
-              </button>
-              <button
-                onClick={() => {
-                  if (imgSource === 'url' && imgUrl.trim() && !/^https?:\/\/.+/.test(imgUrl.trim())) {
-                    setImgUrlError('請輸入有效的 http/https 網址')
-                    return
-                  }
-                  confirmImageInsert()
-                }}
-                disabled={imgSource === 'vault' && !vaultImgSelected}
-                style={{ padding: '6px 14px', borderRadius: '6px', fontSize: '13px', color: '#fff', background: 'var(--color-accent)', border: 'none', cursor: imgSource === 'vault' && !vaultImgSelected ? 'not-allowed' : 'pointer', opacity: imgSource === 'vault' && !vaultImgSelected ? 0.5 : 1 }}>
-                確認
-              </button>
+                  {/* 兩個大 icon 按鈕 */}
+                  {importMode === null && (
+                    <div style={{ display: 'flex', gap: '12px' }}>
+                      <button
+                        onClick={handleImportFile}
+                        style={btnBase}
+                        onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--color-accent)'; e.currentTarget.style.background = 'var(--color-accent-dim, rgba(10,132,255,0.08))' }}
+                        onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--color-border)'; e.currentTarget.style.background = 'var(--color-bg-base)' }}
+                      >
+                        <span style={{ fontSize: '32px' }}>📁</span>
+                        <span style={{ fontWeight: 500 }}>系統圖片</span>
+                        <span style={{ fontSize: '11px', color: 'var(--color-text-muted)', textAlign: 'center' }}>從本機選取並複製到工作區</span>
+                      </button>
+                      <button
+                        onClick={() => setImportMode('url')}
+                        style={btnBase}
+                        onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--color-accent)'; e.currentTarget.style.background = 'var(--color-accent-dim, rgba(10,132,255,0.08))' }}
+                        onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--color-border)'; e.currentTarget.style.background = 'var(--color-bg-base)' }}
+                      >
+                        <span style={{ fontSize: '32px' }}>🔗</span>
+                        <span style={{ fontWeight: 500 }}>網址圖片</span>
+                        <span style={{ fontSize: '11px', color: 'var(--color-text-muted)', textAlign: 'center' }}>下載網路圖片到工作區</span>
+                      </button>
+                    </div>
+                  )}
+
+                  {/* URL 輸入（選擇網址模式後顯示） */}
+                  {importMode === 'url' && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      <input
+                        value={importUrl}
+                        onChange={e => { setImportUrl(e.target.value); setImportUrlError('') }}
+                        placeholder="https://example.com/image.png"
+                        autoFocus
+                        style={{ padding: '7px 10px', borderRadius: '6px', border: `1px solid ${importUrlError ? 'var(--color-error, #e04040)' : 'var(--color-border)'}`, background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }}
+                        onKeyDown={e => { if (e.key === 'Enter') handleImportUrl() }}
+                      />
+                      {importUrlError && <span style={{ fontSize: '11px', color: 'var(--color-error, #e04040)' }}>{importUrlError}</span>}
+                      <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+                        <button onClick={() => setImportMode(null)}
+                          style={{ padding: '6px 14px', borderRadius: '6px', fontSize: '13px', color: 'var(--color-text-secondary)', background: 'var(--color-bg-base)', border: '1px solid var(--color-border)', cursor: 'pointer' }}>
+                          返回
+                        </button>
+                        <button onClick={handleImportUrl} disabled={importBusy || !importUrl.trim()}
+                          style={{ padding: '6px 14px', borderRadius: '6px', fontSize: '13px', color: '#fff', background: 'var(--color-accent)', border: 'none', cursor: (!importBusy && importUrl.trim()) ? 'pointer' : 'not-allowed', opacity: (!importBusy && importUrl.trim()) ? 1 : 0.5 }}>
+                          {importBusy ? '下載中…' : '下載'}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {importBusy && importMode === null && (
+                    <div style={{ fontSize: '12px', color: 'var(--color-text-muted)', textAlign: 'center' }}>處理中…</div>
+                  )}
+                  {importError && (
+                    <div style={{ fontSize: '12px', color: 'var(--color-error, #e04040)', lineHeight: 1.5 }}>{importError}</div>
+                  )}
+                </div>
+
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        )
+      })()}
 
       {/* Quick Copy Modal */}
       {quickCopyModal && (
