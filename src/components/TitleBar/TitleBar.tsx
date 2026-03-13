@@ -33,12 +33,15 @@ export default function TitleBar({ title }: TitleBarProps) {
   const win = getCurrentWindow()
 
   return (
-    <div data-tauri-drag-region className="app-titlebar">
-      <span className="app-titlebar-title" data-tauri-drag-region>
-        {title || 'noteTreeLM'}
-      </span>
-      {/* Windows 視窗控制按鈕 */}
-      <div className="app-titlebar-controls" onMouseDown={e => e.stopPropagation()}>
+    <div className="app-titlebar" style={{ display: 'flex', alignItems: 'center' }}>
+      {/* 拖曳區：佔滿剩餘空間 */}
+      <div data-tauri-drag-region className="app-titlebar-drag" style={{ flex: 1, display: 'flex', alignItems: 'center', height: '100%' }}>
+        <span className="app-titlebar-title">
+          {title || 'noteTreeLM'}
+        </span>
+      </div>
+      {/* Windows 視窗控制按鈕（在拖曳區外，避免事件被攔截） */}
+      <div className="app-titlebar-controls">
         <button
           className="titlebar-btn titlebar-btn-min"
           title="最小化"

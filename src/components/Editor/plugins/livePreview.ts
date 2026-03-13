@@ -19,6 +19,12 @@ const mdBlock = new MarkdownIt({ html: true, linkify: true, typographer: true, b
 // Safe because there is only one editor view in this app at any time.
 let _view: EditorView | null = null
 
+// ── Module-level asset path cache (for Obsidian bare-filename fallback) ───────
+// list_assets returns all vault file relative paths; cached for 30s to avoid
+// repeated expensive scans when multiple images load simultaneously.
+let _assetPaths: string[] = []
+let _assetCacheTs = 0
+
 // ── Table cell helpers ────────────────────────────────────────────────────────
 function parseTableCells(line: string): string[] {
   let s = line.trim()
@@ -398,27 +404,52 @@ class ImageWidget extends WidgetType {
 
     const loadLocal = (rawSrc: string) => {
       const { settings } = useSettingsStore.getState()
-      const vaultPath = settings.system_current_vault_path
+      // Normalize backslashes to forward slashes for Windows vault paths
+      const vaultPath = settings.system_current_vault_path.replace(/\\/g, '/')
       let decoded = rawSrc
       try { decoded = decodeURI(rawSrc) } catch { /* keep original */ }
       // Detect absolute paths: Unix (/...) and Windows (C:\... or C:/...)
       const isAbsolute = decoded.startsWith('/') || /^[A-Za-z]:[/\\]/.test(decoded)
       const absolutePath = isAbsolute ? decoded : `${vaultPath}/${decoded}`
-      invoke<string>('read_file_base64', { path: absolutePath }).then(base64 => {
-        const ext = absolutePath.split('.').pop()?.toLowerCase() ?? ''
-        const mimeMap: Record<string, string> = {
-          png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
-          gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
-          bmp: 'image/bmp', ico: 'image/x-icon',
-        }
+
+      const mimeMap: Record<string, string> = {
+        png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+        gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
+        bmp: 'image/bmp', ico: 'image/x-icon',
+      }
+      const applyBase64 = (path: string, base64: string) => {
+        const ext = path.split('.').pop()?.toLowerCase() ?? ''
         img.src = `data:${mimeMap[ext] ?? 'image/png'};base64,${base64}`
-      }).catch(() => {
-        img.title = `無法載入: ${absolutePath}`
+      }
+      const showError = () => {
+        img.title = `無法載入: ${decoded}`
         img.style.border = '1px dashed var(--color-border)'
         img.style.padding = '4px'
         img.style.minWidth = '60px'
         img.style.minHeight = '24px'
-      })
+      }
+
+      invoke<string>('read_file_base64', { path: absolutePath })
+        .then(base64 => applyBase64(absolutePath, base64))
+        .catch(async () => {
+          // Obsidian compatibility: bare filename (no path separator) → search entire vault
+          const isBareFilename = !isAbsolute && !decoded.includes('/') && !decoded.includes('\\')
+          if (isBareFilename) {
+            if (Date.now() - _assetCacheTs > 30000) {
+              try { _assetPaths = await invoke<string[]>('list_assets'); _assetCacheTs = Date.now() } catch { /* keep cache */ }
+            }
+            const lower = decoded.toLowerCase()
+            const match = _assetPaths.find(a => a.toLowerCase() === lower || a.toLowerCase().endsWith('/' + lower))
+            if (match) {
+              const matchAbsPath = `${vaultPath}/${match}`
+              invoke<string>('read_file_base64', { path: matchAbsPath })
+                .then(base64 => applyBase64(matchAbsPath, base64))
+                .catch(showError)
+              return
+            }
+          }
+          showError()
+        })
     }
 
     if (this.src.startsWith('http') || this.src.startsWith('data:') ||
@@ -824,12 +855,14 @@ function buildInlineDecos(view: EditorView): DecorationSet {
       if (!['png','jpg','jpeg','gif','webp','svg','bmp','avif'].includes(ext)) continue
       const mFrom = vpFrom + m.index
       const mTo = mFrom + m[0].length
-      const src = `vault://localhost/${relPath}`
+      // Use relative path directly — ImageWidget.loadLocal() will resolve it
+      // via read_file_base64, which is reliable on all platforms (avoids vault://
+      // protocol issues on Windows WebView2).
       const suffix = parts.slice(1).join('|') // e.g. "300" or "name|300" or ""
       // ImageWidget parses alt as "name|size" — if suffix starts with a digit it's a bare
       // size (no name), so prepend | so the last-|index logic picks it up correctly.
       const alt = suffix && /^\d/.test(suffix) ? `|${suffix}` : suffix
-      add(mFrom, mTo, Decoration.replace({ widget: new ImageWidget(src, alt, mFrom, mTo) }))
+      add(mFrom, mTo, Decoration.replace({ widget: new ImageWidget(relPath, alt, mFrom, mTo) }))
     }
   }
 

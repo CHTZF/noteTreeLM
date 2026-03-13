@@ -160,13 +160,31 @@ async function resolveImageSrc(src: string, vaultPath: string): Promise<string> 
   let decoded = src
   try { decoded = decodeURI(src) } catch { /* 保持原值 */ }
 
-  // 解析為絕對路徑
-  const absolutePath = decoded.startsWith('/') ? decoded : `${vaultPath}/${decoded}`
+  // 解析為絕對路徑（正規化 Windows 反斜線）
+  const normalizedVaultPath = vaultPath.replace(/\\/g, '/')
+  const absolutePath = decoded.startsWith('/') || /^[A-Za-z]:[/\\]/.test(decoded)
+    ? decoded
+    : `${normalizedVaultPath}/${decoded}`
 
   try {
     const base64 = await invoke<string>('read_file_base64', { path: absolutePath })
     return `data:${guessMimeType(absolutePath)};base64,${base64}`
   } catch (e) {
+    // Obsidian compatibility: bare filename (no path separator) → search entire vault
+    const isAbsolute = decoded.startsWith('/') || /^[A-Za-z]:[/\\]/.test(decoded)
+    const isBareFilename = !isAbsolute && !decoded.includes('/') && !decoded.includes('\\')
+    if (isBareFilename) {
+      try {
+        const assets = await invoke<string[]>('list_assets')
+        const lower = decoded.toLowerCase()
+        const match = assets.find(a => a.toLowerCase() === lower || a.toLowerCase().endsWith('/' + lower))
+        if (match) {
+          const matchAbsPath = `${normalizedVaultPath}/${match}`
+          const base64 = await invoke<string>('read_file_base64', { path: matchAbsPath })
+          return `data:${guessMimeType(matchAbsPath)};base64,${base64}`
+        }
+      } catch { /* fallthrough */ }
+    }
     console.warn('無法讀取圖片:', absolutePath, e)
     return src
   }

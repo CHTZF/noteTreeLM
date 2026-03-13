@@ -151,6 +151,12 @@ export default function Editor({ onOpenNote }: EditorProps) {
           viewMode === 'live' ? [livePreviewPlugin] : []
         ),
       })
+      // When becoming visible (switching from preview→live/editor), the editor
+      // may have been hidden with display:none, causing stale measurements.
+      // Force a remeasure so CodeMirror recalculates the viewport correctly.
+      if (viewMode === 'live' || viewMode === 'editor') {
+        requestAnimationFrame(() => view.requestMeasure())
+      }
     } catch (e) {
       console.error('livePreview reconfigure error:', e)
     }
