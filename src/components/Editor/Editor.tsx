@@ -6,6 +6,7 @@ import { languages } from '@codemirror/language-data'
 import { keymap } from '@codemirror/view'
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
+import { invoke } from '@tauri-apps/api/core'
 import { useEditorStore } from '../../stores/editorStore'
 import { useVaultStore } from '../../stores/vaultStore'
 import { useSettingsStore } from '../../stores/settingsStore'
@@ -61,12 +62,15 @@ export default function Editor({ onOpenNote }: EditorProps) {
 
   // ── Image modal state ─────────────────────────────────────────────────────
   const [imageModal, setImageModal] = useState<{ from: number; to: number } | null>(null)
-  const [imgSource, setImgSource] = useState<'file' | 'url'>('file')
+  const [imgSource, setImgSource] = useState<'file' | 'url' | 'vault'>('file')
   const [imgFilePath, setImgFilePath] = useState('')
   const [imgUrl, setImgUrl] = useState('')
   const [imgSize, setImgSize] = useState('')
   const [imgAlt, setImgAlt] = useState('')
   const [imgUrlError, setImgUrlError] = useState('')
+  const [vaultImages, setVaultImages] = useState<string[]>([])
+  const [vaultImgFilter, setVaultImgFilter] = useState('')
+  const [vaultImgSelected, setVaultImgSelected] = useState('')
 
   const openNote = useCallback((path: string) => {
     onOpenNote(path)
@@ -410,11 +414,13 @@ export default function Editor({ onOpenNote }: EditorProps) {
     return () => setLiveEditImageHandler(null)
   }, [])
 
+  const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'avif']
+
   const pickImageFile = useCallback(async () => {
     try {
       const file = await openDialog({
         multiple: false,
-        filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'] }],
+        filters: [{ name: 'Images', extensions: IMAGE_EXTENSIONS }],
       })
       if (!file) return
       const path = typeof file === 'string' ? file : (file as any).path ?? String(file)
@@ -423,24 +429,41 @@ export default function Editor({ onOpenNote }: EditorProps) {
     } catch {}
   }, [])
 
+  const loadVaultImages = useCallback(async () => {
+    try {
+      const all = await invoke<string[]>('list_assets')
+      const imgs = all.filter(p => {
+        const ext = p.split('.').pop()?.toLowerCase() ?? ''
+        return IMAGE_EXTENSIONS.includes(ext)
+      })
+      setVaultImages(imgs)
+    } catch {}
+  }, [])
+
   const confirmImageInsert = useCallback(() => {
     if (!imageModal) return
     const view = viewRef.current
     if (!view) return
-    const src = (imgSource === 'file' ? imgFilePath : imgUrl).trim()
-    if (!src) return
-    const sizeStr = imgSize.trim() ? `|${imgSize.trim()}` : ''
-    const alt = imgAlt.trim() || (imgSource === 'file'
-      ? (imgFilePath.split('/').pop()?.replace(/\.[^.]+$/, '') ?? 'image')
-      : 'image')
-    const insert = `![${alt}${sizeStr}](${src})`
+    let insert: string
+    if (imgSource === 'vault') {
+      if (!vaultImgSelected) return
+      insert = `![[${vaultImgSelected}]]`
+    } else {
+      const src = (imgSource === 'file' ? imgFilePath : imgUrl).trim()
+      if (!src) return
+      const sizeStr = imgSize.trim() ? `|${imgSize.trim()}` : ''
+      const alt = imgAlt.trim() || (imgSource === 'file'
+        ? (imgFilePath.split('/').pop()?.replace(/\.[^.]+$/, '') ?? 'image')
+        : 'image')
+      insert = `![${alt}${sizeStr}](${src})`
+    }
     view.dispatch({
       changes: { from: imageModal.from, to: imageModal.to, insert },
       selection: { anchor: imageModal.from + insert.length },
     })
     setImageModal(null)
     view.focus()
-  }, [imageModal, imgSource, imgFilePath, imgUrl, imgAlt, imgSize])
+  }, [imageModal, imgSource, imgFilePath, imgUrl, imgAlt, imgSize, vaultImgSelected])
 
   const applyCmAction = useCallback((action: string) => {
     setCmCtxMenu(null)
@@ -757,25 +780,29 @@ export default function Editor({ onOpenNote }: EditorProps) {
             {/* 來源選擇 */}
             <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: 'var(--color-text-secondary)' }}>
               來源
-              <select value={imgSource} onChange={e => { setImgSource(e.target.value as 'file' | 'url'); setImgUrlError('') }}
+              <select value={imgSource} onChange={e => {
+                const v = e.target.value as 'file' | 'url' | 'vault'
+                setImgSource(v)
+                setImgUrlError('')
+                if (v === 'vault') { setVaultImgSelected(''); loadVaultImages() }
+              }}
                 style={{ flex: 1, padding: '5px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }}>
                 <option value="file">系統圖片</option>
                 <option value="url">使用網址</option>
+                <option value="vault">工作區圖片</option>
               </select>
             </label>
 
             {/* 系統圖片 picker */}
             {imgSource === 'file' && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                  <button onClick={pickImageFile}
-                    style={{ padding: '5px 12px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px', cursor: 'pointer', flexShrink: 0 }}>
-                    選擇圖片…
-                  </button>
-                  <span style={{ fontSize: '12px', color: 'var(--color-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
-                    {imgFilePath || '尚未選擇'}
-                  </span>
-                </div>
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                <button onClick={pickImageFile}
+                  style={{ padding: '5px 12px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px', cursor: 'pointer', flexShrink: 0 }}>
+                  選擇圖片…
+                </button>
+                <span style={{ fontSize: '12px', color: 'var(--color-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                  {imgFilePath || '尚未選擇'}
+                </span>
               </div>
             )}
 
@@ -789,21 +816,80 @@ export default function Editor({ onOpenNote }: EditorProps) {
               </div>
             )}
 
-            {/* 圖片大小 */}
-            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: 'var(--color-text-secondary)' }}>
-              大小（px 或 %）
-              <input value={imgSize} onChange={e => setImgSize(e.target.value)}
-                placeholder="例：300 或 50%"
-                style={{ flex: 1, padding: '5px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }} />
-            </label>
+            {/* 工作區圖片 picker */}
+            {imgSource === 'vault' && (() => {
+              const filtered = vaultImages.filter(p =>
+                p.toLowerCase().includes(vaultImgFilter.toLowerCase())
+              )
+              return (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                  <input
+                    value={vaultImgFilter}
+                    onChange={e => setVaultImgFilter(e.target.value)}
+                    placeholder="搜尋圖片檔名…"
+                    style={{ padding: '5px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }}
+                  />
+                  <div style={{
+                    maxHeight: '180px', overflowY: 'auto',
+                    border: '1px solid var(--color-border)', borderRadius: '5px',
+                    background: 'var(--color-bg-base)',
+                  }}>
+                    {filtered.length === 0 ? (
+                      <div style={{ padding: '12px', fontSize: '12px', color: 'var(--color-text-muted)', textAlign: 'center' }}>
+                        {vaultImages.length === 0 ? '工作區內沒有圖片' : '無符合結果'}
+                      </div>
+                    ) : filtered.map(p => (
+                      <div
+                        key={p}
+                        onClick={() => setVaultImgSelected(p)}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: '8px',
+                          padding: '6px 10px', cursor: 'pointer', fontSize: '12px',
+                          background: vaultImgSelected === p ? 'var(--color-accent)' : 'transparent',
+                          color: vaultImgSelected === p ? '#fff' : 'var(--color-text-primary)',
+                        }}
+                        onMouseEnter={e => { if (vaultImgSelected !== p) e.currentTarget.style.background = 'var(--color-bg-hover)' }}
+                        onMouseLeave={e => { if (vaultImgSelected !== p) e.currentTarget.style.background = 'transparent' }}
+                      >
+                        <img
+                          src={`vault://localhost/${p}`}
+                          alt=""
+                          style={{ width: '28px', height: '28px', objectFit: 'cover', borderRadius: '3px', flexShrink: 0 }}
+                          onError={e => { (e.currentTarget as HTMLImageElement).style.visibility = 'hidden' }}
+                        />
+                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {p.split('/').pop()}
+                        </span>
+                        <span style={{ marginLeft: 'auto', opacity: 0.5, flexShrink: 0, fontSize: '11px' }}>
+                          {p.includes('/') ? p.substring(0, p.lastIndexOf('/')) : ''}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                  {vaultImgSelected && (
+                    <div style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>
+                      將插入：<code style={{ color: 'var(--color-accent)' }}>![[{vaultImgSelected}]]</code>
+                    </div>
+                  )}
+                </div>
+              )
+            })()}
 
-            {/* 顯示名稱 */}
-            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: 'var(--color-text-secondary)' }}>
-              顯示名稱
-              <input value={imgAlt} onChange={e => setImgAlt(e.target.value)}
-                placeholder="（選填）"
-                style={{ flex: 1, padding: '5px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }} />
-            </label>
+            {/* 圖片大小 / 顯示名稱（vault 模式不適用） */}
+            {imgSource !== 'vault' && <>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: 'var(--color-text-secondary)' }}>
+                大小（px 或 %）
+                <input value={imgSize} onChange={e => setImgSize(e.target.value)}
+                  placeholder="例：300 或 50%"
+                  style={{ flex: 1, padding: '5px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }} />
+              </label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: 'var(--color-text-secondary)' }}>
+                顯示名稱
+                <input value={imgAlt} onChange={e => setImgAlt(e.target.value)}
+                  placeholder="（選填）"
+                  style={{ flex: 1, padding: '5px 8px', borderRadius: '5px', border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '13px' }} />
+              </label>
+            </>}
 
             {/* 按鈕 */}
             <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '4px' }}>
@@ -819,7 +905,8 @@ export default function Editor({ onOpenNote }: EditorProps) {
                   }
                   confirmImageInsert()
                 }}
-                style={{ padding: '6px 14px', borderRadius: '6px', fontSize: '13px', color: '#fff', background: 'var(--color-accent)', border: 'none', cursor: 'pointer' }}>
+                disabled={imgSource === 'vault' && !vaultImgSelected}
+                style={{ padding: '6px 14px', borderRadius: '6px', fontSize: '13px', color: '#fff', background: 'var(--color-accent)', border: 'none', cursor: imgSource === 'vault' && !vaultImgSelected ? 'not-allowed' : 'pointer', opacity: imgSource === 'vault' && !vaultImgSelected ? 0.5 : 1 }}>
                 確認
               </button>
             </div>
