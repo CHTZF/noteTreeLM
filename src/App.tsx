@@ -115,6 +115,15 @@ export default function App() {
     }
   }, [])
 
+  // F12 → open DevTools (production debug helper)
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'F12') invoke('open_devtools').catch(() => {})
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [])
+
   // 首次掛載驗證 session
   useEffect(() => { checkSession() }, [])
 

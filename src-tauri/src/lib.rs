@@ -30,6 +30,11 @@ use tauri::{
     Manager,
 };
 
+#[tauri::command]
+fn open_devtools(window: tauri::WebviewWindow) {
+    window.open_devtools();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -205,6 +210,8 @@ pub fn run() {
             download_llama_server,
             get_coreml_model_path,
             download_coreml_model,
+            // DevTools (debug helper)
+            open_devtools,
         ])
         .build(tauri::generate_context!())
         .expect("noteTreeLM 構建失敗")
