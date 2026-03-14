@@ -1,34 +1,46 @@
 /* ─── Custom Title Bar ────────────────────────────────────────────────────── */
+/* Grid layout: drag region takes remaining space, controls take exact width.
+   No position:absolute — keeps controls in normal flow so pointer events work. */
 .app-titlebar {
   height: var(--titlebar-height);
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: grid;
+  grid-template-columns: 1fr max-content;
   background: var(--color-bg-surface);
   border-bottom: 1px solid var(--color-border);
   flex-shrink: 0;
-  position: relative;
   user-select: none;
+}
+
+/* macOS: single full-width drag region (no controls column) */
+.app-titlebar.macos {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.app-titlebar-drag {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  overflow: hidden;
 }
 
 .app-titlebar-title {
   font-size: 12px;
   font-weight: 600;
-  /* iOS uses "secondary label" color for inactive window titles */
   color: var(--color-text-secondary);
   letter-spacing: 0.005em;
+  padding: 0 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   pointer-events: none;
 }
 
-/* Windows 視窗控制按鈕 */
+/* Windows 視窗控制按鈕 — normal flow grid cell, no absolute positioning */
 .app-titlebar-controls {
   display: flex;
   align-items: stretch;
-  position: absolute;
-  right: 0;
-  top: 0;
-  height: 100%;
-  -webkit-app-region: no-drag;
 }
 
 .titlebar-btn {

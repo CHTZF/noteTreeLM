@@ -22,37 +22,41 @@ export default function TitleBar({ title }: TitleBarProps) {
 
   if (!isWindows) {
     return (
-      <div data-tauri-drag-region className="app-titlebar">
-        <span className="app-titlebar-title" data-tauri-drag-region>
+      <div data-tauri-drag-region className="app-titlebar macos">
+        <span data-tauri-drag-region className="app-titlebar-title">
           {title || 'noteTreeLM'}
         </span>
       </div>
     )
   }
 
-  const win = getCurrentWindow()
+  // Windows: grid layout (1fr | max-content).
+  // Controls are in normal document flow — no position:absolute.
+  // data-tauri-drag-region is per the official docs: applied to the drag div
+  // and each child that should also be draggable (title span).
+  const appWindow = getCurrentWindow()
 
   return (
-    <div className="app-titlebar" style={{ display: 'flex', alignItems: 'center' }}>
-      {/* 拖曳區：佔滿剩餘空間 */}
-      <div data-tauri-drag-region className="app-titlebar-drag" style={{ flex: 1, display: 'flex', alignItems: 'center', height: '100%' }}>
-        <span className="app-titlebar-title">
+    <div className="app-titlebar">
+      {/* 拖曳區：grid 第一欄 */}
+      <div data-tauri-drag-region className="app-titlebar-drag">
+        <span data-tauri-drag-region className="app-titlebar-title">
           {title || 'noteTreeLM'}
         </span>
       </div>
-      {/* Windows 視窗控制按鈕（在拖曳區外，避免事件被攔截） */}
+      {/* 控制按鈕：grid 第二欄，正常文件流，不受 drag region 干擾 */}
       <div className="app-titlebar-controls">
         <button
           className="titlebar-btn titlebar-btn-min"
           title="最小化"
-          onClick={() => win.minimize()}
+          onClick={() => appWindow.minimize()}
         >
           <svg width="10" height="1" viewBox="0 0 10 1"><rect width="10" height="1" fill="currentColor"/></svg>
         </button>
         <button
           className="titlebar-btn titlebar-btn-max"
           title={isMaximized ? '還原' : '最大化'}
-          onClick={() => win.toggleMaximize()}
+          onClick={() => appWindow.toggleMaximize()}
         >
           {isMaximized
             ? <svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 0H10V7H7V10H0V3H3V0ZM7 3H3V7H7V3Z" fill="currentColor" fillRule="evenodd"/></svg>
@@ -62,7 +66,7 @@ export default function TitleBar({ title }: TitleBarProps) {
         <button
           className="titlebar-btn titlebar-btn-close"
           title="關閉"
-          onClick={() => win.close()}
+          onClick={() => appWindow.close()}
         >
           <svg width="10" height="10" viewBox="0 0 10 10"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg>
         </button>
