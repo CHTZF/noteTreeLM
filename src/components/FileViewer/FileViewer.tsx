@@ -28,20 +28,6 @@ const TEXT_EXTS = [
   'swift', 'kt', 'lua', 'r', 'sql', 'env', 'gitignore',
 ]
 
-// 組合絕對路徑：使用平台原生分隔符，確保 Rust std::fs 能正確讀取
-// Windows：全部換成反斜線；macOS/Linux：全部換成正斜線
-const isWindows = navigator.userAgent.includes('Windows')
-function buildAbsPath(vaultPath: string, relPath: string): string {
-  if (isWindows) {
-    const v = vaultPath.replace(/\//g, '\\').replace(/\\+$/, '')
-    const r = relPath.replace(/\//g, '\\')
-    return `${v}\\${r}`
-  }
-  const v = vaultPath.replace(/\\+$/, '').replace(/\/+$/, '')
-  const r = relPath.replace(/\\/g, '/')
-  return `${v}/${r}`
-}
-
 export default function FileViewer({ path }: FileViewerProps) {
   const { settings } = useSettingsStore()
   const { openPathExternally } = useVaultStore()
@@ -57,9 +43,7 @@ export default function FileViewer({ path }: FileViewerProps) {
   const filename = normalizedRelPath.split('/').pop() ?? normalizedRelPath
   const ext = filename.split('.').pop()?.toLowerCase() ?? ''
 
-  // Build absolute path using native OS separators for Rust std::fs
-  const absPath = buildAbsPath(settings.system_current_vault_path, normalizedRelPath)
-  // Forward-slash version for convertFileSrc (URL-based fallback)
+  // Absolute path (forward slashes) for convertFileSrc (audio/video/pdf) and openPathExternally
   const absPathFwd = settings.system_current_vault_path.replace(/\\/g, '/').replace(/\/+$/, '') + '/' + normalizedRelPath
 
   const isImage = IMAGE_EXTS.includes(ext)
@@ -68,33 +52,30 @@ export default function FileViewer({ path }: FileViewerProps) {
   const isPdf = PDF_EXTS.includes(ext)
   const isText = TEXT_EXTS.includes(ext)
 
-  // 圖片：read_file_base64 → data URL（相容 Windows，不依賴 asset:// CSP）
+  // 圖片：read_vault_file_base64（Rust 側用 PathBuf::join 組合路徑，跨平台可靠）
   useEffect(() => {
     if (!isImage) { setImageSrc(null); setImageError(null); return }
     setImageSrc(null)
     setImageError(null)
-    invoke<string>('read_file_base64', { path: absPath })
+    invoke<string>('read_vault_file_base64', { relPath: normalizedRelPath })
       .then((b64) => setImageSrc(`data:${guessMime(ext)};base64,${b64}`))
       .catch((e) => {
-        // 顯示錯誤路徑，方便診斷
-        setImageError(`無法載入圖片\n路徑：${absPath}\n錯誤：${String(e)}`)
-        // 嘗試 convertFileSrc fallback
-        setImageSrc(convertFileSrc(absPathFwd))
+        setImageError(`無法載入圖片\n路徑：${normalizedRelPath}\n錯誤：${String(e)}`)
       })
-  }, [absPath, isImage])
+  }, [normalizedRelPath, isImage])
 
   useEffect(() => {
     if (!isText) { setTextContent(null); return }
     setLoading(true)
     setError(null)
-    invoke<string>('read_file_base64', { path: absPath })
+    invoke<string>('read_vault_file_base64', { relPath: normalizedRelPath })
       .then((b64) => {
         const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))
         setTextContent(new TextDecoder().decode(bytes))
       })
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false))
-  }, [absPath, isText])
+  }, [normalizedRelPath, isText])
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', background: 'var(--color-bg-base)' }}>
@@ -109,7 +90,7 @@ export default function FileViewer({ path }: FileViewerProps) {
           {filename}
         </span>
         <button
-          onClick={() => openPathExternally(absPath).catch(() => {})}
+          onClick={() => openPathExternally(absPathFwd).catch(() => {})}
           style={{
             padding: '4px 10px', fontSize: 12,
             background: 'var(--color-bg-hover)',
@@ -137,9 +118,8 @@ export default function FileViewer({ path }: FileViewerProps) {
             alt={filename}
             style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }}
             onError={() => {
-              // convertFileSrc fallback also failed; show diagnostic
-              if (imageError) return // already showing error
               setImageSrc(null)
+              if (!imageError) setImageError(`圖片解碼失敗：${filename}`)
             }}
           />
         )}
@@ -197,7 +177,7 @@ export default function FileViewer({ path }: FileViewerProps) {
             <div style={{ fontSize: 48, marginBottom: 12 }}>📄</div>
             <div style={{ marginBottom: 12 }}>{filename}</div>
             <button
-              onClick={() => openPathExternally(absPath).catch(() => {})}
+              onClick={() => openPathExternally(absPathFwd).catch(() => {})}
               style={{
                 padding: '6px 14px', fontSize: 13,
                 background: 'var(--color-accent)',

@@ -135,6 +135,7 @@ pub fn run() {
             move_note,
             move_folder,
             read_file_base64,
+            read_vault_file_base64,
             create_folder,
             list_folders,
             delete_folder,

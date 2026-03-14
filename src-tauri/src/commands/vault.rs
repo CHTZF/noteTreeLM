@@ -702,6 +702,24 @@ pub async fn read_file_base64(path: String) -> Result<String, AppError> {
     Ok(BASE64.encode(&bytes))
 }
 
+/// 以相對路徑讀取 Vault 中的檔案（base64）
+/// 使用 State 取得 vault_path，再以 PathBuf::join 組合，
+/// 完全由 Rust 處理路徑分隔符，不依賴前端字串拼接。
+#[tauri::command]
+pub async fn read_vault_file_base64(
+    state: State<'_, AppState>,
+    rel_path: String,
+) -> Result<String, AppError> {
+    let vault_path = state.get_vault_path().await;
+    if vault_path.is_empty() {
+        return Err(AppError::Vault("尚未設定 Vault 路徑".to_string()));
+    }
+    let abs_path = PathBuf::from(&vault_path).join(&rel_path);
+    let bytes = std::fs::read(&abs_path)
+        .map_err(|e| AppError::Vault(format!("無法讀取檔案 {}: {}", abs_path.display(), e)))?;
+    Ok(BASE64.encode(&bytes))
+}
+
 /// 在 Vault 中建立資料夾（包括空資料夾）
 #[tauri::command]
 pub async fn create_folder(
