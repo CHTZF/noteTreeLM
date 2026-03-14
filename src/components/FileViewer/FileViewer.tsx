@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useVaultStore } from '../../stores/vaultStore'
+import { useDebugStore } from '../../stores/debugStore'
 
 const MIME_MAP: Record<string, string> = {
   jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
@@ -60,7 +61,9 @@ export default function FileViewer({ path }: FileViewerProps) {
     invoke<string>('read_vault_file_base64', { relPath: normalizedRelPath })
       .then((b64) => setImageSrc(`data:${guessMime(ext)};base64,${b64}`))
       .catch((e) => {
-        setImageError(`無法載入圖片\n路徑：${normalizedRelPath}\n錯誤：${String(e)}`)
+        const msg = `無法讀取圖片 ${normalizedRelPath}：${String(e)}`
+        setImageError(msg)
+        useDebugStore.getState().addLog('FileViewer', 'error', msg)
       })
   }, [normalizedRelPath, isImage])
 
@@ -73,7 +76,11 @@ export default function FileViewer({ path }: FileViewerProps) {
         const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))
         setTextContent(new TextDecoder().decode(bytes))
       })
-      .catch((e) => setError(String(e)))
+      .catch((e) => {
+        const msg = `無法讀取檔案 ${normalizedRelPath}：${String(e)}`
+        setError(msg)
+        useDebugStore.getState().addLog('FileViewer', 'error', msg)
+      })
       .finally(() => setLoading(false))
   }, [normalizedRelPath, isText])
 
@@ -118,8 +125,12 @@ export default function FileViewer({ path }: FileViewerProps) {
             alt={filename}
             style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }}
             onError={() => {
+              const msg = `圖片解碼失敗：${filename}`
               setImageSrc(null)
-              if (!imageError) setImageError(`圖片解碼失敗：${filename}`)
+              if (!imageError) {
+                setImageError(msg)
+                useDebugStore.getState().addLog('FileViewer', 'error', msg)
+              }
             }}
           />
         )}
