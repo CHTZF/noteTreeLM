@@ -7,6 +7,7 @@ import { keymap } from '@codemirror/view'
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { invoke } from '@tauri-apps/api/core'
+import { convertFileSrc } from '@tauri-apps/api/core'
 import { useEditorStore } from '../../stores/editorStore'
 import { useVaultStore } from '../../stores/vaultStore'
 import { useSettingsStore } from '../../stores/settingsStore'
@@ -922,7 +923,7 @@ export default function Editor({ onOpenNote }: EditorProps) {
                         onMouseEnter={e => { if (vaultImgSelected !== p) e.currentTarget.style.background = 'var(--color-bg-hover)' }}
                         onMouseLeave={e => { if (vaultImgSelected !== p) e.currentTarget.style.background = 'transparent' }}
                       >
-                        <img src={`vault://localhost/${p}`} alt="" style={{ width: '28px', height: '28px', objectFit: 'cover', borderRadius: '3px', flexShrink: 0 }}
+                        <img src={convertFileSrc(settings.system_current_vault_path.replace(/\\/g, '/').replace(/\/+$/, '') + '/' + p)} alt="" style={{ width: '28px', height: '28px', objectFit: 'cover', borderRadius: '3px', flexShrink: 0 }}
                           onError={e => { (e.currentTarget as HTMLImageElement).style.visibility = 'hidden' }} />
                         <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{p.split('/').pop()}</span>
                         <span style={{ opacity: 0.45, flexShrink: 0, fontSize: '11px' }}>{p.includes('/') ? p.substring(0, p.lastIndexOf('/')) : ''}</span>

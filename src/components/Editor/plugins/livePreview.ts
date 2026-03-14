@@ -452,9 +452,11 @@ class ImageWidget extends WidgetType {
         })
     }
 
-    if (this.src.startsWith('http') || this.src.startsWith('data:') ||
-        this.src.startsWith('asset:') || this.src.startsWith('vault:')) {
+    if (this.src.startsWith('http') || this.src.startsWith('data:') || this.src.startsWith('asset:')) {
       img.src = this.src
+    } else if (this.src.startsWith('vault://localhost/')) {
+      // vault:// scheme is not supported on Windows WebView2 — extract relative path and load as base64
+      loadLocal(decodeURIComponent(this.src.slice('vault://localhost/'.length)))
     } else {
       loadLocal(this.src)
     }
