@@ -646,6 +646,11 @@ const liveBlockField = StateField.define<DecorationSet>({
 })
 
 // ── Inline decoration builder ─────────────────────────────────────────────────
+// NOTE: We intentionally iterate the full document instead of view.visibleRanges.
+// On Windows WebView2, visibleRanges can be empty or stale after display:none→block
+// transitions (even after requestMeasure + double rAF), which would cause all
+// inline decorations to silently disappear. For typical note-length documents
+// (<50KB) the performance difference is negligible.
 function buildInlineDecos(view: EditorView): DecorationSet {
   const cursor = view.state.selection.main.head
   const doc    = view.state.doc
@@ -663,7 +668,9 @@ function buildInlineDecos(view: EditorView): DecorationSet {
   const addMark = (from: number, to: number, cls: string) => add(from, to, Decoration.mark({ class: cls }))
   const cursorIn = (from: number, to: number) => cursor >= from && cursor <= to
 
-  for (const { from: vpFrom, to: vpTo } of view.visibleRanges) {
+  // Use full document range — avoids visibleRanges timing issues on Windows WebView2
+  const fullRange = [{ from: 0, to: doc.length }]
+  for (const { from: vpFrom, to: vpTo } of fullRange) {
     syntaxTree(view.state).iterate({
       from: vpFrom,
       to: vpTo,
@@ -829,7 +836,7 @@ function buildInlineDecos(view: EditorView): DecorationSet {
   // ── Image syntax scan ─────────────────────────────────────────────────────
   // Regex-based (more reliable than syntax tree for ![alt|size](url) variants).
   const imageRe = /!\[([^\]]*)\]\(([^)]+)\)/g
-  for (const { from: vpFrom, to: vpTo } of view.visibleRanges) {
+  for (const { from: vpFrom, to: vpTo } of fullRange) {
     const text = doc.sliceString(vpFrom, vpTo)
     let m: RegExpExecArray | null
     imageRe.lastIndex = 0
@@ -843,7 +850,7 @@ function buildInlineDecos(view: EditorView): DecorationSet {
 
   // ── Obsidian-style vault embed: ![[path]] or ![[path|size]] ───────────────
   const vaultImgRe = /!\[\[([^\]]+)\]\]/g
-  for (const { from: vpFrom, to: vpTo } of view.visibleRanges) {
+  for (const { from: vpFrom, to: vpTo } of fullRange) {
     const text = doc.sliceString(vpFrom, vpTo)
     let m: RegExpExecArray | null
     vaultImgRe.lastIndex = 0
@@ -869,7 +876,7 @@ function buildInlineDecos(view: EditorView): DecorationSet {
   // ── Quick-copy HTML spans ──────────────────────────────────────────────────
   // Always rendered (no cursorIn check). Right-click opens the edit modal.
   const quickCopyRe = /<span class="quick-copy" data-copy="([^"]*)"([^>]*)>(.*?)<\/span>/g
-  for (const { from: vpFrom, to: vpTo } of view.visibleRanges) {
+  for (const { from: vpFrom, to: vpTo } of fullRange) {
     const text = doc.sliceString(vpFrom, vpTo)
     let m: RegExpExecArray | null
     quickCopyRe.lastIndex = 0
