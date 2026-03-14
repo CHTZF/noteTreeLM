@@ -6,8 +6,8 @@ import { languages } from '@codemirror/language-data'
 import { keymap } from '@codemirror/view'
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
+import { open as openPath } from '@tauri-apps/plugin-shell'
 import { invoke } from '@tauri-apps/api/core'
-import { convertFileSrc } from '@tauri-apps/api/core'
 import { useEditorStore } from '../../stores/editorStore'
 import { useVaultStore } from '../../stores/vaultStore'
 import { useSettingsStore } from '../../stores/settingsStore'
@@ -20,6 +20,26 @@ import { toast } from '../common/Toast'
 
 // Editor styles are defined in App.css (.cm-editor selectors) to avoid
 // Windows WebView2 Constructable Stylesheet failures (EditorView.theme uses adoptedStyleSheets).
+
+const MIME_MAP: Record<string, string> = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+  gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml', bmp: 'image/bmp',
+}
+
+function VaultThumb({ relPath }: { relPath: string }) {
+  const [src, setSrc] = useState('')
+  useEffect(() => {
+    invoke<string>('read_vault_file_base64', { relPath })
+      .then(b64 => {
+        const ext = relPath.split('.').pop()?.toLowerCase() ?? 'png'
+        setSrc(`data:${MIME_MAP[ext] ?? 'image/png'};base64,${b64}`)
+      })
+      .catch(() => {})
+  }, [relPath])
+  return src
+    ? <img src={src} alt="" style={{ width: '28px', height: '28px', objectFit: 'cover', borderRadius: '3px', flexShrink: 0 }} />
+    : <div style={{ width: '28px', height: '28px', flexShrink: 0 }} />
+}
 
 interface EditorProps {
   canGoBack?: boolean
@@ -643,7 +663,20 @@ export default function Editor({ onOpenNote }: EditorProps) {
     }
   }, [handleAction])
 
-  const wikilinkHandler = (title: string, anchor?: string) => {
+  const wikilinkHandler = async (title: string, anchor?: string) => {
+    // If the title has a file extension, treat it as a non-note file and open with system default app
+    if (/\.[^/.]+$/.test(title)) {
+      try {
+        const assets = await invoke<string[]>('list_assets')
+        const lower = title.toLowerCase()
+        const match = assets.find(a => a.toLowerCase() === lower || a.toLowerCase().endsWith('/' + lower))
+        if (match) {
+          const vaultPath = useSettingsStore.getState().settings.system_current_vault_path.replace(/\\/g, '/')
+          await openPath(`${vaultPath}/${match}`)
+        }
+      } catch { /* ignore */ }
+      return
+    }
     const note = useVaultStore.getState().notes.find((n) => n.title === title)
     if (!note) return
     if (note.path === currentPath) {
@@ -923,8 +956,7 @@ export default function Editor({ onOpenNote }: EditorProps) {
                         onMouseEnter={e => { if (vaultImgSelected !== p) e.currentTarget.style.background = 'var(--color-bg-hover)' }}
                         onMouseLeave={e => { if (vaultImgSelected !== p) e.currentTarget.style.background = 'transparent' }}
                       >
-                        <img src={convertFileSrc(settings.system_current_vault_path.replace(/\\/g, '/').replace(/\/+$/, '') + '/' + p)} alt="" style={{ width: '28px', height: '28px', objectFit: 'cover', borderRadius: '3px', flexShrink: 0 }}
-                          onError={e => { (e.currentTarget as HTMLImageElement).style.visibility = 'hidden' }} />
+                        <VaultThumb relPath={p} />
                         <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{p.split('/').pop()}</span>
                         <span style={{ opacity: 0.45, flexShrink: 0, fontSize: '11px' }}>{p.includes('/') ? p.substring(0, p.lastIndexOf('/')) : ''}</span>
                       </div>

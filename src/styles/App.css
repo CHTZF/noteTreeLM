@@ -66,15 +66,65 @@
   color: #fff;
 }
 
-/* ─── CodeMirror Editor theme ────────────────────────────────────────────────
+/* ─── CodeMirror base structural styles ─────────────────────────────────────
+   @codemirror/view injects these via StyleModule / adoptedStyleSheets which is
+   silently broken on Windows WebView2. Re-declared as plain global CSS using
+   .cm-editor as scope (replacing the .ͼN hash scope CM uses internally).
+   Source: @codemirror/view baseTheme$1. */
+
+/* Editor root */
+.cm-editor                { position: relative !important; box-sizing: border-box; display: flex !important; flex-direction: column; }
+.cm-editor.cm-focused     { outline: 1px dotted #212121; }
+
+/* Scroller */
+.cm-editor .cm-scroller   { display: flex !important; align-items: flex-start !important; font-family: monospace; line-height: 1.4; height: 100%; overflow-x: auto; position: relative; z-index: 0; overflow-anchor: none; }
+
+/* Content */
+.cm-editor .cm-content    { margin: 0; flex-grow: 2; flex-shrink: 0; display: block; white-space: pre; word-wrap: normal; box-sizing: border-box; min-height: 100%; padding: 4px 0; outline: none; }
+.cm-editor .cm-content[contenteditable=true] { -webkit-user-modify: read-write-plaintext-only; }
+.cm-editor .cm-lineWrapping { white-space: break-spaces; word-break: break-word; overflow-wrap: anywhere; flex-shrink: 1; }
+
+/* Lines */
+.cm-editor .cm-line       { display: block; padding: 0 2px 0 6px; }
+
+/* Layers (cursor / selection) */
+.cm-editor .cm-layer      { position: absolute; left: 0; top: 0; contain: size style; pointer-events: none; }
+.cm-editor .cm-layer > *  { position: absolute; }
+.cm-editor .cm-cursorLayer { pointer-events: none; }
+.cm-editor.cm-focused > .cm-scroller > .cm-cursorLayer { animation: steps(1) cm-blink 1.2s infinite; }
+@keyframes cm-blink  { 0% {} 50% { opacity: 0; } 100% {} }
+@keyframes cm-blink2 { 0% {} 50% { opacity: 0; } 100% {} }
+
+/* Cursor */
+.cm-editor .cm-cursor, .cm-editor .cm-dropCursor { border-left: 1.2px solid black; margin-left: -0.6px; pointer-events: none; }
+.cm-editor .cm-cursor     { display: none; }
+.cm-editor .cm-dropCursor { position: absolute; }
+.cm-editor.cm-focused > .cm-scroller > .cm-cursorLayer .cm-cursor { display: block; }
+
+/* Gutters */
+.cm-editor .cm-gutters    { display: flex !important; flex-shrink: 0; height: 100% !important; box-sizing: border-box; z-index: 200; }
+.cm-editor .cm-gutters-before { inset-inline-start: 0; }
+.cm-editor .cm-gutters-after  { inset-inline-end: 0; }
+.cm-editor .cm-gutter     { display: flex !important; flex-direction: column; flex-shrink: 0; box-sizing: border-box; min-height: 100%; overflow: hidden; }
+.cm-editor .cm-gutterElement { box-sizing: border-box; }
+.cm-editor .cm-lineNumbers .cm-gutterElement { padding: 0 3px 0 5px; min-width: 20px; text-align: right; white-space: nowrap; }
+
+/* Misc widgets */
+.cm-editor .cm-widgetBuffer { vertical-align: text-top; height: 1em; width: 0; display: inline; }
+.cm-editor .cm-placeholder  { color: #888; display: inline-block; vertical-align: top; user-select: none; }
+.cm-editor .cm-tab           { display: inline-block; overflow: hidden; vertical-align: bottom; }
+.cm-editor .cm-iso           { unicode-bidi: isolate; }
+.cm-editor .cm-announced     { position: fixed; top: -10000px; }
+
+/* ─── CodeMirror theme overrides (app colors / fonts) ───────────────────────
    Defined here instead of EditorView.theme() to avoid Windows WebView2
-   Constructable Stylesheet failures (adoptedStyleSheets not rendering).
-   Uses .cm-editor selector (set by basicSetup) as scope instead of & theme. */
+   Constructable Stylesheet failures (adoptedStyleSheets not rendering). */
 
 .cm-editor { background: var(--color-bg-base); color: var(--color-text-primary); height: 100%; }
 .cm-editor .cm-content { padding: 24px 32px; font-family: var(--font-mono); font-size: var(--font-size-editor); line-height: 1.7; caret-color: var(--color-accent); -webkit-user-select: text; user-select: text; }
 .cm-editor .cm-gutters { background: var(--color-bg-base); border-right: 1px solid var(--color-border); color: var(--color-text-muted); }
 .cm-editor .cm-activeLine { background: var(--color-accent-dim); }
+.cm-editor .cm-activeLineGutter { background: var(--color-accent-dim); }
 .cm-editor.cm-focused .cm-selectionBackground,
 .cm-editor .cm-selectionBackground { background: rgba(124,140,248,0.4) !important; }
 .cm-editor .cm-cursor { border-left-color: var(--color-accent); }

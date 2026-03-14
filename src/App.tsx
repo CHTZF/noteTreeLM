@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef, useCallback, Fragment } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
+import { open as openPath } from '@tauri-apps/plugin-shell'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
 import { faGear, faBolt, faChevronLeft, faChevronRight, faSitemap, faFolderTree, faMagnifyingGlass, faBug, faComments, faMicrophone, faArrowRightArrowLeft, faTrash, faArrowRightFromBracket, faCircleQuestion, faUser } from '@fortawesome/free-solid-svg-icons'
 import { useSettingsStore } from './stores/settingsStore'
@@ -803,7 +804,19 @@ function AppMain() {
     return (
       <PreviewPanel
         content={paneContents[leaf.id] ?? ''}
-        onWikilinkClick={title => {
+        onWikilinkClick={async title => {
+          if (/\.[^/.]+$/.test(title)) {
+            try {
+              const assets = await invoke<string[]>('list_assets')
+              const lower = title.toLowerCase()
+              const match = assets.find(a => a.toLowerCase() === lower || a.toLowerCase().endsWith('/' + lower))
+              if (match) {
+                const vaultPath = useSettingsStore.getState().settings.system_current_vault_path.replace(/\\/g, '/')
+                await openPath(`${vaultPath}/${match}`)
+              }
+            } catch { /* ignore */ }
+            return
+          }
           const note = useVaultStore.getState().notes.find(n => n.title === title)
           if (note) openNote(note.path)
         }}
