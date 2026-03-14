@@ -17,7 +17,7 @@ interface FileViewerProps {
   path: string  // relative path from vault root
 }
 
-const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'ico']
+const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'ico', 'tiff', 'tif', 'avif']
 const AUDIO_EXTS = ['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac']
 const VIDEO_EXTS = ['mp4', 'mkv', 'avi', 'mov', 'webm']
 const PDF_EXTS = ['pdf']
@@ -28,6 +28,20 @@ const TEXT_EXTS = [
   'swift', 'kt', 'lua', 'r', 'sql', 'env', 'gitignore',
 ]
 
+// 組合絕對路徑：使用平台原生分隔符，確保 Rust std::fs 能正確讀取
+// Windows：全部換成反斜線；macOS/Linux：全部換成正斜線
+const isWindows = navigator.userAgent.includes('Windows')
+function buildAbsPath(vaultPath: string, relPath: string): string {
+  if (isWindows) {
+    const v = vaultPath.replace(/\//g, '\\').replace(/\\+$/, '')
+    const r = relPath.replace(/\//g, '\\')
+    return `${v}\\${r}`
+  }
+  const v = vaultPath.replace(/\\+$/, '').replace(/\/+$/, '')
+  const r = relPath.replace(/\\/g, '/')
+  return `${v}/${r}`
+}
+
 export default function FileViewer({ path }: FileViewerProps) {
   const { settings } = useSettingsStore()
   const { openPathExternally } = useVaultStore()
@@ -36,12 +50,17 @@ export default function FileViewer({ path }: FileViewerProps) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [imageSrc, setImageSrc] = useState<string | null>(null)
+  const [imageError, setImageError] = useState<string | null>(null)
 
-  const filename = path.split('/').pop() ?? path
+  // Normalize relative path to forward slashes for display/ext detection
+  const normalizedRelPath = path.replace(/\\/g, '/')
+  const filename = normalizedRelPath.split('/').pop() ?? normalizedRelPath
   const ext = filename.split('.').pop()?.toLowerCase() ?? ''
-  // Normalize backslashes to forward slashes (Windows vault paths use backslashes,
-  // but convertFileSrc requires a URL-friendly path)
-  const absPath = settings.system_current_vault_path.replace(/\\/g, '/').replace(/\/+$/, '') + '/' + path
+
+  // Build absolute path using native OS separators for Rust std::fs
+  const absPath = buildAbsPath(settings.system_current_vault_path, normalizedRelPath)
+  // Forward-slash version for convertFileSrc (URL-based fallback)
+  const absPathFwd = settings.system_current_vault_path.replace(/\\/g, '/').replace(/\/+$/, '') + '/' + normalizedRelPath
 
   const isImage = IMAGE_EXTS.includes(ext)
   const isAudio = AUDIO_EXTS.includes(ext)
@@ -49,14 +68,19 @@ export default function FileViewer({ path }: FileViewerProps) {
   const isPdf = PDF_EXTS.includes(ext)
   const isText = TEXT_EXTS.includes(ext)
 
-  const assetUrl = convertFileSrc(absPath)
-
-  // 圖片：用 read_file_base64 → data URL（相容 Windows，不依賴 asset:// CSP）
+  // 圖片：read_file_base64 → data URL（相容 Windows，不依賴 asset:// CSP）
   useEffect(() => {
-    if (!isImage) { setImageSrc(null); return }
+    if (!isImage) { setImageSrc(null); setImageError(null); return }
+    setImageSrc(null)
+    setImageError(null)
     invoke<string>('read_file_base64', { path: absPath })
       .then((b64) => setImageSrc(`data:${guessMime(ext)};base64,${b64}`))
-      .catch(() => setImageSrc(assetUrl)) // fallback
+      .catch((e) => {
+        // 顯示錯誤路徑，方便診斷
+        setImageError(`無法載入圖片\n路徑：${absPath}\n錯誤：${String(e)}`)
+        // 嘗試 convertFileSrc fallback
+        setImageSrc(convertFileSrc(absPathFwd))
+      })
   }, [absPath, isImage])
 
   useEffect(() => {
@@ -112,20 +136,37 @@ export default function FileViewer({ path }: FileViewerProps) {
             src={imageSrc}
             alt={filename}
             style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }}
+            onError={() => {
+              // convertFileSrc fallback also failed; show diagnostic
+              if (imageError) return // already showing error
+              setImageSrc(null)
+            }}
           />
+        )}
+        {isImage && !imageSrc && imageError && (
+          <pre style={{
+            color: 'var(--color-error, #e06c75)', padding: 16,
+            fontSize: 12, fontFamily: 'var(--font-mono)',
+            whiteSpace: 'pre-wrap', wordBreak: 'break-all', margin: 0,
+          }}>
+            {imageError}
+          </pre>
+        )}
+        {isImage && !imageSrc && !imageError && (
+          <span style={{ color: 'var(--color-text-muted)', padding: 16 }}>載入中…</span>
         )}
 
         {isAudio && (
-          <audio controls src={assetUrl} style={{ width: '100%', maxWidth: 480 }} />
+          <audio controls src={convertFileSrc(absPathFwd)} style={{ width: '100%', maxWidth: 480 }} />
         )}
 
         {isVideo && (
-          <video controls src={assetUrl} style={{ maxWidth: '100%', maxHeight: '100%' }} />
+          <video controls src={convertFileSrc(absPathFwd)} style={{ maxWidth: '100%', maxHeight: '100%' }} />
         )}
 
         {isPdf && (
           <iframe
-            src={assetUrl}
+            src={convertFileSrc(absPathFwd)}
             style={{ width: '100%', height: '100%', border: 'none', flex: 1 }}
             title={filename}
           />
