@@ -928,50 +928,8 @@ const liveInlinePlugin = ViewPlugin.fromClass(
 // ── Export ────────────────────────────────────────────────────────────────────
 export const livePreviewPlugin: Extension = [liveBlockField, liveInlinePlugin]
 
-// ── Theme ─────────────────────────────────────────────────────────────────────
-export const livePreviewTheme = EditorView.theme({
-  '.cm-live-hidden': { fontSize: '0 !important', width: '0', display: 'inline-block', overflow: 'hidden' },
-  '.cm-live-h1': { fontSize: '1.9em', fontWeight: '700', fontFamily: 'var(--font-sans)', color: 'var(--color-text-primary)', letterSpacing: '-0.02em' },
-  '.cm-live-h2': { fontSize: '1.5em',  fontWeight: '700', fontFamily: 'var(--font-sans)', color: 'var(--color-text-primary)' },
-  '.cm-live-h3': { fontSize: '1.25em', fontWeight: '600', fontFamily: 'var(--font-sans)', color: 'var(--color-text-primary)' },
-  '.cm-live-h4': { fontSize: '1.1em',  fontWeight: '600', fontFamily: 'var(--font-sans)', color: 'var(--color-text-primary)' },
-  '.cm-live-h5': { fontSize: '1em',    fontWeight: '600', fontFamily: 'var(--font-sans)', color: 'var(--color-text-secondary)' },
-  '.cm-live-h6': { fontSize: '0.95em', fontWeight: '600', fontFamily: 'var(--font-sans)', color: 'var(--color-text-muted)' },
-  '.cm-live-bold':   { fontWeight: '700' },
-  '.cm-live-italic': { fontStyle: 'italic' },
-  '.cm-live-strike': { textDecoration: 'line-through', opacity: '0.7' },
-  '.cm-live-code': {
-    fontFamily: 'var(--font-mono)', fontSize: '0.85em',
-    background: 'var(--color-bg-elevated)', borderRadius: 'var(--radius-sm)',
-    padding: '0.1em 0.4em', color: 'var(--color-danger)',
-  },
-  '.cm-live-link': { color: 'var(--color-accent)', textDecoration: 'underline', cursor: 'text' },
-  // Block widget container — overflow:hidden creates a BFC so that child margins
-  // (e.g. .preview-content table/hr/p have margin:1em 0) do NOT collapse outside
-  // the widget div. Without this, those margins are excluded from offsetHeight,
-  // causing CM6 to underestimate widget height and mismap click positions.
-  '.cm-live-block-widget': {
-    display: 'block', width: '100%', boxSizing: 'border-box', overflow: 'hidden',
-  },
-  // Reset margins for all block-level elements rendered inside live-preview widgets.
-  // These elements normally get margin from .preview-content rules (App.css),
-  // which would escape the widget container and throw off CM6's height map.
-  '.cm-live-block-widget table': { margin: '0' },
-  '.cm-live-block-widget hr':    { margin: '0' },
-  '.cm-live-block-widget pre':   { margin: '0' },
-  '.cm-live-block-widget p':     { margin: '0' },
-  '.cm-live-block-widget blockquote': { margin: '0' },
-  // Blockquote line styling — matches .preview-content blockquote
-  '.cm-line.cm-live-blockquote-line': {
-    borderLeft: '3px solid var(--color-accent)',
-    paddingLeft: '1em',
-    color: 'var(--color-text-secondary)',
-    background: 'var(--color-accent-dim)',
-    borderRadius: '0 var(--radius-sm) var(--radius-sm) 0',
-  },
-  // Unordered list items — hide `- ` marker, show • via ::before
-  '.cm-line.cm-live-ul-item': { paddingLeft: '1.6em', position: 'relative' },
-  '.cm-line.cm-live-ul-item::before': { content: "'•'", position: 'absolute', left: '0.4em' },
-  // Ordered list items — keep numbers visible, add hanging indent
-  '.cm-line.cm-live-ol-item': { paddingLeft: '0.4em' },
-})
+// ── Theme (empty) ─────────────────────────────────────────────────────────────
+// All cm-live-* styles have been moved to App.css (global CSS) to avoid
+// WebView2 CSP issues with dynamically-injected Constructable Stylesheets on Windows.
+// The export is kept so Editor.tsx doesn't need to change its import.
+export const livePreviewTheme = EditorView.baseTheme({})

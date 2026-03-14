@@ -66,6 +66,71 @@
   color: #fff;
 }
 
+/* ─── CodeMirror Live Preview styles ────────────────────────────────────────
+   Defined here (global CSS) instead of EditorView.theme() to avoid WebView2
+   CSP issues with dynamically-injected Constructable Stylesheets on Windows.
+   All class names are prefixed with cm-live- to avoid conflicts. */
+
+/* Inline: hide markdown syntax tokens (##, **, ~~, etc.) */
+.cm-live-hidden {
+  font-size: 0 !important;
+  width: 0;
+  display: inline-block;
+  overflow: hidden;
+}
+
+/* Inline: headings */
+.cm-live-h1 { font-size: 1.9em;  font-weight: 700; font-family: var(--font-sans); color: var(--color-text-primary); letter-spacing: -0.02em; }
+.cm-live-h2 { font-size: 1.5em;  font-weight: 700; font-family: var(--font-sans); color: var(--color-text-primary); }
+.cm-live-h3 { font-size: 1.25em; font-weight: 600; font-family: var(--font-sans); color: var(--color-text-primary); }
+.cm-live-h4 { font-size: 1.1em;  font-weight: 600; font-family: var(--font-sans); color: var(--color-text-primary); }
+.cm-live-h5 { font-size: 1em;    font-weight: 600; font-family: var(--font-sans); color: var(--color-text-secondary); }
+.cm-live-h6 { font-size: 0.95em; font-weight: 600; font-family: var(--font-sans); color: var(--color-text-muted); }
+
+/* Inline: emphasis */
+.cm-live-bold   { font-weight: 700; }
+.cm-live-italic { font-style: italic; }
+.cm-live-strike { text-decoration: line-through; opacity: 0.7; }
+.cm-live-code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--color-bg-elevated);
+  border-radius: var(--radius-sm);
+  padding: 0.1em 0.4em;
+  color: var(--color-danger);
+}
+.cm-live-link { color: var(--color-accent); text-decoration: underline; cursor: text; }
+
+/* Block widget container — overflow:hidden creates BFC so child margins
+   (table/hr/p) don't collapse outside the widget, keeping CM6 height map accurate. */
+.cm-live-block-widget {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+.cm-live-block-widget table     { margin: 0; }
+.cm-live-block-widget hr        { margin: 0; }
+.cm-live-block-widget pre       { margin: 0; }
+.cm-live-block-widget p         { margin: 0; }
+.cm-live-block-widget blockquote { margin: 0; }
+
+/* Line: blockquote */
+.cm-line.cm-live-blockquote-line {
+  border-left: 3px solid var(--color-accent);
+  padding-left: 1em;
+  color: var(--color-text-secondary);
+  background: var(--color-accent-dim);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+
+/* Line: unordered list — hide '- ' marker, show bullet via ::before */
+.cm-line.cm-live-ul-item { padding-left: 1.6em; position: relative; }
+.cm-line.cm-live-ul-item::before { content: '•'; position: absolute; left: 0.4em; }
+
+/* Line: ordered list — keep numbers, add hanging indent */
+.cm-line.cm-live-ol-item { padding-left: 0.4em; }
+
 /* ─── App Layout ──────────────────────────────────────────────────────────── */
 .app-layout {
   display: flex;
