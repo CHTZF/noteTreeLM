@@ -149,43 +149,57 @@ function processHtmlForPreview(html: string): string {
 }
 
 // 將圖片 src 解析為可用的圖片 URL
-// - 絕對路徑 / vault 相對路徑 → 呼叫 Rust read_file_base64 回傳 data URL
+// - 相對路徑 → read_vault_file_base64（Rust PathBuf::join，跨平台可靠）
+// - 絕對路徑 → read_file_base64
+// - vault://localhost/ → 擷取相對路徑後走相對路徑邏輯
 // - src 可能被 markdown-it 的 encodeURI 編碼，先用 decodeURI 還原
-async function resolveImageSrc(src: string, vaultPath: string): Promise<string> {
-  if (src.startsWith('data:') || src.startsWith('http') || src.startsWith('vault:') || src.startsWith('asset:')) {
-    return src
-  }
+async function resolveImageSrc(src: string, _vaultPath: string): Promise<string> {
+  if (src.startsWith('data:') || src.startsWith('asset:')) return src
+  // http:// 僅允許外部 URL（tauri.localhost 表示相對路徑解析失敗，仍需重試）
+  if (src.startsWith('http') && !src.startsWith('http://tauri.localhost') && !src.startsWith('https://tauri.localhost')) return src
 
   // markdown-it 會對 image URL 呼叫 encodeURI，此處還原為原始路徑
   let decoded = src
   try { decoded = decodeURI(src) } catch { /* 保持原值 */ }
 
-  // 解析為絕對路徑（正規化 Windows 反斜線）
-  const normalizedVaultPath = vaultPath.replace(/\\/g, '/')
-  const absolutePath = decoded.startsWith('/') || /^[A-Za-z]:[/\\]/.test(decoded)
-    ? decoded
-    : `${normalizedVaultPath}/${decoded}`
+  // vault:// scheme（macOS WKWebView 用）→ 轉為相對路徑
+  if (decoded.startsWith('vault://localhost/')) {
+    decoded = decodeURIComponent(decoded.slice('vault://localhost/'.length))
+  }
 
+  const isAbsolute = decoded.startsWith('/') || /^[A-Za-z]:[/\\]/.test(decoded)
+
+  if (isAbsolute) {
+    // 絕對路徑：直接呼叫 read_file_base64
+    const normalizedPath = decoded.replace(/\\/g, '/')
+    try {
+      const base64 = await invoke<string>('read_file_base64', { path: normalizedPath })
+      return `data:${guessMimeType(normalizedPath)};base64,${base64}`
+    } catch (e) {
+      console.warn('無法讀取圖片:', normalizedPath, e)
+      return src
+    }
+  }
+
+  // 相對路徑：使用 read_vault_file_base64（Rust 側組合路徑，不依賴前端字串拼接）
   try {
-    const base64 = await invoke<string>('read_file_base64', { path: absolutePath })
-    return `data:${guessMimeType(absolutePath)};base64,${base64}`
+    const base64 = await invoke<string>('read_vault_file_base64', { relPath: decoded })
+    return `data:${guessMimeType(decoded)};base64,${base64}`
   } catch (e) {
-    // Obsidian compatibility: bare filename (no path separator) → search entire vault
-    const isAbsolute = decoded.startsWith('/') || /^[A-Za-z]:[/\\]/.test(decoded)
-    const isBareFilename = !isAbsolute && !decoded.includes('/') && !decoded.includes('\\')
+    // Obsidian bare filename fallback：搜尋整個 vault
+    const isBareFilename = !decoded.includes('/') && !decoded.includes('\\')
     if (isBareFilename) {
       try {
         const assets = await invoke<string[]>('list_assets')
         const lower = decoded.toLowerCase()
         const match = assets.find(a => a.toLowerCase() === lower || a.toLowerCase().endsWith('/' + lower))
         if (match) {
-          const matchAbsPath = `${normalizedVaultPath}/${match}`
-          const base64 = await invoke<string>('read_file_base64', { path: matchAbsPath })
-          return `data:${guessMimeType(matchAbsPath)};base64,${base64}`
+          const base64 = await invoke<string>('read_vault_file_base64', { relPath: match })
+          return `data:${guessMimeType(match)};base64,${base64}`
         }
       } catch { /* fallthrough */ }
     }
-    console.warn('無法讀取圖片:', absolutePath, e)
+    console.warn('無法讀取圖片:', decoded, e)
     return src
   }
 }
