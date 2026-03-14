@@ -153,9 +153,21 @@ export default function Editor({ onOpenNote }: EditorProps) {
       })
       // When becoming visible (switching from preview→live/editor), the editor
       // may have been hidden with display:none, causing stale measurements.
-      // Force a remeasure so CodeMirror recalculates the viewport correctly.
+      // On Windows WebView2 the layout may need two frames to settle, so we
+      // use a double-rAF: first frame triggers measurement, second frame
+      // dispatches a no-op selection update to force liveInlinePlugin to
+      // rebuild decorations with the now-correct visibleRanges.
       if (viewMode === 'live' || viewMode === 'editor') {
-        requestAnimationFrame(() => view.requestMeasure())
+        requestAnimationFrame(() => {
+          view.requestMeasure()
+          requestAnimationFrame(() => {
+            if (viewRef.current === view) {
+              // Setting selection to its current value sets selectionSet=true
+              // in the ViewUpdate, which triggers liveInlinePlugin to rebuild.
+              view.dispatch({ selection: view.state.selection })
+            }
+          })
+        })
       }
     } catch (e) {
       console.error('livePreview reconfigure error:', e)
