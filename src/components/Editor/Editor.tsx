@@ -17,16 +17,8 @@ import PreviewPanel from './PreviewPanel'
 import BacklinksPanel from '../BacklinksPanel/BacklinksPanel'
 import { toast } from '../common/Toast'
 
-// CSS variables are live — when data-theme changes the editor repaints automatically
-const editorTheme = EditorView.theme({
-  '&': { background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', height: '100%' },
-  '.cm-content': { padding: '24px 32px', fontFamily: 'var(--font-mono)', fontSize: 'var(--font-size-editor)', lineHeight: '1.7', caretColor: 'var(--color-accent)', WebkitUserSelect: 'text' },
-  '.cm-gutters': { background: 'var(--color-bg-base)', borderRight: '1px solid var(--color-border)', color: 'var(--color-text-muted)' },
-  '.cm-activeLine': { background: 'var(--color-accent-dim)' },
-  '&.cm-focused .cm-selectionBackground, .cm-selectionBackground': { background: 'rgba(124,140,248,0.4)' },
-  '.cm-cursor': { borderLeftColor: 'var(--color-accent)' },
-  '.cm-wikilink-mark': { color: 'var(--color-accent)', textDecoration: 'underline dotted' },
-})
+// Editor styles are defined in App.css (.cm-editor selectors) to avoid
+// Windows WebView2 Constructable Stylesheet failures (EditorView.theme uses adoptedStyleSheets).
 
 interface EditorProps {
   canGoBack?: boolean
@@ -120,7 +112,6 @@ export default function Editor({ onOpenNote }: EditorProps) {
           basicSetup,
           history(),
           markdown({ base: markdownLanguage, codeLanguages: languages }),
-          editorTheme,
           livePreviewTheme,
           wikilinkPlugin,
           liveCompartment.current.of([]), // initially no live preview

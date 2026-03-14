@@ -66,9 +66,23 @@
   color: #fff;
 }
 
+/* ─── CodeMirror Editor theme ────────────────────────────────────────────────
+   Defined here instead of EditorView.theme() to avoid Windows WebView2
+   Constructable Stylesheet failures (adoptedStyleSheets not rendering).
+   Uses .cm-editor selector (set by basicSetup) as scope instead of & theme. */
+
+.cm-editor { background: var(--color-bg-base); color: var(--color-text-primary); height: 100%; }
+.cm-editor .cm-content { padding: 24px 32px; font-family: var(--font-mono); font-size: var(--font-size-editor); line-height: 1.7; caret-color: var(--color-accent); -webkit-user-select: text; user-select: text; }
+.cm-editor .cm-gutters { background: var(--color-bg-base); border-right: 1px solid var(--color-border); color: var(--color-text-muted); }
+.cm-editor .cm-activeLine { background: var(--color-accent-dim); }
+.cm-editor.cm-focused .cm-selectionBackground,
+.cm-editor .cm-selectionBackground { background: rgba(124,140,248,0.4) !important; }
+.cm-editor .cm-cursor { border-left-color: var(--color-accent); }
+.cm-editor .cm-wikilink-mark { color: var(--color-accent); text-decoration: underline dotted; }
+
 /* ─── CodeMirror Live Preview styles ────────────────────────────────────────
    Defined here (global CSS) instead of EditorView.theme() to avoid WebView2
-   CSP issues with dynamically-injected Constructable Stylesheets on Windows.
+   Constructable Stylesheet failures on Windows.
    All class names are prefixed with cm-live- to avoid conflicts. */
 
 /* Inline: hide markdown syntax tokens (##, **, ~~, etc.) */
