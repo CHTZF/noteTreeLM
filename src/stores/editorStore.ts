@@ -10,6 +10,8 @@ interface EditorStore {
   viewModes: Record<string, ViewMode>
   /** 外部寫入後通知 Editor 同步視圖：null = 無待更新 */
   pendingContent: string | null
+  /** 等待捲動到的錨點（heading / block id），由 Chat 打開段落時設定 */
+  pendingAnchor: string | undefined
   setCurrentPath: (path: string | null) => void
   setContent: (content: string) => void
   setDirty: (dirty: boolean) => void
@@ -17,6 +19,7 @@ interface EditorStore {
   /** 外部（如 ChatPanel）寫入後呼叫，讓 Editor 同步 CM6 視圖並清除 dirty */
   applyExternalWrite: (content: string) => void
   clearPendingContent: () => void
+  setPendingAnchor: (anchor: string | undefined) => void
 }
 
 export const useEditorStore = create<EditorStore>((set) => ({
@@ -26,6 +29,7 @@ export const useEditorStore = create<EditorStore>((set) => ({
   viewMode: 'preview',
   viewModes: {},
   pendingContent: null,
+  pendingAnchor: undefined,
 
   setCurrentPath: (path) => set((s) => ({
     currentPath: path,
@@ -42,4 +46,5 @@ export const useEditorStore = create<EditorStore>((set) => ({
   })),
   applyExternalWrite: (content) => set({ pendingContent: content }),
   clearPendingContent: () => set({ pendingContent: null }),
+  setPendingAnchor: (anchor) => set({ pendingAnchor: anchor }),
 }))

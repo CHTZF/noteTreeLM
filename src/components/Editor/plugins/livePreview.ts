@@ -892,6 +892,69 @@ function buildInlineDecos(view: EditorView): DecorationSet {
     }
   }
 
+  // ── {color:#xxx}text{/color} syntax ─────────────────────────────────────────
+  const colorTagRe = /\{color:([^}\n]+)\}(.*?)\{\/color\}/g
+  for (const { from: vpFrom, to: vpTo } of fullRange) {
+    const text = doc.sliceString(vpFrom, vpTo)
+    let m: RegExpExecArray | null
+    colorTagRe.lastIndex = 0
+    while ((m = colorTagRe.exec(text)) !== null) {
+      const mFrom = vpFrom + m.index
+      const mTo = mFrom + m[0].length
+      const color = m[1].trim()
+      const openTag = `{color:${m[1]}}`
+      const innerFrom = mFrom + openTag.length
+      const innerTo = mTo - '{/color}'.length
+      if (innerFrom >= innerTo) continue
+      if (!cursorIn(mFrom, mTo)) {
+        add(mFrom, innerFrom, Decoration.mark({ class: 'cm-live-hidden' }))
+        add(innerFrom, innerTo, Decoration.mark({ attributes: { style: `color:${color}` } }))
+        add(innerTo, mTo, Decoration.mark({ class: 'cm-live-hidden' }))
+      } else {
+        add(mFrom, innerFrom, Decoration.mark({ class: 'cm-live-syntax-mark' }))
+        add(innerFrom, innerTo, Decoration.mark({ attributes: { style: `color:${color}` } }))
+        add(innerTo, mTo, Decoration.mark({ class: 'cm-live-syntax-mark' }))
+      }
+    }
+  }
+
+  // ── {font:family;size;weight}text{/font} syntax ───────────────────────────
+  const fontTagRe = /\{font:([^}\n]*)\}(.*?)\{\/font\}/g
+  for (const { from: vpFrom, to: vpTo } of fullRange) {
+    const text = doc.sliceString(vpFrom, vpTo)
+    let m: RegExpExecArray | null
+    fontTagRe.lastIndex = 0
+    while ((m = fontTagRe.exec(text)) !== null) {
+      const mFrom = vpFrom + m.index
+      const mTo = mFrom + m[0].length
+      const fontSpec = m[1]
+      const parts = fontSpec.split(';')
+      const family = (parts[0] || '').trim()
+      const size = (parts[1] || '').trim()
+      const weight = (parts[2] || '').trim()
+      const styles: string[] = []
+      if (family && family !== 'inherit') {
+        styles.push(`font-family:${family.includes(' ') ? `'${family}'` : family}`)
+      }
+      if (size) styles.push(`font-size:${size}px`)
+      if (weight && weight !== 'inherit') styles.push(`font-weight:${weight}`)
+      if (!styles.length) continue
+      const openTag = `{font:${fontSpec}}`
+      const innerFrom = mFrom + openTag.length
+      const innerTo = mTo - '{/font}'.length
+      if (innerFrom >= innerTo) continue
+      if (!cursorIn(mFrom, mTo)) {
+        add(mFrom, innerFrom, Decoration.mark({ class: 'cm-live-hidden' }))
+        add(innerFrom, innerTo, Decoration.mark({ attributes: { style: styles.join(';') } }))
+        add(innerTo, mTo, Decoration.mark({ class: 'cm-live-hidden' }))
+      } else {
+        add(mFrom, innerFrom, Decoration.mark({ class: 'cm-live-syntax-mark' }))
+        add(innerFrom, innerTo, Decoration.mark({ attributes: { style: styles.join(';') } }))
+        add(innerTo, mTo, Decoration.mark({ class: 'cm-live-syntax-mark' }))
+      }
+    }
+  }
+
   decos.sort((a, b) => a.from !== b.from ? a.from - b.from : b.to - a.to)
   // Build sorted line-decoration entries (one per line, merging multiple classes)
   const lineDecoArr: DecoEntry[] = Array.from(lineDecoMap.entries())

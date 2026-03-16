@@ -23,8 +23,6 @@ interface PreviewPanelProps {
   onEdit?: () => void
   pendingAnchor?: string
   onAnchorScrolled?: () => void
-  /** Called when user applies inline style via right-click menu */
-  onTextStyle?: (text: string, styleStr: string, contextBefore: string) => void
   /** Called when user edits a quick-copy span via right-click: (dataCopyDecoded, newHtml) */
   onEditQuickCopy?: (dataCopyDecoded: string, newHtml: string) => void
 }
@@ -40,10 +38,9 @@ interface EditQcState {
   copyContent: string
 }
 
-// ─── Text-style context-menu state ───────────────────────────────────────────
+// ─── Copy context-menu state ──────────────────────────────────────────────────
 interface CtxMenu {
-  x: number; y: number; text: string; contextBefore: string
-  mode: 'menu' | 'font' | 'color'
+  x: number; y: number; text: string
 }
 
 function slugifyHeading(text: string): string {
@@ -88,6 +85,27 @@ const processWikilinks = (renderedHtml: string) => {
     const display = (alias || title).trim()
     const anchorAttr = anchor ? ` data-wikilink-anchor="${anchor.trim()}"` : ''
     return `<a href="#" data-wikilink="${title.trim()}"${anchorAttr} class="wikilink">${display}</a>`
+  })
+  return result
+}
+
+// 將 {color:#xxx}text{/color} 和 {font:family;size;weight}text{/font} 轉為 HTML span
+function processCustomStyle(html: string): string {
+  let result = html.replace(/\{color:([^}\n]+)\}(.*?)\{\/color\}/g, (_, color, text) =>
+    `<span style="color:${color.trim()}">${text}</span>`
+  )
+  result = result.replace(/\{font:([^}\n]*)\}(.*?)\{\/font\}/g, (_, fontSpec, text) => {
+    const parts = fontSpec.split(';')
+    const family = (parts[0] || '').trim()
+    const size = (parts[1] || '').trim()
+    const weight = (parts[2] || '').trim()
+    const styles: string[] = []
+    if (family && family !== 'inherit') {
+      styles.push(`font-family:${family.includes(' ') ? `'${family}'` : family}`)
+    }
+    if (size) styles.push(`font-size:${size}px`)
+    if (weight && weight !== 'inherit') styles.push(`font-weight:${weight}`)
+    return styles.length ? `<span style="${styles.join(';')}">${text}</span>` : text
   })
   return result
 }
@@ -204,16 +222,105 @@ async function resolveImageSrc(src: string, _vaultPath: string): Promise<string>
   }
 }
 
-export default function PreviewPanel({ content, onWikilinkClick, onEdit, pendingAnchor, onAnchorScrolled, onTextStyle, onEditQuickCopy }: PreviewPanelProps) {
+export default function PreviewPanel({ content, onWikilinkClick, onEdit, pendingAnchor, onAnchorScrolled, onEditQuickCopy }: PreviewPanelProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const { settings } = useSettingsStore()
 
-  // ─── Right-click style menu ───────────────────────────────────────────────
+  // ─── Find-in-page ─────────────────────────────────────────────────────────
+  const [findOpen, setFindOpen] = useState(false)
+  const [findQuery, setFindQuery] = useState('')
+  const [findMatchCount, setFindMatchCount] = useState(0)
+  const [findMatchIndex, setFindMatchIndex] = useState(0)
+  const findInputRef = useRef<HTMLInputElement>(null)
+  const findMatchesRef = useRef<HTMLElement[]>([])
+
+  const clearFindHighlights = useCallback(() => {
+    findMatchesRef.current.forEach(span => {
+      const parent = span.parentNode
+      if (parent) {
+        const text = document.createTextNode(span.textContent || '')
+        parent.replaceChild(text, span)
+        parent.normalize()
+      }
+    })
+    findMatchesRef.current = []
+  }, [])
+
+  const highlightMatches = useCallback((query: string) => {
+    clearFindHighlights()
+    if (!query.trim() || !containerRef.current) {
+      setFindMatchCount(0); setFindMatchIndex(0)
+      return
+    }
+    const lowerQuery = query.toLowerCase()
+    const walker = document.createTreeWalker(containerRef.current, NodeFilter.SHOW_TEXT, null)
+    const textNodes: Text[] = []
+    let n: Text | null
+    while ((n = walker.nextNode() as Text | null)) textNodes.push(n)
+
+    const matches: HTMLElement[] = []
+    for (const textNode of textNodes) {
+      const text = textNode.textContent || ''
+      const lower = text.toLowerCase()
+      let idx = lower.indexOf(lowerQuery)
+      if (idx === -1) continue
+      const frag = document.createDocumentFragment()
+      let last = 0
+      while (idx !== -1) {
+        if (idx > last) frag.appendChild(document.createTextNode(text.slice(last, idx)))
+        const span = document.createElement('span')
+        span.className = 'find-highlight'
+        span.textContent = text.slice(idx, idx + query.length)
+        frag.appendChild(span)
+        matches.push(span)
+        last = idx + query.length
+        idx = lower.indexOf(lowerQuery, last)
+      }
+      if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)))
+      textNode.parentNode?.replaceChild(frag, textNode)
+    }
+    findMatchesRef.current = matches
+    setFindMatchCount(matches.length)
+    if (matches.length > 0) {
+      setFindMatchIndex(0)
+      matches[0].classList.add('find-highlight-active')
+      matches[0].scrollIntoView({ behavior: 'smooth', block: 'center' })
+    } else {
+      setFindMatchIndex(0)
+    }
+  }, [clearFindHighlights])
+
+  const closeFind = useCallback(() => {
+    clearFindHighlights()
+    setFindOpen(false); setFindQuery(''); setFindMatchCount(0); setFindMatchIndex(0)
+  }, [clearFindHighlights])
+
+  const navigateFind = useCallback((dir: 1 | -1) => {
+    const matches = findMatchesRef.current
+    if (matches.length === 0) return
+    matches[findMatchIndex]?.classList.remove('find-highlight-active')
+    const next = (findMatchIndex + dir + matches.length) % matches.length
+    setFindMatchIndex(next)
+    matches[next].classList.add('find-highlight-active')
+    matches[next].scrollIntoView({ behavior: 'smooth', block: 'center' })
+  }, [findMatchIndex])
+
+  // Cmd/Ctrl+F → open find; Escape → close
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'f') {
+        e.preventDefault()
+        setFindOpen(true)
+        setTimeout(() => findInputRef.current?.focus(), 0)
+      }
+      if (e.key === 'Escape') closeFind()
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [closeFind])
+
+  // ─── Copy context menu ────────────────────────────────────────────────────
   const [ctxMenu, setCtxMenu] = useState<CtxMenu | null>(null)
-  const [fontFamily, setFontFamily] = useState('inherit')
-  const [fontSize, setFontSize] = useState('')
-  const [fontWeight, setFontWeight] = useState('inherit')
-  const [textColor, setTextColor] = useState('#e03030')
   const menuRef = useRef<HTMLDivElement>(null)
 
   // ─── Edit Quick-Copy modal ────────────────────────────────────────────────
@@ -267,52 +374,27 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit, pending
       return
     }
 
-    if (!onTextStyle) return
     const selection = window.getSelection()
     const sel = selection?.toString()?.trim() ?? ''
-    if (!sel || !selection || selection.rangeCount === 0) return
+    if (!sel) return
     e.preventDefault()
-    // Capture plain text before the selection within the container (for position disambiguation)
-    let contextBefore = ''
-    try {
-      const range = selection.getRangeAt(0)
-      if (containerRef.current) {
-        const beforeRange = document.createRange()
-        beforeRange.setStart(containerRef.current, 0)
-        beforeRange.setEnd(range.startContainer, range.startOffset)
-        contextBefore = beforeRange.toString()
-      }
-    } catch { /* ignore */ }
-    setCtxMenu({ x: e.clientX, y: e.clientY, text: sel, contextBefore, mode: 'menu' })
-    setFontFamily('inherit'); setFontSize(''); setFontWeight('inherit'); setTextColor('#e03030')
-  }, [onTextStyle, onEditQuickCopy])
-
-  const applyFont = useCallback(() => {
-    if (!ctxMenu) return
-    const parts: string[] = []
-    if (fontFamily && fontFamily !== 'inherit') parts.push(`font-family:${fontFamily}`)
-    if (fontSize) parts.push(`font-size:${fontSize}px`)
-    if (fontWeight && fontWeight !== 'inherit') parts.push(`font-weight:${fontWeight}`)
-    if (parts.length > 0) onTextStyle?.(ctxMenu.text, parts.join(';'), ctxMenu.contextBefore)
-    setCtxMenu(null)
-  }, [ctxMenu, fontFamily, fontSize, fontWeight, onTextStyle])
-
-  const applyColor = useCallback(() => {
-    if (!ctxMenu) return
-    onTextStyle?.(ctxMenu.text, `color:${textColor}`, ctxMenu.contextBefore)
-    setCtxMenu(null)
-  }, [ctxMenu, textColor, onTextStyle])
+    setCtxMenu({ x: e.clientX, y: e.clientY, text: sel })
+  }, [onEditQuickCopy])
 
   // 渲染管線：
-  //   preprocessImageUrls → md.render → processWikilinks → DOMPurify → processHtmlForPreview
-  // processHtmlForPreview 在 detached div 上同步處理標題 id 和 block id，
-  // 確保 ^id 文字在首次 paint 前就被移除（避免 useEffect 延遲造成的閃現）
+  //   preprocessImageUrls → md.render → processCustomStyle → processWikilinks → DOMPurify → processHtmlForPreview
   const html = processHtmlForPreview(
     DOMPurify.sanitize(
-      processWikilinks(md.render(preprocessImageUrls(content))),
+      processWikilinks(processCustomStyle(md.render(preprocessImageUrls(content)))),
       { ADD_ATTR: ['data-wikilink', 'data-wikilink-anchor', 'class', 'data-img-size', 'style', 'data-copy'] }
     )
   )
+
+  // 內容變更時重新套用搜尋高亮（新筆記開啟時）
+  useEffect(() => {
+    if (findOpen && findQuery.trim()) highlightMatches(findQuery)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [html])
 
   // 圖片後處理：套用尺寸 + 解析圖片路徑為 data URL
   useEffect(() => {
@@ -488,7 +570,7 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit, pending
 
   return (
     <div style={{ flex: 1, position: 'relative', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-      {/* 標題收合 CSS */}
+      {/* 標題收合 + 搜尋高亮 CSS */}
       <style>{`
         .preview-content h1,.preview-content h2,.preview-content h3,
         .preview-content h4,.preview-content h5,.preview-content h6 { cursor:pointer; }
@@ -499,7 +581,50 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit, pending
         .preview-content h3[data-collapsed="true"]::before,.preview-content h4[data-collapsed="true"]::before,
         .preview-content h5[data-collapsed="true"]::before,.preview-content h6[data-collapsed="true"]::before
           { content:'▶ '; }
+        .find-highlight { background: #ffcc00; color: #000; border-radius: 2px; }
+        .find-highlight-active { background: #ff8800 !important; color: #000; }
       `}</style>
+
+      {/* Find-in-page bar */}
+      {findOpen && (
+        <div style={{
+          position: 'absolute', top: 0, left: 0, right: 0, zIndex: 100,
+          display: 'flex', alignItems: 'center', gap: '6px',
+          padding: '6px 10px',
+          background: 'var(--color-bg-elevated)',
+          borderBottom: '1px solid var(--color-border)',
+          boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+        }}>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--color-text-muted)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+            <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+          <input
+            ref={findInputRef}
+            value={findQuery}
+            onChange={e => { setFindQuery(e.target.value); highlightMatches(e.target.value) }}
+            onKeyDown={e => {
+              if (e.key === 'Enter') { e.shiftKey ? navigateFind(-1) : navigateFind(1) }
+              if (e.key === 'Escape') closeFind()
+            }}
+            placeholder="在筆記中搜尋…"
+            style={{
+              flex: 1, padding: '3px 8px', borderRadius: '5px',
+              border: '1px solid var(--color-border)',
+              background: 'var(--color-bg-base)', color: 'var(--color-text-primary)',
+              fontSize: '13px', outline: 'none',
+            }}
+          />
+          <span style={{ fontSize: '11px', color: 'var(--color-text-muted)', whiteSpace: 'nowrap', minWidth: '50px' }}>
+            {findMatchCount === 0 ? (findQuery ? '無結果' : '') : `${findMatchIndex + 1} / ${findMatchCount}`}
+          </span>
+          <button onClick={() => navigateFind(-1)} disabled={findMatchCount === 0} title="上一個 (Shift+Enter)"
+            style={{ padding: '2px 6px', borderRadius: '4px', border: '1px solid var(--color-border)', background: 'transparent', color: 'var(--color-text-secondary)', cursor: 'pointer', fontSize: '12px' }}>▲</button>
+          <button onClick={() => navigateFind(1)} disabled={findMatchCount === 0} title="下一個 (Enter)"
+            style={{ padding: '2px 6px', borderRadius: '4px', border: '1px solid var(--color-border)', background: 'transparent', color: 'var(--color-text-secondary)', cursor: 'pointer', fontSize: '12px' }}>▼</button>
+          <button onClick={closeFind} title="關閉 (Esc)"
+            style={{ padding: '2px 6px', borderRadius: '4px', border: 'none', background: 'transparent', color: 'var(--color-text-muted)', cursor: 'pointer', fontSize: '14px', lineHeight: 1 }}>✕</button>
+        </div>
+      )}
 
       {onEdit && (
         <button
@@ -614,123 +739,34 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit, pending
         </div>
       </div>
 
-      {/* ── Right-click style menu ── */}
+      {/* ── Right-click copy menu ── */}
       {ctxMenu && (
         <div
           ref={menuRef}
           style={{
             position: 'fixed', zIndex: 99999,
-            left: Math.min(ctxMenu.x, window.innerWidth - 240),
-            top: Math.min(ctxMenu.y, window.innerHeight - 320),
+            left: Math.min(ctxMenu.x, window.innerWidth - 180),
+            top: Math.min(ctxMenu.y, window.innerHeight - 80),
             background: 'var(--color-bg-elevated)',
             border: '1px solid var(--color-border)',
             borderRadius: '8px',
             boxShadow: '0 6px 24px rgba(0,0,0,0.3)',
-            minWidth: 220,
+            minWidth: 160,
             overflow: 'hidden',
           }}
           onMouseDown={e => e.stopPropagation()}
         >
-          {ctxMenu.mode === 'menu' && (
-            <>
-              <div style={{ padding: '8px 12px', fontSize: '11px', color: 'var(--color-text-muted)', borderBottom: '1px solid var(--color-border)', userSelect: 'none' }}>
-                已選取：「{ctxMenu.text.slice(0, 20)}{ctxMenu.text.length > 20 ? '…' : ''}」
-              </div>
-              {[
-                { label: '複製文字', action: () => { navigator.clipboard.writeText(ctxMenu.text); setCtxMenu(null) } },
-                { label: '改變字型 (字型/大小/粗細)', action: () => setCtxMenu(m => m && ({ ...m, mode: 'font' })) },
-                { label: '改變顏色', action: () => setCtxMenu(m => m && ({ ...m, mode: 'color' })) },
-              ].map(item => (
-                <div
-                  key={item.label}
-                  onClick={item.action}
-                  style={{ padding: '9px 14px', fontSize: '13px', cursor: 'pointer', color: 'var(--color-text-primary)' }}
-                  onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-bg-hover)')}
-                  onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
-                >
-                  {item.label}
-                </div>
-              ))}
-            </>
-          )}
-
-          {ctxMenu.mode === 'font' && (
-            <div style={{ padding: '12px', display: 'flex', flexDirection: 'column', gap: 10 }}>
-              <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)' }}>改變字型</div>
-              <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: '12px', color: 'var(--color-text-muted)' }}>
-                字型
-                <select value={fontFamily} onChange={e => setFontFamily(e.target.value)}
-                  style={{ padding: '4px 6px', borderRadius: 5, border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '12px' }}>
-                  <option value="inherit">預設</option>
-                  <option value="serif">Serif</option>
-                  <option value="sans-serif">Sans-serif</option>
-                  <option value="monospace">Monospace</option>
-                  <option value="'Noto Serif TC', serif">Noto Serif TC</option>
-                  <option value="'Source Han Sans TC', sans-serif">Source Han Sans</option>
-                </select>
-              </label>
-              <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: '12px', color: 'var(--color-text-muted)' }}>
-                大小 (px)
-                <input type="number" min={8} max={72} placeholder="例: 16" value={fontSize}
-                  onChange={e => setFontSize(e.target.value)}
-                  style={{ padding: '4px 6px', borderRadius: 5, border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '12px', width: '100%', boxSizing: 'border-box' }} />
-              </label>
-              <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: '12px', color: 'var(--color-text-muted)' }}>
-                粗細
-                <select value={fontWeight} onChange={e => setFontWeight(e.target.value)}
-                  style={{ padding: '4px 6px', borderRadius: 5, border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '12px' }}>
-                  <option value="inherit">預設</option>
-                  <option value="300">細 (300)</option>
-                  <option value="normal">正常 (400)</option>
-                  <option value="500">中等 (500)</option>
-                  <option value="bold">粗 (700)</option>
-                  <option value="900">極粗 (900)</option>
-                </select>
-              </label>
-              <div style={{ display: 'flex', gap: 6, marginTop: 2 }}>
-                <button type="button" onClick={applyFont}
-                  style={{ flex: 1, padding: '5px', borderRadius: 5, background: 'var(--color-accent)', color: 'white', fontSize: '12px', cursor: 'pointer' }}>
-                  套用
-                </button>
-                <button type="button" onClick={() => setCtxMenu(m => m && ({ ...m, mode: 'menu' }))}
-                  style={{ flex: 1, padding: '5px', borderRadius: 5, background: 'var(--color-bg-hover)', color: 'var(--color-text-secondary)', fontSize: '12px', cursor: 'pointer' }}>
-                  返回
-                </button>
-              </div>
-            </div>
-          )}
-
-          {ctxMenu.mode === 'color' && (
-            <div style={{ padding: '12px', display: 'flex', flexDirection: 'column', gap: 10 }}>
-              <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)' }}>改變顏色</div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                {['#e03030','#e07830','#d4c020','#30a850','#2080e0','#8040e0','#e030a0','#888888','#000000'].map(c => (
-                  <div key={c} onClick={() => setTextColor(c)}
-                    style={{ width: 22, height: 22, borderRadius: 4, background: c, cursor: 'pointer',
-                      border: textColor === c ? '2px solid var(--color-text-primary)' : '2px solid transparent' }} />
-                ))}
-              </div>
-              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '12px', color: 'var(--color-text-muted)' }}>
-                自訂
-                <input type="color" value={textColor} onChange={e => setTextColor(e.target.value)}
-                  style={{ width: 32, height: 24, padding: 0, border: '1px solid var(--color-border)', borderRadius: 4, cursor: 'pointer' }} />
-                <span style={{ fontFamily: 'monospace' }}>{textColor}</span>
-              </label>
-              <div style={{ padding: '8px 10px', borderRadius: 6, background: 'var(--color-bg-base)', fontSize: '13px', border: '1px solid var(--color-border)' }}>
-                <span style={{ color: textColor }}>{ctxMenu.text.slice(0, 30)}{ctxMenu.text.length > 30 ? '…' : ''}</span>
-              </div>
-              <div style={{ display: 'flex', gap: 6 }}>
-                <button type="button" onClick={applyColor}
-                  style={{ flex: 1, padding: '5px', borderRadius: 5, background: 'var(--color-accent)', color: 'white', fontSize: '12px', cursor: 'pointer' }}>
-                  套用
-                </button>
-                <button type="button" onClick={() => setCtxMenu(m => m && ({ ...m, mode: 'menu' }))}
-                  style={{ flex: 1, padding: '5px', borderRadius: 5, background: 'var(--color-bg-hover)', color: 'var(--color-text-secondary)', fontSize: '12px', cursor: 'pointer' }}>
-                  返回
-                </button>
-              </div>
-            </div>
-          )}
+          <div style={{ padding: '8px 12px', fontSize: '11px', color: 'var(--color-text-muted)', borderBottom: '1px solid var(--color-border)', userSelect: 'none' }}>
+            「{ctxMenu.text.slice(0, 20)}{ctxMenu.text.length > 20 ? '…' : ''}」
+          </div>
+          <div
+            onClick={() => { navigator.clipboard.writeText(ctxMenu.text); setCtxMenu(null) }}
+            style={{ padding: '9px 14px', fontSize: '13px', cursor: 'pointer', color: 'var(--color-text-primary)' }}
+            onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-bg-hover)')}
+            onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+          >
+            複製文字
+          </div>
         </div>
       )}
 

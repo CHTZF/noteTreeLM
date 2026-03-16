@@ -16,7 +16,7 @@ function getTabDisplayName(path: string): string {
   return TAB_SPECIAL_NAMES[path] ?? path.split('/').pop() ?? path
 }
 import GraphView from './components/Graph/GraphView'
-import SearchPanel from './components/Search/SearchPanel'
+import SemanticSearchPanel from './components/Search/SemanticSearchPanel'
 import DebugPanel from './components/Debug/DebugPanel'
 import ChatPanel from './components/Chat/ChatPanel'
 import FileViewer from './components/FileViewer/FileViewer'
@@ -156,7 +156,7 @@ function AppMain() {
   const { load: loadSettings, settings, savePersonal: saveSettings, saveSystem } = useSettingsStore()
   const { scanVault, setupWatchers, readNote } = useVaultStore()
   const { load: loadGraph } = useGraphStore()
-  const { currentPath } = useEditorStore()
+  const { currentPath, pendingAnchor } = useEditorStore()
   const { push: navPush, back: navBack, forward: navForward, canGoBack, canGoForward } = useNavigationStore()
 
   const [appReady, setAppReady] = useState(false)
@@ -456,12 +456,105 @@ function AppMain() {
   }, [navBack, navForward])
 
   // ─── Open a note in the focused pane ──────────────────────────────────
+  // Chat/LiveChat tabs should never be replaced by content navigation
+  const isChatTab = (p: string) => p === CHAT_TAB || p === LIVE_CHAT_TAB
+
+  // Find a pane that is NOT showing a Chat/LiveChat tab as its active tab,
+  // excluding the given leafId. Returns undefined if none exists.
+  const findNonChatPane = useCallback((root: PaneNode, excludeId: string) => {
+    return getAllLeaves(root).find(l => {
+      if (l.id === excludeId) return false
+      const at = l.tabs.find(t => t.id === l.activeTabId)
+      return !at || !isChatTab(at.path)
+    })
+  }, [])
+
   const openNote = useCallback((path: string) => {
     const root = paneRootRef.current
     const leafId = focusedPaneIdRef.current
     const leaf = findLeaf(root, leafId)
-    console.log('[openNote] path:', path, 'leafId:', leafId, 'leaf:', leaf?.id ?? 'null')
     if (!leaf) return
+
+    // If focused pane is showing Chat/LiveChat, protect it — open in another pane
+    const activeTab = leaf.tabs.find(t => t.id === leaf.activeTabId)
+    if (activeTab && isChatTab(activeTab.path)) {
+      const other = findNonChatPane(root, leafId)
+      if (other) {
+        const existing = other.tabs.find(t => t.path === path)
+        if (existing) {
+          setPaneRoot(prev => mapLeaf(prev, other.id, l => ({ ...l, activeTabId: existing.id })))
+        } else {
+          const id = crypto.randomUUID()
+          setPaneRoot(prev => mapLeaf(prev, other.id, l => ({
+            ...l, tabs: [...l.tabs, { id, path }], activeTabId: id,
+          })))
+        }
+        setFocusedPaneId(other.id)
+      } else {
+        // Only chat pane exists — split it, open note in new pane
+        const newLeafId = crypto.randomUUID()
+        const tabId = crypto.randomUUID()
+        const newLeaf: PaneLeaf = { kind: 'leaf', id: newLeafId, tabs: [{ id: tabId, path }], activeTabId: tabId }
+        setPaneRoot(prev => splitLeaf(prev, leafId, 'h', newLeaf))
+        setFocusedPaneId(newLeafId)
+      }
+      useEditorStore.getState().setCurrentPath(path)
+      navPush(path)
+      return
+    }
+
+    const existing = leaf.tabs.find(t => t.path === path)
+    if (existing) {
+      setPaneRoot(prev => mapLeaf(prev, leafId, l => ({ ...l, activeTabId: existing.id })))
+    } else if (leaf.activeTabId) {
+      // Replace current tab's path (browser-like navigation)
+      setPaneRoot(prev => mapLeaf(prev, leafId, l => ({
+        ...l, tabs: l.tabs.map(t => t.id === l.activeTabId ? { ...t, path } : t),
+      })))
+    } else {
+      const id = crypto.randomUUID()
+      setPaneRoot(prev => mapLeaf(prev, leafId, l => ({
+        ...l, tabs: [...l.tabs, { id, path }], activeTabId: id,
+      })))
+    }
+    useEditorStore.getState().setCurrentPath(path)
+    navPush(path)
+  }, [navPush, findNonChatPane])
+
+  // ─── Open a file in a new tab (keep existing tabs intact) ──────────────
+  const openNoteInNewTab = useCallback((path: string) => {
+    const root = paneRootRef.current
+    const leafId = focusedPaneIdRef.current
+    const leaf = findLeaf(root, leafId)
+    if (!leaf) return
+
+    // If focused pane is showing Chat/LiveChat, protect it — open in another pane
+    const activeTab = leaf.tabs.find(t => t.id === leaf.activeTabId)
+    if (activeTab && isChatTab(activeTab.path)) {
+      const other = findNonChatPane(root, leafId)
+      if (other) {
+        const existing = other.tabs.find(t => t.path === path)
+        if (existing) {
+          setPaneRoot(prev => mapLeaf(prev, other.id, l => ({ ...l, activeTabId: existing.id })))
+        } else {
+          const id = crypto.randomUUID()
+          setPaneRoot(prev => mapLeaf(prev, other.id, l => ({
+            ...l, tabs: [...l.tabs, { id, path }], activeTabId: id,
+          })))
+        }
+        setFocusedPaneId(other.id)
+      } else {
+        const newLeafId = crypto.randomUUID()
+        const tabId = crypto.randomUUID()
+        const newLeaf: PaneLeaf = { kind: 'leaf', id: newLeafId, tabs: [{ id: tabId, path }], activeTabId: tabId }
+        setPaneRoot(prev => splitLeaf(prev, leafId, 'h', newLeaf))
+        setFocusedPaneId(newLeafId)
+      }
+      useEditorStore.getState().setCurrentPath(path)
+      navPush(path)
+      return
+    }
+
     const existing = leaf.tabs.find(t => t.path === path)
     if (existing) {
       setPaneRoot(prev => mapLeaf(prev, leafId, l => ({ ...l, activeTabId: existing.id })))
@@ -473,13 +566,26 @@ function AppMain() {
     }
     useEditorStore.getState().setCurrentPath(path)
     navPush(path)
-  }, [navPush])
+  }, [navPush, findNonChatPane])
 
   // ─── Open a note from Chat/LiveChat in a non-focused pane ──────────────
   // Keeps the focused editor intact so the user can continue chatting.
   // If there's already a second pane, opens there; otherwise splits the
   // focused pane horizontally to create one.
-  const openNoteFromChat = useCallback((path: string) => {
+  const openNoteFromChat = useCallback((pathWithAnchor: string) => {
+    // Support "path#section" encoding from chunk search results
+    const hashIdx = pathWithAnchor.indexOf('#')
+    const rawPath = hashIdx >= 0 ? pathWithAnchor.slice(0, hashIdx) : pathWithAnchor
+    const anchor  = hashIdx >= 0 ? pathWithAnchor.slice(hashIdx + 1) : undefined
+
+    // Convert absolute path → relative (DB stores relative; agent:note_refs emits absolute)
+    const vaultRoot = useSettingsStore.getState().settings.system_current_vault_path
+    const normalizedVault = vaultRoot.replace(/\\/g, '/').replace(/\/$/, '')
+    const normalizedRaw   = rawPath.replace(/\\/g, '/')
+    const path = normalizedRaw.startsWith(normalizedVault + '/')
+      ? normalizedRaw.slice(normalizedVault.length + 1)
+      : rawPath
+
     const root = paneRootRef.current
     const focusedId = focusedPaneIdRef.current
     const otherLeaf = getAllLeaves(root).find(l => l.id !== focusedId)
@@ -503,6 +609,9 @@ function AppMain() {
       setPaneRoot(prev => splitLeaf(prev, focusedId, 'h', newLeaf))
       // focusedPaneId intentionally unchanged — user stays in the current pane
     }
+
+    // Set anchor AFTER pane update so Editor picks it up when content loads
+    useEditorStore.getState().setPendingAnchor(anchor)
   }, [])
 
   // ─── Update active tab path in focused pane (back/forward nav) ─────────
@@ -548,23 +657,20 @@ function AppMain() {
     if (newFocusedId) setFocusedPaneId(newFocusedId)
   }, [])
 
-  // ─── Close a pane entirely (merge tabs to first remaining) ────────────
+  // ─── Close a pane entirely (discard its tabs) ─────────────────────────
   const closePane = useCallback((paneId: string) => {
     const root = paneRootRef.current
     const leaves = getAllLeaves(root)
-    if (leaves.length <= 1) return
-    const closingLeaf = findLeaf(root, paneId)
-    const targetLeaf = leaves.find(l => l.id !== paneId)
-    if (!targetLeaf || !closingLeaf) return
-    let newRoot = removeLeaf(root, paneId)
-    if (!newRoot) return
-    if (closingLeaf.tabs.length > 0) {
-      newRoot = mapLeaf(newRoot, targetLeaf.id, l => ({
-        ...l,
-        tabs: [...l.tabs, ...closingLeaf.tabs],
-        activeTabId: l.activeTabId ?? closingLeaf.activeTabId,
-      }))
+    if (leaves.length <= 1) {
+      // Only one pane — clear all tabs instead of removing the pane
+      setPaneRoot(prev => mapLeaf(prev, paneId, l => ({ ...l, tabs: [], activeTabId: null })))
+      useEditorStore.getState().setCurrentPath(null)
+      return
     }
+    const targetLeaf = leaves.find(l => l.id !== paneId)
+    if (!targetLeaf) return
+    const newRoot = removeLeaf(root, paneId)
+    if (!newRoot) return
     setPaneRoot(newRoot)
     if (focusedPaneIdRef.current === paneId) {
       setFocusedPaneId(targetLeaf.id)
@@ -804,6 +910,8 @@ function AppMain() {
     return (
       <PreviewPanel
         content={paneContents[leaf.id] ?? ''}
+        pendingAnchor={pendingAnchor}
+        onAnchorScrolled={() => useEditorStore.getState().setPendingAnchor(undefined)}
         onWikilinkClick={async title => {
           if (/\.[^/.]+$/.test(title)) {
             try {
@@ -863,12 +971,14 @@ function AppMain() {
           }}
           dragOverTabId={dragOverTabId}
           rightContent={
-            <button
-              className="icon-menubar-btn"
-              title="關閉此面板"
-              onClick={() => closePane(leaf.id)}
-              style={{ fontSize: '16px', width: '19px', flexShrink: 0 }}
-            >×</button>
+            leaf.tabs.length > 0 ? (
+              <button
+                className="icon-menubar-btn"
+                title="關閉此面板"
+                onClick={() => closePane(leaf.id)}
+                style={{ fontSize: '16px', width: '19px', flexShrink: 0 }}
+              >×</button>
+            ) : undefined
           }
         />
         <div
@@ -1133,11 +1243,11 @@ function AppMain() {
         >
           <div style={{ display: leftPanel === 'files' ? 'flex' : 'none', flex: 1, flexDirection: 'column', overflow: 'hidden', minHeight: 0 }}>
             <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-              <FileTree onOpenNote={openNote} />
+              <FileTree onOpenNote={openNote} onOpenNoteInNewTab={openNoteInNewTab} />
             </div>
           </div>
           <div style={{ display: leftPanel === 'search' ? 'flex' : 'none', flex: 1, flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-            <SearchPanel onOpenNote={openNote} />
+            <SemanticSearchPanel onOpenNote={openNote} />
           </div>
           <div style={{ display: leftPanel === 'debug' ? 'flex' : 'none', flex: 1, flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
             <DebugPanel />

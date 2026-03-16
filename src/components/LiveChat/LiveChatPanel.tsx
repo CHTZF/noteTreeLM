@@ -360,10 +360,14 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
     // so they can be embedded as wikilinks in the committed assistant message.
     let localNoteRefs: { label: string; absPath: string }[] = []
     const unlistenNoteRefs = await listen<string[]>('agent:note_refs', (e) => {
-      const suggestions = e.payload.map(absPath => ({
-        absPath,
-        label: absPath.split('/').pop()?.replace(/\.md$/, '') ?? absPath,
-      }))
+      const suggestions = e.payload.map(absPath => {
+        const hashIdx = absPath.indexOf('#')
+        const filePart = hashIdx >= 0 ? absPath.slice(0, hashIdx) : absPath
+        const section = hashIdx >= 0 ? absPath.slice(hashIdx + 1) : ''
+        const filename = filePart.split('/').pop()?.replace(/\.md$/, '') ?? filePart
+        const label = section ? `${filename} § ${section}` : filename
+        return { absPath, label }
+      })
       setNoteSuggestions(suggestions)
       // Deduplicate accumulation (multiple tool rounds may fire the same refs)
       for (const s of suggestions) {
@@ -638,7 +642,7 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
         {/* Note navigation suggestions */}
         {noteSuggestions.length > 0 && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-            <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>找到筆記，要打開嗎？</span>
+            <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>找到相關段落，要打開嗎？</span>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
               {noteSuggestions.map((note, i) => (
                 <button

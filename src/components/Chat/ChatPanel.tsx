@@ -17,6 +17,7 @@ interface Message {
 
 export default function ChatPanel({ liveChatActive = false, onActiveChange, onOpenNote }: { liveChatActive?: boolean; onActiveChange?: (active: boolean) => void; onOpenNote?: (path: string) => void }) {
   const { settings } = useSettingsStore()
+  const { session } = useAuthStore()
   const { content: noteContent, currentPath } = useEditorStore()
   const { addLog } = useDebugStore()
 
@@ -24,7 +25,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const [input, setInput] = useState('')
   const [isStreaming, setIsStreaming] = useState(false)
   const [conversationId, setConversationId] = useState<string | null>(null)
-  const [sidebarOpen, _setSidebarOpen] = useState(true)
+  const [sidebarOpen, setSidebarOpen] = useState(true)
 
   // Notify parent when streaming state changes (for close confirmation)
   useEffect(() => { onActiveChange?.(isStreaming) }, [isStreaming])
@@ -50,6 +51,12 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const justCompressedRef = useRef(false)
   const sessionWriteApprovedRef = useRef(false)
 
+  // Per-conversation draft state (input + chips), keyed by conversationId
+  type DraftState = { input: string; noteSuggestions: { absPath: string; label: string }[] }
+  const conversationDraftsRef = useRef<Record<string, DraftState>>({})
+  const inputRef2 = useRef('')  // mirrors `input` state for save-on-switch (avoids stale closure)
+  useEffect(() => { inputRef2.current = input }, [input])
+
   // Track note suggestions from agent:note_refs for "打開它" shortcut
   const [noteSuggestions, setNoteSuggestions] = useState<{ absPath: string; label: string }[]>([])
   const noteSuggestionsRef = useRef<{ absPath: string; label: string }[]>([])
@@ -58,18 +65,23 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const log = useCallback((msg: string) => addLog('chat', 'info', msg), [addLog])
   const err = useCallback((msg: string) => addLog('chat', 'error', msg), [addLog])
 
-  // 初始化：從 localStorage 恢復上次對話（不自動建立新對話）
+  // 初始化：從 DB 恢復上次對話（不自動建立新對話）
   useEffect(() => {
-    const saved = localStorage.getItem('chat_conversation_id')
-    if (saved) {
-      invoke('get_conversation', { id: saved })
-        .then(() => { setConversationId(saved); loadConversationMessages(saved) })
-        .catch(() => {
-          // Stale ID — remove it and stay on empty screen
-          localStorage.removeItem('chat_conversation_id')
-        })
-    }
-  }, [])
+    const username = session?.username ?? ''
+    if (!username) return
+    invoke<string | null>('get_last_chat_conversation_id', { username })
+      .then(saved => {
+        if (saved) {
+          invoke('get_conversation', { id: saved })
+            .then(() => { setConversationId(saved); loadConversationMessages(saved) })
+            .catch(() => {
+              // Stale ID — clear it and stay on empty screen
+              invoke('set_last_chat_conversation_id', { username, conversationId: null }).catch(() => {})
+            })
+        }
+      })
+      .catch(() => {})
+  }, [session?.username])
 
   const loadConversationMessages = useCallback(async (id: string) => {
     try {
@@ -78,45 +90,61 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       setMessages(msgs.filter(m => m.role === 'user' || m.role === 'assistant')
         .map(m => ({ role: m.role as 'user' | 'assistant', content: m.content })))
     } catch {
-      // Conversation not found in DB (stale localStorage ID) — create a fresh one
+      // Conversation not found in DB — create a fresh one
       try {
         const username = useAuthStore.getState().session?.username ?? ''
         const newId = await invoke<string>('create_conversation', { username, mode: 'chat' })
         setConversationId(newId)
-        localStorage.setItem('chat_conversation_id', newId)
+        invoke('set_last_chat_conversation_id', { username, conversationId: newId }).catch(() => {})
       } catch {}
       setMessages([])
     }
   }, [])
 
-  const handleSelectConversation = useCallback((id: string) => {
-    if (isStreaming) return
-    setConversationId(id)
-    localStorage.setItem('chat_conversation_id', id)
-    loadConversationMessages(id)
-    setError('')
-    setStreamingText('')
-    streamingRef.current = ''
-  }, [isStreaming, loadConversationMessages])
-
-  const handleNewConversation = useCallback((id: string) => {
-    if (!id) {
-      // Current conversation was deleted — reset to empty screen
-      setConversationId(null)
-      localStorage.removeItem('chat_conversation_id')
-      setMessages([])
-      setError('')
-      setStreamingText('')
-      streamingRef.current = ''
-      return
+  // Save draft for the outgoing conversation, then restore (or clear) for the incoming one
+  const switchConversation = useCallback((outgoingId: string | null, incomingId: string | null) => {
+    // Save current draft
+    if (outgoingId) {
+      conversationDraftsRef.current[outgoingId] = {
+        input: inputRef2.current,
+        noteSuggestions: noteSuggestionsRef.current,
+      }
     }
-    setConversationId(id)
-    localStorage.setItem('chat_conversation_id', id)
-    setMessages([])
+    // Restore draft for the new conversation (or start fresh)
+    const draft = incomingId ? conversationDraftsRef.current[incomingId] : undefined
+    setInput(draft?.input ?? '')
+    setNoteSuggestions(draft?.noteSuggestions ?? [])
+    noteSuggestionsRef.current = draft?.noteSuggestions ?? []
+    setPendingWriteDisplay(null)
     setError('')
     setStreamingText('')
     streamingRef.current = ''
   }, [])
+
+  const handleSelectConversation = useCallback((id: string) => {
+    if (isStreaming) return
+    switchConversation(conversationId, id)
+    setConversationId(id)
+    const username = useAuthStore.getState().session?.username ?? ''
+    invoke('set_last_chat_conversation_id', { username, conversationId: id }).catch(() => {})
+    loadConversationMessages(id)
+  }, [isStreaming, conversationId, loadConversationMessages, switchConversation])
+
+  const handleNewConversation = useCallback((id: string) => {
+    const username = useAuthStore.getState().session?.username ?? ''
+    if (!id) {
+      // Current conversation was deleted — reset to empty screen
+      switchConversation(conversationId, null)
+      setConversationId(null)
+      invoke('set_last_chat_conversation_id', { username, conversationId: null }).catch(() => {})
+      setMessages([])
+      return
+    }
+    switchConversation(conversationId, id)
+    setConversationId(id)
+    invoke('set_last_chat_conversation_id', { username, conversationId: id }).catch(() => {})
+    setMessages([])
+  }, [conversationId, switchConversation])
 
   const isConfigured = !!settings.llama_cli_path && !!settings.llm_model_path
   const whisperConfigured = !!settings.whisper_cli_path && !!settings.whisper_model_path
@@ -328,10 +356,14 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
 
       // 追蹤筆記建議（供 chip 按鈕顯示）
       unlistenNoteRefs = await listen<string[]>('agent:note_refs', (e) => {
-        const suggestions = e.payload.map(absPath => ({
-          absPath,
-          label: absPath.split('/').pop()?.replace(/\.md$/, '') ?? absPath,
-        }))
+        const suggestions = e.payload.map(absPath => {
+          const hashIdx = absPath.indexOf('#')
+          const filePart = hashIdx >= 0 ? absPath.slice(0, hashIdx) : absPath
+          const section = hashIdx >= 0 ? absPath.slice(hashIdx + 1) : ''
+          const filename = filePart.split('/').pop()?.replace(/\.md$/, '') ?? filePart
+          const label = section ? `${filename} § ${section}` : filename
+          return { absPath, label }
+        })
         setNoteSuggestions(suggestions)
         noteSuggestionsRef.current = suggestions
       })
@@ -544,43 +576,31 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
 
       {/* Main chat area */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minWidth: 0 }}>
-      {/* No conversation selected — placeholder */}
-      {!conversationId && (
-        <div style={{
-          flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center',
-          justifyContent: 'center', color: 'var(--color-text-muted)', fontSize: '13px',
-          textAlign: 'center', lineHeight: 1.8, padding: '24px', gap: '12px',
-        }}>
-          <div>請選擇過去對話</div>
-          <div style={{ color: 'var(--color-text-muted)', fontSize: '11px' }}>或點擊側欄「＋ 新對話」開始</div>
-        </div>
-      )}
-      {conversationId && <>
-      {/* Voice Overlay */}
-      {showVoiceOverlay && (
-        <VoiceOverlay
-          voiceState={voiceState}
-          transcript={voiceTranscript}
-          preview={voicePreview}
-          previewEnabled={previewEnabled}
-          isSpeaking={voiceIsSpeaking}
-          onConfirm={handleVoiceConfirm}
-          onDiscard={handleVoiceDiscard}
-          onSaveToCurrentNote={currentPath ? handleVoiceSaveToCurrentNote : undefined}
-          onSaveToNewNote={handleVoiceSaveToNewNote}
-        />
-      )}
-      <div style={{ display: 'contents' }}>
-        {/* Header */}
+
+        {/* Persistent header — always visible */}
         <div style={{
           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
           padding: '8px 12px', borderBottom: '1px solid var(--color-border)', flexShrink: 0,
         }}>
-          <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)', letterSpacing: '0.05em' }}>
-            CHAT
-          </span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <button
+              onClick={() => setSidebarOpen(o => !o)}
+              title={sidebarOpen ? '收合對話列表' : '展開對話列表'}
+              style={{
+                width: 24, height: 24, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                background: 'transparent', border: '1px solid var(--color-border)', borderRadius: '4px',
+                color: 'var(--color-text-muted)', cursor: 'pointer', fontSize: '12px', padding: 0, flexShrink: 0,
+              }}
+            >
+              {sidebarOpen
+                ? <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+                : <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+              }
+            </button>
+            <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)', letterSpacing: '0.05em' }}>CHAT</span>
+          </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-            {messages.length > 0 && (
+            {conversationId && messages.length > 0 && (
               <>
                 <button
                   onClick={compressToMemory}
@@ -606,6 +626,34 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
             )}
           </div>
         </div>
+
+      {/* No conversation selected — placeholder */}
+      {!conversationId && (
+        <div style={{
+          flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center',
+          justifyContent: 'center', color: 'var(--color-text-muted)', fontSize: '13px',
+          textAlign: 'center', lineHeight: 1.8, padding: '24px', gap: '12px',
+        }}>
+          <div>請選擇過去對話</div>
+          <div style={{ color: 'var(--color-text-muted)', fontSize: '11px' }}>或點擊左側「＋ 新對話」{sidebarOpen ? '' : '（先展開列表）'}</div>
+        </div>
+      )}
+      {conversationId && <>
+      {/* Voice Overlay */}
+      {showVoiceOverlay && (
+        <VoiceOverlay
+          voiceState={voiceState}
+          transcript={voiceTranscript}
+          preview={voicePreview}
+          previewEnabled={previewEnabled}
+          isSpeaking={voiceIsSpeaking}
+          onConfirm={handleVoiceConfirm}
+          onDiscard={handleVoiceDiscard}
+          onSaveToCurrentNote={currentPath ? handleVoiceSaveToCurrentNote : undefined}
+          onSaveToNewNote={handleVoiceSaveToNewNote}
+        />
+      )}
+      <div style={{ display: 'contents' }}>
 
         {/* 未設定警告 */}
         {!isConfigured && (
@@ -687,7 +735,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         {/* 筆記建議捷徑 */}
         {noteSuggestions.length > 0 && onOpenNote && (
           <div style={{ padding: '4px 8px', display: 'flex', flexWrap: 'wrap', gap: '4px', flexShrink: 0 }}>
-            <span style={{ fontSize: '11px', color: 'var(--color-text-muted)', alignSelf: 'center' }}>找到筆記，要打開嗎？</span>
+            <span style={{ fontSize: '11px', color: 'var(--color-text-muted)', alignSelf: 'center' }}>找到相關段落，要打開嗎？</span>
             {noteSuggestions.map((note, i) => (
               <button
                 key={i}

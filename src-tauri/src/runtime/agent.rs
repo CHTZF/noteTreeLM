@@ -671,13 +671,25 @@ impl Agent {
                 .filter_map(|line| {
                     let line = line.trim();
                     if line.starts_with("- **") {
+                        // Extract path from `(path)` part
                         if let Some(lp) = line.rfind('(') {
                             if let Some(rp) = line[lp..].find(')') {
                                 let rel = &line[lp + 1..lp + rp];
                                 if rel.ends_with(".md") {
                                     let abs =
                                         std::path::PathBuf::from(&self.vault_path).join(rel);
-                                    return Some(abs.to_string_lossy().to_string());
+                                    let abs_path = abs.to_string_lossy().to_string();
+                                    // Extract section from `**title § section**` if present
+                                    let section = if let Some(bold_end) = line.find("** (") {
+                                        let bold_content = &line[4..bold_end]; // skip "- **"
+                                        bold_content.find(" § ").map(|sep| bold_content[sep + 3..].to_string())
+                                    } else {
+                                        None
+                                    };
+                                    return Some(match section {
+                                        Some(sec) if !sec.is_empty() => format!("{}#{}", abs_path, sec),
+                                        _ => abs_path,
+                                    });
                                 }
                             }
                         }

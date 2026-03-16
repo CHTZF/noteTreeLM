@@ -6,7 +6,7 @@ mod state;
 pub mod tools;
 mod vault;
 
-use commands::auth::{login, logout, get_session, change_password};
+use commands::auth::{login, logout, get_session, change_password, start_google_oauth};
 use commands::{
     ai::{stream_chat_external, process_with_llm, stop_llama_server, warmup_llama_server,
          get_llama_server_status, start_llama_server, restart_llama_server,
@@ -18,7 +18,8 @@ use commands::{
                    delete_conversation, update_conversation_title},
     download::*, graph::*, import::*, search::*,
     settings::{get_settings, save_personal_settings, get_system_settings, save_system_settings, get_api_key, set_api_key,
-               get_vault_last_note, set_vault_last_note, check_vcredist},
+               get_vault_last_note, set_vault_last_note, check_vcredist,
+               get_last_chat_conversation_id, set_last_chat_conversation_id},
     vault::*,
     voice::{transcribe_audio, stop_whisper_server, warmup_whisper_server,
             get_whisper_server_status, start_whisper_server, restart_whisper_server},
@@ -90,6 +91,8 @@ pub fn run() {
                         let path = std::path::PathBuf::from(&vp);
                         if path.exists() {
                             if let Ok(vault_pool) = db::init_vault_db(&path).await {
+                                // 背景補齊 chunk 索引（不阻塞啟動）
+                                auto_reindex_chunks_if_needed(vault_pool.clone()).await;
                                 state.set_vault_db(Some(vault_pool)).await;
                             }
                             let stop_tx = vault::watcher::start_watcher(app_handle.clone(), path);
@@ -117,6 +120,7 @@ pub fn run() {
             logout,
             get_session,
             change_password,
+            start_google_oauth,
             // Settings
             get_settings,
             save_personal_settings,
@@ -127,6 +131,8 @@ pub fn run() {
             get_vault_last_note,
             set_vault_last_note,
             check_vcredist,
+            get_last_chat_conversation_id,
+            set_last_chat_conversation_id,
             // Vault
             create_note,
             read_note,
@@ -156,8 +162,10 @@ pub fn run() {
             list_trash,
             restore_trash_item,
             delete_trash_items,
-            // Search
+            // Search / Chunks
             search,
+            reindex_vault_chunks,
+            search_vault_chunks,
             // Graph
             get_graph,
             // Import
@@ -289,5 +297,18 @@ fn handle_vault_protocol(
             .status(404)
             .body(b"File not found".to_vec())
             .unwrap(),
+    }
+}
+
+/// Vault 開啟後，若 chunks 數量少於 notes 數量，在背景補齊索引。
+async fn auto_reindex_chunks_if_needed(db: sqlx::SqlitePool) {
+    let notes_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notes")
+        .fetch_one(&db).await.unwrap_or(0);
+    let chunks_count: i64 = sqlx::query_scalar("SELECT COUNT(DISTINCT file_path) FROM chunks")
+        .fetch_one(&db).await.unwrap_or(0);
+    if chunks_count < notes_count {
+        tokio::spawn(async move {
+            let _ = vault::chunker::reindex_all(&db).await;
+        });
     }
 }

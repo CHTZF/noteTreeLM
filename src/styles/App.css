@@ -151,6 +151,9 @@
 .cm-live-h5 { font-size: 1em;    font-weight: 600; font-family: var(--font-sans); color: var(--color-text-secondary); }
 .cm-live-h6 { font-size: 0.95em; font-weight: 600; font-family: var(--font-sans); color: var(--color-text-muted); }
 
+/* Inline: custom style syntax markers (cursor inside — shown muted) */
+.cm-live-syntax-mark { opacity: 0.35; font-size: 0.8em; }
+
 /* Inline: emphasis */
 .cm-live-bold   { font-weight: 700; }
 .cm-live-italic { font-style: italic; }

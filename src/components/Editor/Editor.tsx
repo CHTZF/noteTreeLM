@@ -60,8 +60,7 @@ export default function Editor({ onOpenNote }: EditorProps) {
   const liveCompartment = useRef(new Compartment())
 
   const { currentPath, content, isDirty, viewMode, setContent, setDirty, setViewMode,
-          pendingContent, clearPendingContent } = useEditorStore()
-  const [pendingAnchor, setPendingAnchor] = useState<string | undefined>(undefined)
+          pendingContent, clearPendingContent, pendingAnchor, setPendingAnchor } = useEditorStore()
   const { readNote, updateNote } = useVaultStore()
   const { settings } = useSettingsStore()
 
@@ -357,12 +356,17 @@ export default function Editor({ onOpenNote }: EditorProps) {
   }, [])
 
   // ── CM6 右鍵選單 ────────────────────────────────────────────────────────────
-  const [cmCtxMenu, setCmCtxMenu] = useState<{ x: number; y: number } | null>(null)
+  const [cmCtxMenu, setCmCtxMenu] = useState<{ x: number; y: number; from: number; to: number; sel: string; mode: 'menu' | 'color' | 'font' } | null>(null)
   const cmMenuRef = useRef<HTMLDivElement>(null)
   const [cmSubMenuOpen, setCmSubMenuOpen] = useState(false)
   const subMenuCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const openSubMenu = () => { if (subMenuCloseTimer.current) clearTimeout(subMenuCloseTimer.current); setCmSubMenuOpen(true) }
   const closeSubMenu = () => { subMenuCloseTimer.current = setTimeout(() => setCmSubMenuOpen(false), 120) }
+  // Color/font picker state
+  const [cmPickColor, setCmPickColor] = useState('#e03030')
+  const [cmFontFamily, setCmFontFamily] = useState('inherit')
+  const [cmFontSize, setCmFontSize] = useState('')
+  const [cmFontWeight, setCmFontWeight] = useState('inherit')
 
   useEffect(() => {
     if (!cmCtxMenu) return
@@ -385,41 +389,6 @@ export default function Editor({ onOpenNote }: EditorProps) {
     })
   }, [])
 
-  const handleTextStyle = useCallback((text: string, styleStr: string, contextBefore: string) => {
-    const view = viewRef.current
-    if (!view) return
-    const doc = view.state.doc.toString()
-    // Collect all occurrences of the selected text
-    const occurrences: number[] = []
-    let search = 0
-    while (true) {
-      const i = doc.indexOf(text, search)
-      if (i < 0) break
-      occurrences.push(i)
-      search = i + 1
-    }
-    if (occurrences.length === 0) return
-    // Strip HTML tags so docBefore (which may contain <span> etc.) compares correctly
-    // against contextBefore (which is plain rendered text)
-    const stripTags = (s: string) => s.replace(/<[^>]*>/g, '')
-    // Pick occurrence whose preceding plain-text best matches contextBefore (longest common suffix)
-    let bestIdx = occurrences[0]
-    let bestScore = -1
-    for (const idx of occurrences) {
-      // Use a larger window (× 4) to account for HTML tag overhead after stripping
-      const rawBefore = doc.slice(Math.max(0, idx - (contextBefore.length + 20) * 4), idx)
-      const docBefore = stripTags(rawBefore)
-      let score = 0
-      for (let k = 1; k <= Math.min(contextBefore.length, docBefore.length); k++) {
-        if (contextBefore[contextBefore.length - k] === docBefore[docBefore.length - k]) score++
-        else break
-      }
-      if (score > bestScore) { bestScore = score; bestIdx = idx }
-    }
-    view.dispatch({
-      changes: { from: bestIdx, to: bestIdx + text.length, insert: `<span style="${styleStr}">${text}</span>` },
-    })
-  }, [])
 
   const confirmQuickCopy = useCallback(() => {
     if (!quickCopyModal) return
@@ -706,7 +675,17 @@ export default function Editor({ onOpenNote }: EditorProps) {
         {/* CM6 Editor (editor + live modes) */}
         <div
           ref={editorRef}
-          onContextMenu={(e) => { if (!currentPath) return; e.preventDefault(); setCmCtxMenu({ x: e.clientX, y: e.clientY }) }}
+          onContextMenu={(e) => {
+            if (!currentPath) return
+            e.preventDefault()
+            const view = viewRef.current
+            if (!view) return
+            const { from, to } = view.state.selection.main
+            const sel = view.state.doc.sliceString(from, to)
+            setCmCtxMenu({ x: e.clientX, y: e.clientY, from, to, sel, mode: 'menu' })
+            setCmPickColor('#e03030')
+            setCmFontFamily('inherit'); setCmFontSize(''); setCmFontWeight('inherit')
+          }}
           style={{
             display: (viewMode === 'editor' || viewMode === 'live') ? 'block' : 'none',
             width: '100%', height: '100%',
@@ -767,7 +746,6 @@ export default function Editor({ onOpenNote }: EditorProps) {
             onEdit={() => setViewMode('live')}
             pendingAnchor={pendingAnchor}
             onAnchorScrolled={() => setPendingAnchor(undefined)}
-            onTextStyle={handleTextStyle}
             onEditQuickCopy={handleEditQuickCopy}
           />
         )}
@@ -782,119 +760,236 @@ export default function Editor({ onOpenNote }: EditorProps) {
           onMouseDown={e => e.stopPropagation()}
           style={{
             position: 'fixed', zIndex: 99999,
-            left: Math.min(cmCtxMenu.x, window.innerWidth - 220),
-            top: Math.min(cmCtxMenu.y, window.innerHeight - 460),
+            left: Math.min(cmCtxMenu.x, window.innerWidth - 240),
+            top: Math.min(cmCtxMenu.y, window.innerHeight - 520),
             background: 'var(--color-bg-elevated)',
             border: '1px solid var(--color-border)',
             borderRadius: '8px',
             boxShadow: '0 6px 24px rgba(0,0,0,0.28)',
-            minWidth: 200, overflow: 'visible', padding: '4px 0',
+            minWidth: 220, overflow: 'visible', padding: '4px 0',
           }}
         >
-              {/* 格式 */}
-          {([
-            { label: '粗體', action: 'bold', shortcut: '⌘B' },
-            { label: '斜體', action: 'italic', shortcut: '⌘I' },
-            { label: '刪除線', action: 'strikethrough' },
-            { label: '行內程式碼', action: 'inline_code' },
-          ] as Array<{ label: string; action: string; shortcut?: string }>).map(item => (
-            <div key={item.action}
-              onClick={() => applyCmAction(item.action)}
-              style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 14px', fontSize: '13px', cursor: 'pointer', color: 'var(--color-text-primary)' }}
+
+          {/* ── 主選單 ── */}
+          {cmCtxMenu.mode === 'menu' && (<>
+            {/* 格式 */}
+            {([
+              { label: '粗體', action: 'bold', shortcut: '⌘B' },
+              { label: '斜體', action: 'italic', shortcut: '⌘I' },
+              { label: '刪除線', action: 'strikethrough' },
+              { label: '行內程式碼', action: 'inline_code' },
+            ] as Array<{ label: string; action: string; shortcut?: string }>).map(item => (
+              <div key={item.action}
+                onClick={() => applyCmAction(item.action)}
+                style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 14px', fontSize: '13px', cursor: 'pointer', color: 'var(--color-text-primary)' }}
+                onMouseEnter={e => { e.currentTarget.style.background = 'var(--color-bg-hover)'; setCmSubMenuOpen(false) }}
+                onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+              >
+                <span>{item.label}</span>
+                {item.shortcut && <span style={{ fontSize: '11px', color: 'var(--color-text-muted)', marginLeft: '16px' }}>{item.shortcut}</span>}
+              </div>
+            ))}
+
+            <div style={{ height: '1px', background: 'var(--color-border)', margin: '3px 0' }} />
+
+            {/* 改變顏色 / 改變字型（僅當有選取文字時） */}
+            {cmCtxMenu.sel && (<>
+              <div
+                onClick={() => setCmCtxMenu(m => m && ({ ...m, mode: 'color' }))}
+                style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 14px', fontSize: '13px', cursor: 'pointer', color: 'var(--color-text-primary)' }}
+                onMouseEnter={e => { e.currentTarget.style.background = 'var(--color-bg-hover)'; setCmSubMenuOpen(false) }}
+                onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+              >
+                <span>改變顏色</span>
+                <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>›</span>
+              </div>
+              <div
+                onClick={() => setCmCtxMenu(m => m && ({ ...m, mode: 'font' }))}
+                style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 14px', fontSize: '13px', cursor: 'pointer', color: 'var(--color-text-primary)' }}
+                onMouseEnter={e => { e.currentTarget.style.background = 'var(--color-bg-hover)'; setCmSubMenuOpen(false) }}
+                onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+              >
+                <span>改變字型</span>
+                <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>›</span>
+              </div>
+              <div style={{ height: '1px', background: 'var(--color-border)', margin: '3px 0' }} />
+            </>)}
+
+            {/* 標題（submenu） */}
+            <div style={{ position: 'relative' }}
+              onMouseEnter={openSubMenu}
+              onMouseLeave={closeSubMenu}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 14px', fontSize: '13px', cursor: 'pointer', color: 'var(--color-text-primary)', background: cmSubMenuOpen ? 'var(--color-bg-hover)' : 'transparent' }}>
+                <span>標題</span>
+                <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>›</span>
+              </div>
+              {cmSubMenuOpen && (
+                <div
+                  onMouseEnter={openSubMenu}
+                  onMouseLeave={closeSubMenu}
+                  style={{
+                    position: 'absolute', left: '100%', top: 0,
+                    background: 'var(--color-bg-elevated)',
+                    border: '1px solid var(--color-border)',
+                    borderRadius: '8px',
+                    boxShadow: '0 6px 24px rgba(0,0,0,0.28)',
+                    minWidth: 120, overflow: 'hidden', padding: '4px 0', zIndex: 99999,
+                  }}>
+                  {(['h1','h2','h3','h4','h5','h6'] as const).map((h, i) => (
+                    <div key={h}
+                      onClick={() => applyCmAction(h)}
+                      style={{ padding: '6px 14px', fontSize: '13px', cursor: 'pointer', color: 'var(--color-text-primary)' }}
+                      onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-bg-hover)')}
+                      onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+                    >
+                      H{i + 1}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div style={{ height: '1px', background: 'var(--color-border)', margin: '3px 0' }} />
+
+            {/* 區塊 */}
+            {([
+              { label: '引言', action: 'blockquote' },
+              { label: '無序清單', action: 'ul' },
+              { label: '有序清單', action: 'ol' },
+            ] as Array<{ label: string; action: string }>).map(item => (
+              <div key={item.action}
+                onClick={() => applyCmAction(item.action)}
+                style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 14px', fontSize: '13px', cursor: 'pointer', color: 'var(--color-text-primary)' }}
+                onMouseEnter={e => { e.currentTarget.style.background = 'var(--color-bg-hover)'; setCmSubMenuOpen(false) }}
+                onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+              >
+                <span>{item.label}</span>
+              </div>
+            ))}
+
+            <div style={{ height: '1px', background: 'var(--color-border)', margin: '3px 0' }} />
+
+            {/* 插入 */}
+            {([
+              { label: '插入連結', action: 'link' },
+              { label: '插入 Wikilink', action: 'wikilink' },
+              { label: '插入圖片', action: 'image' },
+              { label: '插入快捷複製', action: 'quick_copy' },
+              { label: '插入程式碼區塊', action: 'codeblock' },
+              { label: '插入表格', action: 'table' },
+            ] as Array<{ label: string; action: string }>).map(item => (
+              <div key={item.action}
+                onClick={() => applyCmAction(item.action)}
+                style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 14px', fontSize: '13px', cursor: 'pointer', color: 'var(--color-text-primary)' }}
+                onMouseEnter={e => { e.currentTarget.style.background = 'var(--color-bg-hover)'; setCmSubMenuOpen(false) }}
+                onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+              >
+                <span>{item.label}</span>
+              </div>
+            ))}
+
+            <div style={{ height: '1px', background: 'var(--color-border)', margin: '3px 0' }} />
+
+            <div
+              onClick={() => applyCmAction('hr')}
+              style={{ display: 'flex', alignItems: 'center', padding: '6px 14px', fontSize: '13px', cursor: 'pointer', color: 'var(--color-text-primary)' }}
               onMouseEnter={e => { e.currentTarget.style.background = 'var(--color-bg-hover)'; setCmSubMenuOpen(false) }}
               onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
             >
-              <span>{item.label}</span>
-              {item.shortcut && <span style={{ fontSize: '11px', color: 'var(--color-text-muted)', marginLeft: '16px' }}>{item.shortcut}</span>}
+              插入分隔線
             </div>
-          ))}
+          </>)}
 
-          <div style={{ height: '1px', background: 'var(--color-border)', margin: '3px 0' }} />
-
-          {/* 標題（submenu） */}
-          <div style={{ position: 'relative' }}
-            onMouseEnter={openSubMenu}
-            onMouseLeave={closeSubMenu}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 14px', fontSize: '13px', cursor: 'pointer', color: 'var(--color-text-primary)', background: cmSubMenuOpen ? 'var(--color-bg-hover)' : 'transparent' }}>
-              <span>標題</span>
-              <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>›</span>
-            </div>
-            {cmSubMenuOpen && (
-              <div
-                onMouseEnter={openSubMenu}
-                onMouseLeave={closeSubMenu}
-                style={{
-                  position: 'absolute', left: '100%', top: 0,
-                  background: 'var(--color-bg-elevated)',
-                  border: '1px solid var(--color-border)',
-                  borderRadius: '8px',
-                  boxShadow: '0 6px 24px rgba(0,0,0,0.28)',
-                  minWidth: 120, overflow: 'hidden', padding: '4px 0', zIndex: 99999,
-                }}>
-                {(['h1','h2','h3','h4','h5','h6'] as const).map((h, i) => (
-                  <div key={h}
-                    onClick={() => applyCmAction(h)}
-                    style={{ padding: '6px 14px', fontSize: '13px', cursor: 'pointer', color: 'var(--color-text-primary)' }}
-                    onMouseEnter={e => (e.currentTarget.style.background = 'var(--color-bg-hover)')}
-                    onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
-                  >
-                    H{i + 1}
-                  </div>
+          {/* ── 改變顏色 panel ── */}
+          {cmCtxMenu.mode === 'color' && (
+            <div style={{ padding: '12px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)' }}>改變顏色</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {['#e03030','#e07830','#d4c020','#30a850','#2080e0','#8040e0','#e030a0','#888888','#000000'].map(c => (
+                  <div key={c} onClick={() => setCmPickColor(c)}
+                    style={{ width: 22, height: 22, borderRadius: 4, background: c, cursor: 'pointer',
+                      border: cmPickColor === c ? '2px solid var(--color-text-primary)' : '2px solid transparent' }} />
                 ))}
               </div>
-            )}
-          </div>
-
-          <div style={{ height: '1px', background: 'var(--color-border)', margin: '3px 0' }} />
-
-          {/* 區塊 */}
-          {([
-            { label: '引言', action: 'blockquote' },
-            { label: '無序清單', action: 'ul' },
-            { label: '有序清單', action: 'ol' },
-          ] as Array<{ label: string; action: string }>).map(item => (
-            <div key={item.action}
-              onClick={() => applyCmAction(item.action)}
-              style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 14px', fontSize: '13px', cursor: 'pointer', color: 'var(--color-text-primary)' }}
-              onMouseEnter={e => { e.currentTarget.style.background = 'var(--color-bg-hover)'; setCmSubMenuOpen(false) }}
-              onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
-            >
-              <span>{item.label}</span>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '12px', color: 'var(--color-text-muted)' }}>
+                自訂
+                <input type="color" value={cmPickColor} onChange={e => setCmPickColor(e.target.value)}
+                  style={{ width: 32, height: 24, padding: 0, border: '1px solid var(--color-border)', borderRadius: 4, cursor: 'pointer' }} />
+                <span style={{ fontFamily: 'monospace' }}>{cmPickColor}</span>
+              </label>
+              <div style={{ padding: '6px 10px', borderRadius: 6, background: 'var(--color-bg-base)', fontSize: '13px', border: '1px solid var(--color-border)' }}>
+                <span style={{ color: cmPickColor }}>{cmCtxMenu.sel.slice(0, 30)}{cmCtxMenu.sel.length > 30 ? '…' : ''}</span>
+              </div>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button type="button" onClick={() => {
+                  const view = viewRef.current; if (!view) return
+                  const { from, to, sel } = cmCtxMenu
+                  view.dispatch({ changes: { from, to, insert: `{color:${cmPickColor}}${sel}{/color}` } })
+                  setCmCtxMenu(null); view.focus()
+                }} style={{ flex: 1, padding: '5px', borderRadius: 5, background: 'var(--color-accent)', color: 'white', fontSize: '12px', cursor: 'pointer' }}>
+                  套用
+                </button>
+                <button type="button" onClick={() => setCmCtxMenu(m => m && ({ ...m, mode: 'menu' }))}
+                  style={{ flex: 1, padding: '5px', borderRadius: 5, background: 'var(--color-bg-hover)', color: 'var(--color-text-secondary)', fontSize: '12px', cursor: 'pointer' }}>
+                  返回
+                </button>
+              </div>
             </div>
-          ))}
+          )}
 
-          <div style={{ height: '1px', background: 'var(--color-border)', margin: '3px 0' }} />
-
-          {/* 插入 */}
-          {([
-            { label: '插入連結', action: 'link' },
-            { label: '插入 Wikilink', action: 'wikilink' },
-            { label: '插入圖片', action: 'image' },
-            { label: '插入快捷複製', action: 'quick_copy' },
-            { label: '插入程式碼區塊', action: 'codeblock' },
-            { label: '插入表格', action: 'table' },
-          ] as Array<{ label: string; action: string }>).map(item => (
-            <div key={item.action}
-              onClick={() => applyCmAction(item.action)}
-              style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 14px', fontSize: '13px', cursor: 'pointer', color: 'var(--color-text-primary)' }}
-              onMouseEnter={e => { e.currentTarget.style.background = 'var(--color-bg-hover)'; setCmSubMenuOpen(false) }}
-              onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
-            >
-              <span>{item.label}</span>
+          {/* ── 改變字型 panel ── */}
+          {cmCtxMenu.mode === 'font' && (
+            <div style={{ padding: '12px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)' }}>改變字型</div>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: '12px', color: 'var(--color-text-muted)' }}>
+                字型
+                <select value={cmFontFamily} onChange={e => setCmFontFamily(e.target.value)}
+                  style={{ padding: '4px 6px', borderRadius: 5, border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '12px' }}>
+                  <option value="inherit">預設</option>
+                  <option value="serif">Serif</option>
+                  <option value="sans-serif">Sans-serif</option>
+                  <option value="monospace">Monospace</option>
+                  <option value="Noto Serif TC">Noto Serif TC</option>
+                  <option value="Source Han Sans TC">Source Han Sans</option>
+                </select>
+              </label>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: '12px', color: 'var(--color-text-muted)' }}>
+                大小 (px)
+                <input type="number" min={8} max={72} placeholder="例: 16" value={cmFontSize}
+                  onChange={e => setCmFontSize(e.target.value)}
+                  style={{ padding: '4px 6px', borderRadius: 5, border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '12px', width: '100%', boxSizing: 'border-box' }} />
+              </label>
+              <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: '12px', color: 'var(--color-text-muted)' }}>
+                粗細
+                <select value={cmFontWeight} onChange={e => setCmFontWeight(e.target.value)}
+                  style={{ padding: '4px 6px', borderRadius: 5, border: '1px solid var(--color-border)', background: 'var(--color-bg-base)', color: 'var(--color-text-primary)', fontSize: '12px' }}>
+                  <option value="inherit">預設</option>
+                  <option value="300">細 (300)</option>
+                  <option value="normal">正常 (400)</option>
+                  <option value="500">中等 (500)</option>
+                  <option value="bold">粗 (700)</option>
+                  <option value="900">極粗 (900)</option>
+                </select>
+              </label>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button type="button" onClick={() => {
+                  const view = viewRef.current; if (!view) return
+                  const { from, to, sel } = cmCtxMenu
+                  const spec = [cmFontFamily, cmFontSize, cmFontWeight].join(';')
+                  view.dispatch({ changes: { from, to, insert: `{font:${spec}}${sel}{/font}` } })
+                  setCmCtxMenu(null); view.focus()
+                }} style={{ flex: 1, padding: '5px', borderRadius: 5, background: 'var(--color-accent)', color: 'white', fontSize: '12px', cursor: 'pointer' }}>
+                  套用
+                </button>
+                <button type="button" onClick={() => setCmCtxMenu(m => m && ({ ...m, mode: 'menu' }))}
+                  style={{ flex: 1, padding: '5px', borderRadius: 5, background: 'var(--color-bg-hover)', color: 'var(--color-text-secondary)', fontSize: '12px', cursor: 'pointer' }}>
+                  返回
+                </button>
+              </div>
             </div>
-          ))}
+          )}
 
-          <div style={{ height: '1px', background: 'var(--color-border)', margin: '3px 0' }} />
-
-          <div
-            onClick={() => applyCmAction('hr')}
-            style={{ display: 'flex', alignItems: 'center', padding: '6px 14px', fontSize: '13px', cursor: 'pointer', color: 'var(--color-text-primary)' }}
-            onMouseEnter={e => { e.currentTarget.style.background = 'var(--color-bg-hover)'; setCmSubMenuOpen(false) }}
-            onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
-          >
-            插入分隔線
-          </div>
         </div>
       )}
 

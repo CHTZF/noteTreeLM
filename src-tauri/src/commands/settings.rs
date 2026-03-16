@@ -275,6 +275,19 @@ async fn handle_vault_switch(app: AppHandle, state: AppState, new_path: String) 
         let path = std::path::PathBuf::from(&new_path);
         if path.exists() {
             if let Ok(vault_pool) = crate::db::init_vault_db(&path).await {
+                // 背景補齊 chunk 索引
+                {
+                    let db = vault_pool.clone();
+                    let notes_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notes")
+                        .fetch_one(&db).await.unwrap_or(0);
+                    let chunks_count: i64 = sqlx::query_scalar("SELECT COUNT(DISTINCT file_path) FROM chunks")
+                        .fetch_one(&db).await.unwrap_or(0);
+                    if chunks_count < notes_count {
+                        tokio::spawn(async move {
+                            let _ = crate::vault::chunker::reindex_all(&db).await;
+                        });
+                    }
+                }
                 state.set_vault_db(Some(vault_pool)).await;
             }
             let stop_tx = vault::watcher::start_watcher(app, path);
@@ -300,6 +313,30 @@ pub async fn set_vault_last_note(
     note_path: String,
 ) -> Result<(), AppError> {
     queries::set_vault_last_note(&state.settings_db, &vault_path, &note_path).await
+}
+
+#[tauri::command]
+pub async fn get_last_chat_conversation_id(
+    state: State<'_, AppState>,
+    username: String,
+) -> Result<Option<String>, AppError> {
+    queries::get_user_setting(&state.settings_db, &username, "last_chat_conversation_id").await
+}
+
+#[tauri::command]
+pub async fn set_last_chat_conversation_id(
+    state: State<'_, AppState>,
+    username: String,
+    conversation_id: Option<String>,
+) -> Result<(), AppError> {
+    match conversation_id {
+        Some(id) if !id.is_empty() => {
+            queries::set_user_setting(&state.settings_db, &username, "last_chat_conversation_id", &id).await
+        }
+        _ => {
+            queries::set_user_setting(&state.settings_db, &username, "last_chat_conversation_id", "").await
+        }
+    }
 }
 
 #[tauri::command]
