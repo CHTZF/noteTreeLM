@@ -1843,7 +1843,12 @@ async fn search_chunks_with_graph(vault_db: &SurrealDb, vault_id: &str, fts_quer
 }
 
 /// 建立新筆記（自動建立父資料夾）
-pub(crate) async fn tool_create_note(rel_path: &str, content: &str, vault_path: &str) -> String {
+pub(crate) async fn tool_create_note(
+    rel_path: &str,
+    content: &str,
+    vault_path: &str,
+    db_ctx: Option<(SurrealDb, String)>,
+) -> String {
     let abs_path = match resolve_vault_path(rel_path, vault_path) {
         Ok(p) => p,
         Err(e) => return e,
@@ -1851,22 +1856,78 @@ pub(crate) async fn tool_create_note(rel_path: &str, content: &str, vault_path: 
     if let Some(parent) = abs_path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
-    match tokio::fs::write(&abs_path, content).await {
-        Ok(_) => format!("✅ 已建立筆記：{}", rel_path),
-        Err(e) => format!("建立失敗：{}", e),
+    if let Err(e) = tokio::fs::write(&abs_path, content).await {
+        return format!("建立失敗：{}", e);
     }
+    // 同步到 notes table
+    if let Some((db, vault_id)) = db_ctx {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_dt = surrealdb::sql::Datetime::from(
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms).unwrap_or_default()
+        );
+        let title = {
+            let first = content.lines().find(|l| !l.trim().is_empty()).unwrap_or(rel_path);
+            first.trim_start_matches('#').trim().to_string()
+        };
+        let wc = content.split_whitespace().count() as i64;
+        let checksum = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
+        let _ = db.query(
+            "INSERT INTO notes (vault_id, path, title, content, word_count, created_at, modified_at, checksum) \
+             VALUES ($vid, $path, $title, $content, $wc, $now, $now, $cs) \
+             ON DUPLICATE KEY UPDATE title = $title, content = $content, word_count = $wc, modified_at = $now, checksum = $cs"
+        )
+        .bind(("vid", vault_id.clone()))
+        .bind(("path", rel_path.to_owned()))
+        .bind(("title", title))
+        .bind(("content", content.to_owned()))
+        .bind(("wc", wc))
+        .bind(("now", now_dt))
+        .bind(("cs", checksum))
+        .await;
+    }
+    format!("✅ 已建立筆記：{}", rel_path)
 }
 
 /// 更新現有筆記（覆寫全文）
-pub(crate) async fn tool_update_note(rel_path: &str, content: &str, vault_path: &str) -> String {
+pub(crate) async fn tool_update_note(
+    rel_path: &str,
+    content: &str,
+    vault_path: &str,
+    db_ctx: Option<(SurrealDb, String)>,
+) -> String {
     let abs_path = match resolve_vault_path(rel_path, vault_path) {
         Ok(p) => p,
         Err(e) => return e,
     };
-    match tokio::fs::write(&abs_path, content).await {
-        Ok(_) => format!("✅ 已更新筆記：{}", rel_path),
-        Err(e) => format!("更新失敗：{}", e),
+    if let Err(e) = tokio::fs::write(&abs_path, content).await {
+        return format!("更新失敗：{}", e);
     }
+    // 同步到 notes table
+    if let Some((db, vault_id)) = db_ctx {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_dt = surrealdb::sql::Datetime::from(
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms).unwrap_or_default()
+        );
+        let title = {
+            let first = content.lines().find(|l| !l.trim().is_empty()).unwrap_or(rel_path);
+            first.trim_start_matches('#').trim().to_string()
+        };
+        let wc = content.split_whitespace().count() as i64;
+        let checksum = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
+        let _ = db.query(
+            "UPDATE notes SET content = $content, title = $title, word_count = $wc, modified_at = $now, checksum = $cs \
+             WHERE vault_id = $vid AND path = $path"
+        )
+        .bind(("content", content.to_owned()))
+        .bind(("title", title))
+        .bind(("wc", wc))
+        .bind(("now", now_dt))
+        .bind(("cs", checksum))
+        .bind(("vid", vault_id))
+        .bind(("path", rel_path.to_owned()))
+        .await;
+    }
+    format!("✅ 已更新筆記：{}", rel_path)
 }
 
 /// 建立資料夾
@@ -1958,12 +2019,14 @@ async fn execute_vault_tool(
         "create_note" => {
             let path = ensure_md(args["path"].as_str().unwrap_or(""));
             let content = args["content"].as_str().unwrap_or("");
-            tool_create_note(&path, content, vault_path).await
+            let db_ctx = vault_db.map(|(db, vid)| (db.clone(), vid.to_owned()));
+            tool_create_note(&path, content, vault_path, db_ctx).await
         }
         "update_note" => {
             let path = ensure_md(args["path"].as_str().unwrap_or(""));
             let content = args["content"].as_str().unwrap_or("");
-            tool_update_note(&path, content, vault_path).await
+            let db_ctx = vault_db.map(|(db, vid)| (db.clone(), vid.to_owned()));
+            tool_update_note(&path, content, vault_path, db_ctx).await
         }
         "create_folder" => {
             let path = args["path"].as_str().unwrap_or("");
@@ -2070,13 +2133,31 @@ pub async fn get_memory_rules(state: State<'_, AppState>) -> Result<Vec<MemoryRu
     }).collect())
 }
 
-/// 刪除指定 pattern 的記憶規則（SurrealDB 版，以 pattern 作為唯一識別）
+/// 刪除指定 pattern 的記憶規則（SurrealDB 版）
+/// id 為前端傳入的 enumerate index（與 get_memory_rules 的 idx 對應）
 #[tauri::command]
 pub async fn delete_memory_rule(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
-    // id 在 SurrealDB 版本中為 enumerate index，無法直接使用。
-    // 前端應改傳 pattern 識別。保留 i64 簽名以向下相容，此處刪除所有同索引的 rule。
-    // 實際刪除需從前端傳 pattern，此處 fallback 為 no-op。
-    let _ = id;
+    let db = &state.db;
+    let vault_id = state.get_vault_id().await?;
+
+    // 取出同 vault 所有 rules（依 created_at 排序，與 get_memory_rules 一致）
+    #[derive(Deserialize)]
+    struct PatternRow { pattern: String }
+    let mut resp = db.query(
+        "SELECT pattern FROM memory_rules WHERE vault_id = $vid ORDER BY created_at"
+    )
+    .bind(("vid", vault_id.clone()))
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    let rows: Vec<PatternRow> = resp.take(0).unwrap_or_default();
+
+    if let Some(row) = rows.into_iter().nth(id as usize) {
+        db.query("DELETE memory_rules WHERE vault_id = $vid AND pattern = $pat")
+            .bind(("vid", vault_id))
+            .bind(("pat", row.pattern))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    }
     Ok(())
 }
 

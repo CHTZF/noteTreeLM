@@ -127,6 +127,8 @@ pub fn build_vault_registry(
     {
         let vp_exec = vault_path.clone();
         let vp_rb = vault_path.clone();
+        let db_cn = vault_db.clone();
+        let vid_cn = vault_id.clone();
         registry.register(
             "create_note".into(),
             Tool {
@@ -134,8 +136,10 @@ pub fn build_vault_registry(
                     let path = args["path"].as_str().unwrap_or("").to_string();
                     let content = args["content"].as_str().unwrap_or("").to_string();
                     let vp = vp_exec.clone();
+                    let db = db_cn.clone();
+                    let vid = vid_cn.clone();
                     Box::pin(async move {
-                        let result = tool_create_note(&path, &content, &vp).await;
+                        let result = tool_create_note(&path, &content, &vp, Some((db, vid))).await;
                         if result.contains("失敗") {
                             Err(result)
                         } else {
@@ -162,6 +166,8 @@ pub fn build_vault_registry(
     {
         let vp_exec = vault_path.clone();
         let vp_rb = vault_path.clone();
+        let db_un = vault_db.clone();
+        let vid_un = vault_id.clone();
         let backups: Arc<Mutex<HashMap<String, String>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let backups_rb = Arc::clone(&backups);
@@ -173,6 +179,8 @@ pub fn build_vault_registry(
                     let path = args["path"].as_str().unwrap_or("").to_string();
                     let content = args["content"].as_str().unwrap_or("").to_string();
                     let vp = vp_exec.clone();
+                    let db = db_un.clone();
+                    let vid = vid_un.clone();
                     let backups = Arc::clone(&backups);
                     Box::pin(async move {
                         let abs_path = resolve_vault_path(&path, &vp).map_err(|e| e)?;
@@ -180,11 +188,12 @@ pub fn build_vault_registry(
                         let original =
                             tokio::fs::read_to_string(&abs_path).await.unwrap_or_default();
                         backups.lock().await.insert(path.clone(), original);
-                        // 寫入新內容
-                        tokio::fs::write(&abs_path, &content)
-                            .await
-                            .map_err(|e| format!("更新失敗：{}", e))?;
-                        Ok(Value::String(format!("✅ 已更新筆記：{}", path)))
+                        // 寫入新內容並同步 DB
+                        let result = tool_update_note(&path, &content, &vp, Some((db, vid))).await;
+                        if result.contains("失敗") {
+                            return Err(result);
+                        }
+                        Ok(Value::String(result))
                     })
                 }),
                 rollback: Some(Arc::new(move |args: Value| {
