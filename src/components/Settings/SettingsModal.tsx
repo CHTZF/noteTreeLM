@@ -734,40 +734,42 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                 <label style={labelStyle}>顯示名稱</label>
                 <input value={draft.display_name ?? ''} onChange={(e) => up({ display_name: e.target.value })} placeholder={session?.username ?? ''} style={inputStyle} />
               </div>
-              <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0 20px' }} />
-              <div style={{ fontSize: '12px', fontWeight: 600, letterSpacing: '0.07em', color: 'var(--color-text-secondary)', textTransform: 'uppercase', marginBottom: '12px' }}>變更密碼</div>
-              <div style={fieldStyle}>
-                <label style={labelStyle}>目前密碼</label>
-                <input type="password" value={currentPassword} onChange={(e) => setCurrentPassword(e.target.value)} style={inputStyle} />
-              </div>
-              <div style={fieldStyle}>
-                <label style={labelStyle}>新密碼</label>
-                <input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} style={inputStyle} />
-              </div>
-              <div style={fieldStyle}>
-                <label style={labelStyle}>確認新密碼</label>
-                <input
-                  type="password"
-                  value={confirmPassword}
-                  onChange={(e) => setConfirmPassword(e.target.value)}
-                  style={{
-                    ...inputStyle,
-                    ...(confirmPassword && newPassword !== confirmPassword
-                      ? { borderColor: 'var(--color-danger)', outline: 'none' }
-                      : confirmPassword && newPassword === confirmPassword
-                      ? { borderColor: 'var(--color-success)' }
-                      : {}),
-                  }}
-                />
-                {confirmPassword && newPassword !== confirmPassword && (
-                  <div style={{ fontSize: '11px', color: 'var(--color-danger)', marginTop: '4px' }}>密碼不一致</div>
-                )}
-              </div>
-              <button
-                onClick={handleChangePassword}
-                disabled={pwSaving || (!!confirmPassword && newPassword !== confirmPassword)}
-                style={{ padding: '7px 20px', borderRadius: '6px', background: 'var(--color-accent)', color: '#fff', fontSize: '13px', fontWeight: 500, opacity: (pwSaving || (!!confirmPassword && newPassword !== confirmPassword)) ? 0.5 : 1, cursor: (pwSaving || (!!confirmPassword && newPassword !== confirmPassword)) ? 'not-allowed' : 'pointer' }}
-              >{pwSaving ? '儲存中…' : '更新密碼'}</button>
+              {session?.auth_provider !== 'google' && <>
+                <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0 20px' }} />
+                <div style={{ fontSize: '12px', fontWeight: 600, letterSpacing: '0.07em', color: 'var(--color-text-secondary)', textTransform: 'uppercase', marginBottom: '12px' }}>變更密碼</div>
+                <div style={fieldStyle}>
+                  <label style={labelStyle}>目前密碼</label>
+                  <input type="password" value={currentPassword} onChange={(e) => setCurrentPassword(e.target.value)} style={inputStyle} />
+                </div>
+                <div style={fieldStyle}>
+                  <label style={labelStyle}>新密碼</label>
+                  <input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} style={inputStyle} />
+                </div>
+                <div style={fieldStyle}>
+                  <label style={labelStyle}>確認新密碼</label>
+                  <input
+                    type="password"
+                    value={confirmPassword}
+                    onChange={(e) => setConfirmPassword(e.target.value)}
+                    style={{
+                      ...inputStyle,
+                      ...(confirmPassword && newPassword !== confirmPassword
+                        ? { borderColor: 'var(--color-danger)', outline: 'none' }
+                        : confirmPassword && newPassword === confirmPassword
+                        ? { borderColor: 'var(--color-success)' }
+                        : {}),
+                    }}
+                  />
+                  {confirmPassword && newPassword !== confirmPassword && (
+                    <div style={{ fontSize: '11px', color: 'var(--color-danger)', marginTop: '4px' }}>密碼不一致</div>
+                  )}
+                </div>
+                <button
+                  onClick={handleChangePassword}
+                  disabled={pwSaving || (!!confirmPassword && newPassword !== confirmPassword)}
+                  style={{ padding: '7px 20px', borderRadius: '6px', background: 'var(--color-accent)', color: '#fff', fontSize: '13px', fontWeight: 500, opacity: (pwSaving || (!!confirmPassword && newPassword !== confirmPassword)) ? 0.5 : 1, cursor: (pwSaving || (!!confirmPassword && newPassword !== confirmPassword)) ? 'not-allowed' : 'pointer' }}
+                >{pwSaving ? '儲存中…' : '更新密碼'}</button>
+              </>}
             </>}
 
             {tab === 'general' && <>

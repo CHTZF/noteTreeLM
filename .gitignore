@@ -1,4 +1,5 @@
 AIREADME.md
+src-tauri/google-oauth.json
 node_modules
 dist
 target

@@ -5,6 +5,7 @@ export interface SessionInfo {
   token: string
   username: string
   expires_at: number
+  auth_provider: string // "local" | "google"
 }
 
 interface AuthStore {
@@ -14,6 +15,7 @@ interface AuthStore {
 
   checkSession: () => Promise<void>
   login: (username: string, password: string) => Promise<void>
+  loginWithGoogle: () => Promise<void>
   logout: () => Promise<void>
   clearError: () => void
 }
@@ -40,6 +42,17 @@ export const useAuthStore = create<AuthStore>((set) => ({
       set({ session, isLoading: false })
     } catch (e: any) {
       set({ isLoading: false, error: typeof e === 'string' ? e : '登入失敗' })
+      throw e
+    }
+  },
+
+  loginWithGoogle: async () => {
+    set({ isLoading: true, error: null })
+    try {
+      const session = await invoke<SessionInfo>('start_google_oauth')
+      set({ session, isLoading: false })
+    } catch (e: any) {
+      set({ isLoading: false, error: typeof e === 'string' ? e : 'Google 登入失敗' })
       throw e
     }
   },

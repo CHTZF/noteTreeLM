@@ -5,7 +5,7 @@ import { type IconDefinition } from '@fortawesome/fontawesome-svg-core'
 import {
   faFolder, faFolderOpen, faFile, faFileLines, faFileImage, faFileCode,
   faFileAudio, faFileVideo, faFilePdf, faFileZipper,
-  faTrash, faPen,
+  faTrash, faPen, faArrowUpRightFromSquare,
   faChevronRight,
   faPlus, faFolderPlus, faFileArrowUp,
   faArrowDownAZ, faArrowUpZA,
@@ -270,9 +270,10 @@ async function performMove(draggedPath: string, targetFolder: string) {
 
 interface FileTreeProps {
   onOpenNote: (path: string) => void
+  onOpenNoteInNewTab?: (path: string) => void
 }
 
-export default function FileTree({ onOpenNote }: FileTreeProps) {
+export default function FileTree({ onOpenNote, onOpenNoteInNewTab }: FileTreeProps) {
   const { fileTree, createNote, createFolder, importImage } = useVaultStore()
   const { currentPath } = useEditorStore()
   const { settings } = useSettingsStore()
@@ -370,7 +371,7 @@ export default function FileTree({ onOpenNote }: FileTreeProps) {
             <p>還沒有筆記</p><p style={{ marginTop: '8px' }}>點擊 + 新增第一篇</p>
           </div>
         ) : fileTree.map((node) => (
-          <TreeNode key={node.path} node={node} depth={0} currentPath={currentPath} vaultPath={settings.system_current_vault_path} onOpenNote={onOpenNote} />
+          <TreeNode key={node.path} node={node} depth={0} currentPath={currentPath} vaultPath={settings.system_current_vault_path} onOpenNote={onOpenNote} onOpenNoteInNewTab={onOpenNoteInNewTab} />
         ))}
       </div>
     </div>
@@ -383,9 +384,10 @@ interface TreeNodeProps {
   currentPath: string | null
   vaultPath: string
   onOpenNote: (path: string) => void
+  onOpenNoteInNewTab?: (path: string) => void
 }
 
-function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeProps) {
+function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote, onOpenNoteInNewTab }: TreeNodeProps) {
   const [isExpanded, setIsExpanded] = useState(true)
   const [isHovered, setIsHovered] = useState(false)
   const [menuOpen, setMenuOpen] = useState(false)
@@ -503,6 +505,8 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
         )}
         {menuOpen && (
           <div ref={menuRef} style={{ position: 'fixed', left: menuX, top: menuY - 15, background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)', borderRadius: '6px', boxShadow: '0 4px 16px rgba(0,0,0,0.35)', zIndex: 200, minWidth: '130px', overflow: 'hidden', padding: '4px 0' }}>
+            {onOpenNoteInNewTab && <MenuItem icon={faArrowUpRightFromSquare} label="開啟新分頁" onClick={(e) => { e.stopPropagation(); setMenuOpen(false); onOpenNoteInNewTab(node.path) }} />}
+            {onOpenNoteInNewTab && <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />}
             <MenuItem icon={faPen} label="重新命名" onClick={handleRenameAsset} />
             <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
             <MenuItem icon={faTrash} label="刪除" danger onClick={handleDeleteAsset} />
@@ -739,7 +743,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
               </div>
             )}
             {node.children?.map((child) => (
-              <TreeNode key={child.path} node={child} depth={depth + 1} currentPath={currentPath} vaultPath={vaultPath} onOpenNote={onOpenNote} />
+              <TreeNode key={child.path} node={child} depth={depth + 1} currentPath={currentPath} vaultPath={vaultPath} onOpenNote={onOpenNote} onOpenNoteInNewTab={onOpenNoteInNewTab} />
             ))}
           </div>
         </div>
@@ -904,6 +908,8 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote }: TreeNodeP
       )}
       {menuOpen && (
         <div ref={menuRef} style={{ position: 'fixed', left: menuX, top: menuY - 15, background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)', borderRadius: '6px', boxShadow: '0 4px 16px rgba(0,0,0,0.35)', zIndex: 200, minWidth: '130px', overflow: 'hidden', padding: '4px 0' }}>
+          {onOpenNoteInNewTab && <MenuItem icon={faArrowUpRightFromSquare} label="開啟新分頁" onClick={(e) => { e.stopPropagation(); setMenuOpen(false); onOpenNoteInNewTab(node.path) }} />}
+          {onOpenNoteInNewTab && <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />}
           <MenuItem icon={faPen} label="重新命名" onClick={handleRenameNote} />
           <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
           <MenuItem icon={faTrash} label="刪除" danger onClick={handleDeleteNote} />

@@ -1608,76 +1608,61 @@ pub(crate) async fn tool_search_vault(query: &str, vault_db: &sqlx::SqlitePool, 
         return "請提供搜索關鍵字".to_string();
     }
 
-    // 1. 先清洗口語指令詞
+    // 1. 清洗 query
     let cleaned = clean_fts_query(query);
-    // 2. 再解析比較條件，提取核心搜索詞
     let (cmp, search_query) = parse_comparison(&cleaned);
     let fts_query = {
-        let q = if search_query.trim().is_empty() {
-            cleaned.clone()
-        } else {
-            search_query.trim().to_string()
-        };
-        // 再次清洗（比較詞剝除後可能遺留助詞）
+        let q = if search_query.trim().is_empty() { cleaned.clone() } else { search_query.trim().to_string() };
         clean_fts_query(&q)
     };
 
-    // Debug：顯示搜索細節
-    let _ = app.emit(
-        "llm:stderr",
-        format!(
-            "[search] 原始 query: {:?}　→　清洗後: {:?}　→　FTS: {:?}　比較條件: {}",
-            query,
-            cleaned,
-            fts_query,
-            cmp.as_ref().map(|c| c.label()).unwrap_or_else(|| "無".to_string())
-        ),
-    );
+    let _ = app.emit("llm:stderr", format!(
+        "[search] query: {:?} → fts: {:?} cmp: {}",
+        query, fts_query,
+        cmp.as_ref().map(|c| c.label()).unwrap_or_else(|| "無".to_string())
+    ));
 
+    // 2. 嘗試 chunk-based 搜尋（有 chunks 表時使用）
+    let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks")
+        .fetch_one(vault_db).await.unwrap_or(0);
+
+    if chunk_count > 0 && cmp.is_none() {
+        if let Ok(result) = search_chunks_with_graph(vault_db, &fts_query).await {
+            if !result.is_empty() {
+                return result;
+            }
+        }
+    }
+
+    // 3. Fallback：原有全文搜尋（比較條件查詢 / chunk 為空時）
     let rows = sqlx::query(
-        "SELECT path, title
-         FROM search_fts
-         WHERE search_fts MATCH ?1
-         ORDER BY bm25(search_fts)
-         LIMIT 15",
+        "SELECT path, title FROM search_fts WHERE search_fts MATCH ?1
+         ORDER BY bm25(search_fts) LIMIT 15",
     )
     .bind(&fts_query)
     .fetch_all(vault_db)
     .await;
 
     match rows {
-        Ok(rows) if rows.is_empty() => {
-            format!("未找到包含「{}」的筆記", fts_query)
-        }
+        Ok(rows) if rows.is_empty() => format!("未找到包含「{}」的筆記", fts_query),
         Ok(rows) => {
             let mut result_lines = Vec::new();
             for r in &rows {
                 let path: String = r.get("path");
                 let title: String = r.get("title");
                 let content: Option<String> = sqlx::query_scalar(
-                    "SELECT content FROM notes WHERE path = ?",
-                )
-                .bind(&path)
-                .fetch_optional(vault_db)
-                .await
-                .ok()
-                .flatten();
+                    "SELECT content FROM notes WHERE path = ?")
+                    .bind(&path).fetch_optional(vault_db).await.ok().flatten();
 
                 let snippet = if let Some(ref c) = content {
                     if let Some(ref cmp_ref) = cmp {
-                        // 有比較條件：只列出符合數值的行
                         let matched = filter_lines_by_comparison(c, cmp_ref);
-                        if matched.is_empty() {
-                            continue; // 此筆記無符合條件的行，略過
-                        }
+                        if matched.is_empty() { continue; }
                         format!("（符合條件的行）\n{}", matched.join("\n"))
                     } else {
-                        // 一般 snippet：找關鍵字前後文
                         let q = fts_query.to_lowercase();
                         let cl = c.to_lowercase();
                         if let Some(pos) = cl.find(&q) {
-                            // Snap to char boundaries — CJK chars are 3 bytes each,
-                            // so raw arithmetic offsets can land mid-character.
                             let mut start = pos.saturating_sub(60);
                             while start > 0 && !c.is_char_boundary(start) { start -= 1; }
                             let mut end = (pos + q.len() + 100).min(c.len());
@@ -1687,27 +1672,16 @@ pub(crate) async fn tool_search_vault(query: &str, vault_db: &sqlx::SqlitePool, 
                             c.chars().take(120).collect::<String>() + "..."
                         }
                     }
-                } else {
-                    String::new()
-                };
+                } else { String::new() };
 
                 result_lines.push(format!("- **{}** ({})\n  {}", title, path, snippet));
             }
-
             if result_lines.is_empty() {
-                format!(
-                    "在「{}」相關筆記中，未找到數值{}的項目",
-                    fts_query,
-                    cmp.as_ref().map(|c| c.label()).unwrap_or_default()
-                )
+                format!("在「{}」相關筆記中，未找到數值{}的項目", fts_query,
+                    cmp.as_ref().map(|c| c.label()).unwrap_or_default())
             } else {
                 let header = if let Some(ref c) = cmp {
-                    format!(
-                        "搜索「{}」，篩選數值{}，找到 {} 筆：",
-                        fts_query,
-                        c.label(),
-                        result_lines.len()
-                    )
+                    format!("搜索「{}」，篩選數值{}，找到 {} 筆：", fts_query, c.label(), result_lines.len())
                 } else {
                     format!("找到 {} 篇相關筆記：", result_lines.len())
                 };
@@ -1716,6 +1690,100 @@ pub(crate) async fn tool_search_vault(query: &str, vault_db: &sqlx::SqlitePool, 
         }
         Err(e) => format!("搜索失敗：{}", e),
     }
+}
+
+/// Chunk-based search + 1-hop graph expansion
+async fn search_chunks_with_graph(vault_db: &sqlx::SqlitePool, fts_query: &str) -> Result<String, sqlx::Error> {
+    // ── Step 1: FTS on chunks ───────────────────────────────────────────
+    let chunk_rows = sqlx::query(
+        "SELECT c.id, c.file_path, c.section, c.content, c.links
+         FROM chunks_fts f
+         JOIN chunks c ON c.rowid = f.rowid
+         WHERE chunks_fts MATCH ?1
+         ORDER BY bm25(chunks_fts)
+         LIMIT 8",
+    )
+    .bind(fts_query)
+    .fetch_all(vault_db)
+    .await?;
+
+    if chunk_rows.is_empty() {
+        return Ok(String::new());
+    }
+
+    // ── Step 2: Collect matched file paths ─────────────────────────────
+    let matched_paths: Vec<String> = chunk_rows
+        .iter()
+        .map(|r| r.get::<String, _>("file_path"))
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    // ── Step 3: Graph expansion — find 1-hop linked files ───────────────
+    // Outgoing links (files this note links to)
+    let mut expanded_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for path in &matched_paths {
+        let out: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT target_path FROM links
+             WHERE source_path = ? AND target_path IS NOT NULL AND link_type = 'wikilink'",
+        )
+        .bind(path)
+        .fetch_all(vault_db)
+        .await
+        .unwrap_or_default();
+
+        let inc: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT source_path FROM links
+             WHERE target_path = ? AND link_type = 'wikilink'",
+        )
+        .bind(path)
+        .fetch_all(vault_db)
+        .await
+        .unwrap_or_default();
+
+        for p in out.into_iter().chain(inc) {
+            if !matched_paths.contains(&p) {
+                expanded_paths.insert(p);
+            }
+        }
+    }
+
+    // ── Step 4: Fetch titles for all relevant files ─────────────────────
+    let all_paths: Vec<String> = matched_paths.iter().cloned()
+        .chain(expanded_paths.iter().cloned()).collect();
+
+    let mut titles: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for path in &all_paths {
+        let title: Option<String> = sqlx::query_scalar("SELECT title FROM notes WHERE path = ?")
+            .bind(path).fetch_optional(vault_db).await.unwrap_or(None);
+        if let Some(t) = title { titles.insert(path.clone(), t); }
+    }
+
+    // ── Step 5: Build result ────────────────────────────────────────────
+    let mut result_lines = Vec::new();
+
+    // Direct hits (with section info)
+    for row in &chunk_rows {
+        let path: String    = row.get("file_path");
+        let section: String = row.get("section");
+        let content: String = row.get("content");
+        let title = titles.get(&path).cloned().unwrap_or_else(|| path.clone());
+
+        let snippet: String = content.chars().take(200).collect();
+        let section_label = if section.is_empty() { String::new() } else { format!(" § {}", section) };
+        result_lines.push(format!("- **{}{}** ({})\n  {}…", title, section_label, path, snippet.trim()));
+    }
+
+    // Graph-expanded files (headline only — LLM can use read_note for detail)
+    if !expanded_paths.is_empty() {
+        result_lines.push(String::from("\n📎 相關連結筆記（透過 wikilink 擴展）："));
+        for path in &expanded_paths {
+            let title = titles.get(path).cloned().unwrap_or_else(|| path.clone());
+            result_lines.push(format!("- **{}** ({})", title, path));
+        }
+    }
+
+    Ok(format!("找到 {} 個相關段落：\n{}", chunk_rows.len(), result_lines.join("\n")))
 }
 
 /// 建立新筆記（自動建立父資料夾）

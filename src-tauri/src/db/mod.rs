@@ -22,6 +22,7 @@ pub async fn init_vault_db(vault_path: &Path) -> crate::error::Result<SqlitePool
     let db_url = format!("sqlite://{}?mode=rwc", db_path.to_string_lossy());
     let pool = connect(db_url).await?;
     run_migrations(&pool, include_str!("../../migrations/vault_001.sql")).await?;
+    run_migrations(&pool, include_str!("../../migrations/vault_002.sql")).await?;
     Ok(pool)
 }
 

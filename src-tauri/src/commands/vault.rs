@@ -1,7 +1,7 @@
 use crate::{
     error::AppError,
     state::AppState,
-    vault::{extract_title, count_words, indexer},
+    vault::{extract_title, count_words, indexer, chunker},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
@@ -131,6 +131,10 @@ pub async fn create_note(
     .execute(&db)
     .await?;
 
+    // 建立 chunks（忽略失敗，不影響主流程）
+    let chunks = chunker::chunk_note(&rel_path, &content, now);
+    let _ = chunker::upsert_chunks(&db, &chunks).await;
+
     Ok(Note {
         path: rel_path,
         title,
@@ -207,6 +211,10 @@ pub async fn update_note(
         .bind(&path)
         .execute(&db)
         .await?;
+
+    // 更新 chunks
+    let chunks = chunker::chunk_note(&path, &content, now);
+    let _ = chunker::upsert_chunks(&db, &chunks).await;
 
     Ok(())
 }
@@ -295,6 +303,9 @@ pub async fn delete_note(
         .bind(&path)
         .execute(&db)
         .await?;
+
+    // 刪除對應 chunks
+    let _ = chunker::delete_chunks(&db, &path).await;
 
     Ok(DeleteResult { affected_links })
 }
@@ -1475,4 +1486,113 @@ async fn scan_dir(
         }
     }
     Ok(())
+}
+
+/// 重新建立整個 vault 的 chunk 索引（首次啟動舊 vault 或手動觸發）
+#[tauri::command]
+pub async fn reindex_vault_chunks(
+    state: State<'_, AppState>,
+) -> Result<usize, AppError> {
+    let db = state.get_vault_db().await?;
+    let count = chunker::reindex_all(&db).await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(count)
+}
+
+/// 語意搜尋：chunk FTS + 1-hop graph expansion（供前端 SemanticSearchPanel 使用）
+#[tauri::command]
+pub async fn search_vault_chunks(
+    state: State<'_, AppState>,
+    query: String,
+) -> Result<String, AppError> {
+    use std::collections::{HashMap, HashSet};
+    use sqlx::Row;
+
+    if query.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let db = state.get_vault_db().await?;
+
+    // 1. FTS search on chunks
+    let chunk_rows = sqlx::query(
+        "SELECT c.file_path, c.section, c.content
+         FROM chunks_fts f
+         JOIN chunks c ON c.rowid = f.rowid
+         WHERE chunks_fts MATCH ?1
+         ORDER BY bm25(chunks_fts)
+         LIMIT 10",
+    )
+    .bind(query.trim())
+    .fetch_all(&db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if chunk_rows.is_empty() {
+        return Ok(String::new());
+    }
+
+    // 2. Collect matched file paths
+    let matched_paths: HashSet<String> = chunk_rows
+        .iter()
+        .map(|r| r.get::<String, _>("file_path"))
+        .collect();
+
+    // 3. Fetch titles
+    let mut titles: HashMap<String, String> = HashMap::new();
+    for path in &matched_paths {
+        let title: Option<String> = sqlx::query_scalar("SELECT title FROM notes WHERE path = ?")
+            .bind(path)
+            .fetch_optional(&db)
+            .await
+            .unwrap_or(None);
+        if let Some(t) = title { titles.insert(path.clone(), t); }
+    }
+
+    // 4. Graph expansion (1-hop)
+    let mut expanded: HashSet<String> = HashSet::new();
+    for path in &matched_paths {
+        let out: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT target_path FROM links
+             WHERE source_path = ? AND target_path IS NOT NULL AND link_type = 'wikilink'",
+        )
+        .bind(path).fetch_all(&db).await.unwrap_or_default();
+
+        let inc: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT source_path FROM links WHERE target_path = ? AND link_type = 'wikilink'",
+        )
+        .bind(path).fetch_all(&db).await.unwrap_or_default();
+
+        for p in out.into_iter().chain(inc) {
+            if !matched_paths.contains(&p) {
+                expanded.insert(p);
+            }
+        }
+    }
+
+    // Fetch expanded titles
+    for path in &expanded {
+        let title: Option<String> = sqlx::query_scalar("SELECT title FROM notes WHERE path = ?")
+            .bind(path).fetch_optional(&db).await.unwrap_or(None);
+        if let Some(t) = title { titles.insert(path.clone(), t); }
+    }
+
+    // 5. Build response string
+    let mut lines = vec![format!("找到 {} 個相關段落：", chunk_rows.len())];
+    for row in &chunk_rows {
+        let path: String    = row.get("file_path");
+        let section: String = row.get("section");
+        let content: String = row.get("content");
+        let title = titles.get(&path).cloned().unwrap_or_else(|| path.clone());
+        let snippet: String = content.chars().take(200).collect();
+        let section_label = if section.is_empty() { String::new() } else { format!(" § {}", section) };
+        lines.push(format!("- **{}{}** ({})\n  {}…", title, section_label, path, snippet.trim()));
+    }
+    if !expanded.is_empty() {
+        lines.push("\n📎 相關連結筆記（透過 wikilink 擴展）：".to_string());
+        for path in &expanded {
+            let title = titles.get(path).cloned().unwrap_or_else(|| path.clone());
+            lines.push(format!("- **{}** ({})", title, path));
+        }
+    }
+    Ok(lines.join("\n"))
 }
