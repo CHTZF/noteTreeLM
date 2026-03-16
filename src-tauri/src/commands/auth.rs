@@ -42,6 +42,11 @@ fn session_path(app: &tauri::AppHandle) -> std::path::PathBuf {
     app.path().app_data_dir().expect("app_data_dir").join("session.json")
 }
 
+#[derive(Deserialize)]
+struct UserRow {
+    username: String,
+}
+
 #[tauri::command]
 pub async fn login(
     username: String,
@@ -51,14 +56,15 @@ pub async fn login(
 ) -> Result<SessionInfo, String> {
     let hash = hash_password(&password);
 
-    let row = sqlx::query("SELECT username FROM users WHERE username = ? AND password_hash = ?")
-        .bind(&username)
-        .bind(&hash)
-        .fetch_optional(&state.settings_db)
+    let mut resp = state.db
+        .query("SELECT username FROM users WHERE username = $username AND password_hash = $hash LIMIT 1")
+        .bind(("username", username.clone()))
+        .bind(("hash", hash.clone()))
         .await
         .map_err(|e| e.to_string())?;
+    let rows: Vec<UserRow> = resp.take(0).map_err(|e| e.to_string())?;
 
-    if row.is_none() {
+    if rows.is_empty() {
         return Err("帳號或密碼錯誤".to_string());
     }
 
@@ -118,22 +124,23 @@ pub async fn change_password(
     let session: SessionInfo = serde_json::from_str(&json).map_err(|e| e.to_string())?;
 
     let current_hash = hash_password(&current_password);
-    let row = sqlx::query("SELECT id FROM users WHERE username = ? AND password_hash = ?")
-        .bind(&session.username)
-        .bind(&current_hash)
-        .fetch_optional(&state.settings_db)
+    let mut resp = state.db
+        .query("SELECT username FROM users WHERE username = $username AND password_hash = $hash LIMIT 1")
+        .bind(("username", session.username.clone()))
+        .bind(("hash", current_hash.clone()))
         .await
         .map_err(|e| e.to_string())?;
+    let rows: Vec<UserRow> = resp.take(0).map_err(|e| e.to_string())?;
 
-    if row.is_none() {
+    if rows.is_empty() {
         return Err("目前密碼錯誤".to_string());
     }
 
     let new_hash = hash_password(&new_password);
-    sqlx::query("UPDATE users SET password_hash = ? WHERE username = ?")
-        .bind(&new_hash)
-        .bind(&session.username)
-        .execute(&state.settings_db)
+    state.db
+        .query("UPDATE users SET password_hash = $hash WHERE username = $username")
+        .bind(("hash", new_hash.clone()))
+        .bind(("username", session.username.clone()))
         .await
         .map_err(|e| e.to_string())?;
 

@@ -1,4 +1,5 @@
 use crate::{db::queries, error::AppError, state::AppState};
+use crate::db::surreal::SurrealDb;
 use crate::runtime::memory_agent::{
     extract_cjk_bigrams_with_extra_stops, format_memory_rows, load_memory_rules,
     parse_query_since_with_rules, parse_text_tool_calls, tool_query_memory,
@@ -7,7 +8,6 @@ use chrono::Local;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::Row;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,15 +35,15 @@ fn find_free_port(preferred: u16) -> u16 {
 
 /// 從 DB 讀取 llama-server 路徑、模型路徑（port 由執行時自動分配）
 async fn resolve_server_config(state: &AppState) -> Result<(PathBuf, String), AppError> {
-    let pool = &state.settings_db;
+    let db = &state.db;
 
-    let server_path = queries::get_setting(pool, "llama_cli_path")
+    let server_path = queries::get_setting(db, "llama_cli_path")
         .await?
         .unwrap_or_default();
     // Trim whitespace and surrounding quotes (users sometimes paste quoted paths from terminal)
     let server_path = server_path.trim().trim_matches('"').trim_matches('\'').to_string();
 
-    let model_path = queries::get_setting(pool, "llm_model_path")
+    let model_path = queries::get_setting(db, "llm_model_path")
         .await?
         .unwrap_or_default();
     let model_path = model_path.trim().trim_matches('"').trim_matches('\'').to_string();
@@ -472,13 +472,14 @@ pub async fn invoke_agent(
 
     // 2. Vault 資訊
     let vault_path = state.get_vault_path().await;
-    let vault_db_opt = state.get_vault_db().await.ok();
+    let vault_id_opt = state.get_vault_id().await.ok();
+    let vault_db = state.db.clone();
 
     // 3. 組裝 messages_json
     //    - conversation_id 存在：從 DB 載入歷史，追加當前 user 訊息
     //    - 否則：使用前端傳入的 messages（向下相容）
     let mut messages_json: Vec<serde_json::Value> = if let Some(ref conv_id) = conversation_id {
-        let mut db_msgs = load_messages(&state.settings_db, conv_id).await?;
+        let mut db_msgs = load_messages(&state.db, conv_id).await?;
         let arr = db_msgs.as_array_mut()
             .ok_or_else(|| AppError::AI("messages_json 格式錯誤".into()))?;
         // 追加當前 user 訊息（input）
@@ -503,12 +504,13 @@ pub async fn invoke_agent(
     }
 
     // 4. 建立 ToolRegistry（vault 可用時注入工具）
-    let registry = if !vault_path.is_empty() {
-        if let Some(ref db) = vault_db_opt {
-            crate::tools::build_vault_registry(vault_path.clone(), db.clone(), app.clone())
-        } else {
-            Arc::new(ToolRegistry::new())
-        }
+    let registry = if !vault_path.is_empty() && vault_id_opt.is_some() {
+        crate::tools::build_vault_registry(
+            vault_path.clone(),
+            vault_db.clone(),
+            vault_id_opt.clone().unwrap_or_default(),
+            app.clone(),
+        )
     } else {
         Arc::new(ToolRegistry::new())
     };
@@ -582,7 +584,7 @@ pub async fn invoke_agent(
     // 8. 建立 Agent，執行
     //    vault_tools: Agent 在 ToolUse/Chat 路徑使用（None = 無 vault 工具）
     //    Intent::Memory 路徑由 Agent 自行注入 MemoryAgent::tools_definition()
-    let vault_tools_opt = if !vault_path.is_empty() && vault_db_opt.is_some() {
+    let vault_tools_opt = if !vault_path.is_empty() && vault_id_opt.is_some() {
         Some(vault_tools())
     } else {
         None
@@ -590,13 +592,15 @@ pub async fn invoke_agent(
 
     // 9. prefetch_memory：Intent::Memory 路徑的純 Rust 預取（<100ms，無 LLM）
     //    有結果 → 注入 system prompt 作為初始種子；無結果 → 空字串，LLM 自行用 query_memory 搜尋
-    let prefetch_memory: Option<PrefetchFn> = if let Some(ref db) = vault_db_opt {
-        let db_pf = db.clone();
+    let prefetch_memory: Option<PrefetchFn> = if vault_id_opt.is_some() {
+        let db_pf = vault_db.clone();
+        let vid_pf = vault_id_opt.clone().unwrap_or_default();
         Some(Arc::new(move |query: String| {
             let db = db_pf.clone();
+            let vault_id = vid_pf.clone();
             Box::pin(async move {
                 let now = Local::now();
-                let rules = load_memory_rules(&db).await;
+                let rules = load_memory_rules(&db, &vault_id).await;
                 let extra_stops: Vec<char> = rules.iter()
                     .filter(|(pt, _, _)| pt == "stopword")
                     .filter_map(|(_, pattern, _)| pattern.chars().next())
@@ -605,35 +609,55 @@ pub async fn invoke_agent(
                 let terms = extract_cjk_bigrams_with_extra_stops(&query, &extra_stops);
                 let limit = 3i64;
 
+                #[derive(Deserialize)]
+                struct PrefetchRow { path: String, title: String, created_at: surrealdb::sql::Datetime }
+
                 let rows: Vec<(String, String, i64)> = if terms.is_empty() {
-                    sqlx::query_as::<_, (String, String, i64)>(
+                    let mut resp = db.query(
                         "SELECT path, title, created_at FROM notes
-                         WHERE path LIKE 'memories/ai_memory_%'
-                         ORDER BY created_at DESC LIMIT ?"
+                         WHERE vault_id = $vid AND string::starts_with(path, 'memories/')
+                         ORDER BY created_at DESC LIMIT $limit"
                     )
-                    .bind(limit).fetch_all(&db).await.unwrap_or_default()
-                    .into_iter().filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min))
-                    .collect()
+                    .bind(("vid", vault_id.clone()))
+                    .bind(("limit", limit))
+                    .await.ok();
+                    resp.as_mut()
+                        .and_then(|r| r.take::<Vec<PrefetchRow>>(0).ok())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|r| (r.path, r.title, r.created_at.timestamp() * 1000))
+                        .filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min))
+                        .collect()
                 } else {
+                    // Build a LIKE-based filter for terms
                     let conditions: String = terms.iter()
-                        .map(|t| format!("content LIKE '%{}%'", t))
+                        .enumerate()
+                        .map(|(i, _)| format!("string::contains(content, $term{})", i))
                         .collect::<Vec<_>>().join(" OR ");
                     let sql = format!(
                         "SELECT path, title, created_at FROM notes
-                         WHERE path LIKE 'memories/ai_memory_%' AND ({})
-                         ORDER BY created_at DESC LIMIT {}",
-                        conditions, limit
+                         WHERE vault_id = $vid AND string::starts_with(path, 'memories/') AND ({})
+                         ORDER BY created_at DESC LIMIT $limit",
+                        conditions
                     );
-                    sqlx::query_as::<_, (String, String, i64)>(&sql)
-                        .fetch_all(&db).await.unwrap_or_default()
-                        .into_iter().filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min))
+                    let mut q = db.query(&sql).bind(("vid", vault_id.clone())).bind(("limit", limit));
+                    for (i, term) in terms.iter().enumerate() {
+                        q = q.bind((format!("term{}", i), term.clone()));
+                    }
+                    let mut resp = q.await.ok();
+                    resp.as_mut()
+                        .and_then(|r| r.take::<Vec<PrefetchRow>>(0).ok())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|r| (r.path, r.title, r.created_at.timestamp() * 1000))
+                        .filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min))
                         .collect()
                 };
 
                 if rows.is_empty() {
                     String::new()
                 } else {
-                    format_memory_rows(&rows, "", &db).await
+                    format_memory_rows(&rows, "", &db, &vault_id).await
                 }
             })
         }))
@@ -643,7 +667,7 @@ pub async fn invoke_agent(
 
     let agent = Agent::new(
         Dispatcher::new(registry),
-        IntentClassifier::new(state.settings_db.clone()),
+        IntentClassifier::new(state.db.clone()),
         llm_fn,
         confirm_write,
         emit_fn,
@@ -653,7 +677,7 @@ pub async fn invoke_agent(
         vault_tools_opt,
         prefetch_memory,
         embed_fn,
-        state.settings_db.clone(),
+        state.db.clone(),
         conversation_id.clone(),
     );
 
@@ -675,8 +699,8 @@ pub async fn invoke_agent(
         }
 
         let arr = serde_json::Value::Array(to_save);
-        let _ = save_messages(&state.settings_db, conv_id, &arr).await;
-        let _ = maybe_set_title(&state.settings_db, conv_id, &arr).await;
+        let _ = save_messages(&state.db, conv_id, &arr).await;
+        let _ = maybe_set_title(&state.db, conv_id, &arr).await;
     }
 
     Ok(response_text)
@@ -910,10 +934,10 @@ pub async fn process_with_llm(
 /// App 啟動時呼叫：若已設定路徑則背景預熱 llama-server
 pub async fn warmup_llama_server(state: &AppState, app: &AppHandle) {
     let configured = matches!(
-        queries::get_setting(&state.settings_db, "llama_cli_path").await,
+        queries::get_setting(&state.db, "llama_cli_path").await,
         Ok(Some(ref p)) if !p.is_empty()
     ) && matches!(
-        queries::get_setting(&state.settings_db, "llm_model_path").await,
+        queries::get_setting(&state.db, "llm_model_path").await,
         Ok(Some(ref p)) if !p.is_empty()
     );
     if !configured {
@@ -1602,8 +1626,8 @@ fn filter_lines_by_comparison(content: &str, cmp: &Comparison) -> Vec<String> {
     matched
 }
 
-/// 全文搜索 Vault（使用 SQLite FTS5），支援比較條件過濾
-pub(crate) async fn tool_search_vault(query: &str, vault_db: &sqlx::SqlitePool, app: &AppHandle) -> String {
+/// 全文搜索 Vault（使用 SurrealDB BM25 FTS），支援比較條件過濾
+pub(crate) async fn tool_search_vault(query: &str, vault_db: &SurrealDb, vault_id: &str, app: &AppHandle) -> String {
     if query.trim().is_empty() {
         return "請提供搜索關鍵字".to_string();
     }
@@ -1622,37 +1646,59 @@ pub(crate) async fn tool_search_vault(query: &str, vault_db: &sqlx::SqlitePool, 
         cmp.as_ref().map(|c| c.label()).unwrap_or_else(|| "無".to_string())
     ));
 
-    // 2. 嘗試 chunk-based 搜尋（有 chunks 表時使用）
-    let chunk_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks")
-        .fetch_one(vault_db).await.unwrap_or(0);
+    // 2. 嘗試 chunk-based 搜尋（有 chunks 時使用）
+    #[derive(Deserialize)]
+    struct CountRow { count: i64 }
+    let mut cr = vault_db.query("SELECT count() AS count FROM chunks WHERE vault_id = $vid GROUP ALL")
+        .bind(("vid", vault_id.to_owned()))
+        .await.ok();
+    let chunk_count = cr.as_mut()
+        .and_then(|r| r.take::<Vec<CountRow>>(0).ok())
+        .and_then(|rows| rows.first().map(|r| r.count))
+        .unwrap_or(0);
 
     if chunk_count > 0 && cmp.is_none() {
-        if let Ok(result) = search_chunks_with_graph(vault_db, &fts_query).await {
+        if let Ok(result) = search_chunks_with_graph(vault_db, vault_id, &fts_query).await {
             if !result.is_empty() {
                 return result;
             }
         }
     }
 
-    // 3. Fallback：原有全文搜尋（比較條件查詢 / chunk 為空時）
-    let rows = sqlx::query(
-        "SELECT path, title FROM search_fts WHERE search_fts MATCH ?1
-         ORDER BY bm25(search_fts) LIMIT 15",
+    // 3. Fallback：notes 全文搜尋（比較條件查詢 / chunk 為空時）
+    #[derive(Deserialize)]
+    struct NoteRow { path: String, title: String }
+    let mut resp = vault_db.query(
+        "SELECT path, title FROM notes WHERE vault_id = $vid AND (title @1@ $q OR content @2@ $q) ORDER BY search::score(1) + search::score(2) DESC LIMIT 15"
     )
-    .bind(&fts_query)
-    .fetch_all(vault_db)
+    .bind(("vid", vault_id.to_owned()))
+    .bind(("q", fts_query.clone()))
     .await;
 
-    match rows {
-        Ok(rows) if rows.is_empty() => format!("未找到包含「{}」的筆記", fts_query),
-        Ok(rows) => {
+    match resp {
+        Err(e) => format!("搜索失敗：{}", e),
+        Ok(ref mut r) => {
+            let rows: Vec<NoteRow> = r.take(0).unwrap_or_default();
+            if rows.is_empty() {
+                return format!("未找到包含「{}」的筆記", fts_query);
+            }
             let mut result_lines = Vec::new();
-            for r in &rows {
-                let path: String = r.get("path");
-                let title: String = r.get("title");
-                let content: Option<String> = sqlx::query_scalar(
-                    "SELECT content FROM notes WHERE path = ?")
-                    .bind(&path).fetch_optional(vault_db).await.ok().flatten();
+            for row in &rows {
+                let path = &row.path;
+                let title = &row.title;
+
+                // Fetch content for snippet/comparison
+                #[derive(Deserialize)]
+                struct ContentRow { content: String }
+                let mut cr2 = vault_db.query(
+                    "SELECT content FROM notes WHERE vault_id = $vid AND path = $path LIMIT 1"
+                )
+                .bind(("vid", vault_id.to_owned()))
+                .bind(("path", path.clone()))
+                .await.ok();
+                let content: Option<String> = cr2.as_mut()
+                    .and_then(|r| r.take::<Vec<ContentRow>>(0).ok())
+                    .and_then(|rows| rows.into_iter().next().map(|r| r.content));
 
                 let snippet = if let Some(ref c) = content {
                     if let Some(ref cmp_ref) = cmp {
@@ -1688,24 +1734,22 @@ pub(crate) async fn tool_search_vault(query: &str, vault_db: &sqlx::SqlitePool, 
                 format!("{}\n{}", header, result_lines.join("\n"))
             }
         }
-        Err(e) => format!("搜索失敗：{}", e),
     }
 }
 
 /// Chunk-based search + 1-hop graph expansion
-async fn search_chunks_with_graph(vault_db: &sqlx::SqlitePool, fts_query: &str) -> Result<String, sqlx::Error> {
-    // ── Step 1: FTS on chunks ───────────────────────────────────────────
-    let chunk_rows = sqlx::query(
-        "SELECT c.id, c.file_path, c.section, c.content, c.links
-         FROM chunks_fts f
-         JOIN chunks c ON c.rowid = f.rowid
-         WHERE chunks_fts MATCH ?1
-         ORDER BY bm25(chunks_fts)
-         LIMIT 8",
+async fn search_chunks_with_graph(vault_db: &SurrealDb, vault_id: &str, fts_query: &str) -> Result<String, crate::error::AppError> {
+    // ── Step 1: BM25 FTS on chunks ─────────────────────────────────────
+    #[derive(Deserialize)]
+    struct ChunkRow { file_path: String, section: String, content: String }
+    let mut resp = vault_db.query(
+        "SELECT file_path, section, content FROM chunks WHERE vault_id = $vid AND content @1@ $q ORDER BY search::score(1) DESC LIMIT 10"
     )
-    .bind(fts_query)
-    .fetch_all(vault_db)
-    .await?;
+    .bind(("vid", vault_id.to_owned()))
+    .bind(("q", fts_query.to_owned()))
+    .await
+    .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+    let chunk_rows: Vec<ChunkRow> = resp.take(0).map_err(|e| crate::error::AppError::Database(e.to_string()))?;
 
     if chunk_rows.is_empty() {
         return Ok(String::new());
@@ -1714,37 +1758,41 @@ async fn search_chunks_with_graph(vault_db: &sqlx::SqlitePool, fts_query: &str) 
     // ── Step 2: Collect matched file paths ─────────────────────────────
     let matched_paths: Vec<String> = chunk_rows
         .iter()
-        .map(|r| r.get::<String, _>("file_path"))
+        .map(|r| r.file_path.clone())
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
 
     // ── Step 3: Graph expansion — find 1-hop linked files ───────────────
-    // Outgoing links (files this note links to)
     let mut expanded_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     for path in &matched_paths {
-        let out: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT target_path FROM links
-             WHERE source_path = ? AND target_path IS NOT NULL AND link_type = 'wikilink'",
+        // Outgoing links
+        #[derive(Deserialize)] struct TargetRow { target_path: Option<String> }
+        let mut out_resp = vault_db.query(
+            "SELECT target_path FROM links WHERE vault_id = $vid AND source_path = $path AND target_path != NONE AND link_type = 'wikilink'"
         )
-        .bind(path)
-        .fetch_all(vault_db)
-        .await
-        .unwrap_or_default();
+        .bind(("vid", vault_id.to_owned()))
+        .bind(("path", path.clone()))
+        .await.unwrap_or_else(|_| unreachable!());
+        let out_rows: Vec<TargetRow> = out_resp.take(0).unwrap_or_default();
 
-        let inc: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT source_path FROM links
-             WHERE target_path = ? AND link_type = 'wikilink'",
+        // Incoming links
+        #[derive(Deserialize)] struct SourceRow { source_path: String }
+        let mut inc_resp = vault_db.query(
+            "SELECT source_path FROM links WHERE vault_id = $vid AND target_path = $path AND link_type = 'wikilink'"
         )
-        .bind(path)
-        .fetch_all(vault_db)
-        .await
-        .unwrap_or_default();
+        .bind(("vid", vault_id.to_owned()))
+        .bind(("path", path.clone()))
+        .await.unwrap_or_else(|_| unreachable!());
+        let inc_rows: Vec<SourceRow> = inc_resp.take(0).unwrap_or_default();
 
-        for p in out.into_iter().chain(inc) {
-            if !matched_paths.contains(&p) {
-                expanded_paths.insert(p);
+        for r in out_rows {
+            if let Some(p) = r.target_path {
+                if !matched_paths.contains(&p) { expanded_paths.insert(p); }
             }
+        }
+        for r in inc_rows {
+            if !matched_paths.contains(&r.source_path) { expanded_paths.insert(r.source_path); }
         }
     }
 
@@ -1754,27 +1802,35 @@ async fn search_chunks_with_graph(vault_db: &sqlx::SqlitePool, fts_query: &str) 
 
     let mut titles: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for path in &all_paths {
-        let title: Option<String> = sqlx::query_scalar("SELECT title FROM notes WHERE path = ?")
-            .bind(path).fetch_optional(vault_db).await.unwrap_or(None);
-        if let Some(t) = title { titles.insert(path.clone(), t); }
+        #[derive(Deserialize)] struct TitleRow { title: String }
+        let mut tr = vault_db.query(
+            "SELECT title FROM notes WHERE vault_id = $vid AND path = $path LIMIT 1"
+        )
+        .bind(("vid", vault_id.to_owned()))
+        .bind(("path", path.clone()))
+        .await.ok();
+        if let Some(t) = tr.as_mut()
+            .and_then(|r| r.take::<Vec<TitleRow>>(0).ok())
+            .and_then(|rows| rows.into_iter().next())
+        {
+            titles.insert(path.clone(), t.title);
+        }
     }
 
     // ── Step 5: Build result ────────────────────────────────────────────
     let mut result_lines = Vec::new();
 
-    // Direct hits (with section info)
     for row in &chunk_rows {
-        let path: String    = row.get("file_path");
-        let section: String = row.get("section");
-        let content: String = row.get("content");
-        let title = titles.get(&path).cloned().unwrap_or_else(|| path.clone());
+        let path = &row.file_path;
+        let section = &row.section;
+        let content = &row.content;
+        let title = titles.get(path).cloned().unwrap_or_else(|| path.clone());
 
         let snippet: String = content.chars().take(200).collect();
         let section_label = if section.is_empty() { String::new() } else { format!(" § {}", section) };
         result_lines.push(format!("- **{}{}** ({})\n  {}…", title, section_label, path, snippet.trim()));
     }
 
-    // Graph-expanded files (headline only — LLM can use read_note for detail)
     if !expanded_paths.is_empty() {
         result_lines.push(String::from("\n📎 相關連結筆記（透過 wikilink 擴展）："));
         for path in &expanded_paths {
@@ -1787,7 +1843,12 @@ async fn search_chunks_with_graph(vault_db: &sqlx::SqlitePool, fts_query: &str) 
 }
 
 /// 建立新筆記（自動建立父資料夾）
-pub(crate) async fn tool_create_note(rel_path: &str, content: &str, vault_path: &str) -> String {
+pub(crate) async fn tool_create_note(
+    rel_path: &str,
+    content: &str,
+    vault_path: &str,
+    db_ctx: Option<(SurrealDb, String)>,
+) -> String {
     let abs_path = match resolve_vault_path(rel_path, vault_path) {
         Ok(p) => p,
         Err(e) => return e,
@@ -1795,22 +1856,78 @@ pub(crate) async fn tool_create_note(rel_path: &str, content: &str, vault_path: 
     if let Some(parent) = abs_path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
-    match tokio::fs::write(&abs_path, content).await {
-        Ok(_) => format!("✅ 已建立筆記：{}", rel_path),
-        Err(e) => format!("建立失敗：{}", e),
+    if let Err(e) = tokio::fs::write(&abs_path, content).await {
+        return format!("建立失敗：{}", e);
     }
+    // 同步到 notes table
+    if let Some((db, vault_id)) = db_ctx {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_dt = surrealdb::sql::Datetime::from(
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms).unwrap_or_default()
+        );
+        let title = {
+            let first = content.lines().find(|l| !l.trim().is_empty()).unwrap_or(rel_path);
+            first.trim_start_matches('#').trim().to_string()
+        };
+        let wc = content.split_whitespace().count() as i64;
+        let checksum = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
+        let _ = db.query(
+            "INSERT INTO notes (vault_id, path, title, content, word_count, created_at, modified_at, checksum) \
+             VALUES ($vid, $path, $title, $content, $wc, $now, $now, $cs) \
+             ON DUPLICATE KEY UPDATE title = $title, content = $content, word_count = $wc, modified_at = $now, checksum = $cs"
+        )
+        .bind(("vid", vault_id.clone()))
+        .bind(("path", rel_path.to_owned()))
+        .bind(("title", title))
+        .bind(("content", content.to_owned()))
+        .bind(("wc", wc))
+        .bind(("now", now_dt))
+        .bind(("cs", checksum))
+        .await;
+    }
+    format!("✅ 已建立筆記：{}", rel_path)
 }
 
 /// 更新現有筆記（覆寫全文）
-pub(crate) async fn tool_update_note(rel_path: &str, content: &str, vault_path: &str) -> String {
+pub(crate) async fn tool_update_note(
+    rel_path: &str,
+    content: &str,
+    vault_path: &str,
+    db_ctx: Option<(SurrealDb, String)>,
+) -> String {
     let abs_path = match resolve_vault_path(rel_path, vault_path) {
         Ok(p) => p,
         Err(e) => return e,
     };
-    match tokio::fs::write(&abs_path, content).await {
-        Ok(_) => format!("✅ 已更新筆記：{}", rel_path),
-        Err(e) => format!("更新失敗：{}", e),
+    if let Err(e) = tokio::fs::write(&abs_path, content).await {
+        return format!("更新失敗：{}", e);
     }
+    // 同步到 notes table
+    if let Some((db, vault_id)) = db_ctx {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_dt = surrealdb::sql::Datetime::from(
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms).unwrap_or_default()
+        );
+        let title = {
+            let first = content.lines().find(|l| !l.trim().is_empty()).unwrap_or(rel_path);
+            first.trim_start_matches('#').trim().to_string()
+        };
+        let wc = content.split_whitespace().count() as i64;
+        let checksum = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
+        let _ = db.query(
+            "UPDATE notes SET content = $content, title = $title, word_count = $wc, modified_at = $now, checksum = $cs \
+             WHERE vault_id = $vid AND path = $path"
+        )
+        .bind(("content", content.to_owned()))
+        .bind(("title", title))
+        .bind(("wc", wc))
+        .bind(("now", now_dt))
+        .bind(("cs", checksum))
+        .bind(("vid", vault_id))
+        .bind(("path", rel_path.to_owned()))
+        .await;
+    }
+    format!("✅ 已更新筆記：{}", rel_path)
 }
 
 /// 建立資料夾
@@ -1869,7 +1986,7 @@ fn detect_tool_calls(
 async fn execute_vault_tool(
     name: &str,
     args: &serde_json::Value,
-    vault_db: Option<&sqlx::SqlitePool>,
+    vault_db: Option<(&SurrealDb, &str)>,
     vault_path: &str,
     app: &AppHandle,
     ext_config: &ExtAiConfig,
@@ -1887,7 +2004,7 @@ async fn execute_vault_tool(
         "search_vault" => {
             let query = args["query"].as_str().unwrap_or("");
             match vault_db {
-                Some(db) => tool_search_vault(query, db, app).await,
+                Some((db, vid)) => tool_search_vault(query, db, vid, app).await,
                 None => "Vault 資料庫未就緒".to_string(),
             }
         }
@@ -1902,12 +2019,14 @@ async fn execute_vault_tool(
         "create_note" => {
             let path = ensure_md(args["path"].as_str().unwrap_or(""));
             let content = args["content"].as_str().unwrap_or("");
-            tool_create_note(&path, content, vault_path).await
+            let db_ctx = vault_db.map(|(db, vid)| (db.clone(), vid.to_owned()));
+            tool_create_note(&path, content, vault_path, db_ctx).await
         }
         "update_note" => {
             let path = ensure_md(args["path"].as_str().unwrap_or(""));
             let content = args["content"].as_str().unwrap_or("");
-            tool_update_note(&path, content, vault_path).await
+            let db_ctx = vault_db.map(|(db, vid)| (db.clone(), vid.to_owned()));
+            tool_update_note(&path, content, vault_path, db_ctx).await
         }
         "create_folder" => {
             let path = args["path"].as_str().unwrap_or("");
@@ -1921,7 +2040,7 @@ async fn execute_vault_tool(
             let since = args["since"].as_str().map(String::from);
             let limit = args["limit"].as_u64().map(|v| v as usize);
             match vault_db {
-                Some(db) => tool_query_memory(keywords, since, limit, db).await,
+                Some((db, vid)) => tool_query_memory(keywords, since, limit, db, vid).await,
                 None => "Vault 資料庫未就緒".to_string(),
             }
         }
@@ -1959,12 +2078,18 @@ pub async fn add_memory_rule(
     pattern: String,
     value: String,
 ) -> Result<(), AppError> {
-    let db = state.get_vault_db().await?;
-    sqlx::query(
-        "INSERT OR REPLACE INTO memory_rules(pattern_type, pattern, value) VALUES (?, ?, ?)"
+    let db = &state.db;
+    let vault_id = state.get_vault_id().await?;
+    db.query(
+        "INSERT INTO memory_rules (vault_id, pattern_type, pattern, value) VALUES ($vid, $pt, $p, $v)
+         ON DUPLICATE KEY UPDATE value = $v"
     )
-    .bind(&pattern_type).bind(&pattern).bind(&value)
-    .execute(&db).await?;
+    .bind(("vid", vault_id.clone()))
+    .bind(("pt", pattern_type.clone()))
+    .bind(("p", pattern.clone()))
+    .bind(("v", value.clone()))
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
     Ok(())
 }
 
@@ -1980,22 +2105,59 @@ pub struct MemoryRuleEntry {
 /// 取得所有記憶查詢規則（供設定頁面顯示）
 #[tauri::command]
 pub async fn get_memory_rules(state: State<'_, AppState>) -> Result<Vec<MemoryRuleEntry>, AppError> {
-    let db = state.get_vault_db().await?;
-    let rows = sqlx::query_as::<_, (i64, String, String, String, i64)>(
-        "SELECT id, pattern_type, pattern, value, created_at FROM memory_rules ORDER BY id"
+    let db = &state.db;
+    let vault_id = state.get_vault_id().await?;
+
+    #[derive(Deserialize)]
+    struct RuleRow {
+        pattern_type: String,
+        pattern: String,
+        value: String,
+        created_at: surrealdb::sql::Datetime,
+    }
+    let mut resp = db.query(
+        "SELECT pattern_type, pattern, value, created_at FROM memory_rules WHERE vault_id = $vid ORDER BY created_at"
     )
-    .fetch_all(&db).await?;
-    Ok(rows.into_iter().map(|(id, pattern_type, pattern, value, created_at)| {
-        MemoryRuleEntry { id, pattern_type, pattern, value, created_at }
+    .bind(("vid", vault_id.clone()))
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    let rows: Vec<RuleRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(rows.into_iter().enumerate().map(|(idx, r)| {
+        MemoryRuleEntry {
+            id: idx as i64,
+            pattern_type: r.pattern_type,
+            pattern: r.pattern.clone(),
+            value: r.value,
+            created_at: r.created_at.timestamp(),
+        }
     }).collect())
 }
 
-/// 刪除指定 id 的記憶規則
+/// 刪除指定 pattern 的記憶規則（SurrealDB 版）
+/// id 為前端傳入的 enumerate index（與 get_memory_rules 的 idx 對應）
 #[tauri::command]
 pub async fn delete_memory_rule(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
-    let db = state.get_vault_db().await?;
-    sqlx::query("DELETE FROM memory_rules WHERE id = ?")
-        .bind(id).execute(&db).await?;
+    let db = &state.db;
+    let vault_id = state.get_vault_id().await?;
+
+    // 取出同 vault 所有 rules（依 created_at 排序，與 get_memory_rules 一致）
+    #[derive(Deserialize)]
+    struct PatternRow { pattern: String }
+    let mut resp = db.query(
+        "SELECT pattern FROM memory_rules WHERE vault_id = $vid ORDER BY created_at"
+    )
+    .bind(("vid", vault_id.clone()))
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    let rows: Vec<PatternRow> = resp.take(0).unwrap_or_default();
+
+    if let Some(row) = rows.into_iter().nth(id as usize) {
+        db.query("DELETE memory_rules WHERE vault_id = $vid AND pattern = $pat")
+            .bind(("vid", vault_id))
+            .bind(("pat", row.pattern))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    }
     Ok(())
 }
 
@@ -2012,14 +2174,15 @@ pub struct IntentKeywordsRow {
 pub async fn get_intent_keywords(
     state: State<'_, AppState>,
 ) -> Result<Vec<IntentKeywordsRow>, AppError> {
-    let rows = sqlx::query_as::<_, (String, String)>(
+    #[derive(Deserialize)]
+    struct IkRow { intent: String, keywords: Vec<String> }
+    let mut resp = state.db.query(
         "SELECT intent, keywords FROM intent_keywords ORDER BY intent"
     )
-    .fetch_all(&state.settings_db).await?;
-    Ok(rows.into_iter().map(|(intent, kw_json)| {
-        let keywords: Vec<String> = serde_json::from_str(&kw_json).unwrap_or_default();
-        IntentKeywordsRow { intent, keywords }
-    }).collect())
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    let rows: Vec<IkRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(rows.into_iter().map(|r| IntentKeywordsRow { intent: r.intent, keywords: r.keywords }).collect())
 }
 
 /// 新增或更新一個 intent 的完整 keywords 列表
@@ -2029,10 +2192,14 @@ pub async fn save_intent_keywords(
     intent: String,
     keywords: Vec<String>,
 ) -> Result<(), AppError> {
-    let kw_json = serde_json::to_string(&keywords).unwrap_or_else(|_| "[]".into());
-    sqlx::query("INSERT OR REPLACE INTO intent_keywords(intent, keywords) VALUES (?, ?)")
-        .bind(&intent).bind(&kw_json)
-        .execute(&state.settings_db).await?;
+    state.db.query(
+        "INSERT INTO intent_keywords (intent, keywords) VALUES ($intent, $keywords)
+         ON DUPLICATE KEY UPDATE keywords = $keywords"
+    )
+    .bind(("intent", intent.clone()))
+    .bind(("keywords", keywords.clone()))
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
     Ok(())
 }
 
@@ -2042,9 +2209,10 @@ pub async fn delete_intent_row(
     state: State<'_, AppState>,
     intent: String,
 ) -> Result<(), AppError> {
-    sqlx::query("DELETE FROM intent_keywords WHERE intent = ?")
-        .bind(&intent)
-        .execute(&state.settings_db).await?;
+    state.db.query("DELETE FROM intent_keywords WHERE intent = $intent")
+        .bind(("intent", intent.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
     Ok(())
 }
 
@@ -2069,7 +2237,8 @@ pub async fn save_memory_session(
     let title = format!("AI 對話記憶 — {}", display_time);
     let rel_path = format!("memories/ai_memory_{}.md", timestamp);
 
-    let db = state.get_vault_db().await?;
+    let db = &state.db;
+    let vault_id = state.get_vault_id().await?;
 
     // 確保 memories/ 資料夾存在
     let memories_dir = PathBuf::from(&vault_path).join("memories");
@@ -2096,36 +2265,27 @@ pub async fn save_memory_session(
     tokio::fs::write(&abs_path, &content).await
         .map_err(|e| AppError::Vault(format!("寫入記憶筆記失敗：{}", e)))?;
 
-    // 插入 DB（FTS trigger 會自動同步 search_fts）
-    let now_ms = chrono::Utc::now().timestamp_millis();
+    // 插入 SurrealDB
+    let now_dt = surrealdb::sql::Datetime::from(chrono::Utc::now());
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     let checksum = format!("{:x}", hasher.finalize());
     let word_count = content.split_whitespace().count() as i64;
 
-    sqlx::query(
-        "INSERT OR REPLACE INTO notes(path, title, content, word_count, created_at, modified_at, checksum)
-         VALUES (?, ?, ?, ?, ?, ?, ?)"
+    db.query(
+        "INSERT INTO notes (vault_id, path, title, content, word_count, created_at, modified_at, checksum)
+         VALUES ($vid, $path, $title, $content, $wc, $now, $now, $checksum)
+         ON DUPLICATE KEY UPDATE title = $title, content = $content, word_count = $wc, modified_at = $now, checksum = $checksum"
     )
-    .bind(&rel_path)
-    .bind(&title)
-    .bind(&content)
-    .bind(word_count)
-    .bind(now_ms)
-    .bind(now_ms)
-    .bind(&checksum)
-    .execute(&db)
-    .await?;
-
-    sqlx::query(
-        "INSERT OR REPLACE INTO graph_nodes(id, node_type, label, created_at)
-         VALUES (?, 'note', ?, ?)"
-    )
-    .bind(&rel_path)
-    .bind(&title)
-    .bind(now_ms / 1000)
-    .execute(&db)
-    .await?;
+    .bind(("vid", vault_id.clone()))
+    .bind(("path", rel_path.clone()))
+    .bind(("title", title.clone()))
+    .bind(("content", content.clone()))
+    .bind(("wc", word_count))
+    .bind(("now", now_dt))
+    .bind(("checksum", checksum.clone()))
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
 
     Ok(rel_path)
 }
@@ -2147,40 +2307,50 @@ pub async fn query_memory(
     limit: Option<usize>,
 ) -> Result<Vec<MemoryResult>, AppError> {
     let limit = limit.unwrap_or(10).min(50) as i64;
-    let db = state.get_vault_db().await?;
+    let db = &state.db;
+    let vault_id = state.get_vault_id().await?;
+
+    #[derive(Deserialize)]
+    struct MemRow {
+        path: String,
+        title: String,
+        created_at: surrealdb::sql::Datetime,
+        content: String,
+    }
+
     if keywords.is_empty() {
         // 無關鍵字時回傳最新的記憶筆記
-        let rows = sqlx::query_as::<_, (String, String, i64, String)>(
+        let mut resp = db.query(
             "SELECT path, title, created_at, content FROM notes
-             WHERE path LIKE 'memories/ai_memory_%'
+             WHERE vault_id = $vid AND string::starts_with(path, 'memories/')
              ORDER BY created_at DESC
-             LIMIT ?"
+             LIMIT $limit"
         )
-        .bind(limit)
-        .fetch_all(&db)
-        .await?;
+        .bind(("vid", vault_id.clone()))
+        .bind(("limit", limit))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        let rows: Vec<MemRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
 
-        return Ok(rows.into_iter().map(|(path, title, created_at, content)| {
-            let snippet = content.chars().skip_while(|c| *c == '-' || *c == '\n').take(200).collect();
-            MemoryResult { path, title, created_at, snippet }
+        return Ok(rows.into_iter().map(|r| {
+            let snippet = r.content.chars().skip_while(|c| *c == '-' || *c == '\n').take(200).collect();
+            MemoryResult { path: r.path, title: r.title, created_at: r.created_at.timestamp() * 1000, snippet }
         }).collect());
     }
 
     let fts_query = keywords.join(" OR ");
-    let rows = sqlx::query_as::<_, (String, String, i64, String)>(
-        "SELECT s.path, s.title, n.created_at, n.content
-         FROM search_fts s
-         JOIN notes n ON n.path = s.path
-         WHERE s.path LIKE 'memories/ai_memory_%'
-           AND search_fts MATCH ?
-         ORDER BY bm25(search_fts)
-         LIMIT ?"
+    let mut resp = db.query(
+        "SELECT path, title, created_at, content FROM notes
+         WHERE vault_id = $vid AND string::starts_with(path, 'memories/') AND content @1@ $q
+         ORDER BY search::score(1) DESC
+         LIMIT $limit"
     )
-    .bind(&fts_query)
-    .bind(limit)
-    .fetch_all(&db)
+    .bind(("vid", vault_id.clone()))
+    .bind(("q", fts_query.clone()))
+    .bind(("limit", limit))
     .await
-    .unwrap_or_default();
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    let rows: Vec<MemRow> = resp.take(0).unwrap_or_default();
 
     let since_ts: Option<i64> = since.and_then(|s| {
         chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok().map(|d| {
@@ -2192,10 +2362,10 @@ pub async fn query_memory(
     });
 
     let results = rows.into_iter()
-        .filter(|(_, _, ts, _)| since_ts.map_or(true, |min_ts| *ts >= min_ts))
-        .map(|(path, title, created_at, content)| {
-            let snippet = content.chars().skip_while(|c| *c == '-' || *c == '\n').take(200).collect();
-            MemoryResult { path, title, created_at, snippet }
+        .filter(|r| since_ts.map_or(true, |min_ts| r.created_at.timestamp() * 1000 >= min_ts))
+        .map(|r| {
+            let snippet = r.content.chars().skip_while(|c| *c == '-' || *c == '\n').take(200).collect();
+            MemoryResult { path: r.path, title: r.title, created_at: r.created_at.timestamp() * 1000, snippet }
         })
         .collect();
 
@@ -2300,7 +2470,8 @@ pub async fn run_tool_pipeline(
 
     let session_id = Uuid::new_v4().to_string();
     let vault_path = state.get_vault_path().await;
-    let vault_db = state.get_vault_db().await.ok();
+    let vault_id_opt = state.get_vault_id().await.ok();
+    let vault_db = state.db.clone();
 
     let all_tool_names: Vec<&str> = steps.iter().map(|s| s.name.as_str()).collect();
 
@@ -2314,13 +2485,13 @@ pub async fn run_tool_pipeline(
     // 只有 call_external_ai 需要 ext_config，避免不必要的 keychain 存取
     let needs_ext = steps.iter().any(|s| s.name == "call_external_ai");
     let ext_config = if needs_ext {
-        let settings_db = &state.settings_db;
-        let ext_provider = queries::get_setting(settings_db, "ai_provider")
+        let db = &state.db;
+        let ext_provider = queries::get_setting(db, "ai_provider")
             .await.unwrap_or_default().unwrap_or_default();
-        let ext_base_url = queries::get_setting(settings_db, "ai_base_url")
+        let ext_base_url = queries::get_setting(db, "ai_base_url")
             .await.unwrap_or_default()
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-        let ext_model = queries::get_setting(settings_db, "ai_model")
+        let ext_model = queries::get_setting(db, "ai_model")
             .await.unwrap_or_default()
             .unwrap_or_else(|| "gpt-4o".to_string());
         let ext_api_key = read_api_key_sync(&ext_provider);
@@ -2351,11 +2522,12 @@ pub async fn run_tool_pipeline(
             continue;
         }
 
+        let vault_db_ref = vault_id_opt.as_deref().map(|vid| (&vault_db, vid));
         let start = std::time::Instant::now();
         let output = execute_vault_tool(
             &step.name,
             &step.args,
-            vault_db.as_ref(),
+            vault_db_ref,
             &vault_path,
             &app,
             &ext_config,
@@ -2426,7 +2598,8 @@ pub async fn test_vault_tool(
 
     let session_id = Uuid::new_v4().to_string();
     let vault_path = state.get_vault_path().await;
-    let vault_db = state.get_vault_db().await.ok();
+    let db = state.db.clone();
+    let vault_id_opt = state.get_vault_id().await.ok();
 
     // ── Emit prepare ─────────────────────────────────────────────────────────
     let _ = app.emit("agent:tx_debug", serde_json::json!({
@@ -2439,13 +2612,12 @@ pub async fn test_vault_tool(
     // Avoids unnecessary keychain access (read_api_key_sync) which can block on macOS
     // if the security framework is busy during concurrent operations.
     let ext_config = if tool_name == "call_external_ai" {
-        let settings_db = &state.settings_db;
-        let ext_provider = queries::get_setting(settings_db, "ai_provider")
+        let ext_provider = queries::get_setting(&db, "ai_provider")
             .await.unwrap_or_default().unwrap_or_default();
-        let ext_base_url = queries::get_setting(settings_db, "ai_base_url")
+        let ext_base_url = queries::get_setting(&db, "ai_base_url")
             .await.unwrap_or_default()
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-        let ext_model = queries::get_setting(settings_db, "ai_model")
+        let ext_model = queries::get_setting(&db, "ai_model")
             .await.unwrap_or_default()
             .unwrap_or_else(|| "gpt-4o".to_string());
         let ext_api_key = read_api_key_sync(&ext_provider);
@@ -2457,7 +2629,7 @@ pub async fn test_vault_tool(
     let result = execute_vault_tool(
         &tool_name,
         &args,
-        vault_db.as_ref(),
+        vault_id_opt.as_deref().map(|vid| (&db, vid)),
         &vault_path,
         &app,
         &ext_config,

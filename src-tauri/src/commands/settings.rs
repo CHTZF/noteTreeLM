@@ -49,12 +49,12 @@ pub struct Settings {
 
 #[tauri::command]
 pub async fn get_settings(state: State<'_, AppState>, username: String) -> Result<Settings, AppError> {
-    let pool = &state.settings_db;
+    let db = &state.db;
 
     // 個人設定：只查 user_settings，不 fallback
     macro_rules! get {
         ($key:expr, $default:expr) => {
-            queries::get_user_setting(pool, &username, $key)
+            queries::get_user_setting(db, &username, $key)
                 .await?
                 .unwrap_or_else(|| $default.to_string())
         };
@@ -63,7 +63,7 @@ pub async fn get_settings(state: State<'_, AppState>, username: String) -> Resul
     // 系統設定：只查全域 settings
     macro_rules! gget {
         ($key:expr, $default:expr) => {
-            queries::get_setting(pool, $key)
+            queries::get_setting(db, $key)
                 .await?
                 .unwrap_or_else(|| $default.to_string())
         };
@@ -122,11 +122,11 @@ pub async fn get_settings(state: State<'_, AppState>, username: String) -> Resul
 
 #[tauri::command]
 pub async fn get_system_settings(state: State<'_, AppState>) -> Result<SystemSettings, AppError> {
-    let pool = &state.settings_db;
+    let db = &state.db;
 
     macro_rules! gget {
         ($key:expr, $default:expr) => {
-            queries::get_setting(pool, $key)
+            queries::get_setting(db, $key)
                 .await?
                 .unwrap_or_else(|| $default.to_string())
         };
@@ -174,11 +174,11 @@ pub async fn save_system_settings(
     state: State<'_, AppState>,
     settings: SystemSettings,
 ) -> Result<(), AppError> {
-    let pool = &state.settings_db;
+    let db = &state.db;
 
     macro_rules! gsave {
         ($key:expr, $value:expr) => {
-            queries::set_setting(pool, $key, &$value.to_string()).await?
+            queries::set_setting(db, $key, &$value.to_string()).await?
         };
     }
 
@@ -211,11 +211,11 @@ pub async fn save_personal_settings(
     username: String,
     settings: Settings,
 ) -> Result<(), AppError> {
-    let pool = state.settings_db.clone();
+    let db = state.db.clone();
 
     macro_rules! save {
         ($key:expr, $value:expr) => {
-            queries::set_user_setting(&pool, &username, $key, &$value.to_string()).await?
+            queries::set_user_setting(&db, &username, $key, &$value.to_string()).await?
         };
     }
 
@@ -251,13 +251,12 @@ pub async fn save_personal_settings(
 
     let recent_json = serde_json::to_string(&settings.recent_vaults)
         .map_err(|e| AppError::Settings(e.to_string()))?;
-    queries::set_user_setting(&pool, &username, "recent_vaults", &recent_json).await?;
+    queries::set_user_setting(&db, &username, "recent_vaults", &recent_json).await?;
 
     Ok(())
 }
 
-/// 處理 vault 切換：關閉舊 DB、初始化新 DB、重啟 FileWatcher
-/// 獨立函式讓 AppState 以 clone（Arc-cheap）方式傳入，避免 `State<'_, AppState>` 的 HRTB Send 問題
+/// 處理 vault 切換：更新 vault_path、重啟 FileWatcher、背景補齊 chunk 索引
 async fn handle_vault_switch(app: AppHandle, state: AppState, new_path: String) {
     let old_path = state.get_vault_path().await;
 
@@ -267,28 +266,18 @@ async fn handle_vault_switch(app: AppHandle, state: AppState, new_path: String) 
             let mut guard = state.watcher_stop.lock().await;
             drop(guard.take());
         }
-        // 關閉舊 vault DB
-        state.set_vault_db(None).await;
-        // 更新 vault_path
+        // 更新 vault_path（新的 vault_id）
         state.set_vault_path(new_path.clone()).await;
-        // 初始化新 vault DB 並啟動新 watcher（若路徑有效）
+        // 初始化新 vault：啟動 watcher 並在背景補齊 chunk 索引
         let path = std::path::PathBuf::from(&new_path);
         if path.exists() {
-            if let Ok(vault_pool) = crate::db::init_vault_db(&path).await {
-                // 背景補齊 chunk 索引
-                {
-                    let db = vault_pool.clone();
-                    let notes_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notes")
-                        .fetch_one(&db).await.unwrap_or(0);
-                    let chunks_count: i64 = sqlx::query_scalar("SELECT COUNT(DISTINCT file_path) FROM chunks")
-                        .fetch_one(&db).await.unwrap_or(0);
-                    if chunks_count < notes_count {
-                        tokio::spawn(async move {
-                            let _ = crate::vault::chunker::reindex_all(&db).await;
-                        });
-                    }
-                }
-                state.set_vault_db(Some(vault_pool)).await;
+            // 背景補齊 chunk 索引
+            {
+                let db = state.db.clone();
+                let vid = new_path.clone();
+                tokio::spawn(async move {
+                    let _ = crate::vault::chunker::reindex_all(&db, &vid).await;
+                });
             }
             let stop_tx = vault::watcher::start_watcher(app, path);
             *state.watcher_stop.lock().await = Some(stop_tx);
@@ -303,7 +292,7 @@ pub async fn get_vault_last_note(
     state: State<'_, AppState>,
     vault_path: String,
 ) -> Result<Option<String>, AppError> {
-    queries::get_vault_last_note(&state.settings_db, &vault_path).await
+    queries::get_vault_last_note(&state.db, &vault_path).await
 }
 
 #[tauri::command]
@@ -312,7 +301,7 @@ pub async fn set_vault_last_note(
     vault_path: String,
     note_path: String,
 ) -> Result<(), AppError> {
-    queries::set_vault_last_note(&state.settings_db, &vault_path, &note_path).await
+    queries::set_vault_last_note(&state.db, &vault_path, &note_path).await
 }
 
 #[tauri::command]
@@ -320,7 +309,7 @@ pub async fn get_last_chat_conversation_id(
     state: State<'_, AppState>,
     username: String,
 ) -> Result<Option<String>, AppError> {
-    queries::get_user_setting(&state.settings_db, &username, "last_chat_conversation_id").await
+    queries::get_user_setting(&state.db, &username, "last_chat_conversation_id").await
 }
 
 #[tauri::command]
@@ -331,10 +320,10 @@ pub async fn set_last_chat_conversation_id(
 ) -> Result<(), AppError> {
     match conversation_id {
         Some(id) if !id.is_empty() => {
-            queries::set_user_setting(&state.settings_db, &username, "last_chat_conversation_id", &id).await
+            queries::set_user_setting(&state.db, &username, "last_chat_conversation_id", &id).await
         }
         _ => {
-            queries::set_user_setting(&state.settings_db, &username, "last_chat_conversation_id", "").await
+            queries::set_user_setting(&state.db, &username, "last_chat_conversation_id", "").await
         }
     }
 }

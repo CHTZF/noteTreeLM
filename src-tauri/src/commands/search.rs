@@ -21,51 +21,56 @@ pub async fn search(
     }
 
     let limit = limit.unwrap_or(20);
-    let db = state.get_vault_db().await?;
+    let db = state.db.clone();
+    let vault_id = state.get_vault_id().await?;
 
-    // FTS5 搜尋：每個空白分隔的詞用雙引號包起來，避免特殊字元造成語法錯誤，並加 * 做前綴比對
-    let fts_query = query
-        .split_whitespace()
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("\"{}\"*", t.replace('"', "")))
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    if fts_query.is_empty() {
-        return Ok(vec![]);
+    #[derive(Deserialize)]
+    struct SearchRow {
+        path: String,
+        title: String,
     }
 
-    let rows = sqlx::query_as::<_, (String, String, f64)>(
-        "SELECT s.path, s.title, bm25(search_fts) as score
-         FROM search_fts s
-         WHERE search_fts MATCH ?
-         ORDER BY score
-         LIMIT ?"
-    )
-    .bind(&fts_query)
-    .bind(limit)
-    .fetch_all(&db)
-    .await
-    .unwrap_or_default();
+    let mut resp = db
+        .query(
+            "SELECT path, title FROM notes WHERE vault_id = $vid AND (title @1@ $q OR content @2@ $q) ORDER BY search::score(1) + search::score(2) DESC LIMIT $limit",
+        )
+        .bind(("vid", vault_id.clone()))
+        .bind(("q", query.trim().to_owned()))
+        .bind(("limit", limit))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let rows: Vec<SearchRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
 
     let mut results = Vec::new();
-    for (path, title, score) in rows {
-        // 取得內容片段
-        let content: String = sqlx::query_scalar(
-            "SELECT content FROM notes WHERE path = ?"
-        )
-        .bind(&path)
-        .fetch_optional(&db)
-        .await?
-        .unwrap_or_default();
+    for (i, row) in rows.into_iter().enumerate() {
+        #[derive(Deserialize)]
+        struct ContentRow {
+            content: String,
+        }
+
+        let mut resp2 = db
+            .query("SELECT content FROM notes WHERE vault_id = $vid AND path = $path LIMIT 1")
+            .bind(("vid", vault_id.clone()))
+            .bind(("path", row.path.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let content_rows: Vec<ContentRow> = resp2.take(0).unwrap_or_default();
+        let content = content_rows
+            .into_iter()
+            .next()
+            .map(|r| r.content)
+            .unwrap_or_default();
 
         let snippet = extract_snippet(&content, &query);
+        // SurrealDB does not expose a raw BM25 score; use reverse rank as a proxy
+        let score = 1.0 / (i as f64 + 1.0);
 
         results.push(SearchResult {
-            path,
-            title,
+            path: row.path,
+            title: row.title,
             snippet,
-            score: score.abs(),
+            score,
         });
     }
 

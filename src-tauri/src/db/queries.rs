@@ -1,74 +1,118 @@
-use sqlx::SqlitePool;
+use serde::Deserialize;
+use crate::db::surreal::SurrealDb;
 
-pub async fn get_setting(pool: &SqlitePool, key: &str) -> crate::error::Result<Option<String>> {
-    let row = sqlx::query_scalar::<_, String>(
-        "SELECT value FROM settings WHERE key = ?"
-    )
-    .bind(key)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row)
+// ── 泛型輔助：從 SELECT 結果取第一個 value 欄位 ─────────────────────────
+#[derive(Deserialize)]
+struct ValueRow {
+    value: String,
 }
 
-pub async fn set_setting(pool: &SqlitePool, key: &str, value: &str) -> crate::error::Result<()> {
-    sqlx::query(
-        "INSERT INTO settings(key, value, updated_at) VALUES (?, ?, strftime('%s','now'))
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+// ── Global settings ──────────────────────────────────────────────────────
+
+pub async fn get_setting(db: &SurrealDb, key: &str) -> crate::error::Result<Option<String>> {
+    let mut resp = db
+        .query("SELECT value FROM settings WHERE key = $key LIMIT 1")
+        .bind(("key", key.to_owned()))
+        .await
+        .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+    let rows: Vec<ValueRow> = resp
+        .take(0)
+        .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+    Ok(rows.into_iter().next().map(|r| r.value))
+}
+
+pub async fn set_setting(db: &SurrealDb, key: &str, value: &str) -> crate::error::Result<()> {
+    db.query(
+        "INSERT INTO settings (key, value) VALUES ($key, $value)
+         ON DUPLICATE KEY UPDATE value = $value, updated_at = time::now()",
     )
-    .bind(key)
-    .bind(value)
-    .execute(pool)
-    .await?;
+    .bind(("key", key.to_owned()))
+    .bind(("value", value.to_owned()))
+    .await
+    .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
     Ok(())
 }
 
-/// 讀取 per-user 設定；只查 user_settings，不 fallback 到全域。
-/// 需要全域值請直接呼叫 get_setting。
-pub async fn get_user_setting(pool: &SqlitePool, username: &str, key: &str) -> crate::error::Result<Option<String>> {
-    let row = sqlx::query_scalar::<_, String>(
-        "SELECT value FROM user_settings WHERE username = ? AND key = ?"
-    )
-    .bind(username)
-    .bind(key)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row)
+// ── Per-user settings ────────────────────────────────────────────────────
+
+pub async fn get_user_setting(
+    db: &SurrealDb,
+    username: &str,
+    key: &str,
+) -> crate::error::Result<Option<String>> {
+    let mut resp = db
+        .query(
+            "SELECT value FROM user_settings WHERE username = $username AND key = $key LIMIT 1",
+        )
+        .bind(("username", username.to_owned()))
+        .bind(("key", key.to_owned()))
+        .await
+        .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+    let rows: Vec<ValueRow> = resp
+        .take(0)
+        .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+    Ok(rows.into_iter().next().map(|r| r.value))
 }
 
-/// 寫入 per-user 設定
-pub async fn set_user_setting(pool: &SqlitePool, username: &str, key: &str, value: &str) -> crate::error::Result<()> {
-    sqlx::query(
-        "INSERT INTO user_settings(username, key, value, updated_at) VALUES (?, ?, ?, strftime('%s','now'))
-         ON CONFLICT(username, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+pub async fn set_user_setting(
+    db: &SurrealDb,
+    username: &str,
+    key: &str,
+    value: &str,
+) -> crate::error::Result<()> {
+    db.query(
+        "INSERT INTO user_settings (username, key, value)
+         VALUES ($username, $key, $value)
+         ON DUPLICATE KEY UPDATE value = $value, updated_at = time::now()",
     )
-    .bind(username)
-    .bind(key)
-    .bind(value)
-    .execute(pool)
-    .await?;
+    .bind(("username", username.to_owned()))
+    .bind(("key", key.to_owned()))
+    .bind(("value", value.to_owned()))
+    .await
+    .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
     Ok(())
 }
 
+// ── Vault last-open note ─────────────────────────────────────────────────
 
-pub async fn get_vault_last_note(pool: &SqlitePool, vault_path: &str) -> crate::error::Result<Option<String>> {
-    let note = sqlx::query_scalar::<_, String>(
-        "SELECT last_open_note FROM vault_states WHERE vault_path = ?"
-    )
-    .bind(vault_path)
-    .fetch_optional(pool)
-    .await?;
-    Ok(note.filter(|s| !s.is_empty()))
+pub async fn get_vault_last_note(
+    db: &SurrealDb,
+    vault_path: &str,
+) -> crate::error::Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct Row {
+        last_open_note: String,
+    }
+    let mut resp = db
+        .query(
+            "SELECT last_open_note FROM vault_states WHERE vault_path = $vault_path LIMIT 1",
+        )
+        .bind(("vault_path", vault_path.to_owned()))
+        .await
+        .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+    let rows: Vec<Row> = resp
+        .take(0)
+        .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+    Ok(rows
+        .into_iter()
+        .next()
+        .map(|r| r.last_open_note)
+        .filter(|s| !s.is_empty()))
 }
 
-pub async fn set_vault_last_note(pool: &SqlitePool, vault_path: &str, note_path: &str) -> crate::error::Result<()> {
-    sqlx::query(
-        "INSERT INTO vault_states(vault_path, last_open_note, updated_at)
-         VALUES (?, ?, strftime('%s','now'))
-         ON CONFLICT(vault_path) DO UPDATE SET last_open_note = excluded.last_open_note, updated_at = excluded.updated_at"
+pub async fn set_vault_last_note(
+    db: &SurrealDb,
+    vault_path: &str,
+    note_path: &str,
+) -> crate::error::Result<()> {
+    db.query(
+        "INSERT INTO vault_states (vault_path, last_open_note)
+         VALUES ($vault_path, $note_path)
+         ON DUPLICATE KEY UPDATE last_open_note = $note_path, updated_at = time::now()",
     )
-    .bind(vault_path)
-    .bind(note_path)
-    .execute(pool)
-    .await?;
+    .bind(("vault_path", vault_path.to_owned()))
+    .bind(("note_path", note_path.to_owned()))
+    .await
+    .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
     Ok(())
 }

@@ -12,8 +12,10 @@
 //   parse_text_tool_calls              — 解析 <tool_call>...</tool_call> 格式
 
 use chrono::{Datelike, Local};
+use serde::Deserialize;
 use serde_json::Value;
-use sqlx::SqlitePool;
+
+use crate::db::surreal::SurrealDb;
 
 // ── MemoryAgent ───────────────────────────────────────────────────────────────
 
@@ -189,11 +191,15 @@ fn extract_number_before(query: &str, suffix: &str) -> Option<i64> {
 }
 
 /// 載入 memory_rules 表中的規則
-pub(crate) async fn load_memory_rules(db: &SqlitePool) -> Vec<(String, String, String)> {
-    sqlx::query_as::<_, (String, String, String)>(
-        "SELECT pattern_type, pattern, value FROM memory_rules ORDER BY id"
-    )
-    .fetch_all(db).await.unwrap_or_default()
+pub(crate) async fn load_memory_rules(db: &SurrealDb, vault_id: &str) -> Vec<(String, String, String)> {
+    #[derive(Deserialize)]
+    struct Row { pattern_type: String, pattern: String, value: String }
+    let vid = vault_id.to_owned();
+    let mut resp = match db.query("SELECT pattern_type, pattern, value FROM memory_rules WHERE vault_id = $vid")
+        .bind(("vid", vid))
+        .await { Ok(r) => r, Err(_) => return vec![] };
+    let rows: Vec<Row> = resp.take(0).unwrap_or_default();
+    rows.into_iter().map(|r| (r.pattern_type, r.pattern, r.value)).collect()
 }
 
 /// 與 parse_query_since 相同，但先套用資料庫中的自訂規則
@@ -254,24 +260,35 @@ pub(crate) fn extract_cjk_bigrams_with_extra_stops(query: &str, extra_stops: &[c
 // ── 記憶 DB 工具 ──────────────────────────────────────────────────────────────
 
 /// 將規則寫入 memory_rules 表（供 add_memory_rule command 共用）
-pub(crate) async fn add_memory_rule_to_db(db: &SqlitePool, pattern_type: &str, pattern: &str, value: &str) -> String {
-    match sqlx::query(
-        "INSERT OR REPLACE INTO memory_rules(pattern_type, pattern, value) VALUES (?, ?, ?)"
-    )
-    .bind(pattern_type).bind(pattern).bind(value)
-    .execute(db).await {
-        Ok(_)  => format!("規則已儲存：[{}] {} → {}", pattern_type, pattern, value),
-        Err(e) => format!("規則儲存失敗：{}", e),
+pub(crate) async fn add_memory_rule_to_db(db: &SurrealDb, vault_id: &str, pattern_type: &str, pattern: &str, value: &str) -> String {
+    let vid = vault_id.to_owned();
+    let pt = pattern_type.to_owned();
+    let p = pattern.to_owned();
+    let v = value.to_owned();
+    let result_msg = format!("已記住規則：{} = {}", pattern, value);
+    match db.query("INSERT INTO memory_rules (vault_id, pattern_type, pattern, value) VALUES ($vid, $pt, $p, $v) ON DUPLICATE KEY UPDATE value = $v, pattern_type = $pt")
+        .bind(("vid", vid))
+        .bind(("pt", pt))
+        .bind(("p", p))
+        .bind(("v", v))
+        .await {
+        Ok(_) => result_msg,
+        Err(e) => format!("儲存規則失敗：{}", e),
     }
 }
 
 /// 格式化記憶筆記列表為純文字（供 LLM context 使用）
-pub(crate) async fn format_memory_rows(rows: &[(String, String, i64)], prefix: &str, vault_db: &SqlitePool) -> String {
+pub(crate) async fn format_memory_rows(rows: &[(String, String, i64)], prefix: &str, vault_db: &SurrealDb, vault_id: &str) -> String {
     let mut output = if prefix.is_empty() {
         format!("找到 {} 筆記憶筆記：\n\n", rows.len())
     } else {
         format!("{}\n找到 {} 筆記憶筆記：\n\n", prefix, rows.len())
     };
+
+    #[derive(Deserialize)]
+    struct ContentRow { content: String }
+
+    let vid = vault_id.to_owned();
 
     for (path, title, created_ms) in rows {
         let dt = chrono::DateTime::from_timestamp_millis(*created_ms)
@@ -279,12 +296,19 @@ pub(crate) async fn format_memory_rows(rows: &[(String, String, i64)], prefix: &
             .unwrap_or_else(|| "未知時間".to_string());
 
         // 取前 600 字元的摘要（跳過 frontmatter 分隔符）
-        let snippet: String = sqlx::query_scalar::<_, String>("SELECT content FROM notes WHERE path = ?")
-            .bind(path)
-            .fetch_optional(vault_db)
-            .await
-            .unwrap_or_default()
-            .unwrap_or_default()
+        let path_owned = path.clone();
+        let vid_owned = vid.clone();
+        let mut resp = vault_db.query("SELECT content FROM notes WHERE vault_id = $vid AND path = $path LIMIT 1")
+            .bind(("vid", vid_owned))
+            .bind(("path", path_owned))
+            .await.ok();
+        let content = resp.as_mut()
+            .and_then(|r| r.take::<Vec<ContentRow>>(0).ok())
+            .and_then(|rows| rows.into_iter().next())
+            .map(|r| r.content)
+            .unwrap_or_default();
+
+        let snippet: String = content
             .chars()
             .skip_while(|c| *c == '-' || *c == '\n')
             .take(600)
@@ -300,7 +324,8 @@ pub(crate) async fn tool_query_memory(
     keywords: Vec<String>,
     since: Option<String>,
     limit: Option<usize>,
-    vault_db: &SqlitePool,
+    vault_db: &SurrealDb,
+    vault_id: &str,
 ) -> String {
     let limit = limit.unwrap_or(3).min(10) as i64;
 
@@ -314,48 +339,64 @@ pub(crate) async fn tool_query_memory(
         })
     });
 
+    #[derive(Deserialize)]
+    struct NoteRow { path: String, title: String, modified_at: i64 }
+
     let rows: Vec<(String, String, i64)> = if keywords.is_empty() {
         // 無關鍵字：按時間降序回傳最新記憶
-        let mut q = sqlx::query_as::<_, (String, String, i64)>(
-            "SELECT path, title, created_at
-             FROM notes
-             WHERE path LIKE 'memories/ai_memory_%'
-             ORDER BY created_at DESC
-             LIMIT ?"
+        let mut resp = vault_db.query(
+            "SELECT path, title, modified_at FROM notes WHERE vault_id = $vid AND string::starts_with(path, 'memories/') ORDER BY modified_at DESC LIMIT $lim"
         )
-        .bind(limit)
-        .fetch_all(vault_db)
-        .await
-        .unwrap_or_default();
+        .bind(("vid", vault_id.to_owned()))
+        .bind(("lim", limit))
+        .await;
+
+        let mut rows: Vec<(String, String, i64)> = resp
+            .as_mut()
+            .ok()
+            .and_then(|r| r.take::<Vec<NoteRow>>(0).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| (r.path, r.title, r.modified_at))
+            .collect();
 
         if let Some(min_ts) = since_ts {
-            q.retain(|(_, _, ts)| *ts >= min_ts);
+            rows.retain(|(_, _, ts)| *ts >= min_ts);
         }
-        q
+        rows
     } else {
-        // 有關鍵字：用 FTS5 MATCH 搜尋（OR 連接）
-        let fts_terms: Vec<String> = keywords.iter()
-            .map(|k| format!("\"{}\"", k.replace('"', "")))
-            .collect();
-        let fts_query = fts_terms.join(" OR ");
+        // 有關鍵字：對每個關鍵字使用 FTS 搜尋，合併去重
+        let mut seen = std::collections::HashSet::new();
+        let mut collected: Vec<(String, String, i64)> = Vec::new();
 
-        let rows = sqlx::query_as::<_, (String, String, i64)>(
-            "SELECT s.path, s.title, n.created_at
-             FROM search_fts s
-             JOIN notes n ON n.path = s.path
-             WHERE s.path LIKE 'memories/ai_memory_%'
-               AND search_fts MATCH ?
-             ORDER BY bm25(search_fts)
-             LIMIT ?"
-        )
-        .bind(&fts_query)
-        .bind(limit)
-        .fetch_all(vault_db)
-        .await
-        .unwrap_or_default();
+        for kw in &keywords {
+            let mut resp = vault_db.query(
+                "SELECT path, title, modified_at FROM notes WHERE vault_id = $vid AND string::starts_with(path, 'memories/') AND content ~ $kw ORDER BY modified_at DESC LIMIT $lim"
+            )
+            .bind(("vid", vault_id.to_owned()))
+            .bind(("kw", kw.to_owned()))
+            .bind(("lim", limit))
+            .await;
 
-        rows.into_iter()
+            let kw_rows: Vec<(String, String, i64)> = resp
+                .as_mut()
+                .ok()
+                .and_then(|r| r.take::<Vec<NoteRow>>(0).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| (r.path, r.title, r.modified_at))
+                .collect();
+
+            for row in kw_rows {
+                if seen.insert(row.0.clone()) {
+                    collected.push(row);
+                }
+            }
+        }
+
+        collected.into_iter()
             .filter(|(_, _, ts)| since_ts.map_or(true, |min_ts| *ts >= min_ts))
+            .take(limit as usize)
             .collect()
     };
 
@@ -364,25 +405,28 @@ pub(crate) async fn tool_query_memory(
             return "目前沒有任何已儲存的記憶筆記".to_string();
         }
         // FTS 找不到時，降級到最新 1 筆，避免空手而回
-        let fallback = sqlx::query_as::<_, (String, String, i64)>(
-            "SELECT path, title, created_at
-             FROM notes
-             WHERE path LIKE 'memories/ai_memory_%'
-             ORDER BY created_at DESC
-             LIMIT 1"
+        let mut resp = vault_db.query(
+            "SELECT path, title, modified_at FROM notes WHERE vault_id = $vid AND string::starts_with(path, 'memories/') ORDER BY modified_at DESC LIMIT 1"
         )
-        .fetch_optional(vault_db)
-        .await
-        .unwrap_or_default();
+        .bind(("vid", vault_id.to_owned()))
+        .await;
 
-        if fallback.is_none() {
+        let fallback: Vec<(String, String, i64)> = resp
+            .as_mut()
+            .ok()
+            .and_then(|r| r.take::<Vec<NoteRow>>(0).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| (r.path, r.title, r.modified_at))
+            .collect();
+
+        if fallback.is_empty() {
             return format!("未找到關鍵字「{}」相關的記憶筆記，且目前無任何記憶存檔", keywords.join("、"));
         }
-        let rows_fallback = fallback.into_iter().collect::<Vec<_>>();
-        return format_memory_rows(&rows_fallback, &format!("（關鍵字「{}」無精確匹配，以下為最新記憶）", keywords.join("、")), vault_db).await;
+        return format_memory_rows(&fallback, &format!("（關鍵字「{}」無精確匹配，以下為最新記憶）", keywords.join("、")), vault_db, vault_id).await;
     }
 
-    format_memory_rows(&rows, "", vault_db).await
+    format_memory_rows(&rows, "", vault_db, vault_id).await
 }
 
 /// 解析 LLM 以文字格式輸出的工具調用

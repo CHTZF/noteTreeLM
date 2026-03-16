@@ -1,9 +1,12 @@
 //! Markdown Chunker — splits notes into heading-level chunks and
-//! maintains the `chunks` / `chunks_fts` tables in the vault DB.
+//! maintains the `chunks` table in SurrealDB.
 
 use regex::Regex;
 use sha2::{Digest, Sha256};
-use sqlx::SqlitePool;
+use serde::Deserialize;
+
+use crate::db::surreal::SurrealDb;
+use crate::error::AppError;
 
 // ── Data types ────────────────────────────────────────────────────────────
 
@@ -97,75 +100,96 @@ pub fn chunk_note(file_path: &str, content: &str, now_ms: i64) -> Vec<Chunk> {
 
 /// Upsert a set of chunks into the vault DB.
 /// Deletes stale chunks from the same file that are no longer present.
-pub async fn upsert_chunks(db: &SqlitePool, chunks: &[Chunk]) -> Result<(), sqlx::Error> {
+pub async fn upsert_chunks(db: &SurrealDb, vault_id: &str, chunks: &[Chunk]) -> Result<(), AppError> {
     if chunks.is_empty() {
         return Ok(());
     }
     let file_path = &chunks[0].file_path;
 
-    // Delete chunks no longer present in the re-indexed note
+    // Collect current chunk ids
     let ids: Vec<&str> = chunks.iter().map(|c| c.id.as_str()).collect();
-    // Build placeholder list: ?,?,?...
-    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let delete_sql = format!(
-        "DELETE FROM chunks WHERE file_path = ? AND id NOT IN ({})",
-        placeholders
-    );
-    let mut q = sqlx::query(&delete_sql).bind(file_path);
-    for id in &ids {
-        q = q.bind(id);
+
+    // Delete stale chunks (those for this file+vault not in the current set)
+    // We do this by fetching existing chunk_ids and deleting those not in ids
+    #[derive(Deserialize)]
+    struct ChunkIdRow { chunk_id: String }
+
+    let mut resp = db
+        .query("SELECT chunk_id FROM chunks WHERE vault_id = $vid AND file_path = $fp")
+        .bind(("vid", vault_id.to_owned()))
+        .bind(("fp", file_path.as_str().to_owned()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let existing_rows: Vec<ChunkIdRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+
+    for row in existing_rows {
+        if !ids.contains(&row.chunk_id.as_str()) {
+            db.query("DELETE FROM chunks WHERE vault_id = $vid AND chunk_id = $cid")
+                .bind(("vid", vault_id.to_owned()))
+                .bind(("cid", row.chunk_id.clone()))
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        }
     }
-    q.execute(db).await?;
 
     // Upsert each chunk
     for c in chunks {
-        let links_json = serde_json::to_string(&c.links).unwrap_or_else(|_| "[]".to_string());
-        sqlx::query(
-            "INSERT INTO chunks(id, file_path, section, content, links, chunk_type, word_count, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET
-               content    = excluded.content,
-               links      = excluded.links,
-               word_count = excluded.word_count,
-               updated_at = excluded.updated_at",
+        db.query(
+            "INSERT INTO chunks (vault_id, chunk_id, file_path, section, content, links, chunk_type, word_count, updated_at)
+             VALUES ($vid, $cid, $fp, $section, $content, $links, $chunk_type, $wc, $updated_at)
+             ON DUPLICATE KEY UPDATE
+               content    = $content,
+               links      = $links,
+               word_count = $wc,
+               updated_at = $updated_at"
         )
-        .bind(&c.id)
-        .bind(&c.file_path)
-        .bind(&c.section)
-        .bind(&c.content)
-        .bind(&links_json)
-        .bind(&c.chunk_type)
-        .bind(c.word_count)
-        .bind(c.updated_at)
-        .execute(db)
-        .await?;
+        .bind(("vid", vault_id.to_owned()))
+        .bind(("cid", c.id.clone()))
+        .bind(("fp", c.file_path.clone()))
+        .bind(("section", c.section.clone()))
+        .bind(("content", c.content.clone()))
+        .bind(("links", c.links.clone()))
+        .bind(("chunk_type", c.chunk_type.clone()))
+        .bind(("wc", c.word_count))
+        .bind(("updated_at", c.updated_at))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
     }
     Ok(())
 }
 
 /// Remove all chunks for a given file path (called on note delete).
-pub async fn delete_chunks(db: &SqlitePool, file_path: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM chunks WHERE file_path = ?")
-        .bind(file_path)
-        .execute(db)
-        .await?;
+pub async fn delete_chunks(db: &SurrealDb, vault_id: &str, file_path: &str) -> Result<(), AppError> {
+    db.query("DELETE FROM chunks WHERE vault_id = $vid AND file_path = $fp")
+        .bind(("vid", vault_id.to_owned()))
+        .bind(("fp", file_path.to_owned()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
     Ok(())
 }
 
 /// Bulk reindex: re-chunk every note in the DB.
 /// Returns the number of notes processed.
-pub async fn reindex_all(db: &SqlitePool) -> Result<usize, sqlx::Error> {
-    let notes: Vec<(String, String)> =
-        sqlx::query_as("SELECT path, content FROM notes")
-            .fetch_all(db)
-            .await?;
+pub async fn reindex_all(db: &SurrealDb, vault_id: &str) -> Result<usize, AppError> {
+    #[derive(Deserialize)]
+    struct NotePathContent {
+        path: String,
+        content: String,
+    }
+
+    let mut resp = db
+        .query("SELECT path, content FROM notes WHERE vault_id = $vid")
+        .bind(("vid", vault_id.to_owned()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let notes: Vec<NotePathContent> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
 
     let count = notes.len();
     let now = chrono::Utc::now().timestamp_millis();
 
-    for (path, content) in &notes {
-        let chunks = chunk_note(path, content, now);
-        upsert_chunks(db, &chunks).await?;
+    for note in &notes {
+        let chunks = chunk_note(&note.path, &note.content, now);
+        upsert_chunks(db, vault_id, &chunks).await?;
     }
     Ok(count)
 }

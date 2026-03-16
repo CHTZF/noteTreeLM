@@ -235,7 +235,7 @@ pub async fn get_external_model_paths(
     kind: String,
 ) -> Result<Vec<String>, AppError> {
     let key = format!("external_models_{}", kind);
-    let json = queries::get_setting(&state.settings_db, &key)
+    let json = queries::get_setting(&state.db, &key)
         .await?
         .unwrap_or_else(|| "[]".to_string());
     Ok(serde_json::from_str(&json).unwrap_or_default())
@@ -250,7 +250,7 @@ pub async fn set_external_model_paths(
 ) -> Result<(), AppError> {
     let key = format!("external_models_{}", kind);
     let json = serde_json::to_string(&paths).map_err(|e| AppError::Io(e.to_string()))?;
-    queries::set_setting(&state.settings_db, &key, &json).await?;
+    queries::set_setting(&state.db, &key, &json).await?;
     Ok(())
 }
 

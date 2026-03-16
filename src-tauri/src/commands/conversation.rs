@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
 use tauri::State;
 use uuid::Uuid;
 
+use crate::db::surreal::SurrealDb;
 use crate::error::AppError;
 use crate::state::AppState;
 
@@ -28,6 +28,18 @@ pub struct ConversationSnapshot {
     pub updated_at: i64,
 }
 
+// ── Row deserialization helpers ─────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ConvRow {
+    id: String,
+    mode: String,
+    title: String,
+    updated_at: surrealdb::sql::Datetime,
+    created_at: surrealdb::sql::Datetime,
+    messages_json: String,
+}
+
 // ── Commands ───────────────────────────────────────────────────────────────
 
 /// 建立新對話，回傳 conversation_id（UUID）
@@ -38,17 +50,16 @@ pub async fn create_conversation(
     mode: String,
     title: Option<String>,
 ) -> Result<String, AppError> {
-    let db = &state.settings_db;
+    let db = &state.db;
     let id = Uuid::new_v4().to_string();
     let title = title.unwrap_or_default();
-    sqlx::query(
-        "INSERT INTO conversations(id, account_id, mode, title) VALUES (?, ?, ?, ?)"
+    db.query(
+        "INSERT INTO conversations (id, account_id, mode, title) VALUES ($id, $account_id, $mode, $title)"
     )
-    .bind(&id)
-    .bind(&username)
-    .bind(&mode)
-    .bind(&title)
-    .execute(db)
+    .bind(("id", id.clone()))
+    .bind(("account_id", username.clone()))
+    .bind(("mode", mode.clone()))
+    .bind(("title", title.clone()))
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
     Ok(id)
@@ -63,33 +74,46 @@ pub async fn list_conversations(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<Vec<ConversationSummary>, AppError> {
-    let db = &state.settings_db;
+    let db = &state.db;
     let limit = limit.unwrap_or(50);
     let offset = offset.unwrap_or(0);
 
-    let rows = sqlx::query(
-        "SELECT c.id, c.mode, c.title, c.updated_at,
-                (SELECT 1 FROM pending_plans p WHERE p.conversation_id = c.id) AS has_plan
-         FROM conversations c
-         WHERE c.mode = ? AND c.account_id = ?
-         ORDER BY c.updated_at DESC
-         LIMIT ? OFFSET ?"
+    // SurrealDB: LIMIT + START (offset)
+    let mut resp = db.query(
+        "SELECT id, mode, title, updated_at FROM conversations
+         WHERE mode = $mode AND account_id = $account_id
+         ORDER BY updated_at DESC
+         LIMIT $limit START $offset"
     )
-    .bind(&mode)
-    .bind(&username)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(db)
+    .bind(("mode", mode.clone()))
+    .bind(("account_id", username.clone()))
+    .bind(("limit", limit))
+    .bind(("offset", offset))
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    Ok(rows.into_iter().map(|row| ConversationSummary {
-        id: row.get("id"),
-        mode: row.get("mode"),
-        title: row.get("title"),
-        updated_at: row.get("updated_at"),
-        has_pending_plan: row.get::<Option<i64>, _>("has_plan").is_some(),
-    }).collect())
+    #[derive(Deserialize)]
+    struct ListRow {
+        id: String,
+        mode: String,
+        title: String,
+        updated_at: surrealdb::sql::Datetime,
+    }
+    let rows: Vec<ListRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+
+    let mut summaries = Vec::new();
+    for row in rows {
+        // Check if pending plan exists
+        let has_plan = has_pending_plan(db, &row.id).await?;
+        summaries.push(ConversationSummary {
+            id: row.id,
+            mode: row.mode,
+            title: row.title,
+            updated_at: row.updated_at.timestamp(),
+            has_pending_plan: has_plan,
+        });
+    }
+    Ok(summaries)
 }
 
 /// 取得單一對話完整內容
@@ -98,39 +122,44 @@ pub async fn get_conversation(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<ConversationSnapshot, AppError> {
-    let db = &state.settings_db;
+    let db = &state.db;
 
-    let row = sqlx::query(
-        "SELECT c.id, c.mode, c.title, c.messages_json, c.created_at, c.updated_at,
-                (SELECT 1 FROM pending_plans p WHERE p.conversation_id = c.id) AS has_plan
-         FROM conversations c WHERE c.id = ?"
+    let mut resp = db.query(
+        "SELECT id, mode, title, messages_json, created_at, updated_at FROM conversations WHERE id = $id LIMIT 1"
     )
-    .bind(&id)
-    .fetch_one(db)
+    .bind(("id", id.clone()))
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    let rows: Vec<ConvRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+    let row = rows.into_iter().next()
+        .ok_or_else(|| AppError::Database(format!("conversation {} not found", id)))?;
+
+    let has_plan = has_pending_plan(db, &row.id).await?;
     Ok(ConversationSnapshot {
-        id: row.get("id"),
-        mode: row.get("mode"),
-        title: row.get("title"),
-        messages_json: row.get("messages_json"),
-        has_pending_plan: row.get::<Option<i64>, _>("has_plan").is_some(),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
+        id: row.id,
+        mode: row.mode,
+        title: row.title,
+        messages_json: row.messages_json,
+        has_pending_plan: has_plan,
+        created_at: row.created_at.timestamp(),
+        updated_at: row.updated_at.timestamp(),
     })
 }
 
-/// 刪除對話（pending_plan 由 ON DELETE CASCADE 自動清除）
+/// 刪除對話（pending_plan 同步刪除）
 #[tauri::command]
 pub async fn delete_conversation(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<(), AppError> {
-    let db = &state.settings_db;
-    sqlx::query("DELETE FROM conversations WHERE id = ?")
-        .bind(&id)
-        .execute(db)
+    let db = &state.db;
+    db.query("DELETE FROM conversations WHERE id = $id")
+        .bind(("id", id.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    db.query("DELETE FROM pending_plans WHERE conversation_id = $id")
+        .bind(("id", id.clone()))
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
     Ok(())
@@ -143,13 +172,12 @@ pub async fn update_conversation_title(
     id: String,
     title: String,
 ) -> Result<(), AppError> {
-    let db = &state.settings_db;
-    sqlx::query(
-        "UPDATE conversations SET title = ?, updated_at = strftime('%s','now') WHERE id = ?"
+    let db = &state.db;
+    db.query(
+        "UPDATE conversations SET title = $title, updated_at = time::now() WHERE id = $id"
     )
-    .bind(&title)
-    .bind(&id)
-    .execute(db)
+    .bind(("title", title.clone()))
+    .bind(("id", id.clone()))
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
     Ok(())
@@ -157,41 +185,56 @@ pub async fn update_conversation_title(
 
 // ── Internal helpers（供 invoke_agent 呼叫，不走 Tauri command）────────────
 
-/// 讀取對話 messages_json（回傳 serde_json::Value）
-/// 若 conversation_id 不存在（DB 被重置或 localStorage 殘留），回傳空陣列而非錯誤
-pub async fn load_messages(db: &sqlx::SqlitePool, conv_id: &str) -> Result<serde_json::Value, AppError> {
-    let row = sqlx::query("SELECT messages_json FROM conversations WHERE id = ?")
-        .bind(conv_id)
-        .fetch_optional(db)
+async fn has_pending_plan(db: &SurrealDb, conv_id: &str) -> Result<bool, AppError> {
+    #[derive(Deserialize)]
+    struct CountRow {
+        count: i64,
+    }
+    let mut resp = db
+        .query("SELECT count() AS count FROM pending_plans WHERE conversation_id = $id GROUP ALL")
+        .bind(("id", conv_id.to_owned()))
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+    let rows: Vec<CountRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(rows.first().map(|r| r.count > 0).unwrap_or(false))
+}
 
-    let row = match row {
-        None => return Ok(serde_json::json!([])),  // conversation 不存在，視為空對話
-        Some(r) => r,
-    };
-    let json_str: String = row.get("messages_json");
-    serde_json::from_str(&json_str).map_err(|e| AppError::AI(e.to_string()))
+/// 讀取對話 messages_json（回傳 serde_json::Value）
+/// 若 conversation_id 不存在（DB 被重置或 localStorage 殘留），回傳空陣列而非錯誤
+pub async fn load_messages(db: &SurrealDb, conv_id: &str) -> Result<serde_json::Value, AppError> {
+    #[derive(Deserialize)]
+    struct MsgRow {
+        messages_json: String,
+    }
+    let mut resp = db
+        .query("SELECT messages_json FROM conversations WHERE id = $id LIMIT 1")
+        .bind(("id", conv_id.to_owned()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let rows: Vec<MsgRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+    match rows.into_iter().next() {
+        None => Ok(serde_json::json!([])),  // conversation 不存在，視為空對話
+        Some(r) => serde_json::from_str(&r.messages_json).map_err(|e| AppError::AI(e.to_string())),
+    }
 }
 
 /// 儲存完整 messages_json 回 DB，同時更新 updated_at
 /// 使用 UPSERT：若 conversation row 不存在（例如 localStorage 殘留 stale ID），自動建立
 pub async fn save_messages(
-    db: &sqlx::SqlitePool,
+    db: &SurrealDb,
     conv_id: &str,
     messages: &serde_json::Value,
 ) -> Result<(), AppError> {
     let json_str = serde_json::to_string(messages).map_err(|e| AppError::AI(e.to_string()))?;
-    sqlx::query(
-        "INSERT INTO conversations(id, mode, messages_json, updated_at) \
-         VALUES (?, 'chat', ?, strftime('%s','now')) \
-         ON CONFLICT(id) DO UPDATE SET \
-           messages_json = excluded.messages_json, \
-           updated_at = excluded.updated_at"
+    db.query(
+        "INSERT INTO conversations (id, mode, messages_json, updated_at)
+         VALUES ($id, 'chat', $messages_json, time::now())
+         ON DUPLICATE KEY UPDATE
+           messages_json = $messages_json,
+           updated_at = time::now()",
     )
-    .bind(conv_id)
-    .bind(&json_str)
-    .execute(db)
+    .bind(("id", conv_id.to_owned()))
+    .bind(("messages_json", json_str.clone()))
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
     Ok(())
@@ -199,22 +242,25 @@ pub async fn save_messages(
 
 /// 如果對話標題還是空的，自動用第一條 user 訊息的前 20 字填入
 pub async fn maybe_set_title(
-    db: &sqlx::SqlitePool,
+    db: &SurrealDb,
     conv_id: &str,
     messages: &serde_json::Value,
 ) -> Result<(), AppError> {
-    // 只有 title 為空時才填
-    let row = sqlx::query("SELECT title FROM conversations WHERE id = ?")
-        .bind(conv_id)
-        .fetch_optional(db)
+    #[derive(Deserialize)]
+    struct TitleRow {
+        title: String,
+    }
+    let mut resp = db
+        .query("SELECT title FROM conversations WHERE id = $id LIMIT 1")
+        .bind(("id", conv_id.to_owned()))
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-    let row = match row {
+    let rows: Vec<TitleRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+    let row = match rows.into_iter().next() {
         None => return Ok(()), // conversation 不存在，跳過
         Some(r) => r,
     };
-    let title: String = row.get("title");
-    if !title.is_empty() {
+    if !row.title.is_empty() {
         return Ok(());
     }
 
@@ -228,12 +274,11 @@ pub async fn maybe_set_title(
                     } else {
                         chars
                     };
-                    sqlx::query(
-                        "UPDATE conversations SET title = ? WHERE id = ? AND title = ''"
+                    db.query(
+                        "UPDATE conversations SET title = $title WHERE id = $id AND title = ''"
                     )
-                    .bind(&auto_title)
-                    .bind(conv_id)
-                    .execute(db)
+                    .bind(("title", auto_title.clone()))
+                    .bind(("id", conv_id.to_owned()))
                     .await
                     .map_err(|e| AppError::Database(e.to_string()))?;
                     break;
@@ -252,9 +297,9 @@ pub struct DeferredTool {
     pub args: serde_json::Value,
 }
 
-/// 儲存 pending plan（embedding centroids 以 LE f32 bytes 儲存）
+/// 儲存 pending plan（embedding centroids 以 JSON array<float> 儲存）
 pub async fn save_pending_plan(
-    db: &sqlx::SqlitePool,
+    db: &SurrealDb,
     conv_id: &str,
     deferred_tools: &[DeferredTool],
     confirm_centroid: &[f32],
@@ -264,21 +309,25 @@ pub async fn save_pending_plan(
     let tools_json = serde_json::to_string(deferred_tools)
         .map_err(|e| AppError::AI(e.to_string()))?;
 
-    let confirm_bytes = f32_slice_to_bytes(confirm_centroid);
-    let cancel_bytes = f32_slice_to_bytes(cancel_centroid);
-    let interrupt_bytes = f32_slice_to_bytes(interrupt_centroid);
+    let confirm_vec: Vec<f64> = confirm_centroid.iter().map(|&f| f as f64).collect();
+    let cancel_vec: Vec<f64> = cancel_centroid.iter().map(|&f| f as f64).collect();
+    let interrupt_vec: Vec<f64> = interrupt_centroid.iter().map(|&f| f as f64).collect();
 
-    sqlx::query(
-        "INSERT OR REPLACE INTO pending_plans
+    db.query(
+        "INSERT INTO pending_plans
          (conversation_id, deferred_tools_json, confirm_centroid, cancel_centroid, interrupt_centroid)
-         VALUES (?, ?, ?, ?, ?)"
+         VALUES ($conversation_id, $tools_json, $confirm, $cancel, $interrupt)
+         ON DUPLICATE KEY UPDATE
+           deferred_tools_json = $tools_json,
+           confirm_centroid = $confirm,
+           cancel_centroid = $cancel,
+           interrupt_centroid = $interrupt",
     )
-    .bind(conv_id)
-    .bind(&tools_json)
-    .bind(&confirm_bytes)
-    .bind(&cancel_bytes)
-    .bind(&interrupt_bytes)
-    .execute(db)
+    .bind(("conversation_id", conv_id.to_owned()))
+    .bind(("tools_json", tools_json.clone()))
+    .bind(("confirm", confirm_vec))
+    .bind(("cancel", cancel_vec))
+    .bind(("interrupt", interrupt_vec))
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
     Ok(())
@@ -286,59 +335,62 @@ pub async fn save_pending_plan(
 
 /// 讀取 pending plan
 pub async fn load_pending_plan(
-    db: &sqlx::SqlitePool,
+    db: &SurrealDb,
     conv_id: &str,
 ) -> Result<Option<LoadedPendingPlan>, AppError> {
-    let row = sqlx::query(
-        "SELECT deferred_tools_json, confirm_centroid, cancel_centroid, interrupt_centroid, created_at
-         FROM pending_plans WHERE conversation_id = ?"
-    )
-    .bind(conv_id)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
-    let row = match row {
+    #[derive(Deserialize)]
+    struct PlanRow {
+        deferred_tools_json: String,
+        confirm_centroid: Vec<f64>,
+        cancel_centroid: Vec<f64>,
+        interrupt_centroid: Vec<f64>,
+        created_at: surrealdb::sql::Datetime,
+    }
+    let mut resp = db
+        .query(
+            "SELECT deferred_tools_json, confirm_centroid, cancel_centroid, interrupt_centroid, created_at
+             FROM pending_plans WHERE conversation_id = $id LIMIT 1",
+        )
+        .bind(("id", conv_id.to_owned()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let rows: Vec<PlanRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+    let row = match rows.into_iter().next() {
         None => return Ok(None),
         Some(r) => r,
     };
 
-    let tools_json: String = row.get("deferred_tools_json");
-    let deferred_tools: Vec<DeferredTool> = serde_json::from_str(&tools_json)
+    let deferred_tools: Vec<DeferredTool> = serde_json::from_str(&row.deferred_tools_json)
         .map_err(|e| AppError::AI(e.to_string()))?;
-
-    let confirm_centroid = bytes_to_f32_vec(row.get("confirm_centroid"));
-    let cancel_centroid = bytes_to_f32_vec(row.get("cancel_centroid"));
-    let interrupt_centroid = bytes_to_f32_vec(row.get("interrupt_centroid"));
-    let created_at: i64 = row.get("created_at");
 
     Ok(Some(LoadedPendingPlan {
         deferred_tools,
-        confirm_centroid,
-        cancel_centroid,
-        interrupt_centroid,
-        created_at,
+        confirm_centroid: row.confirm_centroid.iter().map(|&f| f as f32).collect(),
+        cancel_centroid: row.cancel_centroid.iter().map(|&f| f as f32).collect(),
+        interrupt_centroid: row.interrupt_centroid.iter().map(|&f| f as f32).collect(),
+        created_at: row.created_at.timestamp(),
     }))
 }
 
 /// 刪除 pending plan
-pub async fn delete_pending_plan(db: &sqlx::SqlitePool, conv_id: &str) -> Result<(), AppError> {
-    sqlx::query("DELETE FROM pending_plans WHERE conversation_id = ?")
-        .bind(conv_id)
-        .execute(db)
+pub async fn delete_pending_plan(db: &SurrealDb, conv_id: &str) -> Result<(), AppError> {
+    db.query("DELETE FROM pending_plans WHERE conversation_id = $id")
+        .bind(("id", conv_id.to_owned()))
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
     Ok(())
 }
 
 /// 清理超過 TTL（預設 24h）的過期 pending plans
-pub async fn cleanup_expired_pending_plans(db: &sqlx::SqlitePool, ttl_secs: i64) -> Result<(), AppError> {
-    let cutoff = chrono::Utc::now().timestamp() - ttl_secs;
-    sqlx::query("DELETE FROM pending_plans WHERE created_at < ?")
-        .bind(cutoff)
-        .execute(db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+pub async fn cleanup_expired_pending_plans(db: &SurrealDb, ttl_secs: i64) -> Result<(), AppError> {
+    let cutoff_ts = chrono::Utc::now().timestamp() - ttl_secs;
+    // SurrealDB: compare datetime, cutoff as Unix epoch
+    db.query(
+        "DELETE FROM pending_plans WHERE time::unix(created_at) < $cutoff"
+    )
+    .bind(("cutoff", cutoff_ts))
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
     Ok(())
 }
 
@@ -348,20 +400,4 @@ pub struct LoadedPendingPlan {
     pub cancel_centroid: Vec<f32>,
     pub interrupt_centroid: Vec<f32>,
     pub created_at: i64,
-}
-
-// ── Byte conversion helpers ───────────────────────────────────────────────
-
-fn f32_slice_to_bytes(v: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(v.len() * 4);
-    for &f in v {
-        bytes.extend_from_slice(&f.to_le_bytes());
-    }
-    bytes
-}
-
-fn bytes_to_f32_vec(bytes: Vec<u8>) -> Vec<f32> {
-    bytes.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
 }
