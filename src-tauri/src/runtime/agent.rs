@@ -3,9 +3,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde_json::Value;
-use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+use crate::db::surreal::SurrealDb;
 
 use super::dispatcher::Dispatcher;
 use super::intent_classifier::{Intent, IntentClassifier};
@@ -35,8 +36,8 @@ pub struct Agent {
     prefetch_memory: Option<PrefetchFn>,
     /// Embedding 回呼（用於 plan_announce centroid 計算）
     embed_fn: EmbedFn,
-    /// settings DB（用於 pending_plans CRUD）
-    settings_db: SqlitePool,
+    /// DB（用於 pending_plans CRUD）
+    db: SurrealDb,
     /// 目前對話的 conversation_id（None = 無 DB 模式）
     conversation_id: Option<String>,
 }
@@ -54,7 +55,7 @@ impl Agent {
         vault_tools: Option<Value>,
         prefetch_memory: Option<PrefetchFn>,
         embed_fn: EmbedFn,
-        settings_db: SqlitePool,
+        db: SurrealDb,
         conversation_id: Option<String>,
     ) -> Self {
         Self {
@@ -69,7 +70,7 @@ impl Agent {
             vault_tools,
             prefetch_memory,
             embed_fn,
-            settings_db,
+            db,
             conversation_id,
         }
     }
@@ -91,14 +92,14 @@ impl Agent {
 
         // ── 檢查是否有 pending plan（conversation_id 模式）─────────────
         if let Some(ref conv_id) = self.conversation_id {
-            let plan = load_pending_plan(&self.settings_db, conv_id).await
+            let plan = load_pending_plan(&self.db, conv_id).await
                 .unwrap_or(None);
 
             if let Some(pending) = plan {
                 // TTL 檢查：超過 24h 自動取消
                 let age = chrono::Utc::now().timestamp() - pending.created_at;
                 if age > 86400 {
-                    let _ = delete_pending_plan(&self.settings_db, conv_id).await;
+                    let _ = delete_pending_plan(&self.db, conv_id).await;
                     // 通知 LLM 計畫已過期，繼續正常處理
                     messages.push(serde_json::json!({
                         "role": "user",
@@ -115,7 +116,7 @@ impl Agent {
                     ).await;
 
                     // 無論任何 intent 都清除 pending plan
-                    let _ = delete_pending_plan(&self.settings_db, conv_id).await;
+                    let _ = delete_pending_plan(&self.db, conv_id).await;
 
                     match intent {
                         Intent::Confirm => {
@@ -351,7 +352,7 @@ impl Agent {
                             let c_cancel  = compute_centroid(&cancel_vecs.iter().filter(|v| !v.is_empty()).cloned().collect::<Vec<_>>());
                             let c_inter   = compute_centroid(&interrupt_vecs.iter().filter(|v| !v.is_empty()).cloned().collect::<Vec<_>>());
                             let _ = save_pending_plan(
-                                &self.settings_db, conv_id, &deferred,
+                                &self.db, conv_id, &deferred,
                                 &c_confirm, &c_cancel, &c_inter,
                             ).await;
                             // 通知 LLM 計畫已記錄
@@ -416,7 +417,7 @@ impl Agent {
                             let c_inter   = compute_centroid(&non_empty(interrupt_vecs));
 
                             let _ = save_pending_plan(
-                                &self.settings_db, conv_id, &deferred,
+                                &self.db, conv_id, &deferred,
                                 &c_confirm, &c_cancel, &c_inter,
                             ).await;
                         }
@@ -567,7 +568,7 @@ impl Agent {
                 let c_cancel  = compute_centroid(&non_empty(cancel_vecs));
                 let c_inter   = compute_centroid(&non_empty(interrupt_vecs));
                 let _ = save_pending_plan(
-                    &self.settings_db, conv_id, &deferred,
+                    &self.db, conv_id, &deferred,
                     &c_confirm, &c_cancel, &c_inter,
                 ).await;
             }

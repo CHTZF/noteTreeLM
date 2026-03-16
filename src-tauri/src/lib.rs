@@ -57,19 +57,18 @@ pub fn run() {
 
             let app_handle = app.handle().clone();
 
-            // 只同步完成最小必要初始化：settings DB + manage state
-            // 其餘（vault DB、FileWatcher、server warmup）移至背景，讓視窗盡快顯示
+            // 同步完成最小必要初始化：SurrealDB 初始化 + manage state
             let state = tauri::async_runtime::block_on(async {
                 let app_data_dir = app_handle
                     .path()
                     .app_data_dir()
                     .expect("無法取得 app data 目錄");
 
-                let settings_pool = db::init_settings_db(&app_data_dir)
+                let surreal_db = db::surreal::init_db(&app_data_dir)
                     .await
-                    .expect("設定資料庫初始化失敗");
+                    .expect("SurrealDB 初始化失敗");
 
-                AppState::new(settings_pool)
+                AppState::new(surreal_db)
             });
 
             app_handle.manage(state);
@@ -80,20 +79,23 @@ pub fn run() {
                 let _ = window.set_decorations(false);
             }
 
-            // 背景完成 vault DB 初始化、FileWatcher、server warmup
+            // 背景完成 vault 初始化、FileWatcher、server warmup
             tauri::async_runtime::spawn(async move {
                 let state = app_handle.state::<AppState>();
 
                 // 載入已設定的 vault 路徑
-                if let Ok(Some(vp)) = db::queries::get_setting(&state.settings_db, "system_current_vault_path").await {
+                if let Ok(Some(vp)) = db::queries::get_setting(&state.db, "system_current_vault_path").await {
                     if !vp.is_empty() {
                         state.set_vault_path(vp.clone()).await;
                         let path = std::path::PathBuf::from(&vp);
                         if path.exists() {
-                            if let Ok(vault_pool) = db::init_vault_db(&path).await {
-                                // 背景補齊 chunk 索引（不阻塞啟動）
-                                auto_reindex_chunks_if_needed(vault_pool.clone()).await;
-                                state.set_vault_db(Some(vault_pool)).await;
+                            // 背景補齊 chunk 索引（不阻塞啟動）
+                            {
+                                let db = state.db.clone();
+                                let vid = vp.clone();
+                                tokio::spawn(async move {
+                                    let _ = vault::chunker::reindex_all(&db, &vid).await;
+                                });
                             }
                             let stop_tx = vault::watcher::start_watcher(app_handle.clone(), path);
                             *state.watcher_stop.lock().await = Some(stop_tx);
@@ -297,18 +299,5 @@ fn handle_vault_protocol(
             .status(404)
             .body(b"File not found".to_vec())
             .unwrap(),
-    }
-}
-
-/// Vault 開啟後，若 chunks 數量少於 notes 數量，在背景補齊索引。
-async fn auto_reindex_chunks_if_needed(db: sqlx::SqlitePool) {
-    let notes_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notes")
-        .fetch_one(&db).await.unwrap_or(0);
-    let chunks_count: i64 = sqlx::query_scalar("SELECT COUNT(DISTINCT file_path) FROM chunks")
-        .fetch_one(&db).await.unwrap_or(0);
-    if chunks_count < notes_count {
-        tokio::spawn(async move {
-            let _ = vault::chunker::reindex_all(&db).await;
-        });
     }
 }

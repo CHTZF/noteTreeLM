@@ -6,7 +6,6 @@ use crate::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::SqlitePool;
 use std::path::PathBuf;
 use tauri::State;
 
@@ -34,7 +33,7 @@ pub struct RenameResult {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Link {
-    pub id: i64,
+    pub id: String,
     pub source_path: String,
     pub target_title: String,
     pub target_path: Option<String>,
@@ -51,6 +50,33 @@ fn compute_checksum(content: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Internal row for deserializing note fields from SurrealDB.
+/// created_at / modified_at are stored as SurrealDB datetime, we convert to ms.
+#[derive(Deserialize)]
+struct NoteRow {
+    path: String,
+    title: String,
+    content: String,
+    frontmatter: Option<String>,
+    word_count: i64,
+    created_at: surrealdb::sql::Datetime,
+    modified_at: surrealdb::sql::Datetime,
+}
+
+impl From<NoteRow> for Note {
+    fn from(r: NoteRow) -> Self {
+        Note {
+            path: r.path,
+            title: r.title,
+            content: r.content,
+            frontmatter: r.frontmatter,
+            word_count: r.word_count,
+            created_at: r.created_at.timestamp_millis(),
+            modified_at: r.modified_at.timestamp_millis(),
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn create_note(
     state: State<'_, AppState>,
@@ -62,7 +88,8 @@ pub async fn create_note(
     if vault_path.is_empty() {
         return Err(AppError::Vault("尚未設定 Vault 路徑".to_string()));
     }
-    let db = state.get_vault_db().await?;
+    let db = state.db.clone();
+    let vault_id = state.get_vault_id().await?;
 
     let content = content.unwrap_or_default();
     let folder = folder.unwrap_or_default();
@@ -81,14 +108,16 @@ pub async fn create_note(
     };
 
     // 檢查是否已有同名筆記
-    let existing: Option<String> = sqlx::query_scalar(
-        "SELECT path FROM notes WHERE title = ?"
-    )
-    .bind(&title)
-    .fetch_optional(&db)
-    .await?;
-
-    if existing.is_some() {
+    #[derive(Deserialize)]
+    struct PathRow { path: String }
+    let mut resp = db
+        .query("SELECT path FROM notes WHERE title = $title AND vault_id = $vid LIMIT 1")
+        .bind(("title", title.clone()))
+        .bind(("vid", vault_id.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let existing_rows: Vec<PathRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+    if !existing_rows.is_empty() {
         return Err(AppError::Vault(format!(
             "已存在同名筆記：「{}」，請使用其他名稱或不同資料夾。",
             title
@@ -102,38 +131,44 @@ pub async fn create_note(
 
     tokio::fs::write(&abs_path, &content).await?;
 
-    let now = chrono::Utc::now().timestamp_millis();
+    let now_ms = chrono::Utc::now().timestamp_millis();
     let checksum = compute_checksum(&content);
     let word_count = count_words(&content);
 
-    sqlx::query(
-        "INSERT INTO notes(path, title, content, word_count, created_at, modified_at, checksum)
-         VALUES (?, ?, ?, ?, ?, ?, ?)"
+    // Store timestamps as SurrealDB datetime using microsecond-precision ISO string
+    let now_dt = surrealdb::sql::Datetime::from(
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms).unwrap_or_default()
+    );
+
+    db.query(
+        "INSERT INTO notes (vault_id, path, title, content, word_count, created_at, modified_at, checksum)
+         VALUES ($vid, $path, $title, $content, $wc, $now, $now, $cs)"
     )
-    .bind(&rel_path)
-    .bind(&title)
-    .bind(&content)
-    .bind(word_count)
-    .bind(now)
-    .bind(now)
-    .bind(&checksum)
-    .execute(&db)
-    .await?;
+    .bind(("vid", vault_id.clone()))
+    .bind(("path", rel_path.clone()))
+    .bind(("title", title.clone()))
+    .bind(("content", content.clone()))
+    .bind(("wc", word_count))
+    .bind(("now", now_dt.clone()))
+    .bind(("cs", checksum.clone()))
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
 
     // 同步 graph_nodes
-    sqlx::query(
-        "INSERT OR REPLACE INTO graph_nodes(id, node_type, label, created_at)
-         VALUES (?, 'note', ?, ?)"
+    db.query(
+        "INSERT INTO graph_nodes (vault_id, node_id, node_type, label)
+         VALUES ($vid, $path, 'note', $title)
+         ON DUPLICATE KEY UPDATE label = $title"
     )
-    .bind(&rel_path)
-    .bind(&title)
-    .bind(now / 1000)
-    .execute(&db)
-    .await?;
+    .bind(("vid", vault_id.clone()))
+    .bind(("path", rel_path.clone()))
+    .bind(("title", title.clone()))
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
 
     // 建立 chunks（忽略失敗，不影響主流程）
-    let chunks = chunker::chunk_note(&rel_path, &content, now);
-    let _ = chunker::upsert_chunks(&db, &chunks).await;
+    let chunks = chunker::chunk_note(&rel_path, &content, now_ms);
+    let _ = chunker::upsert_chunks(&db, &vault_id, &chunks).await;
 
     Ok(Note {
         path: rel_path,
@@ -141,8 +176,8 @@ pub async fn create_note(
         content,
         frontmatter: None,
         word_count,
-        created_at: now,
-        modified_at: now,
+        created_at: now_ms,
+        modified_at: now_ms,
     })
 }
 
@@ -151,25 +186,22 @@ pub async fn read_note(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<Note, AppError> {
-    let db = state.get_vault_db().await?;
-    let row = sqlx::query_as::<_, (String, String, String, Option<String>, i64, i64, i64)>(
-        "SELECT path, title, content, frontmatter, word_count, created_at, modified_at
-         FROM notes WHERE path = ?"
-    )
-    .bind(&path)
-    .fetch_optional(&db)
-    .await?
-    .ok_or_else(|| AppError::Vault(format!("找不到筆記：{}", path)))?;
+    let db = state.db.clone();
+    let vault_id = state.get_vault_id().await?;
 
-    Ok(Note {
-        path: row.0,
-        title: row.1,
-        content: row.2,
-        frontmatter: row.3,
-        word_count: row.4,
-        created_at: row.5,
-        modified_at: row.6,
-    })
+    let mut resp = db
+        .query("SELECT path, title, content, frontmatter, word_count, created_at, modified_at FROM notes WHERE vault_id = $vid AND path = $path LIMIT 1")
+        .bind(("vid", vault_id.clone()))
+        .bind(("path", path.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let rows: Vec<NoteRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+    let row = rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| AppError::Vault(format!("找不到筆記：{}", path)))?;
+
+    Ok(row.into())
 }
 
 #[tauri::command]
@@ -179,94 +211,111 @@ pub async fn update_note(
     content: String,
 ) -> Result<(), AppError> {
     let vault_path = state.get_vault_path().await;
-    let db = state.get_vault_db().await?;
+    let db = state.db.clone();
+    let vault_id = state.get_vault_id().await?;
     let abs_path = PathBuf::from(&vault_path).join(&path);
 
     tokio::fs::write(&abs_path, &content).await?;
 
-    let now = chrono::Utc::now().timestamp_millis();
+    let now_ms = chrono::Utc::now().timestamp_millis();
     let checksum = compute_checksum(&content);
     let title = extract_title(&path, &content);
     let word_count = count_words(&content);
 
-    sqlx::query(
-        "UPDATE notes SET content = ?, title = ?, word_count = ?, modified_at = ?, checksum = ?
-         WHERE path = ?"
+    let now_dt = surrealdb::sql::Datetime::from(
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms).unwrap_or_default()
+    );
+
+    db.query(
+        "UPDATE notes SET content = $content, title = $title, word_count = $wc, modified_at = $now, checksum = $cs
+         WHERE vault_id = $vid AND path = $path"
     )
-    .bind(&content)
-    .bind(&title)
-    .bind(word_count)
-    .bind(now)
-    .bind(&checksum)
-    .bind(&path)
-    .execute(&db)
-    .await?;
+    .bind(("content", content.clone()))
+    .bind(("title", title.clone()))
+    .bind(("wc", word_count))
+    .bind(("now", now_dt))
+    .bind(("cs", checksum.clone()))
+    .bind(("vid", vault_id.clone()))
+    .bind(("path", path.clone()))
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
 
     // 更新 links
-    sync_links(&db, &path, &content).await?;
+    sync_links(&db, &vault_id, &path, &content).await?;
 
     // 更新 graph node label
-    sqlx::query("UPDATE graph_nodes SET label = ? WHERE id = ?")
-        .bind(&title)
-        .bind(&path)
-        .execute(&db)
-        .await?;
+    db.query("UPDATE graph_nodes SET label = $title WHERE vault_id = $vid AND node_id = $path")
+        .bind(("title", title.clone()))
+        .bind(("vid", vault_id.clone()))
+        .bind(("path", path.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     // 更新 chunks
-    let chunks = chunker::chunk_note(&path, &content, now);
-    let _ = chunker::upsert_chunks(&db, &chunks).await;
+    let chunks = chunker::chunk_note(&path, &content, now_ms);
+    let _ = chunker::upsert_chunks(&db, &vault_id, &chunks).await;
 
     Ok(())
 }
 
 async fn sync_links(
-    db: &SqlitePool,
+    db: &crate::db::surreal::SurrealDb,
+    vault_id: &str,
     source_path: &str,
     content: &str,
 ) -> Result<(), AppError> {
     // 刪除舊的 links（wikilink 和 image_embed）
-    sqlx::query("DELETE FROM links WHERE source_path = ?")
-        .bind(source_path)
-        .execute(db)
-        .await?;
+    db.query("DELETE FROM links WHERE vault_id = $vid AND source_path = $sp")
+        .bind(("vid", vault_id.to_owned()))
+        .bind(("sp", source_path.to_owned()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     // 解析並插入新 links
     let parsed = indexer::parse_links(content);
     for link in parsed {
         // 嘗試解析 target_path
-        let target_path: Option<String> = sqlx::query_scalar(
-            "SELECT path FROM notes WHERE title = ? LIMIT 1"
-        )
-        .bind(&link.target_title)
-        .fetch_optional(db)
-        .await?;
+        #[derive(Deserialize)]
+        struct PathRow { path: String }
+        let mut resp = db
+            .query("SELECT path FROM notes WHERE vault_id = $vid AND title = $title LIMIT 1")
+            .bind(("vid", vault_id.to_owned()))
+            .bind(("title", link.target_title.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let path_rows: Vec<PathRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+        let target_path: Option<String> = path_rows.into_iter().next().map(|r| r.path);
 
-        sqlx::query(
-            "INSERT OR IGNORE INTO links(source_path, target_title, target_path, link_type, raw_text, alias, heading, line_number)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        db.query(
+            "INSERT INTO links (vault_id, source_path, target_title, target_path, link_type, raw_text, alias, heading, line_number)
+             VALUES ($vid, $sp, $tt, $tp, $lt, $rt, $alias, $heading, $ln)
+             ON DUPLICATE KEY UPDATE source_path = $sp"
         )
-        .bind(source_path)
-        .bind(&link.target_title)
-        .bind(&target_path)
-        .bind(&link.link_type)
-        .bind(&link.raw_text)
-        .bind(&link.alias)
-        .bind(&link.heading)
-        .bind(link.line_number)
-        .execute(db)
-        .await?;
+        .bind(("vid", vault_id.to_owned()))
+        .bind(("sp", source_path.to_owned()))
+        .bind(("tt", link.target_title.clone()))
+        .bind(("tp", target_path.clone()))
+        .bind(("lt", link.link_type.clone()))
+        .bind(("rt", link.raw_text.clone()))
+        .bind(("alias", link.alias.clone()))
+        .bind(("heading", link.heading.clone()))
+        .bind(("ln", link.line_number))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
         // 更新 graph edge（僅 wikilink）
         if link.link_type == "wikilink" {
             if let Some(ref tp) = target_path {
-                sqlx::query(
-                    "INSERT OR IGNORE INTO graph_edges(source_id, target_id, edge_type)
-                     VALUES (?, ?, 'wikilink')"
+                db.query(
+                    "INSERT INTO graph_edges (vault_id, source_id, target_id, edge_type)
+                     VALUES ($vid, $src, $tgt, 'wikilink')
+                     ON DUPLICATE KEY UPDATE edge_type = 'wikilink'"
                 )
-                .bind(source_path)
-                .bind(tp)
-                .execute(db)
-                .await?;
+                .bind(("vid", vault_id.to_owned()))
+                .bind(("src", source_path.to_owned()))
+                .bind(("tgt", tp.clone()))
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
             }
         }
     }
@@ -280,32 +329,44 @@ pub async fn delete_note(
     path: String,
 ) -> Result<DeleteResult, AppError> {
     let vault_path = state.get_vault_path().await;
-    let db = state.get_vault_db().await?;
+    let db = state.db.clone();
+    let vault_id = state.get_vault_id().await?;
 
     // 計算反向連結數量
-    let affected_links: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM links WHERE target_path = ?"
-    )
-    .bind(&path)
-    .fetch_one(&db)
-    .await?;
+    #[derive(Deserialize)]
+    struct CountRow { count: i64 }
+    let mut resp = db
+        .query("SELECT count() AS count FROM links WHERE vault_id = $vid AND target_path = $path GROUP ALL")
+        .bind(("vid", vault_id.clone()))
+        .bind(("path", path.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let count_rows: Vec<CountRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+    let affected_links: i64 = count_rows.into_iter().next().map(|r| r.count).unwrap_or(0);
 
     // 刪除實體檔案
     let abs_path = PathBuf::from(&vault_path).join(&path);
     tokio::fs::remove_file(&abs_path).await.ok();
 
-    // DB 刪除（CASCADE 自動清除 links、tags、graph_nodes、graph_edges）
-    sqlx::query("DELETE FROM notes WHERE path = ?")
-        .bind(&path)
-        .execute(&db)
-        .await?;
-    sqlx::query("DELETE FROM graph_nodes WHERE id = ?")
-        .bind(&path)
-        .execute(&db)
-        .await?;
+    // DB 刪除
+    db.query("DELETE FROM notes WHERE vault_id = $vid AND path = $path")
+        .bind(("vid", vault_id.clone()))
+        .bind(("path", path.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    db.query("DELETE FROM graph_nodes WHERE vault_id = $vid AND node_id = $path")
+        .bind(("vid", vault_id.clone()))
+        .bind(("path", path.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    db.query("DELETE FROM links WHERE vault_id = $vid AND source_path = $path")
+        .bind(("vid", vault_id.clone()))
+        .bind(("path", path.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     // 刪除對應 chunks
-    let _ = chunker::delete_chunks(&db, &path).await;
+    let _ = chunker::delete_chunks(&db, &vault_id, &path).await;
 
     Ok(DeleteResult { affected_links })
 }
@@ -317,7 +378,8 @@ pub async fn rename_note(
     new_title: String,
 ) -> Result<RenameResult, AppError> {
     let vault_path = state.get_vault_path().await;
-    let db = state.get_vault_db().await?;
+    let db = state.db.clone();
+    let vault_id = state.get_vault_id().await?;
 
     // 建立新路徑（保持原資料夾）
     let old_pathbuf = PathBuf::from(&path);
@@ -334,17 +396,31 @@ pub async fn rename_note(
     };
 
     // 找出所有引用舊標題的筆記
-    let old_title: String = sqlx::query_scalar("SELECT title FROM notes WHERE path = ?")
-        .bind(&path)
-        .fetch_one(&db)
-        .await?;
+    #[derive(Deserialize)]
+    struct TitleRow { title: String }
+    let mut resp = db
+        .query("SELECT title FROM notes WHERE vault_id = $vid AND path = $path LIMIT 1")
+        .bind(("vid", vault_id.clone()))
+        .bind(("path", path.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let title_rows: Vec<TitleRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+    let old_title = title_rows
+        .into_iter()
+        .next()
+        .map(|r| r.title)
+        .ok_or_else(|| AppError::Vault(format!("找不到筆記：{}", path)))?;
 
-    let backlinks: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT source_path FROM links WHERE target_title = ?"
-    )
-    .bind(&old_title)
-    .fetch_all(&db)
-    .await?;
+    #[derive(Deserialize)]
+    struct SourcePathRow { source_path: String }
+    let mut resp = db
+        .query("SELECT source_path FROM links WHERE vault_id = $vid AND target_title = $title")
+        .bind(("vid", vault_id.clone()))
+        .bind(("title", old_title.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let backlink_rows: Vec<SourcePathRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+    let backlinks: Vec<String> = backlink_rows.into_iter().map(|r| r.source_path).collect();
 
     // 更新每個反向連結的檔案內容
     let mut updated_files = Vec::new();
@@ -371,19 +447,21 @@ pub async fn rename_note(
     }
     tokio::fs::rename(&abs_old, &abs_new).await?;
 
-    // 更新 DB（ON UPDATE CASCADE 會自動更新 links.source_path 和 links.target_path）
-    sqlx::query("UPDATE notes SET path = ?, title = ? WHERE path = ?")
-        .bind(&new_path)
-        .bind(&new_title)
-        .bind(&path)
-        .execute(&db)
-        .await?;
-    sqlx::query("UPDATE graph_nodes SET id = ?, label = ? WHERE id = ?")
-        .bind(&new_path)
-        .bind(&new_title)
-        .bind(&path)
-        .execute(&db)
-        .await?;
+    // 更新 DB
+    db.query("UPDATE notes SET path = $new_path, title = $new_title WHERE vault_id = $vid AND path = $path")
+        .bind(("new_path", new_path.clone()))
+        .bind(("new_title", new_title.clone()))
+        .bind(("vid", vault_id.clone()))
+        .bind(("path", path.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    db.query("UPDATE graph_nodes SET node_id = $new_path, label = $new_title WHERE vault_id = $vid AND node_id = $path")
+        .bind(("new_path", new_path.clone()))
+        .bind(("new_title", new_title.clone()))
+        .bind(("vid", vault_id.clone()))
+        .bind(("path", path.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     Ok(RenameResult { new_path, updated_files })
 }
@@ -393,37 +471,28 @@ pub async fn list_notes(
     state: State<'_, AppState>,
     folder: Option<String>,
 ) -> Result<Vec<Note>, AppError> {
-    let db = state.get_vault_db().await?;
-    let rows = if let Some(f) = folder {
+    let db = state.db.clone();
+    let vault_id = state.get_vault_id().await?;
+
+    let rows: Vec<NoteRow> = if let Some(f) = folder {
         let prefix = format!("{}/", f.trim_end_matches('/'));
-        sqlx::query_as::<_, (String, String, String, Option<String>, i64, i64, i64)>(
-            "SELECT path, title, content, frontmatter, word_count, created_at, modified_at
-             FROM notes WHERE path LIKE ? ORDER BY modified_at DESC"
-        )
-        .bind(format!("{}%", prefix))
-        .fetch_all(&db)
-        .await?
+        let mut resp = db
+            .query("SELECT path, title, content, frontmatter, word_count, created_at, modified_at FROM notes WHERE vault_id = $vid AND string::starts_with(path, $prefix) ORDER BY modified_at DESC")
+            .bind(("vid", vault_id.clone()))
+            .bind(("prefix", prefix.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        resp.take(0).map_err(|e| AppError::Database(e.to_string()))?
     } else {
-        sqlx::query_as::<_, (String, String, String, Option<String>, i64, i64, i64)>(
-            "SELECT path, title, content, frontmatter, word_count, created_at, modified_at
-             FROM notes ORDER BY modified_at DESC"
-        )
-        .fetch_all(&db)
-        .await?
+        let mut resp = db
+            .query("SELECT path, title, content, frontmatter, word_count, created_at, modified_at FROM notes WHERE vault_id = $vid ORDER BY modified_at DESC")
+            .bind(("vid", vault_id.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        resp.take(0).map_err(|e| AppError::Database(e.to_string()))?
     };
 
-    Ok(rows
-        .into_iter()
-        .map(|r| Note {
-            path: r.0,
-            title: r.1,
-            content: r.2,
-            frontmatter: r.3,
-            word_count: r.4,
-            created_at: r.5,
-            modified_at: r.6,
-        })
-        .collect())
+    Ok(rows.into_iter().map(|r| r.into()).collect())
 }
 
 #[tauri::command]
@@ -431,27 +500,42 @@ pub async fn get_backlinks(
     state: State<'_, AppState>,
     title: String,
 ) -> Result<Vec<Link>, AppError> {
-    let db = state.get_vault_db().await?;
-    let rows = sqlx::query_as::<_, (i64, String, String, Option<String>, String, String, Option<String>, Option<String>, i64)>(
-        "SELECT id, source_path, target_title, target_path, link_type, raw_text, alias, heading, line_number
-         FROM links WHERE target_title = ? ORDER BY source_path"
-    )
-    .bind(&title)
-    .fetch_all(&db)
-    .await?;
+    let db = state.db.clone();
+    let vault_id = state.get_vault_id().await?;
+
+    #[derive(Deserialize)]
+    struct LinkRow {
+        id: surrealdb::sql::Thing,
+        source_path: String,
+        target_title: String,
+        target_path: Option<String>,
+        link_type: String,
+        raw_text: String,
+        alias: Option<String>,
+        heading: Option<String>,
+        line_number: i64,
+    }
+
+    let mut resp = db
+        .query("SELECT id, source_path, target_title, target_path, link_type, raw_text, alias, heading, line_number FROM links WHERE vault_id = $vid AND target_title = $title ORDER BY source_path")
+        .bind(("vid", vault_id.clone()))
+        .bind(("title", title.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let rows: Vec<LinkRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
 
     Ok(rows
         .into_iter()
         .map(|r| Link {
-            id: r.0,
-            source_path: r.1,
-            target_title: r.2,
-            target_path: r.3,
-            link_type: r.4,
-            raw_text: r.5,
-            alias: r.6,
-            heading: r.7,
-            line_number: r.8,
+            id: r.id.to_string(),
+            source_path: r.source_path,
+            target_title: r.target_title,
+            target_path: r.target_path,
+            link_type: r.link_type,
+            raw_text: r.raw_text,
+            alias: r.alias,
+            heading: r.heading,
+            line_number: r.line_number,
         })
         .collect())
 }
@@ -463,34 +547,67 @@ pub async fn scan_vault(state: State<'_, AppState>) -> Result<usize, AppError> {
     if vault_path.is_empty() {
         return Err(AppError::Vault("尚未設定 Vault 路徑".to_string()));
     }
-    let db = state.get_vault_db().await?;
+    let db = state.db.clone();
+    let vault_id = state.get_vault_id().await?;
 
     let mut count = 0;
-    scan_dir(&db, &vault_path, &vault_path, &mut count).await?;
+    scan_dir(&db, &vault_id, &vault_path, &vault_path, &mut count).await?;
 
     // 清除 DB 中已不存在於磁碟的幽靈條目
-    let all_db_paths: Vec<String> = sqlx::query_scalar("SELECT path FROM notes")
-        .fetch_all(&db)
-        .await?;
-    for path in all_db_paths {
-        let abs = PathBuf::from(&vault_path).join(&path);
+    #[derive(Deserialize)]
+    struct PathRow { path: String }
+    let mut resp = db
+        .query("SELECT path FROM notes WHERE vault_id = $vid")
+        .bind(("vid", vault_id.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let all_db_paths: Vec<PathRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+
+    for row in all_db_paths {
+        let abs = PathBuf::from(&vault_path).join(&row.path);
         if !abs.exists() {
-            sqlx::query("DELETE FROM notes WHERE path = ?")
-                .bind(&path)
-                .execute(&db)
-                .await?;
-            sqlx::query("DELETE FROM graph_nodes WHERE id = ?")
-                .bind(&path)
-                .execute(&db)
-                .await?;
+            db.query("DELETE FROM notes WHERE vault_id = $vid AND path = $path")
+                .bind(("vid", vault_id.clone()))
+                .bind(("path", row.path.clone()))
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            db.query("DELETE FROM graph_nodes WHERE vault_id = $vid AND node_id = $path")
+                .bind(("vid", vault_id.clone()))
+                .bind(("path", row.path.clone()))
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
         }
     }
+
     // 清除 graph_nodes 中孤立的 note 節點
-    sqlx::query(
-        "DELETE FROM graph_nodes WHERE node_type = 'note' AND id NOT IN (SELECT path FROM notes)"
-    )
-    .execute(&db)
-    .await?;
+    // 先取得所有 note 路徑再比對
+    let mut resp2 = db
+        .query("SELECT node_id FROM graph_nodes WHERE vault_id = $vid AND node_type = 'note'")
+        .bind(("vid", vault_id.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    #[derive(Deserialize)]
+    struct NodeIdRow { node_id: String }
+    let node_rows: Vec<NodeIdRow> = resp2.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+
+    for node in node_rows {
+        let mut check = db
+            .query("SELECT path FROM notes WHERE vault_id = $vid AND path = $path LIMIT 1")
+            .bind(("vid", vault_id.clone()))
+            .bind(("path", node.node_id.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        #[derive(Deserialize)]
+        struct CheckRow { path: String }
+        let check_rows: Vec<CheckRow> = check.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+        if check_rows.is_empty() {
+            db.query("DELETE FROM graph_nodes WHERE vault_id = $vid AND node_id = $nid")
+                .bind(("vid", vault_id.clone()))
+                .bind(("nid", node.node_id.clone()))
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+    }
 
     Ok(count)
 }
@@ -503,7 +620,8 @@ pub async fn move_note(
     new_folder: String,
 ) -> Result<String, AppError> {
     let vault_path = state.get_vault_path().await;
-    let db = state.get_vault_db().await?;
+    let db = state.db.clone();
+    let vault_id = state.get_vault_id().await?;
 
     let filename = PathBuf::from(&old_path)
         .file_name()
@@ -529,17 +647,33 @@ pub async fn move_note(
     tokio::fs::rename(&abs_old, &abs_new).await
         .map_err(|e| AppError::Vault(format!("移動失敗：{}", e)))?;
 
-    // notes.path 更新（links 有 ON UPDATE CASCADE 自動跟著更新）
-    sqlx::query("UPDATE notes SET path = ? WHERE path = ?")
-        .bind(&new_path).bind(&old_path).execute(&db).await?;
+    // notes.path 更新
+    db.query("UPDATE notes SET path = $new_path WHERE vault_id = $vid AND path = $old_path")
+        .bind(("new_path", new_path.clone()))
+        .bind(("vid", vault_id.clone()))
+        .bind(("old_path", old_path.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     // graph_nodes / graph_edges 手動更新
-    sqlx::query("UPDATE graph_nodes SET id = ? WHERE id = ?")
-        .bind(&new_path).bind(&old_path).execute(&db).await?;
-    sqlx::query("UPDATE graph_edges SET source_id = ? WHERE source_id = ?")
-        .bind(&new_path).bind(&old_path).execute(&db).await?;
-    sqlx::query("UPDATE graph_edges SET target_id = ? WHERE target_id = ?")
-        .bind(&new_path).bind(&old_path).execute(&db).await?;
+    db.query("UPDATE graph_nodes SET node_id = $new_path WHERE vault_id = $vid AND node_id = $old_path")
+        .bind(("new_path", new_path.clone()))
+        .bind(("vid", vault_id.clone()))
+        .bind(("old_path", old_path.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    db.query("UPDATE graph_edges SET source_id = $new_path WHERE vault_id = $vid AND source_id = $old_path")
+        .bind(("new_path", new_path.clone()))
+        .bind(("vid", vault_id.clone()))
+        .bind(("old_path", old_path.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    db.query("UPDATE graph_edges SET target_id = $new_path WHERE vault_id = $vid AND target_id = $old_path")
+        .bind(("new_path", new_path.clone()))
+        .bind(("vid", vault_id.clone()))
+        .bind(("old_path", old_path.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     Ok(new_path)
 }
@@ -553,7 +687,9 @@ pub async fn move_folder(
     new_parent: String,    // 新父資料夾相對路徑（空 = 根目錄），e.g. "archive"
 ) -> Result<String, AppError> {
     let vault_path = state.get_vault_path().await;
-    let db = state.get_vault_db().await?;
+    let db = state.db.clone();
+    let vault_id = state.get_vault_id().await?;
+
     if folder_path.is_empty() || folder_path.contains("..") {
         return Err(AppError::Vault("無效的資料夾路徑".to_string()));
     }
@@ -594,38 +730,47 @@ pub async fn move_folder(
     // 更新 DB 中所有路徑前綴符合的筆記
     let old_prefix = format!("{}/", folder_path);
     let new_prefix = format!("{}/", new_folder_path);
-    let note_paths: Vec<String> =
-        sqlx::query_scalar("SELECT path FROM notes WHERE path LIKE ?")
-            .bind(format!("{}%", old_prefix))
-            .fetch_all(&db)
-            .await?;
 
-    for old_note_path in &note_paths {
+    #[derive(Deserialize)]
+    struct PathRow { path: String }
+    let mut resp = db
+        .query("SELECT path FROM notes WHERE vault_id = $vid AND string::starts_with(path, $prefix)")
+        .bind(("vid", vault_id.clone()))
+        .bind(("prefix", old_prefix.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let note_paths: Vec<PathRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+
+    for row in &note_paths {
         let new_note_path = format!(
             "{}{}",
             new_prefix,
-            &old_note_path[old_prefix.len()..]
+            &row.path[old_prefix.len()..]
         );
-        sqlx::query("UPDATE notes SET path = ? WHERE path = ?")
-            .bind(&new_note_path)
-            .bind(old_note_path)
-            .execute(&db)
-            .await?;
-        sqlx::query("UPDATE graph_nodes SET id = ? WHERE id = ?")
-            .bind(&new_note_path)
-            .bind(old_note_path)
-            .execute(&db)
-            .await?;
-        sqlx::query("UPDATE graph_edges SET source_id = ? WHERE source_id = ?")
-            .bind(&new_note_path)
-            .bind(old_note_path)
-            .execute(&db)
-            .await?;
-        sqlx::query("UPDATE graph_edges SET target_id = ? WHERE target_id = ?")
-            .bind(&new_note_path)
-            .bind(old_note_path)
-            .execute(&db)
-            .await?;
+        db.query("UPDATE notes SET path = $new_path WHERE vault_id = $vid AND path = $old_path")
+            .bind(("new_path", new_note_path.clone()))
+            .bind(("vid", vault_id.clone()))
+            .bind(("old_path", row.path.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        db.query("UPDATE graph_nodes SET node_id = $new_path WHERE vault_id = $vid AND node_id = $old_path")
+            .bind(("new_path", new_note_path.clone()))
+            .bind(("vid", vault_id.clone()))
+            .bind(("old_path", row.path.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        db.query("UPDATE graph_edges SET source_id = $new_path WHERE vault_id = $vid AND source_id = $old_path")
+            .bind(("new_path", new_note_path.clone()))
+            .bind(("vid", vault_id.clone()))
+            .bind(("old_path", row.path.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        db.query("UPDATE graph_edges SET target_id = $new_path WHERE vault_id = $vid AND target_id = $old_path")
+            .bind(("new_path", new_note_path.clone()))
+            .bind(("vid", vault_id.clone()))
+            .bind(("old_path", row.path.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
     }
 
     Ok(new_folder_path)
@@ -639,7 +784,9 @@ pub async fn rename_folder(
     new_name: String,    // 新目錄名稱，e.g. "new-name"
 ) -> Result<String, AppError> {
     let vault_path = state.get_vault_path().await;
-    let db = state.get_vault_db().await?;
+    let db = state.db.clone();
+    let vault_id = state.get_vault_id().await?;
+
     let new_name = new_name.trim().to_string();
     if folder_path.is_empty() || folder_path.contains("..") || new_name.is_empty() || new_name.contains('/') || new_name.contains("..") {
         return Err(AppError::Vault("無效的資料夾路徑或名稱".to_string()));
@@ -672,34 +819,43 @@ pub async fn rename_folder(
     // 更新 DB 中所有路徑前綴符合的筆記
     let old_prefix = format!("{}/", folder_path);
     let new_prefix = format!("{}/", new_folder_path);
-    let note_paths: Vec<String> =
-        sqlx::query_scalar("SELECT path FROM notes WHERE path LIKE ?")
-            .bind(format!("{}%", old_prefix))
-            .fetch_all(&db)
-            .await?;
 
-    for old_note_path in &note_paths {
-        let new_note_path = format!("{}{}", new_prefix, &old_note_path[old_prefix.len()..]);
-        sqlx::query("UPDATE notes SET path = ? WHERE path = ?")
-            .bind(&new_note_path)
-            .bind(old_note_path)
-            .execute(&db)
-            .await?;
-        sqlx::query("UPDATE graph_nodes SET id = ? WHERE id = ?")
-            .bind(&new_note_path)
-            .bind(old_note_path)
-            .execute(&db)
-            .await?;
-        sqlx::query("UPDATE graph_edges SET source_id = ? WHERE source_id = ?")
-            .bind(&new_note_path)
-            .bind(old_note_path)
-            .execute(&db)
-            .await?;
-        sqlx::query("UPDATE graph_edges SET target_id = ? WHERE target_id = ?")
-            .bind(&new_note_path)
-            .bind(old_note_path)
-            .execute(&db)
-            .await?;
+    #[derive(Deserialize)]
+    struct PathRow { path: String }
+    let mut resp = db
+        .query("SELECT path FROM notes WHERE vault_id = $vid AND string::starts_with(path, $prefix)")
+        .bind(("vid", vault_id.clone()))
+        .bind(("prefix", old_prefix.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let note_paths: Vec<PathRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+
+    for row in &note_paths {
+        let new_note_path = format!("{}{}", new_prefix, &row.path[old_prefix.len()..]);
+        db.query("UPDATE notes SET path = $new_path WHERE vault_id = $vid AND path = $old_path")
+            .bind(("new_path", new_note_path.clone()))
+            .bind(("vid", vault_id.clone()))
+            .bind(("old_path", row.path.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        db.query("UPDATE graph_nodes SET node_id = $new_path WHERE vault_id = $vid AND node_id = $old_path")
+            .bind(("new_path", new_note_path.clone()))
+            .bind(("vid", vault_id.clone()))
+            .bind(("old_path", row.path.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        db.query("UPDATE graph_edges SET source_id = $new_path WHERE vault_id = $vid AND source_id = $old_path")
+            .bind(("new_path", new_note_path.clone()))
+            .bind(("vid", vault_id.clone()))
+            .bind(("old_path", row.path.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        db.query("UPDATE graph_edges SET target_id = $new_path WHERE vault_id = $vid AND target_id = $old_path")
+            .bind(("new_path", new_note_path.clone()))
+            .bind(("vid", vault_id.clone()))
+            .bind(("old_path", row.path.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
     }
 
     Ok(new_folder_path)
@@ -795,26 +951,38 @@ pub async fn delete_folder(
     folder_path: String,
 ) -> Result<u32, AppError> {
     let vault_path = state.get_vault_path().await;
-    let db = state.get_vault_db().await?;
+    let db = state.db.clone();
+    let vault_id = state.get_vault_id().await?;
+
     if folder_path.contains("..") || folder_path.is_empty() {
         return Err(AppError::Vault("無效的資料夾路徑".to_string()));
     }
 
     // 取得此資料夾下的所有筆記路徑
     let prefix = format!("{}/", folder_path.trim_end_matches('/'));
-    let note_paths: Vec<String> = sqlx::query_scalar(
-        "SELECT path FROM notes WHERE path LIKE ?"
-    )
-    .bind(format!("{}%", prefix))
-    .fetch_all(&db)
-    .await?;
 
-    // 從 DB 刪除所有筆記（CASCADE 自動清除 links）
-    for path in &note_paths {
-        sqlx::query("DELETE FROM notes WHERE path = ?")
-            .bind(path).execute(&db).await?;
-        sqlx::query("DELETE FROM graph_nodes WHERE id = ?")
-            .bind(path).execute(&db).await?;
+    #[derive(Deserialize)]
+    struct PathRow { path: String }
+    let mut resp = db
+        .query("SELECT path FROM notes WHERE vault_id = $vid AND string::starts_with(path, $prefix)")
+        .bind(("vid", vault_id.clone()))
+        .bind(("prefix", prefix.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let note_paths: Vec<PathRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+
+    // 從 DB 刪除所有筆記
+    for row in &note_paths {
+        db.query("DELETE FROM notes WHERE vault_id = $vid AND path = $path")
+            .bind(("vid", vault_id.clone()))
+            .bind(("path", row.path.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        db.query("DELETE FROM graph_nodes WHERE vault_id = $vid AND node_id = $path")
+            .bind(("vid", vault_id.clone()))
+            .bind(("path", row.path.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
     }
 
     // 刪除實體目錄（遞迴）
@@ -903,8 +1071,8 @@ async fn collect_assets(
             let ext = path.extension()
                 .map(|e| e.to_string_lossy().to_lowercase())
                 .unwrap_or_default();
-            // 跳過 Markdown 筆記（已由 notes 系統管理）與 SQLite 附屬檔
-            if matches!(ext.as_str(), "md" | "markdown" | "mdx" | "db" | "db-shm" | "db-wal") {
+            // 跳過 Markdown 筆記（已由 notes 系統管理）
+            if matches!(ext.as_str(), "md" | "markdown" | "mdx") {
                 continue;
             }
             if let Some(rel) = crate::vault::to_relative_path(vault_root, &path) {
@@ -1088,7 +1256,7 @@ pub async fn open_path_externally(
 
 // ─────────────────────────────── Trash ──────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize, Clone, sqlx::FromRow)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TrashItem {
     pub id: String,
     pub original_path: String,
@@ -1098,17 +1266,46 @@ pub struct TrashItem {
     pub deleted_at: i64,
 }
 
+#[derive(Deserialize)]
+struct TrashItemRow {
+    item_id: String,
+    original_path: String,
+    name: String,
+    title: String,
+    trash_filename: String,
+    deleted_at: surrealdb::sql::Datetime,
+}
+
+impl From<TrashItemRow> for TrashItem {
+    fn from(r: TrashItemRow) -> Self {
+        TrashItem {
+            id: r.item_id,
+            original_path: r.original_path,
+            name: r.name,
+            title: r.title,
+            trash_filename: r.trash_filename,
+            deleted_at: r.deleted_at.timestamp_millis(),
+        }
+    }
+}
+
 /// 將單一筆記移入 .trash/ 目錄（內部輔助函式）
 async fn trash_single_note(
-    db: &SqlitePool,
+    db: &crate::db::surreal::SurrealDb,
+    vault_id: &str,
     vault_path: &str,
     note_path: &str,
 ) -> Result<(), AppError> {
-    let title: String = sqlx::query_scalar("SELECT title FROM notes WHERE path = ?")
-        .bind(note_path)
-        .fetch_optional(db)
-        .await?
-        .unwrap_or_default();
+    #[derive(Deserialize)]
+    struct TitleRow { title: String }
+    let mut resp = db
+        .query("SELECT title FROM notes WHERE vault_id = $vid AND path = $path LIMIT 1")
+        .bind(("vid", vault_id.to_owned()))
+        .bind(("path", note_path.to_owned()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let title_rows: Vec<TitleRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+    let title = title_rows.into_iter().next().map(|r| r.title).unwrap_or_default();
 
     let filename = PathBuf::from(note_path)
         .file_name()
@@ -1139,30 +1336,37 @@ async fn trash_single_note(
             .map_err(|e| AppError::Vault(format!("移動到垃圾桶失敗：{}", e)))?;
     }
 
-    // 從 DB 刪除（CASCADE 自動清除 links、tags）
-    sqlx::query("DELETE FROM notes WHERE path = ?")
-        .bind(note_path)
-        .execute(db)
-        .await?;
-    sqlx::query("DELETE FROM graph_nodes WHERE id = ?")
-        .bind(note_path)
-        .execute(db)
-        .await?;
+    // 從 DB 刪除
+    db.query("DELETE FROM notes WHERE vault_id = $vid AND path = $path")
+        .bind(("vid", vault_id.to_owned()))
+        .bind(("path", note_path.to_owned()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    db.query("DELETE FROM graph_nodes WHERE vault_id = $vid AND node_id = $path")
+        .bind(("vid", vault_id.to_owned()))
+        .bind(("path", note_path.to_owned()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().timestamp_millis();
-    sqlx::query(
-        "INSERT INTO trash_items(id, original_path, name, title, trash_filename, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?)",
+    let item_id = uuid::Uuid::new_v4().to_string();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now_dt = surrealdb::sql::Datetime::from(
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms).unwrap_or_default()
+    );
+
+    db.query(
+        "INSERT INTO trash_items (vault_id, item_id, original_path, name, title, trash_filename, deleted_at)
+         VALUES ($vid, $item_id, $op, $name, $title, $tf, $deleted_at)"
     )
-    .bind(&id)
-    .bind(note_path)
-    .bind(&filename)
-    .bind(&title)
-    .bind(&trash_filename)
-    .bind(now)
-    .execute(db)
-    .await?;
+    .bind(("vid", vault_id.to_owned()))
+    .bind(("item_id", item_id.clone()))
+    .bind(("op", note_path.to_owned()))
+    .bind(("name", filename.clone()))
+    .bind(("title", title.clone()))
+    .bind(("tf", trash_filename.clone()))
+    .bind(("deleted_at", now_dt))
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
 
     Ok(())
 }
@@ -1180,8 +1384,9 @@ pub async fn trash_note(
     if path.contains("..") {
         return Err(AppError::Vault("無效的路徑".to_string()));
     }
-    let db = state.get_vault_db().await?;
-    trash_single_note(&db, &vault_path, &path).await
+    let db = state.db.clone();
+    let vault_id = state.get_vault_id().await?;
+    trash_single_note(&db, &vault_id, &vault_path, &path).await
 }
 
 /// 將資料夾中所有筆記移至垃圾桶，然後刪除實體資料夾
@@ -1191,21 +1396,28 @@ pub async fn trash_folder(
     folder_path: String,
 ) -> Result<u32, AppError> {
     let vault_path = state.get_vault_path().await;
-    let db = state.get_vault_db().await?;
+    let db = state.db.clone();
+    let vault_id = state.get_vault_id().await?;
+
     if folder_path.contains("..") || folder_path.is_empty() {
         return Err(AppError::Vault("無效的資料夾路徑".to_string()));
     }
 
     let prefix = format!("{}/", folder_path.trim_end_matches('/'));
-    let note_paths: Vec<String> =
-        sqlx::query_scalar("SELECT path FROM notes WHERE path LIKE ?")
-            .bind(format!("{}%", prefix))
-            .fetch_all(&db)
-            .await?;
+
+    #[derive(Deserialize)]
+    struct PathRow { path: String }
+    let mut resp = db
+        .query("SELECT path FROM notes WHERE vault_id = $vid AND string::starts_with(path, $prefix)")
+        .bind(("vid", vault_id.clone()))
+        .bind(("prefix", prefix.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let note_paths: Vec<PathRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
 
     let count = note_paths.len() as u32;
-    for note_path in &note_paths {
-        trash_single_note(&db, &vault_path, note_path).await?;
+    for row in &note_paths {
+        trash_single_note(&db, &vault_id, &vault_path, &row.path).await?;
     }
 
     let abs_path = PathBuf::from(&vault_path).join(&folder_path);
@@ -1223,14 +1435,16 @@ pub async fn trash_folder(
 pub async fn list_trash(
     state: State<'_, AppState>,
 ) -> Result<Vec<TrashItem>, AppError> {
-    let db = state.get_vault_db().await?;
-    let items: Vec<TrashItem> = sqlx::query_as(
-        "SELECT id, original_path, name, title, trash_filename, deleted_at
-         FROM trash_items ORDER BY deleted_at DESC",
-    )
-    .fetch_all(&db)
-    .await?;
-    Ok(items)
+    let db = state.db.clone();
+    let vault_id = state.get_vault_id().await?;
+
+    let mut resp = db
+        .query("SELECT item_id, original_path, name, title, trash_filename, deleted_at FROM trash_items WHERE vault_id = $vid ORDER BY deleted_at DESC")
+        .bind(("vid", vault_id.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let rows: Vec<TrashItemRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(rows.into_iter().map(|r| r.into()).collect())
 }
 
 /// 復原垃圾桶項目到指定資料夾，回傳新路徑
@@ -1244,16 +1458,21 @@ pub async fn restore_trash_item(
     if vault_path.is_empty() {
         return Err(AppError::Vault("尚未設定 Vault 路徑".to_string()));
     }
-    let db = state.get_vault_db().await?;
+    let db = state.db.clone();
+    let vault_id = state.get_vault_id().await?;
 
-    let item: Option<TrashItem> = sqlx::query_as(
-        "SELECT id, original_path, name, title, trash_filename, deleted_at
-         FROM trash_items WHERE id = ?",
-    )
-    .bind(&id)
-    .fetch_optional(&db)
-    .await?;
-    let item = item.ok_or_else(|| AppError::Vault("找不到垃圾桶項目".to_string()))?;
+    let mut resp = db
+        .query("SELECT item_id, original_path, name, title, trash_filename, deleted_at FROM trash_items WHERE vault_id = $vid AND item_id = $id LIMIT 1")
+        .bind(("vid", vault_id.clone()))
+        .bind(("id", id.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let rows: Vec<TrashItemRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+    let item: TrashItem = rows
+        .into_iter()
+        .next()
+        .map(|r| r.into())
+        .ok_or_else(|| AppError::Vault("找不到垃圾桶項目".to_string()))?;
 
     let candidate = if target_folder.is_empty() {
         item.name.clone()
@@ -1293,54 +1512,88 @@ pub async fn restore_trash_item(
 
     // 重新建立 DB 索引
     let title = extract_title(&new_path, &content);
-    let now = chrono::Utc::now().timestamp_millis();
+    let now_ms = chrono::Utc::now().timestamp_millis();
     let word_count = count_words(&content);
     let checksum = {
         let mut h = Sha256::new();
         h.update(content.as_bytes());
         format!("{:x}", h.finalize())
     };
+    let now_dt = surrealdb::sql::Datetime::from(
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms).unwrap_or_default()
+    );
 
-    sqlx::query(
-        "INSERT INTO notes(path, title, content, word_count, created_at, modified_at, checksum)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(path) DO UPDATE SET
-           title = excluded.title, content = excluded.content,
-           word_count = excluded.word_count, modified_at = excluded.modified_at,
-           checksum = excluded.checksum",
+    db.query(
+        "INSERT INTO notes (vault_id, path, title, content, word_count, created_at, modified_at, checksum)
+         VALUES ($vid, $path, $title, $content, $wc, $now, $now, $cs)
+         ON DUPLICATE KEY UPDATE
+           title = $title, content = $content,
+           word_count = $wc, modified_at = $now,
+           checksum = $cs"
     )
-    .bind(&new_path).bind(&title).bind(&content)
-    .bind(word_count).bind(now).bind(now).bind(&checksum)
-    .execute(&db).await?;
+    .bind(("vid", vault_id.clone()))
+    .bind(("path", new_path.clone()))
+    .bind(("title", title.clone()))
+    .bind(("content", content.clone()))
+    .bind(("wc", word_count))
+    .bind(("now", now_dt.clone()))
+    .bind(("cs", checksum.clone()))
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
 
-    sqlx::query(
-        "INSERT OR REPLACE INTO graph_nodes(id, node_type, label, created_at)
-         VALUES (?, 'note', ?, ?)",
+    db.query(
+        "INSERT INTO graph_nodes (vault_id, node_id, node_type, label)
+         VALUES ($vid, $path, 'note', $title)
+         ON DUPLICATE KEY UPDATE label = $title"
     )
-    .bind(&new_path).bind(&title).bind(now / 1000)
-    .execute(&db).await?;
+    .bind(("vid", vault_id.clone()))
+    .bind(("path", new_path.clone()))
+    .bind(("title", title.clone()))
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
 
-    sqlx::query("DELETE FROM links WHERE source_path = ?")
-        .bind(&new_path).execute(&db).await?;
+    db.query("DELETE FROM links WHERE vault_id = $vid AND source_path = $path")
+        .bind(("vid", vault_id.clone()))
+        .bind(("path", new_path.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
     let parsed_links = indexer::parse_links(&content);
     for link in parsed_links {
-        let target_path: Option<String> =
-            sqlx::query_scalar("SELECT path FROM notes WHERE title = ? LIMIT 1")
-                .bind(&link.target_title)
-                .fetch_optional(&db)
-                .await?;
-        sqlx::query(
-            "INSERT OR IGNORE INTO links(source_path, target_title, target_path, link_type, raw_text, alias, heading, line_number)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        #[derive(Deserialize)]
+        struct PathRow { path: String }
+        let mut resp = db
+            .query("SELECT path FROM notes WHERE vault_id = $vid AND title = $title LIMIT 1")
+            .bind(("vid", vault_id.clone()))
+            .bind(("title", link.target_title.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let path_rows: Vec<PathRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+        let target_path: Option<String> = path_rows.into_iter().next().map(|r| r.path);
+
+        db.query(
+            "INSERT INTO links (vault_id, source_path, target_title, target_path, link_type, raw_text, alias, heading, line_number)
+             VALUES ($vid, $sp, $tt, $tp, $lt, $rt, $alias, $heading, $ln)
+             ON DUPLICATE KEY UPDATE source_path = $sp"
         )
-        .bind(&new_path).bind(&link.target_title).bind(&target_path)
-        .bind(link.link_type.as_str()).bind(&link.raw_text)
-        .bind(&link.alias).bind(&link.heading).bind(link.line_number)
-        .execute(&db).await?;
+        .bind(("vid", vault_id.clone()))
+        .bind(("sp", new_path.clone()))
+        .bind(("tt", link.target_title.clone()))
+        .bind(("tp", target_path))
+        .bind(("lt", link.link_type.clone()))
+        .bind(("rt", link.raw_text.clone()))
+        .bind(("alias", link.alias.clone()))
+        .bind(("heading", link.heading.clone()))
+        .bind(("ln", link.line_number))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
     }
 
-    sqlx::query("DELETE FROM trash_items WHERE id = ?")
-        .bind(&id).execute(&db).await?;
+    db.query("DELETE FROM trash_items WHERE vault_id = $vid AND item_id = $id")
+        .bind(("vid", vault_id.clone()))
+        .bind(("id", id.clone()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     Ok(new_path)
 }
@@ -1352,31 +1605,40 @@ pub async fn delete_trash_items(
     ids: Vec<String>,
 ) -> Result<(), AppError> {
     let vault_path = state.get_vault_path().await;
-    let db = state.get_vault_db().await?;
+    let db = state.db.clone();
+    let vault_id = state.get_vault_id().await?;
     let trash_dir = PathBuf::from(&vault_path).join(".trash");
 
     for id in &ids {
-        let trash_filename: Option<String> =
-            sqlx::query_scalar("SELECT trash_filename FROM trash_items WHERE id = ?")
-                .bind(id)
-                .fetch_optional(&db)
-                .await?;
+        #[derive(Deserialize)]
+        struct FilenameRow { trash_filename: String }
+        let mut resp = db
+            .query("SELECT trash_filename FROM trash_items WHERE vault_id = $vid AND item_id = $id LIMIT 1")
+            .bind(("vid", vault_id.clone()))
+            .bind(("id", id.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let rows: Vec<FilenameRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
 
-        if let Some(filename) = trash_filename {
-            let file_path = trash_dir.join(&filename);
+        if let Some(row) = rows.into_iter().next() {
+            let file_path = trash_dir.join(&row.trash_filename);
             if file_path.exists() {
                 let _ = tokio::fs::remove_file(&file_path).await;
             }
         }
-        sqlx::query("DELETE FROM trash_items WHERE id = ?")
-            .bind(id).execute(&db).await?;
+        db.query("DELETE FROM trash_items WHERE vault_id = $vid AND item_id = $id")
+            .bind(("vid", vault_id.clone()))
+            .bind(("id", id.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
     }
 
     Ok(())
 }
 
 async fn scan_dir(
-    db: &SqlitePool,
+    db: &crate::db::surreal::SurrealDb,
+    vault_id: &str,
     vault_root: &str,
     dir: &str,
     count: &mut usize,
@@ -1392,7 +1654,7 @@ async fn scan_dir(
         }
 
         if path.is_dir() {
-            Box::pin(scan_dir(db, vault_root, &path.to_string_lossy(), count)).await?;
+            Box::pin(scan_dir(db, vault_id, vault_root, &path.to_string_lossy(), count)).await?;
         } else if path.extension().map(|e| e == "md").unwrap_or(false) {
             let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
             let rel_path = crate::vault::to_relative_path(vault_root, &path)
@@ -1406,80 +1668,95 @@ async fn scan_dir(
             };
 
             // 檢查是否已存在且 checksum 相同（未變動則跳過）
-            let existing_checksum: Option<String> = sqlx::query_scalar(
-                "SELECT checksum FROM notes WHERE path = ?"
-            )
-            .bind(&rel_path)
-            .fetch_optional(db)
-            .await?;
+            #[derive(Deserialize)]
+            struct ChecksumRow { checksum: String }
+            let mut resp = db
+                .query("SELECT checksum FROM notes WHERE vault_id = $vid AND path = $path LIMIT 1")
+                .bind(("vid", vault_id.to_owned()))
+                .bind(("path", rel_path.clone()))
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            let checksum_rows: Vec<ChecksumRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+            let existing_checksum = checksum_rows.into_iter().next().map(|r| r.checksum);
 
             if existing_checksum.as_deref() == Some(&checksum) {
                 continue;
             }
 
-            let now = chrono::Utc::now().timestamp_millis();
+            let now_ms = chrono::Utc::now().timestamp_millis();
             let word_count = crate::vault::count_words(&content);
+            let now_dt = surrealdb::sql::Datetime::from(
+                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms).unwrap_or_default()
+            );
 
-            sqlx::query(
-                "INSERT INTO notes(path, title, content, word_count, created_at, modified_at, checksum)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(path) DO UPDATE SET
-                   title = excluded.title,
-                   content = excluded.content,
-                   word_count = excluded.word_count,
-                   modified_at = excluded.modified_at,
-                   checksum = excluded.checksum"
+            db.query(
+                "INSERT INTO notes (vault_id, path, title, content, word_count, created_at, modified_at, checksum)
+                 VALUES ($vid, $path, $title, $content, $wc, $now, $now, $cs)
+                 ON DUPLICATE KEY UPDATE
+                   title = $title,
+                   content = $content,
+                   word_count = $wc,
+                   modified_at = $now,
+                   checksum = $cs"
             )
-            .bind(&rel_path)
-            .bind(&title)
-            .bind(&content)
-            .bind(word_count)
-            .bind(now)
-            .bind(now)
-            .bind(&checksum)
-            .execute(db)
-            .await?;
+            .bind(("vid", vault_id.to_owned()))
+            .bind(("path", rel_path.clone()))
+            .bind(("title", title.clone()))
+            .bind(("content", content.clone()))
+            .bind(("wc", word_count))
+            .bind(("now", now_dt))
+            .bind(("cs", checksum.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
             // 更新 graph node
-            sqlx::query(
-                "INSERT OR REPLACE INTO graph_nodes(id, node_type, label, created_at)
-                 VALUES (?, 'note', ?, ?)"
+            db.query(
+                "INSERT INTO graph_nodes (vault_id, node_id, node_type, label)
+                 VALUES ($vid, $path, 'note', $title)
+                 ON DUPLICATE KEY UPDATE label = $title"
             )
-            .bind(&rel_path)
-            .bind(&title)
-            .bind(now / 1000)
-            .execute(db)
-            .await?;
+            .bind(("vid", vault_id.to_owned()))
+            .bind(("path", rel_path.clone()))
+            .bind(("title", title.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
             // 重新解析 links
-            sqlx::query("DELETE FROM links WHERE source_path = ?")
-                .bind(&rel_path)
-                .execute(db)
-                .await?;
+            db.query("DELETE FROM links WHERE vault_id = $vid AND source_path = $path")
+                .bind(("vid", vault_id.to_owned()))
+                .bind(("path", rel_path.clone()))
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
 
             let parsed_links = crate::vault::indexer::parse_links(&content);
             for link in parsed_links {
-                let target_path: Option<String> = sqlx::query_scalar(
-                    "SELECT path FROM notes WHERE title = ? LIMIT 1"
-                )
-                .bind(&link.target_title)
-                .fetch_optional(db)
-                .await?;
+                #[derive(Deserialize)]
+                struct PathRow { path: String }
+                let mut resp = db
+                    .query("SELECT path FROM notes WHERE vault_id = $vid AND title = $title LIMIT 1")
+                    .bind(("vid", vault_id.to_owned()))
+                    .bind(("title", link.target_title.clone()))
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                let path_rows: Vec<PathRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+                let target_path: Option<String> = path_rows.into_iter().next().map(|r| r.path);
 
-                sqlx::query(
-                    "INSERT OR IGNORE INTO links(source_path, target_title, target_path, link_type, raw_text, alias, heading, line_number)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                db.query(
+                    "INSERT INTO links (vault_id, source_path, target_title, target_path, link_type, raw_text, alias, heading, line_number)
+                     VALUES ($vid, $sp, $tt, $tp, $lt, $rt, $alias, $heading, $ln)
+                     ON DUPLICATE KEY UPDATE source_path = $sp"
                 )
-                .bind(&rel_path)
-                .bind(&link.target_title)
-                .bind(&target_path)
-                .bind(&link.link_type)
-                .bind(&link.raw_text)
-                .bind(&link.alias)
-                .bind(&link.heading)
-                .bind(link.line_number)
-                .execute(db)
-                .await?;
+                .bind(("vid", vault_id.to_owned()))
+                .bind(("sp", rel_path.clone()))
+                .bind(("tt", link.target_title.clone()))
+                .bind(("tp", target_path))
+                .bind(("lt", link.link_type.clone()))
+                .bind(("rt", link.raw_text.clone()))
+                .bind(("alias", link.alias.clone()))
+                .bind(("heading", link.heading.clone()))
+                .bind(("ln", link.line_number))
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
             }
 
             *count += 1;
@@ -1493,9 +1770,9 @@ async fn scan_dir(
 pub async fn reindex_vault_chunks(
     state: State<'_, AppState>,
 ) -> Result<usize, AppError> {
-    let db = state.get_vault_db().await?;
-    let count = chunker::reindex_all(&db).await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+    let db = state.db.clone();
+    let vault_id = state.get_vault_id().await?;
+    let count = chunker::reindex_all(&db, &vault_id).await?;
     Ok(count)
 }
 
@@ -1506,26 +1783,33 @@ pub async fn search_vault_chunks(
     query: String,
 ) -> Result<String, AppError> {
     use std::collections::{HashMap, HashSet};
-    use sqlx::Row;
 
     if query.trim().is_empty() {
         return Ok(String::new());
     }
-    let db = state.get_vault_db().await?;
+    let db = state.db.clone();
+    let vault_id = state.get_vault_id().await?;
 
-    // 1. FTS search on chunks
-    let chunk_rows = sqlx::query(
-        "SELECT c.file_path, c.section, c.content
-         FROM chunks_fts f
-         JOIN chunks c ON c.rowid = f.rowid
-         WHERE chunks_fts MATCH ?1
-         ORDER BY bm25(chunks_fts)
-         LIMIT 10",
-    )
-    .bind(query.trim())
-    .fetch_all(&db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    // 1. FTS search on chunks using SurrealDB BM25
+    #[derive(Deserialize)]
+    struct ChunkRow {
+        file_path: String,
+        section: String,
+        content: String,
+    }
+
+    let mut resp = db
+        .query(
+            "SELECT file_path, section, content FROM chunks
+             WHERE vault_id = $vid AND content @@ $query
+             ORDER BY search::score(1) DESC
+             LIMIT 10"
+        )
+        .bind(("vid", vault_id.clone()))
+        .bind(("query", query.trim().to_owned()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let chunk_rows: Vec<ChunkRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
 
     if chunk_rows.is_empty() {
         return Ok(String::new());
@@ -1534,58 +1818,82 @@ pub async fn search_vault_chunks(
     // 2. Collect matched file paths
     let matched_paths: HashSet<String> = chunk_rows
         .iter()
-        .map(|r| r.get::<String, _>("file_path"))
+        .map(|r| r.file_path.clone())
         .collect();
 
     // 3. Fetch titles
+    #[derive(Deserialize)]
+    struct TitleRow { path: String, title: String }
     let mut titles: HashMap<String, String> = HashMap::new();
     for path in &matched_paths {
-        let title: Option<String> = sqlx::query_scalar("SELECT title FROM notes WHERE path = ?")
-            .bind(path)
-            .fetch_optional(&db)
+        let mut resp = db
+            .query("SELECT path, title FROM notes WHERE vault_id = $vid AND path = $path LIMIT 1")
+            .bind(("vid", vault_id.clone()))
+            .bind(("path", path.clone()))
             .await
-            .unwrap_or(None);
-        if let Some(t) = title { titles.insert(path.clone(), t); }
+            .unwrap_or_else(|_| unreachable!());
+        let rows: Vec<TitleRow> = resp.take(0).unwrap_or_default();
+        if let Some(r) = rows.into_iter().next() {
+            titles.insert(r.path, r.title);
+        }
     }
 
     // 4. Graph expansion (1-hop)
+    #[derive(Deserialize)]
+    struct TargetPathRow { target_path: String }
+    #[derive(Deserialize)]
+    struct SourcePathRow { source_path: String }
     let mut expanded: HashSet<String> = HashSet::new();
     for path in &matched_paths {
-        let out: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT target_path FROM links
-             WHERE source_path = ? AND target_path IS NOT NULL AND link_type = 'wikilink'",
-        )
-        .bind(path).fetch_all(&db).await.unwrap_or_default();
+        let mut resp = db
+            .query("SELECT target_path FROM links WHERE vault_id = $vid AND source_path = $path AND target_path != NONE AND link_type = 'wikilink'")
+            .bind(("vid", vault_id.clone()))
+            .bind(("path", path.clone()))
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let out_rows: Vec<TargetPathRow> = resp.take(0).unwrap_or_default();
 
-        let inc: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT source_path FROM links WHERE target_path = ? AND link_type = 'wikilink'",
-        )
-        .bind(path).fetch_all(&db).await.unwrap_or_default();
+        let mut resp2 = db
+            .query("SELECT source_path FROM links WHERE vault_id = $vid AND target_path = $path AND link_type = 'wikilink'")
+            .bind(("vid", vault_id.clone()))
+            .bind(("path", path.clone()))
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let in_rows: Vec<SourcePathRow> = resp2.take(0).unwrap_or_default();
 
-        for p in out.into_iter().chain(inc) {
-            if !matched_paths.contains(&p) {
-                expanded.insert(p);
+        for r in out_rows {
+            if !matched_paths.contains(&r.target_path) {
+                expanded.insert(r.target_path);
+            }
+        }
+        for r in in_rows {
+            if !matched_paths.contains(&r.source_path) {
+                expanded.insert(r.source_path);
             }
         }
     }
 
     // Fetch expanded titles
     for path in &expanded {
-        let title: Option<String> = sqlx::query_scalar("SELECT title FROM notes WHERE path = ?")
-            .bind(path).fetch_optional(&db).await.unwrap_or(None);
-        if let Some(t) = title { titles.insert(path.clone(), t); }
+        let mut resp = db
+            .query("SELECT path, title FROM notes WHERE vault_id = $vid AND path = $path LIMIT 1")
+            .bind(("vid", vault_id.clone()))
+            .bind(("path", path.clone()))
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let rows: Vec<TitleRow> = resp.take(0).unwrap_or_default();
+        if let Some(r) = rows.into_iter().next() {
+            titles.insert(r.path, r.title);
+        }
     }
 
     // 5. Build response string
     let mut lines = vec![format!("找到 {} 個相關段落：", chunk_rows.len())];
     for row in &chunk_rows {
-        let path: String    = row.get("file_path");
-        let section: String = row.get("section");
-        let content: String = row.get("content");
-        let title = titles.get(&path).cloned().unwrap_or_else(|| path.clone());
-        let snippet: String = content.chars().take(200).collect();
-        let section_label = if section.is_empty() { String::new() } else { format!(" § {}", section) };
-        lines.push(format!("- **{}{}** ({})\n  {}…", title, section_label, path, snippet.trim()));
+        let title = titles.get(&row.file_path).cloned().unwrap_or_else(|| row.file_path.clone());
+        let snippet: String = row.content.chars().take(200).collect();
+        let section_label = if row.section.is_empty() { String::new() } else { format!(" § {}", row.section) };
+        lines.push(format!("- **{}{}** ({})\n  {}…", title, section_label, row.file_path, snippet.trim()));
     }
     if !expanded.is_empty() {
         lines.push("\n📎 相關連結筆記（透過 wikilink 擴展）：".to_string());

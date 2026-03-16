@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::Value;
-use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 
@@ -16,6 +15,7 @@ use crate::commands::ai::{
     resolve_vault_path, tool_create_folder, tool_create_note, tool_list_structure,
     tool_read_note, tool_search_vault, tool_update_note,
 };
+use crate::db::surreal::SurrealDb;
 use crate::runtime::memory_agent::{add_memory_rule_to_db, tool_query_memory};
 use crate::runtime::tool_registry::ToolRegistry;
 use crate::runtime::types::Tool;
@@ -24,11 +24,13 @@ use crate::runtime::types::Tool;
 ///
 /// # 參數
 /// - `vault_path`: Vault 根目錄絕對路徑
-/// - `vault_db`:   Vault SQLite 連線池（search / memory 工具使用）
+/// - `vault_id`:   Vault ID（= vault_path，SurrealDB 過濾條件）
+/// - `vault_db`:   SurrealDB 連線（search / memory 工具使用）
 /// - `app`:        Tauri AppHandle（search 工具 emit debug 事件使用）
 pub fn build_vault_registry(
     vault_path: String,
-    vault_db: SqlitePool,
+    vault_db: SurrealDb,
+    vault_id: String,
     app: AppHandle,
 ) -> Arc<ToolRegistry> {
     let mut registry = ToolRegistry::new();
@@ -71,6 +73,7 @@ pub fn build_vault_registry(
     {
         let vp = vault_path.clone();
         let db = vault_db.clone();
+        let vid = vault_id.clone();
         let app = app.clone();
         registry.register(
             "search_vault".into(),
@@ -78,9 +81,10 @@ pub fn build_vault_registry(
                 execute: Arc::new(move |args: Value| {
                     let query = args["query"].as_str().unwrap_or("").to_string();
                     let db = db.clone();
+                    let vid = vid.clone();
                     let app = app.clone();
                     Box::pin(async move {
-                        Ok(Value::String(tool_search_vault(&query, &db, &app).await))
+                        Ok(Value::String(tool_search_vault(&query, &db, &vid, &app).await))
                     })
                 }),
                 rollback: None,
@@ -91,6 +95,7 @@ pub fn build_vault_registry(
     // query_memory
     {
         let db = vault_db.clone();
+        let vid = vault_id.clone();
         registry.register(
             "query_memory".into(),
             Tool {
@@ -106,8 +111,9 @@ pub fn build_vault_registry(
                     let since = args["since"].as_str().map(String::from);
                     let limit = args["limit"].as_u64().map(|v| v as usize);
                     let db = db.clone();
+                    let vid = vid.clone();
                     Box::pin(async move {
-                        Ok(Value::String(tool_query_memory(keywords, since, limit, &db).await))
+                        Ok(Value::String(tool_query_memory(keywords, since, limit, &db, &vid).await))
                     })
                 }),
                 rollback: None,
@@ -236,6 +242,7 @@ pub fn build_vault_registry(
     // add_memory_rule — 讓 LLM 學習新的時間表達式規則（冪等，rollback 不需要）
     {
         let db = vault_db.clone();
+        let vid = vault_id.clone();
         registry.register(
             "add_memory_rule".into(),
             Tool {
@@ -244,8 +251,9 @@ pub fn build_vault_registry(
                     let pattern = args["pattern"].as_str().unwrap_or("").to_string();
                     let value   = args["value"].as_str().unwrap_or("").to_string();
                     let db = db.clone();
+                    let vid = vid.clone();
                     Box::pin(async move {
-                        Ok(Value::String(add_memory_rule_to_db(&db, &ptype, &pattern, &value).await))
+                        Ok(Value::String(add_memory_rule_to_db(&db, &vid, &ptype, &pattern, &value).await))
                     })
                 }),
                 rollback: None,

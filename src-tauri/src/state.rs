@@ -1,16 +1,15 @@
-use sqlx::SqlitePool;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
+use crate::db::surreal::SurrealDb;
 use crate::error::AppError;
 
 #[derive(Clone)]
 pub struct AppState {
-    /// 帳號層級設定 DB（app_data_dir/settings.db）
-    pub settings_db: SqlitePool,
-    /// 目前 Vault 的資料 DB（vault_path/.notetreelm.db）；未設定 vault 時為 None
-    vault_db: Arc<RwLock<Option<SqlitePool>>>,
+    /// 單一 SurrealDB 實例（embedded SurrealKV），取代原本的 settings_db + vault_db
+    pub db: SurrealDb,
+    /// 目前 Vault 的路徑（同時作為 vault_id 使用）
     pub vault_path: Arc<RwLock<String>>,
     /// 持有 llama-server 子進程；App 結束時 kill
     pub llama_server: Arc<Mutex<Option<tokio::process::Child>>>,
@@ -43,10 +42,9 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(settings_db: SqlitePool) -> Self {
+    pub fn new(db: SurrealDb) -> Self {
         Self {
-            settings_db,
-            vault_db: Arc::new(RwLock::new(None)),
+            db,
             vault_path: Arc::new(RwLock::new(String::new())),
             llama_server: Arc::new(Mutex::new(None)),
             whisper_server: Arc::new(Mutex::new(None)),
@@ -73,17 +71,13 @@ impl AppState {
         *self.vault_path.write().await = path;
     }
 
-    /// 取得 vault DB pool；Vault 未設定時回傳錯誤
-    pub async fn get_vault_db(&self) -> Result<SqlitePool, AppError> {
-        self.vault_db
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| AppError::Vault("尚未設定 Vault 路徑".to_string()))
-    }
-
-    /// 設定（或清除）vault DB pool
-    pub async fn set_vault_db(&self, pool: Option<SqlitePool>) {
-        *self.vault_db.write().await = pool;
+    /// 取得目前 vault 的 ID（使用 vault_path）；Vault 未設定時回傳錯誤
+    pub async fn get_vault_id(&self) -> Result<String, AppError> {
+        let path = self.vault_path.read().await.clone();
+        if path.is_empty() {
+            Err(AppError::Vault("尚未設定 Vault 路徑".to_string()))
+        } else {
+            Ok(path)
+        }
     }
 }
