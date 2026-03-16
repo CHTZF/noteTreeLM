@@ -4,6 +4,7 @@ pub mod conversation;
 pub mod download;
 pub mod graph;
 pub mod import;
+pub mod knowledge_import;
 pub mod search;
 pub mod settings;
 pub mod vault;

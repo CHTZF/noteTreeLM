@@ -3,7 +3,7 @@ import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
 import { open as openPath } from '@tauri-apps/plugin-shell'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
-import { faGear, faBolt, faChevronLeft, faChevronRight, faSitemap, faFolderTree, faMagnifyingGlass, faBug, faComments, faMicrophone, faArrowRightArrowLeft, faTrash, faArrowRightFromBracket, faCircleQuestion, faUser } from '@fortawesome/free-solid-svg-icons'
+import { faGear, faBolt, faChevronLeft, faChevronRight, faSitemap, faFolderTree, faMagnifyingGlass, faBug, faComments, faMicrophone, faArrowRightArrowLeft, faTrash, faArrowRightFromBracket, faCircleQuestion, faUser, faFileImport } from '@fortawesome/free-solid-svg-icons'
 import { useSettingsStore } from './stores/settingsStore'
 import { useVaultStore } from './stores/vaultStore'
 import { useGraphStore } from './stores/graphStore'
@@ -26,6 +26,7 @@ import QuickOpen from './components/QuickOpen/QuickOpen'
 import SettingsModal from './components/Settings/SettingsModal'
 import { AgentToolContent } from './components/AgentTools/AgentToolPanel'
 import TrashPanel from './components/Trash/TrashPanel'
+import ImportPanel from './components/ImportCenter/ImportPanel'
 import HelpPanel from './components/Help/HelpPanel'
 import Editor from './components/Editor/Editor'
 import FileTree from './components/FileTree/FileTree'
@@ -45,6 +46,7 @@ const SETTINGS_TAB = '__settings__'
 const SYSTEM_SETTINGS_TAB = '__system_settings__'
 const HELP_TAB = '__help__'
 const TRASH_TAB = '__trash__'
+const IMPORT_TAB = '__import__'
 
 // ─── Pane tree types ───────────────────────────────────────────────────────
 interface PaneLeaf {
@@ -897,6 +899,11 @@ function AppMain() {
         <TrashPanel inline />
       </div>
     )
+    if (activePath === IMPORT_TAB) return (
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        <ImportPanel onOpenNote={openNote} />
+      </div>
+    )
     if (!/\.(md|markdown|mdx)$/i.test(activePath)) return <FileViewer path={activePath} />
     if (isFocused) return (
       <Editor
@@ -1120,6 +1127,12 @@ function AppMain() {
               onClick={() => openNote(AGENT_TOOLS_TAB)}
             ><FontAwesomeIcon icon={faBolt} /></button>
           )}
+
+          <button
+            className={`icon-menubar-btn${currentPath === IMPORT_TAB ? ' active' : ''}`}
+            title="知識匯入"
+            onClick={() => openNote(IMPORT_TAB)}
+          ><FontAwesomeIcon icon={faFileImport} /></button>
 
           {settings.enable_chat && <>
             <button

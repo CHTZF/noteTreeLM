@@ -17,6 +17,8 @@ use commands::{
     conversation::{create_conversation, list_conversations, get_conversation,
                    delete_conversation, update_conversation_title},
     download::*, graph::*, import::*, search::*,
+    knowledge_import::{create_import_session, list_import_sessions, delete_import_session,
+                       fetch_site_outline, import_page, check_page_updates, get_session_pages},
     settings::{get_settings, save_personal_settings, get_system_settings, save_system_settings, get_api_key, set_api_key,
                get_vault_last_note, set_vault_last_note, check_vcredist,
                get_last_chat_conversation_id, set_last_chat_conversation_id},
@@ -172,6 +174,14 @@ pub fn run() {
             get_graph,
             // Import
             import_url,
+            // Knowledge Import
+            create_import_session,
+            list_import_sessions,
+            delete_import_session,
+            fetch_site_outline,
+            import_page,
+            check_page_updates,
+            get_session_pages,
             // Voice
             transcribe_audio,
             stop_whisper_server,
