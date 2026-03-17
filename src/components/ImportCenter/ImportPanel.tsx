@@ -1179,18 +1179,44 @@ interface KBStats {
   daily_trend: Array<{ date: string; total: number; verified: number }>
 }
 
+interface AgingNote {
+  file_path: string
+  title: string
+  days_since_review: number
+  reviewed_at: number | null
+}
+
 function KBDashboard() {
   const [stats, setStats] = useState<KBStats | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [aging, setAging] = useState<AgingNote[]>([])
+  const [markingPath, setMarkingPath] = useState<string | null>(null)
 
-  useEffect(() => {
+  const loadStats = () => {
     setLoading(true)
-    invoke<KBStats>('get_kb_stats')
-      .then(s => { setStats(s); setError(null) })
+    Promise.all([
+      invoke<KBStats>('get_kb_stats'),
+      invoke<AgingNote[]>('get_aging_notes', { thresholdDays: 30 }),
+    ])
+      .then(([s, a]) => { setStats(s); setAging(a); setError(null) })
       .catch(e => setError(fmtError(e)))
       .finally(() => setLoading(false))
-  }, [])
+  }
+
+  useEffect(() => { loadStats() }, [])
+
+  const handleMarkReviewed = async (path: string) => {
+    setMarkingPath(path)
+    try {
+      await invoke('mark_note_reviewed', { path })
+      setAging(prev => prev.filter(n => n.file_path !== path))
+    } catch (e) {
+      toast.error(`標記失敗：${fmtError(e)}`)
+    } finally {
+      setMarkingPath(null)
+    }
+  }
 
   if (loading) return (
     <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--color-text-muted)', fontSize: 13 }}>
@@ -1311,6 +1337,58 @@ function KBDashboard() {
             <div style={{ width: 10, height: 6, background: 'var(--color-success)', borderRadius: 1 }} /> 已驗證
           </div>
         </div>
+      </div>
+
+      {/* Aging notes reminder */}
+      <div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-text-secondary)', display: 'flex', alignItems: 'center', gap: 6 }}>
+            ⏰ 待審查筆記
+            {aging.length > 0 && (
+              <span style={{ fontSize: 10, background: 'var(--color-warning, #e5a50a)', color: '#fff', borderRadius: 10, padding: '1px 6px', fontWeight: 700 }}>
+                {aging.length}
+              </span>
+            )}
+          </div>
+          <span style={{ fontSize: 10, color: 'var(--color-text-muted)' }}>超過 30 天未審查的已驗證筆記</span>
+        </div>
+        {aging.length === 0 ? (
+          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', padding: '8px 0' }}>所有驗證筆記均已及時審查 ✓</div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+            {aging.slice(0, 8).map(note => (
+              <div key={note.file_path} style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                background: 'var(--color-bg-elevated)', borderRadius: 6,
+                padding: '6px 10px', border: '1px solid var(--color-border)',
+              }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 12, color: 'var(--color-text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {note.title}
+                  </div>
+                  <div style={{ fontSize: 10, color: 'var(--color-warning, #e5a50a)' }}>
+                    {note.days_since_review} 天前驗證
+                  </div>
+                </div>
+                <button
+                  disabled={markingPath === note.file_path}
+                  onClick={() => handleMarkReviewed(note.file_path)}
+                  style={{ ...iconBtn, fontSize: 11, padding: '2px 8px', color: 'var(--color-success)', flexShrink: 0 }}
+                  title="標記為已審查"
+                >
+                  {markingPath === note.file_path
+                    ? <FontAwesomeIcon icon={faSpinner} spin />
+                    : '✓ 已審查'}
+                </button>
+              </div>
+            ))}
+            {aging.length > 8 && (
+              <div style={{ fontSize: 11, color: 'var(--color-text-muted)', textAlign: 'center' }}>
+                另有 {aging.length - 8} 筆…
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   )

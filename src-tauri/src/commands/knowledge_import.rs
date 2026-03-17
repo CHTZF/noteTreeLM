@@ -1917,3 +1917,93 @@ pub async fn get_kb_stats(state: State<'_, AppState>) -> Result<KBStats, AppErro
         daily_trend,
     })
 }
+
+// ── Knowledge Aging ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct AgingNote {
+    pub file_path: String,
+    pub title: String,
+    pub days_since_review: i64,
+    pub reviewed_at: Option<i64>,
+}
+
+/// 回傳已驗證但超過 threshold_days 天未審查的筆記列表。
+#[tauri::command]
+pub async fn get_aging_notes(
+    state: State<'_, AppState>,
+    threshold_days: Option<i64>,
+) -> Result<Vec<AgingNote>, AppError> {
+    let vault_id = state.get_vault_id().await?;
+    let db = &state.db;
+    let days = threshold_days.unwrap_or(30);
+
+    use chrono::Local;
+    let now_ms = Local::now().timestamp_millis();
+    let cutoff_ms = now_ms - days * 24 * 60 * 60 * 1000;
+
+    #[derive(serde::Deserialize)]
+    struct ChunkAging {
+        file_path: String,
+        updated_at: i64,
+        reviewed_at: Option<i64>,
+    }
+
+    let mut r = db.query(
+        "SELECT file_path, updated_at, reviewed_at FROM chunks \
+         WHERE vault_id = $vid AND status = 'verified' \
+         GROUP BY file_path, updated_at, reviewed_at"
+    ).bind(("vid", vault_id.clone()))
+    .await.map_err(|e| AppError::Database(e.to_string()))?;
+    let rows: Vec<ChunkAging> = r.take(0).unwrap_or_default();
+
+    // Deduplicate per file_path; use reviewed_at if set, else updated_at
+    use std::collections::HashMap;
+    let mut note_map: HashMap<String, ChunkAging> = HashMap::new();
+    for row in rows {
+        note_map.entry(row.file_path.clone()).or_insert(row);
+    }
+
+    let mut aging: Vec<AgingNote> = note_map.into_values()
+        .filter_map(|row| {
+            let effective_ts = row.reviewed_at.unwrap_or(row.updated_at);
+            if effective_ts <= cutoff_ms {
+                let days_since = (now_ms - effective_ts) / (24 * 60 * 60 * 1000);
+                let title = row.file_path
+                    .split('/').last().unwrap_or("")
+                    .trim_end_matches(".md")
+                    .to_string();
+                Some(AgingNote {
+                    file_path: row.file_path,
+                    title,
+                    days_since_review: days_since,
+                    reviewed_at: row.reviewed_at,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    aging.sort_by(|a, b| b.days_since_review.cmp(&a.days_since_review));
+    Ok(aging)
+}
+
+/// 標記筆記為「已審查」（更新 reviewed_at）
+#[tauri::command]
+pub async fn mark_note_reviewed(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<(), AppError> {
+    let vault_id = state.get_vault_id().await?;
+    use chrono::Local;
+    let now_ms = Local::now().timestamp_millis();
+    state.db.query(
+        "UPDATE chunks SET reviewed_at = $ts WHERE vault_id = $vid AND file_path = $fp"
+    )
+    .bind(("ts", now_ms))
+    .bind(("vid", vault_id))
+    .bind(("fp", path))
+    .await.map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}

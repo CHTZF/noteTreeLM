@@ -2451,8 +2451,6 @@ pub async fn set_note_status(
     .bind(("path", path.clone()))
     .await;
     // Re-upsert chunks（確保 chunks 存在，並帶正確 status）
-    // update_chunks_status 只更新已存在的 chunks；若 chunk 從未建立過則無效。
-    // 改用 upsert_chunks 確保 chunks 一定存在，再由 parse_frontmatter_status 讀取 status。
     {
         let now_ms = chrono::Local::now().timestamp_millis();
         let chunks = crate::vault::chunker::chunk_note(&path, &new_content, now_ms);
@@ -2461,6 +2459,17 @@ pub async fn set_note_status(
             port.map(|p| format!("http://127.0.0.1:{}", p))
         };
         let _ = crate::vault::chunker::upsert_chunks(&state.db, &vault_id, &chunks, emb_url.as_deref()).await;
+    }
+    // 若設為 verified，記錄 reviewed_at 時間戳
+    if status == "verified" {
+        let now_ms = chrono::Local::now().timestamp_millis();
+        let _ = state.db.query(
+            "UPDATE chunks SET reviewed_at = $ts WHERE vault_id = $vid AND file_path = $fp"
+        )
+        .bind(("ts", now_ms))
+        .bind(("vid", vault_id))
+        .bind(("fp", path))
+        .await;
     }
     Ok(())
 }
