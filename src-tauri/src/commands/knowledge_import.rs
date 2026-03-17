@@ -1215,6 +1215,16 @@ async fn run_knowledge_query(
     let _ = app.emit("knowledge:refs", serde_json::json!({ "query_id": query_id, "refs": refs }));
 
     // 4. Build RAG context
+    let is_cross_note = {
+        let q = question.to_lowercase();
+        q.contains("比較") || q.contains("對比") || q.contains("異同") || q.contains("差異")
+        || q.contains("總結") || q.contains("綜合") || q.contains("差別") || q.contains("共同")
+        || q.contains("相同") || q.contains("不同") || q.contains("compare") || q.contains("synthesize")
+    };
+    if is_cross_note {
+        let _ = app.emit("knowledge:cross_note", serde_json::json!({ "query_id": query_id }));
+    }
+
     let context = notes.iter().enumerate().map(|(i, n)| {
         let body = if n.content.starts_with("---") {
             n.content.splitn(4, "---").nth(2).unwrap_or(&n.content).trim_start().to_string()
@@ -1225,12 +1235,22 @@ async fn run_knowledge_query(
         format!("[{}] 標題：{}\n{}", i + 1, n.title, excerpt)
     }).collect::<Vec<_>>().join("\n\n---\n\n");
 
-    let system = format!(
-        "你是知識庫問答助手。根據以下筆記回答使用者問題。\
-        如有引用，以 [1][2] 格式標示來源編號。\
-        若筆記內容不足，誠實說明。用繁體中文回答。\n\n筆記：\n\n{}",
-        context
-    );
+    let system = if is_cross_note {
+        format!(
+            "你是知識庫跨筆記推理助手。根據以下多篇筆記進行比較、對比或綜合分析。\
+            如有引用，以 [1][2] 格式標示來源編號。\
+            若有多個來源可以比較，請用結構化方式（如對比清單）呈現。\
+            若筆記內容不足，誠實說明。用繁體中文回答。\n\n筆記：\n\n{}",
+            context
+        )
+    } else {
+        format!(
+            "你是知識庫問答助手。根據以下筆記回答使用者問題。\
+            如有引用，以 [1][2] 格式標示來源編號。\
+            若筆記內容不足，誠實說明。用繁體中文回答。\n\n筆記：\n\n{}",
+            context
+        )
+    };
 
     // 5. Read AI provider config
     let provider = queries::get_setting(db, "ai_provider")
@@ -1698,7 +1718,19 @@ async fn run_kb_query(
 
     let _ = app.emit("knowledge:refs", serde_json::json!({ "query_id": query_id, "refs": refs }));
 
-    // 3. STRICT system prompt
+    // 3. STRICT system prompt（依題型選擇一般問答或跨筆記推理）
+    let is_cross_note = {
+        let q = question.to_lowercase();
+        q.contains("比較") || q.contains("對比") || q.contains("異同") || q.contains("差異")
+        || q.contains("總結") || q.contains("綜合") || q.contains("差別") || q.contains("共同")
+        || q.contains("相同") || q.contains("不同") || q.contains("compare") || q.contains("synthesize")
+    };
+
+    // Emit a hint so UI can show cross-note mode indicator
+    if is_cross_note {
+        let _ = app.emit("knowledge:cross_note", serde_json::json!({ "query_id": query_id }));
+    }
+
     let context = chunks.iter().enumerate().map(|(i, c)| {
         let loc = if c.section.is_empty() {
             c.file_path.clone()
@@ -1709,15 +1741,28 @@ async fn run_kb_query(
         format!("[{}] 來源：{}\n{}", i + 1, loc, excerpt)
     }).collect::<Vec<_>>().join("\n\n---\n\n");
 
-    let system = format!(
-        "你是嚴格的知識庫問答助手。\
-        規則：\
-        1. 只能根據以下「知識庫片段」回答，禁止使用訓練資料中的知識。\
-        2. 每個陳述必須以 [1]、[2] 等格式標示來源編號。\
-        3. 若知識庫片段中找不到答案，必須明確說「知識庫中沒有此資訊」，不得猜測或補充。\
-        4. 用繁體中文回答。\n\n知識庫片段：\n\n{}",
-        context
-    );
+    let system = if is_cross_note {
+        format!(
+            "你是知識庫跨筆記推理助手。\
+            規則：\
+            1. 根據以下多個「知識庫片段」進行比較、對比或綜合分析。\
+            2. 每個陳述必須以 [1]、[2] 等格式標示來源編號。\
+            3. 若有多個來源可以比較，請用結構化方式（如表格或對比清單）呈現。\
+            4. 若知識庫片段中找不到足夠資訊，必須明確說明。\
+            5. 用繁體中文回答。\n\n知識庫片段：\n\n{}",
+            context
+        )
+    } else {
+        format!(
+            "你是嚴格的知識庫問答助手。\
+            規則：\
+            1. 只能根據以下「知識庫片段」回答，禁止使用訓練資料中的知識。\
+            2. 每個陳述必須以 [1]、[2] 等格式標示來源編號。\
+            3. 若知識庫片段中找不到答案，必須明確說「知識庫中沒有此資訊」，不得猜測或補充。\
+            4. 用繁體中文回答。\n\n知識庫片段：\n\n{}",
+            context
+        )
+    };
 
     // 4. AI streaming
     let provider = queries::get_setting(db, "ai_provider").await.unwrap_or_default().unwrap_or_default();

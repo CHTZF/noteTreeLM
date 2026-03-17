@@ -12,6 +12,7 @@ export interface KBMessage {
   content: string
   refs?: KnowledgeRef[]
   isStreaming?: boolean
+  isCrossNote?: boolean
   error?: string
 }
 

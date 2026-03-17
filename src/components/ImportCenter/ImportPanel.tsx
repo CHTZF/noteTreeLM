@@ -246,6 +246,15 @@ export default function ImportPanel({ onOpenNote }: Props) {
       pendingRefsRef.current = e.payload.refs
     })
 
+    const unCrossNote = await listen<{ query_id: string }>('knowledge:cross_note', e => {
+      if (e.payload.query_id !== queryId) return
+      setMessages(prev => {
+        const last = prev[prev.length - 1]
+        if (!last || last.role !== 'assistant') return prev
+        return [...prev.slice(0, -1), { ...last, isCrossNote: true }]
+      })
+    })
+
     let unDone: (() => void) | null = null
     unDone = await listen<{ query_id: string; error?: string }>('knowledge:done', e => {
       if (e.payload.query_id !== queryId) return
@@ -262,7 +271,7 @@ export default function ImportPanel({ onOpenNote }: Props) {
         return updated
       })
       setIsQuerying(false)
-      unToken(); unRefs(); unDone?.()
+      unToken(); unRefs(); unCrossNote(); unDone?.()
     })
 
     try {
@@ -636,6 +645,13 @@ function MessageBubble({ message, onOpenNote }: { message: KBMessage; onOpenNote
           </div>
         )}
       </div>
+
+      {/* Cross-note indicator */}
+      {message.isCrossNote && (
+        <div style={{ fontSize: 10, color: 'var(--color-accent)', display: 'flex', alignItems: 'center', gap: 4 }}>
+          <span>🔗</span> 跨筆記推理模式
+        </div>
+      )}
 
       {/* Refs */}
       {message.refs && message.refs.length > 0 && (
