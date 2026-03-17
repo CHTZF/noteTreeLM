@@ -459,7 +459,7 @@ function AppMain() {
 
   // ─── Open a note in the focused pane ──────────────────────────────────
   // Chat/LiveChat tabs should never be replaced by content navigation
-  const isChatTab = (p: string) => p === CHAT_TAB || p === LIVE_CHAT_TAB
+  const isChatTab = (p: string) => p === CHAT_TAB || p === LIVE_CHAT_TAB || p === IMPORT_TAB
 
   // Find a pane that is NOT showing a Chat/LiveChat tab as its active tab,
   // excluding the given leafId. Returns undefined if none exists.
@@ -493,7 +493,7 @@ function AppMain() {
         }
         setFocusedPaneId(other.id)
       } else {
-        // Only chat pane exists — split it, open note in new pane
+        // No non-chat pane — split to create a new pane for the note
         const newLeafId = crypto.randomUUID()
         const tabId = crypto.randomUUID()
         const newLeaf: PaneLeaf = { kind: 'leaf', id: newLeafId, tabs: [{ id: tabId, path }], activeTabId: tabId }
@@ -546,6 +546,7 @@ function AppMain() {
         }
         setFocusedPaneId(other.id)
       } else {
+        // No non-chat pane — split to create a new pane for the note
         const newLeafId = crypto.randomUUID()
         const tabId = crypto.randomUUID()
         const newLeaf: PaneLeaf = { kind: 'leaf', id: newLeafId, tabs: [{ id: tabId, path }], activeTabId: tabId }
@@ -590,10 +591,11 @@ function AppMain() {
 
     const root = paneRootRef.current
     const focusedId = focusedPaneIdRef.current
-    const otherLeaf = getAllLeaves(root).find(l => l.id !== focusedId)
+    // Use findNonChatPane so we never overwrite a Chat/LiveChat/Import pane's content
+    const otherLeaf = findNonChatPane(root, focusedId)
 
     if (otherLeaf) {
-      // Re-use existing non-focused pane
+      // Re-use existing non-chat, non-focused pane
       const existing = otherLeaf.tabs.find(t => t.path === path)
       if (existing) {
         setPaneRoot(prev => mapLeaf(prev, otherLeaf.id, l => ({ ...l, activeTabId: existing.id })))
@@ -604,17 +606,17 @@ function AppMain() {
         })))
       }
     } else {
-      // Only one pane — split it and open note in the new pane
+      // No non-chat pane — split to create a new pane for the note
       const newLeafId = crypto.randomUUID()
       const tabId = crypto.randomUUID()
       const newLeaf: PaneLeaf = { kind: 'leaf', id: newLeafId, tabs: [{ id: tabId, path }], activeTabId: tabId }
       setPaneRoot(prev => splitLeaf(prev, focusedId, 'h', newLeaf))
-      // focusedPaneId intentionally unchanged — user stays in the current pane
+      // focusedPaneId intentionally unchanged — user stays in the chat/import pane
     }
 
     // Set anchor AFTER pane update so Editor picks it up when content loads
     useEditorStore.getState().setPendingAnchor(anchor)
-  }, [])
+  }, [findNonChatPane])
 
   // ─── Update active tab path in focused pane (back/forward nav) ─────────
   const setActiveTabPath = useCallback((path: string) => {
@@ -899,11 +901,6 @@ function AppMain() {
         <TrashPanel inline />
       </div>
     )
-    if (activePath === IMPORT_TAB) return (
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-        <ImportPanel onOpenNote={openNote} />
-      </div>
-    )
     if (!/\.(md|markdown|mdx)$/i.test(activePath)) return <FileViewer path={activePath} />
     if (isFocused) return (
       <Editor
@@ -1004,8 +1001,8 @@ function AppMain() {
             }
           }}
         >
-          {/* Always-mounted Chat / LiveChat panels — hidden with display:none when not active */}
-          {leaf.tabs.filter(t => t.path === CHAT_TAB || t.path === LIVE_CHAT_TAB).map(t => (
+          {/* Always-mounted Chat / LiveChat / Import panels — hidden with display:none when not active */}
+          {leaf.tabs.filter(t => t.path === CHAT_TAB || t.path === LIVE_CHAT_TAB || t.path === IMPORT_TAB).map(t => (
             <div key={t.id} style={{
               display: t.id === leaf.activeTabId ? 'flex' : 'none',
               flex: 1, flexDirection: 'column', height: '100%', overflow: 'hidden',
@@ -1023,10 +1020,13 @@ function AppMain() {
                   onActiveChange={active => { chatActiveRef.current.set(t.id, active) }}
                 />
               )}
+              {t.path === IMPORT_TAB && (
+                <ImportPanel onOpenNote={openNoteFromChat} />
+              )}
             </div>
           ))}
-          {/* Regular content — only when active tab is not Chat/LiveChat */}
-          {(!activeTab || (activeTab.path !== CHAT_TAB && activeTab.path !== LIVE_CHAT_TAB)) && (
+          {/* Regular content — only when active tab is not Chat/LiveChat/Import */}
+          {(!activeTab || (activeTab.path !== CHAT_TAB && activeTab.path !== LIVE_CHAT_TAB && activeTab.path !== IMPORT_TAB)) && (
             renderPaneContent(leaf, isFocused, activePath)
           )}
           {isDraggingTab && dropZoneInfo?.paneId === leaf.id && (
@@ -1275,8 +1275,18 @@ function AppMain() {
         />
 
         {/* ── Editor column — pane tree ── */}
+        {/* Always wrap root in pane-area so root element type never changes across
+            leaf→group transitions. Fragment key={leaf.id} ensures React reconciles
+            (not unmounts) the leaf pane when the root pane is split, preserving
+            mounted special panels (Chat / LiveChat / Import) and their state. */}
         <div className="editor-column">
-          {renderPaneNode(paneRoot)}
+          {paneRoot.kind === 'leaf' ? (
+            <div className="pane-area">
+              <Fragment key={paneRoot.id}>
+                {renderPaneNode(paneRoot)}
+              </Fragment>
+            </div>
+          ) : renderPaneNode(paneRoot)}
         </div>
 
 

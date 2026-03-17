@@ -45,16 +45,16 @@ function groupByDate(convs: ConversationSummary[]): { label: string; items: Conv
 
 export default function ConversationList({ mode, selectedId, onSelect, onNew }: Props) {
   const [convs, setConvs] = useState<ConversationSummary[]>([])
-  const [offset, setOffset] = useState(0)
   const [hasMore, setHasMore] = useState(false)
-  const [loading, setLoading] = useState(false)
-  const loadedRef = useRef(false)
+  const [loading, setLoading] = useState(true)
+  const loadingRef = useRef(false)
 
   const loadConvs = async (reset = false) => {
-    if (loading) return
+    if (loadingRef.current) return
+    loadingRef.current = true
     setLoading(true)
     try {
-      const newOffset = reset ? 0 : offset
+      const newOffset = reset ? 0 : convs.length
       const username = useAuthStore.getState().session?.username ?? ''
       const list: ConversationSummary[] = await invoke('list_conversations', {
         username,
@@ -63,19 +63,20 @@ export default function ConversationList({ mode, selectedId, onSelect, onNew }: 
         offset: newOffset,
       })
       setConvs(prev => reset ? list : [...prev, ...list])
-      setOffset(newOffset + list.length)
       setHasMore(list.length === PAGE_SIZE)
+      console.log(`[ConversationList][${mode}] loaded ${list.length} conversations:`, list.map(c => ({ id: c.id, title: c.title, updated_at: new Date(c.updated_at * 1000).toLocaleString() })))
     } catch (e) {
-      console.error('load_conversations', e)
+      console.error(`[ConversationList][${mode}] load_conversations error:`, e)
     } finally {
       setLoading(false)
+      loadingRef.current = false
     }
   }
 
+  // Always reload from DB on mount — no loadedRef guard
   useEffect(() => {
-    if (loadedRef.current) return
-    loadedRef.current = true
     loadConvs(true)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode])
 
   const handleNew = async () => {
@@ -84,7 +85,7 @@ export default function ConversationList({ mode, selectedId, onSelect, onNew }: 
       const id: string = await invoke('create_conversation', { username, mode })
       setConvs(prev => [{ id, mode, title: '新對話', updated_at: Date.now() / 1000, has_pending_plan: false }, ...prev])
       onNew(id)
-    } catch (e) {
+    } catch {
       toast.error('建立對話失敗')
     }
   }
@@ -112,7 +113,10 @@ export default function ConversationList({ mode, selectedId, onSelect, onNew }: 
       </div>
 
       <div className="conv-list-body">
-        {groups.length === 0 && !loading && (
+        {loading && convs.length === 0 && (
+          <div className="conv-empty" style={{ opacity: 0.5 }}>載入中…</div>
+        )}
+        {!loading && groups.length === 0 && (
           <div className="conv-empty">尚無對話記錄</div>
         )}
 

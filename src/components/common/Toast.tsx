@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { useDebugStore } from '../../stores/debugStore'
 
 interface ToastItem {
   id: number
@@ -23,6 +24,8 @@ export const useToastStore = create<ToastStore>((set, get) => ({
   show: (message, type = 'info', duration = 3000) => {
     const id = ++toastId
     set((s) => ({ toasts: [...s.toasts, { id, message, type }] }))
+    if (type === 'error') useDebugStore.getState().addLog('app', 'error', message)
+    else if (type === 'warning') useDebugStore.getState().addLog('app', 'warn', message)
     if (duration > 0) {
       setTimeout(() => get().startDismiss(id), duration)
     }

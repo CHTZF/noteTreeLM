@@ -78,7 +78,7 @@ async fn resolve_server_config(state: &AppState) -> Result<(PathBuf, String), Ap
 
 /// 確保 llama-server 正在運行；若未啟動則自動 spawn
 /// 回傳 base URL（例如 "http://127.0.0.1:8080"）
-async fn ensure_server_running(
+pub(crate) async fn ensure_server_running(
     state: &AppState,
     app: &AppHandle,
 ) -> Result<String, AppError> {
@@ -1058,7 +1058,7 @@ struct StreamResult {
 }
 
 /// 從系統 keyring 讀取 API 金鑰（同步）
-fn read_api_key_sync(provider: &str) -> String {
+pub(crate) fn read_api_key_sync(provider: &str) -> String {
     if provider.is_empty() {
         return String::new();
     }

@@ -304,6 +304,34 @@ pub async fn set_vault_last_note(
     queries::set_vault_last_note(&state.db, &vault_path, &note_path).await
 }
 
+/// 通用版：依 mode 取得上次對話 ID（供 live_chat / knowledge_qa 等 panel 使用）
+#[tauri::command]
+pub async fn get_last_mode_conversation_id(
+    state: State<'_, AppState>,
+    username: String,
+    mode: String,
+) -> Result<Option<String>, AppError> {
+    let key = format!("last_{}_conversation_id", mode);
+    queries::get_user_setting(&state.db, &username, &key).await
+}
+
+/// 通用版：依 mode 儲存上次對話 ID
+#[tauri::command]
+pub async fn set_last_mode_conversation_id(
+    state: State<'_, AppState>,
+    username: String,
+    mode: String,
+    conversation_id: Option<String>,
+) -> Result<(), AppError> {
+    let key = format!("last_{}_conversation_id", mode);
+    match conversation_id {
+        Some(id) if !id.is_empty() => {
+            queries::set_user_setting(&state.db, &username, &key, &id).await
+        }
+        _ => queries::set_user_setting(&state.db, &username, &key, "").await,
+    }
+}
+
 #[tauri::command]
 pub async fn get_last_chat_conversation_id(
     state: State<'_, AppState>,

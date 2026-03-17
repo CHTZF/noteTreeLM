@@ -11,7 +11,7 @@ struct ValueRow {
 
 pub async fn get_setting(db: &SurrealDb, key: &str) -> crate::error::Result<Option<String>> {
     let mut resp = db
-        .query("SELECT value FROM settings WHERE key = $key LIMIT 1")
+        .query("SELECT `value` FROM settings WHERE key = $key LIMIT 1")
         .bind(("key", key.to_owned()))
         .await
         .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
@@ -42,7 +42,7 @@ pub async fn get_user_setting(
 ) -> crate::error::Result<Option<String>> {
     let mut resp = db
         .query(
-            "SELECT value FROM user_settings WHERE username = $username AND key = $key LIMIT 1",
+            "SELECT `value` FROM user_settings WHERE username = $username AND key = $key LIMIT 1",
         )
         .bind(("username", username.to_owned()))
         .bind(("key", key.to_owned()))

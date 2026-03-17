@@ -84,19 +84,20 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   }, [session?.username])
 
   const loadConversationMessages = useCallback(async (id: string) => {
+    console.log('[ChatPanel] loadConversationMessages id:', id)
     try {
       const snap: { messages_json: string } = await invoke('get_conversation', { id })
+      console.log('[ChatPanel] get_conversation raw messages_json:', snap.messages_json)
       const msgs: Array<{ role: string; content: string }> = JSON.parse(snap.messages_json)
-      setMessages(msgs.filter(m => m.role === 'user' || m.role === 'assistant')
-        .map(m => ({ role: m.role as 'user' | 'assistant', content: m.content })))
-    } catch {
-      // Conversation not found in DB — create a fresh one
-      try {
-        const username = useAuthStore.getState().session?.username ?? ''
-        const newId = await invoke<string>('create_conversation', { username, mode: 'chat' })
-        setConversationId(newId)
-        invoke('set_last_chat_conversation_id', { username, conversationId: newId }).catch(() => {})
-      } catch {}
+      const filtered = msgs.filter(m => m.role === 'user' || m.role === 'assistant')
+      console.log('[ChatPanel] parsed', msgs.length, 'msgs, filtered to', filtered.length)
+      setMessages(filtered.map(m => ({ role: m.role as 'user' | 'assistant', content: m.content })))
+    } catch (e) {
+      console.error('[ChatPanel] loadConversationMessages error:', e)
+      // Stale conversation ID — clear it and show empty screen
+      const username = useAuthStore.getState().session?.username ?? ''
+      invoke('set_last_chat_conversation_id', { username, conversationId: null }).catch(() => {})
+      setConversationId(null)
       setMessages([])
     }
   }, [])
@@ -122,6 +123,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   }, [])
 
   const handleSelectConversation = useCallback((id: string) => {
+    console.log('[ChatPanel] handleSelectConversation id:', id, 'isStreaming:', isStreaming)
     if (isStreaming) return
     switchConversation(conversationId, id)
     setConversationId(id)

@@ -42,6 +42,20 @@ struct ConvRow {
 
 // ── Commands ───────────────────────────────────────────────────────────────
 
+/// 從前端儲存 messages_json 到 DB（供 ImportPanel / LiveChatPanel 等不走 invoke_agent 的 panel 使用）
+#[tauri::command]
+pub async fn save_conversation_messages(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    messages_json: String,
+) -> Result<(), AppError> {
+    let messages: serde_json::Value = serde_json::from_str(&messages_json)
+        .map_err(|e| AppError::AI(e.to_string()))?;
+    save_messages(&state.db, &conversation_id, &messages).await?;
+    maybe_set_title(&state.db, &conversation_id, &messages).await?;
+    Ok(())
+}
+
 /// 建立新對話，回傳 conversation_id（UUID）
 #[tauri::command]
 pub async fn create_conversation(
@@ -80,7 +94,7 @@ pub async fn list_conversations(
 
     // SurrealDB: LIMIT + START (offset)
     let mut resp = db.query(
-        "SELECT id, mode, title, updated_at FROM conversations
+        "SELECT record::id(id) AS id, mode, title, updated_at FROM conversations
          WHERE mode = $mode AND account_id = $account_id
          ORDER BY updated_at DESC
          LIMIT $limit START $offset"
@@ -125,7 +139,7 @@ pub async fn get_conversation(
     let db = &state.db;
 
     let mut resp = db.query(
-        "SELECT id, mode, title, messages_json, created_at, updated_at FROM conversations WHERE id = $id LIMIT 1"
+        "SELECT record::id(id) AS id, mode, title, messages_json, created_at, updated_at FROM type::thing('conversations', $id)"
     )
     .bind(("id", id.clone()))
     .await
@@ -154,7 +168,7 @@ pub async fn delete_conversation(
     id: String,
 ) -> Result<(), AppError> {
     let db = &state.db;
-    db.query("DELETE FROM conversations WHERE id = $id")
+    db.query("DELETE type::thing('conversations', $id)")
         .bind(("id", id.clone()))
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -174,7 +188,7 @@ pub async fn update_conversation_title(
 ) -> Result<(), AppError> {
     let db = &state.db;
     db.query(
-        "UPDATE conversations SET title = $title, updated_at = time::now() WHERE id = $id"
+        "UPDATE type::thing('conversations', $id) SET title = $title, updated_at = time::now()"
     )
     .bind(("title", title.clone()))
     .bind(("id", id.clone()))
@@ -207,7 +221,7 @@ pub async fn load_messages(db: &SurrealDb, conv_id: &str) -> Result<serde_json::
         messages_json: String,
     }
     let mut resp = db
-        .query("SELECT messages_json FROM conversations WHERE id = $id LIMIT 1")
+        .query("SELECT messages_json FROM type::thing('conversations', $id)")
         .bind(("id", conv_id.to_owned()))
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -227,11 +241,7 @@ pub async fn save_messages(
 ) -> Result<(), AppError> {
     let json_str = serde_json::to_string(messages).map_err(|e| AppError::AI(e.to_string()))?;
     db.query(
-        "INSERT INTO conversations (id, mode, messages_json, updated_at)
-         VALUES ($id, 'chat', $messages_json, time::now())
-         ON DUPLICATE KEY UPDATE
-           messages_json = $messages_json,
-           updated_at = time::now()",
+        "UPDATE type::thing('conversations', $id) SET messages_json = $messages_json, updated_at = time::now()",
     )
     .bind(("id", conv_id.to_owned()))
     .bind(("messages_json", json_str.clone()))
@@ -251,7 +261,7 @@ pub async fn maybe_set_title(
         title: String,
     }
     let mut resp = db
-        .query("SELECT title FROM conversations WHERE id = $id LIMIT 1")
+        .query("SELECT title FROM type::thing('conversations', $id)")
         .bind(("id", conv_id.to_owned()))
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -275,7 +285,7 @@ pub async fn maybe_set_title(
                         chars
                     };
                     db.query(
-                        "UPDATE conversations SET title = $title WHERE id = $id AND title = ''"
+                        "UPDATE type::thing('conversations', $id) SET title = $title WHERE title = ''"
                     )
                     .bind(("title", auto_title.clone()))
                     .bind(("id", conv_id.to_owned()))

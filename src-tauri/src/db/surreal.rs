@@ -112,7 +112,7 @@ async fn apply_schema(db: &Surreal<Db>) -> crate::error::Result<()> {
         "DEFINE INDEX IF NOT EXISTS idx_notes_vault_modified ON notes FIELDS vault_id, modified_at;",
         "DEFINE INDEX IF NOT EXISTS idx_notes_vault_title ON notes FIELDS vault_id, title;",
         // BM25 Full-text search on notes
-        "DEFINE ANALYZER IF NOT EXISTS note_analyzer TOKENIZERS blank,class,ngram(1,10) FILTERS ascii,lowercase;",
+        "DEFINE ANALYZER IF NOT EXISTS note_analyzer TOKENIZERS blank,class FILTERS ascii,lowercase,ngram(1,10);",
         "DEFINE INDEX IF NOT EXISTS ft_notes ON notes FIELDS title, content SEARCH ANALYZER note_analyzer BM25 HIGHLIGHTS;",
 
         "DEFINE TABLE IF NOT EXISTS links SCHEMAFULL;",
@@ -230,8 +230,7 @@ async fn apply_schema(db: &Surreal<Db>) -> crate::error::Result<()> {
         "DEFINE INDEX IF NOT EXISTS idx_chunks_vault_id   ON chunks FIELDS vault_id, chunk_id UNIQUE;",
         // BM25 FTS on chunks
         "DEFINE INDEX IF NOT EXISTS ft_chunks ON chunks FIELDS content SEARCH ANALYZER note_analyzer BM25;",
-        // HNSW vector index（需要 embedding 欄位非 null 時才有意義）
-        "DEFINE INDEX IF NOT EXISTS hnsw_chunks ON chunks FIELDS embedding HNSW DIST COSINE TYPE F32;",
+        // HNSW vector index（Phase 3：啟用時需指定 DIMENSION N，目前略過）
 
         // ── Import Sessions（知識點匯入） ───────────────────────────
         "DEFINE TABLE IF NOT EXISTS import_sessions SCHEMAFULL;",

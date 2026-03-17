@@ -3,6 +3,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useVoiceRecorder } from '../../hooks/useVoiceRecorder'
+import { useDebugStore } from '../../stores/debugStore'
+import { useLiveChatStore } from '../../stores/liveChatStore'
 import ConversationList from '../Chat/ConversationList'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -88,10 +90,13 @@ interface LiveChatPanelProps {
 
 export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPanelProps) {
   const { settings } = useSettingsStore()
+  const addLog = useDebugStore(s => s.addLog)
 
   // ── UI state ──────────────────────────────────────────────────────────────
   const [liveChatState, setLiveChatState] = useState<LiveChatState>('idle')
-  const [messages, setMessages] = useState<Message[]>([])
+  // messages persisted in store so they survive pane remounts
+  const messages = useLiveChatStore(s => s.messages) as Message[]
+  const setMessages = useLiveChatStore(s => s.setMessages) as (updater: (prev: Message[]) => Message[]) => void
   const [conversationId, setConversationId] = useState<string | null>(null)
   const [sidebarOpen, _setSidebarOpen] = useState(true)
   const [displayTranscript, setDisplayTranscript] = useState('')
@@ -122,26 +127,46 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
     onActiveChange?.(liveChatState !== 'idle')
   }, [liveChatState, onActiveChange])
 
+  // 載入對話訊息（從 DB 恢復）
+  const loadConversationMessages = useCallback(async (id: string) => {
+    console.log('[LiveChatPanel] loadConversationMessages id:', id)
+    try {
+      const snap: { messages_json: string } = await invoke('get_conversation', { id })
+      console.log('[LiveChatPanel] get_conversation raw messages_json:', snap.messages_json)
+      const msgs: Array<{ role: string; content: string }> = JSON.parse(snap.messages_json)
+      const filtered = msgs.filter(m => m.role === 'user' || m.role === 'assistant')
+      console.log('[LiveChatPanel] parsed', msgs.length, 'msgs, filtered to', filtered.length)
+      setMessages(() => filtered.map(m => ({ role: m.role as 'user' | 'assistant', content: m.content })))
+    } catch (e) {
+      console.error('[LiveChatPanel] loadConversationMessages error:', e)
+      setMessages(() => [])
+    }
+  }, [setMessages])
+
   // 初始化 conversation（live_chat mode）— 不自動建立新對話
   useEffect(() => {
     const saved = localStorage.getItem('live_chat_conversation_id')
+    console.log('[LiveChatPanel] mount, saved conversation_id:', saved)
     if (saved) {
-      // Verify it still exists in DB (handles stale IDs after DB reset)
       invoke('get_conversation', { id: saved })
-        .then(() => setConversationId(saved))
-        .catch(() => {
-          // Stale ID — remove it and stay on empty screen
+        .then(() => {
+          console.log('[LiveChatPanel] verified conversation exists, loading messages for', saved)
+          setConversationId(saved)
+          loadConversationMessages(saved)
+        })
+        .catch((e) => {
+          console.warn('[LiveChatPanel] stale conversation_id, clearing:', e)
           localStorage.removeItem('live_chat_conversation_id')
         })
     }
-    // No saved ID → conversationId stays null (show placeholder screen)
-  }, [])
+  }, [loadConversationMessages])
 
   const handleSelectConversation = useCallback((id: string) => {
+    console.log('[LiveChatPanel] handleSelectConversation id:', id)
     setConversationId(id)
     localStorage.setItem('live_chat_conversation_id', id)
-    setMessages([])
-  }, [])
+    loadConversationMessages(id)
+  }, [loadConversationMessages])
 
   // Auto-scroll to bottom when messages or streaming changes
   useEffect(() => {
@@ -171,7 +196,7 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
       setLiveChatState('idle')
       setConversationId(null)
       localStorage.removeItem('live_chat_conversation_id')
-      setMessages([])
+      setMessages(() => [])
       setDisplayTranscript('')
       setStreamingText('')
       transcriptRef.current = ''
@@ -179,7 +204,7 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
     }
     setConversationId(id)
     localStorage.setItem('live_chat_conversation_id', id)
-    setMessages([])
+    setMessages(() => [])
   }, [voiceState, toggle])
 
   // ── startListening helper ─────────────────────────────────────────────────
@@ -417,7 +442,9 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
         system: LIVE_CHAT_SYSTEM,
         conversationId: convId ?? undefined,
       })
-    } catch {
+    } catch (e: unknown) {
+      const msg = typeof e === 'string' ? e : (e instanceof Error ? e.message : JSON.stringify(e))
+      addLog('live-chat', 'error', `invoke_agent 失敗：${msg}`)
       unlistenToken()
       unlistenToolCall()
       unlistenWriteReq()
@@ -431,7 +458,7 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
         toggle()
       }, 200)
     }
-  }, [toggle])
+  }, [toggle, addLog])
 
   // ── Barge-in: user speaks while AI is speaking → cancel TTS + LLM stream ──
   useEffect(() => {
@@ -462,7 +489,7 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
   }, [liveChatState, voiceState, toggle, startListening])
 
   const handleClear = useCallback(() => {
-    setMessages([])
+    setMessages(() => [])
     messagesRef.current = []
   }, [])
 
