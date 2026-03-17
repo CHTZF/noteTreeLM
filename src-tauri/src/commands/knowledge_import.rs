@@ -1493,7 +1493,121 @@ tags: [concept]
     let suggestions: Vec<KBCardSuggestion> = serde_json::from_str(json_str)
         .unwrap_or_default();
 
+    // 存入 DB（先刪同 page 舊建議，再逐筆 insert）
+    if !suggestions.is_empty() {
+        let _ = state.db.query(
+            "DELETE FROM kb_suggestions WHERE vault_id = $vid AND page_id = $pid"
+        )
+        .bind(("vid", vault_id.clone()))
+        .bind(("pid", page_id.clone()))
+        .await;
+
+        let now_ms = chrono::Local::now().timestamp_millis();
+        for s in &suggestions {
+            let sid = uuid::Uuid::new_v4().to_string();
+            let _ = state.db.query(
+                "INSERT INTO kb_suggestions (suggestion_id, vault_id, session_id, page_id, title, template, content, reason, created_at) \
+                 VALUES ($sid, $vid, $sess, $pid, $title, $tmpl, $content, $reason, $now)"
+            )
+            .bind(("sid", sid))
+            .bind(("vid", vault_id.clone()))
+            .bind(("sess", session_id.clone()))
+            .bind(("pid", page_id.clone()))
+            .bind(("title", s.title.clone()))
+            .bind(("tmpl", s.template.clone()))
+            .bind(("content", s.content.clone()))
+            .bind(("reason", s.reason.clone()))
+            .bind(("now", now_ms))
+            .await;
+        }
+    }
+
     Ok(suggestions)
+}
+
+/// 載入已存入 DB 的知識卡片建議（按 session 或 page 過濾）
+#[tauri::command]
+pub async fn list_kb_suggestions(
+    state: State<'_, AppState>,
+    session_id: Option<String>,
+    page_id: Option<String>,
+) -> Result<Vec<KBSuggestionRecord>, AppError> {
+    let vault_id = state.get_vault_id().await?;
+    let db = &state.db;
+
+    #[derive(serde::Deserialize)]
+    struct Row {
+        suggestion_id: String,
+        session_id: String,
+        page_id: String,
+        title: String,
+        template: String,
+        content: String,
+        reason: String,
+        created_at: i64,
+    }
+
+    let rows: Vec<Row> = if let Some(pid) = page_id {
+        let mut r = db.query(
+            "SELECT suggestion_id, session_id, page_id, title, template, content, reason, created_at \
+             FROM kb_suggestions WHERE vault_id = $vid AND page_id = $pid ORDER BY created_at ASC"
+        ).bind(("vid", vault_id)).bind(("pid", pid))
+        .await.map_err(|e| AppError::Database(e.to_string()))?;
+        r.take(0).unwrap_or_default()
+    } else if let Some(sid) = session_id {
+        let mut r = db.query(
+            "SELECT suggestion_id, session_id, page_id, title, template, content, reason, created_at \
+             FROM kb_suggestions WHERE vault_id = $vid AND session_id = $sid ORDER BY created_at ASC"
+        ).bind(("vid", vault_id)).bind(("sid", sid))
+        .await.map_err(|e| AppError::Database(e.to_string()))?;
+        r.take(0).unwrap_or_default()
+    } else {
+        let mut r = db.query(
+            "SELECT suggestion_id, session_id, page_id, title, template, content, reason, created_at \
+             FROM kb_suggestions WHERE vault_id = $vid ORDER BY created_at ASC"
+        ).bind(("vid", vault_id))
+        .await.map_err(|e| AppError::Database(e.to_string()))?;
+        r.take(0).unwrap_or_default()
+    };
+
+    Ok(rows.into_iter().map(|r| KBSuggestionRecord {
+        suggestion_id: r.suggestion_id,
+        session_id: r.session_id,
+        page_id: r.page_id,
+        title: r.title,
+        template: r.template,
+        content: r.content,
+        reason: r.reason,
+        created_at: r.created_at,
+    }).collect())
+}
+
+/// 刪除單筆建議
+#[tauri::command]
+pub async fn dismiss_kb_suggestion(
+    state: State<'_, AppState>,
+    suggestion_id: String,
+) -> Result<(), AppError> {
+    let vault_id = state.get_vault_id().await?;
+    state.db.query(
+        "DELETE FROM kb_suggestions WHERE vault_id = $vid AND suggestion_id = $sid"
+    )
+    .bind(("vid", vault_id))
+    .bind(("sid", suggestion_id))
+    .await.map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+pub struct KBSuggestionRecord {
+    pub suggestion_id: String,
+    pub session_id: String,
+    pub page_id: String,
+    pub title: String,
+    pub template: String,
+    pub content: String,
+    pub reason: String,
+    pub created_at: i64,
 }
 
 /// 搜尋已驗證 KB chunks，回傳格式化的 context 字串供注入 system prompt。

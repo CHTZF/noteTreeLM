@@ -22,7 +22,8 @@ use commands::{
     knowledge_import::{create_import_session, list_import_sessions, delete_import_session,
                        fetch_site_outline, import_page, check_page_updates, get_session_pages,
                        query_knowledge, query_kb, set_session_auto_update, debug_kb_chunks,
-                       suggest_kb_cards, get_kb_stats, get_aging_notes, mark_note_reviewed},
+                       suggest_kb_cards, get_kb_stats, get_aging_notes, mark_note_reviewed,
+                       list_kb_suggestions, dismiss_kb_suggestion},
     knowledge_import::auto_check_all_sessions,
     settings::{get_settings, save_personal_settings, get_system_settings, save_system_settings, get_api_key, set_api_key,
                get_vault_last_note, set_vault_last_note, check_vcredist,
@@ -203,6 +204,8 @@ pub fn run() {
             get_kb_stats,
             get_aging_notes,
             mark_note_reviewed,
+            list_kb_suggestions,
+            dismiss_kb_suggestion,
             // Voice
             transcribe_audio,
             stop_whisper_server,

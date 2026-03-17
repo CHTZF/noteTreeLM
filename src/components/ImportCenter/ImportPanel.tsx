@@ -36,6 +36,13 @@ interface KBCardSuggestion {
   reason: string
 }
 
+interface KBSuggestionRecord extends KBCardSuggestion {
+  suggestion_id: string
+  session_id: string
+  page_id: string
+  created_at: number
+}
+
 interface Props {
   onOpenNote?: (path: string) => void
 }
@@ -714,10 +721,10 @@ function SourceManagePanel({
   const [loadingPages, setLoadingPages] = useState(false)
   const [analyzingSession, setAnalyzingSession] = useState<string | null>(null)
   const [importingIds, setImportingIds] = useState<Set<string>>(new Set())
-  // AI KB card suggestions
+  // AI KB card suggestions (persisted in DB)
   const [suggestingPageId, setSuggestingPageId] = useState<string | null>(null)
-  const [suggestions, setSuggestions] = useState<KBCardSuggestion[]>([])
-  const [creatingCardTitle, setCreatingCardTitle] = useState<string | null>(null)
+  const [suggestions, setSuggestions] = useState<KBSuggestionRecord[]>([])
+  const [creatingCardId, setCreatingCardId] = useState<string | null>(null)
   // Batch verify state
   const [noteStatuses, setNoteStatuses] = useState<Record<string, string>>({})
   const [verifyMode, setVerifyMode] = useState(false)
@@ -730,8 +737,13 @@ function SourceManagePanel({
         .then(r => setPages(r))
         .catch(e => addLog('import', 'error', `載入頁面失敗：${fmtError(e)}`))
         .finally(() => setLoadingPages(false))
+      // 從 DB 還原此 session 的待處理建議
+      invoke<KBSuggestionRecord[]>('list_kb_suggestions', { sessionId: activeSession.session_id })
+        .then(r => setSuggestions(r))
+        .catch(() => {})
     } else {
       setPages([])
+      setSuggestions([])
     }
   }, [activeSession])
 
@@ -760,12 +772,14 @@ function SourceManagePanel({
       await onSessionsChange()
       // 非同步觸發 AI 建議（不阻塞匯入流程）
       setSuggestingPageId(page.page_id)
-      invoke<KBCardSuggestion[]>('suggest_kb_cards', {
+      invoke('suggest_kb_cards', {
         sessionId: page.session_id,
         pageId: page.page_id,
-      }).then(cards => {
-        if (cards.length > 0) setSuggestions(cards)
-      }).catch(() => { /* 建議失敗不影響匯入 */ }).finally(() => {
+      }).then(() =>
+        // 從 DB 重新載入（此 session 所有建議）
+        invoke<KBSuggestionRecord[]>('list_kb_suggestions', { sessionId: page.session_id })
+          .then(r => setSuggestions(r))
+      ).catch(() => { /* 建議失敗不影響匯入 */ }).finally(() => {
         setSuggestingPageId(null)
       })
     } catch (e: unknown) {
@@ -795,18 +809,31 @@ function SourceManagePanel({
     }
   }
 
-  const handleCreateCard = async (card: KBCardSuggestion) => {
-    setCreatingCardTitle(card.title)
+  const handleCreateCard = async (card: KBSuggestionRecord) => {
+    setCreatingCardId(card.suggestion_id)
     try {
-      const path = await invoke<string>('create_note', { title: card.title, content: card.content })
+      const note = await invoke<{ path: string }>('create_note', {
+        title: card.title,
+        content: card.content,
+        folder: null,
+      })
+      // 從 DB 刪除此建議
+      await invoke('dismiss_kb_suggestion', { suggestionId: card.suggestion_id })
       toast.success(`已建立「${card.title}」`)
-      setSuggestions(prev => prev.filter(s => s.title !== card.title))
-      onOpenNote?.(path)
+      setSuggestions(prev => prev.filter(s => s.suggestion_id !== card.suggestion_id))
+      onOpenNote?.(note.path)
     } catch (e) {
       toast.error(`建立筆記失敗：${fmtError(e)}`)
     } finally {
-      setCreatingCardTitle(null)
+      setCreatingCardId(null)
     }
+  }
+
+  const handleDismissCard = async (card: KBSuggestionRecord) => {
+    try {
+      await invoke('dismiss_kb_suggestion', { suggestionId: card.suggestion_id })
+      setSuggestions(prev => prev.filter(s => s.suggestion_id !== card.suggestion_id))
+    } catch { /* silent */ }
   }
 
   // Pages that are imported (have note_path) — candidates for verification
@@ -1123,10 +1150,15 @@ function SourceManagePanel({
             </div>
             {suggestions.length > 0 && (
               <button
-                onClick={() => setSuggestions([])}
+                onClick={async () => {
+                  for (const s of suggestions) {
+                    await invoke('dismiss_kb_suggestion', { suggestionId: s.suggestion_id }).catch(() => {})
+                  }
+                  setSuggestions([])
+                }}
                 style={{ ...iconBtn, fontSize: 10, padding: '2px 5px' }}
-                title="關閉建議"
-              >✕</button>
+                title="全部關閉"
+              >✕ 全部</button>
             )}
           </div>
           {suggestions.map((card) => {
@@ -1134,7 +1166,7 @@ function SourceManagePanel({
             const templateColor = card.template === 'concept' ? 'var(--color-accent)' : card.template === 'procedure' ? 'var(--color-success)' : 'var(--color-warning, #e5a50a)'
             return (
               <div
-                key={card.title}
+                key={card.suggestion_id}
                 style={{
                   background: 'var(--color-bg-primary)',
                   border: '1px solid var(--color-border)',
@@ -1159,16 +1191,23 @@ function SourceManagePanel({
                   </div>
                   <div style={{ fontSize: 11, color: 'var(--color-text-muted)', lineHeight: 1.4 }}>{card.reason}</div>
                 </div>
-                <button
-                  disabled={creatingCardTitle === card.title}
-                  onClick={() => handleCreateCard(card)}
-                  style={{ ...iconBtn, fontSize: 11, padding: '3px 8px', color: 'var(--color-accent)', flexShrink: 0, whiteSpace: 'nowrap' }}
-                  title="建立筆記"
-                >
-                  {creatingCardTitle === card.title
-                    ? <FontAwesomeIcon icon={faSpinner} spin />
-                    : '+ 建立'}
-                </button>
+                <div style={{ display: 'flex', gap: 2, flexShrink: 0 }}>
+                  <button
+                    disabled={creatingCardId === card.suggestion_id}
+                    onClick={() => handleCreateCard(card)}
+                    style={{ ...iconBtn, fontSize: 11, padding: '3px 8px', color: 'var(--color-accent)', whiteSpace: 'nowrap' }}
+                    title="建立筆記"
+                  >
+                    {creatingCardId === card.suggestion_id
+                      ? <FontAwesomeIcon icon={faSpinner} spin />
+                      : '+ 建立'}
+                  </button>
+                  <button
+                    onClick={() => handleDismissCard(card)}
+                    style={{ ...iconBtn, fontSize: 11, padding: '3px 5px', color: 'var(--color-text-muted)' }}
+                    title="忽略此建議"
+                  >✕</button>
+                </div>
               </div>
             )
           })}
