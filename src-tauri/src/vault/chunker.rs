@@ -21,6 +21,7 @@ pub struct Chunk {
     pub word_count: i64,
     pub updated_at: i64,      // milliseconds
     pub embedding:  Option<Vec<f32>>,
+    pub status:     String,   // from frontmatter: "draft" | "verified" | "deprecated" | ""
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -45,6 +46,26 @@ fn word_count(text: &str) -> i64 {
     text.split_whitespace().count() as i64
 }
 
+/// Parse the `status:` field from YAML frontmatter (--- ... ---)
+pub fn parse_frontmatter_status(content: &str) -> String {
+    if !content.starts_with("---") { return String::new(); }
+    let after = if content.starts_with("---\r\n") { 5 } else { 4 };
+    let end = match content[after..].find("\n---") {
+        Some(i) => after + i,
+        None => return String::new(),
+    };
+    for line in content[after..end].lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("status:") {
+            let val = trimmed["status:".len()..].trim();
+            if matches!(val, "verified" | "draft" | "deprecated") {
+                return val.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
 // ── Public API ────────────────────────────────────────────────────────────
 
 /// Split a Markdown note into heading-level chunks.
@@ -55,6 +76,7 @@ fn word_count(text: &str) -> i64 {
 ///   heading of same or higher level)
 /// - Empty sections are omitted
 pub fn chunk_note(file_path: &str, content: &str, now_ms: i64) -> Vec<Chunk> {
+    let status = parse_frontmatter_status(content);
     let heading_re = Regex::new(r"(?m)^(#{1,6}) (.+)$").unwrap();
 
     let mut sections: Vec<(String, Vec<&str>)> = Vec::new();
@@ -95,6 +117,7 @@ pub fn chunk_note(file_path: &str, content: &str, now_ms: i64) -> Vec<Chunk> {
                 word_count: word_count(&text),
                 updated_at: now_ms,
                 embedding:  None,
+                status:     status.clone(),
             }
         })
         .collect()
@@ -151,14 +174,15 @@ pub async fn upsert_chunks(
 
         if let Some(vec) = emb_vec {
             let mut r = db.query(
-                "INSERT INTO chunks (vault_id, chunk_id, file_path, section, content, links, chunk_type, word_count, updated_at, embedding)
-                 VALUES ($vid, $cid, $fp, $section, $content, $links, $chunk_type, $wc, time::now(), $emb)
+                "INSERT INTO chunks (vault_id, chunk_id, file_path, section, content, links, chunk_type, word_count, updated_at, embedding, status)
+                 VALUES ($vid, $cid, $fp, $section, $content, $links, $chunk_type, $wc, time::now(), $emb, $status)
                  ON DUPLICATE KEY UPDATE
                    content    = $content,
                    links      = $links,
                    word_count = $wc,
                    updated_at = time::now(),
-                   embedding  = $emb"
+                   embedding  = $emb,
+                   status     = $status"
             )
             .bind(("vid", vault_id.to_owned()))
             .bind(("cid", c.id.clone()))
@@ -169,18 +193,20 @@ pub async fn upsert_chunks(
             .bind(("chunk_type", c.chunk_type.clone()))
             .bind(("wc", c.word_count))
             .bind(("emb", vec))
+            .bind(("status", c.status.clone()))
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
             let _ = r;
         } else {
             let mut r = db.query(
-                "INSERT INTO chunks (vault_id, chunk_id, file_path, section, content, links, chunk_type, word_count, updated_at)
-                 VALUES ($vid, $cid, $fp, $section, $content, $links, $chunk_type, $wc, time::now())
+                "INSERT INTO chunks (vault_id, chunk_id, file_path, section, content, links, chunk_type, word_count, updated_at, status)
+                 VALUES ($vid, $cid, $fp, $section, $content, $links, $chunk_type, $wc, time::now(), $status)
                  ON DUPLICATE KEY UPDATE
                    content    = $content,
                    links      = $links,
                    word_count = $wc,
-                   updated_at = time::now()"
+                   updated_at = time::now(),
+                   status     = $status"
             )
             .bind(("vid", vault_id.to_owned()))
             .bind(("cid", c.id.clone()))
@@ -190,11 +216,28 @@ pub async fn upsert_chunks(
             .bind(("links", c.links.clone()))
             .bind(("chunk_type", c.chunk_type.clone()))
             .bind(("wc", c.word_count))
+            .bind(("status", c.status.clone()))
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
             let _ = r;
         }
     }
+    Ok(())
+}
+
+/// Update status for all chunks of a file (called after set_note_status).
+pub async fn update_chunks_status(
+    db: &SurrealDb,
+    vault_id: &str,
+    file_path: &str,
+    status: &str,
+) -> Result<(), AppError> {
+    db.query("UPDATE chunks SET status = $status WHERE vault_id = $vid AND file_path = $fp")
+        .bind(("status", status.to_owned()))
+        .bind(("vid", vault_id.to_owned()))
+        .bind(("fp", file_path.to_owned()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
     Ok(())
 }
 

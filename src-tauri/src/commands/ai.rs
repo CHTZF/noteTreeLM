@@ -2336,10 +2336,12 @@ pub async fn set_note_status(
         "UPDATE notes SET content = $content, status = $status WHERE vault_id = $vid AND path = $path"
     )
     .bind(("content", new_content))
-    .bind(("status", status))
-    .bind(("vid", vault_id))
-    .bind(("path", path))
+    .bind(("status", status.clone()))
+    .bind(("vid", vault_id.clone()))
+    .bind(("path", path.clone()))
     .await;
+    // Sync status to all chunks for this file
+    let _ = crate::vault::chunker::update_chunks_status(&state.db, &vault_id, &path, &status).await;
     Ok(())
 }
 

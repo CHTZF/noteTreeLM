@@ -224,6 +224,7 @@ async fn apply_schema(db: &Surreal<Db>) -> crate::error::Result<()> {
         "DEFINE FIELD IF NOT EXISTS chunk_type ON chunks TYPE string DEFAULT 'text';",
         "DEFINE FIELD IF NOT EXISTS word_count ON chunks TYPE int DEFAULT 0;",
         "DEFINE FIELD IF NOT EXISTS updated_at ON chunks TYPE datetime;",
+        "DEFINE FIELD IF NOT EXISTS status     ON chunks TYPE string DEFAULT '';",
         // embedding 欄位（Phase 3 時啟用 HNSW）
         "DEFINE FIELD IF NOT EXISTS embedding  ON chunks TYPE option<array<float>>;",
         "DEFINE INDEX IF NOT EXISTS idx_chunks_vault_file ON chunks FIELDS vault_id, file_path;",
@@ -243,6 +244,7 @@ async fn apply_schema(db: &Surreal<Db>) -> crate::error::Result<()> {
         "DEFINE FIELD IF NOT EXISTS site_outline   ON import_sessions TYPE option<string>;",
         "DEFINE FIELD IF NOT EXISTS crawl_policy   ON import_sessions TYPE option<string>;",
         "DEFINE FIELD IF NOT EXISTS status         ON import_sessions TYPE string DEFAULT 'active';",
+        "DEFINE FIELD IF NOT EXISTS auto_update    ON import_sessions TYPE bool DEFAULT false;",
         "DEFINE FIELD IF NOT EXISTS created_at     ON import_sessions TYPE datetime DEFAULT time::now();",
         "DEFINE FIELD IF NOT EXISTS updated_at     ON import_sessions TYPE datetime DEFAULT time::now();",
         "DEFINE INDEX IF NOT EXISTS idx_import_sessions_vault_id ON import_sessions FIELDS vault_id, session_id UNIQUE;",

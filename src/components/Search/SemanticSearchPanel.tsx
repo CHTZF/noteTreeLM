@@ -121,6 +121,7 @@ export default function SemanticSearchPanel({ onOpenNote }: Props) {
   const [stats, setStats]           = useState<IndexStats | null>(null)
   const [progress, setProgress]     = useState<ReindexProgress | null>(null)
   const [error, setError]           = useState<string | null>(null)
+  const [verifiedOnly, setVerifiedOnly] = useState(false)
   const inputRef                    = useRef<HTMLInputElement>(null)
   const unlistenRef                 = useRef<UnlistenFn | null>(null)
 
@@ -140,7 +141,7 @@ export default function SemanticSearchPanel({ onOpenNote }: Props) {
     if (!q) return
     setLoading(true); setError(null)
     try {
-      const raw = await invoke<string>('search_vault_chunks', { query: q })
+      const raw = await invoke<string>('search_vault_chunks', { query: q, verifiedOnly: verifiedOnly || undefined })
       setResult(parseResult(raw))
     } catch (e: any) {
       setError(typeof e === 'string' ? e : '搜尋失敗')
@@ -250,6 +251,19 @@ export default function SemanticSearchPanel({ onOpenNote }: Props) {
             }} />
           </div>
         )}
+
+        {/* Verified-only toggle */}
+        <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', userSelect: 'none' }}>
+          <input
+            type="checkbox"
+            checked={verifiedOnly}
+            onChange={e => setVerifiedOnly(e.target.checked)}
+            style={{ accentColor: 'var(--color-accent)', cursor: 'pointer' }}
+          />
+          <span style={{ fontSize: '11px', color: verifiedOnly ? 'var(--color-accent)' : 'var(--color-text-muted)' }}>
+            僅已驗證
+          </span>
+        </label>
 
         {/* Search input */}
         <div style={{ display: 'flex', gap: '6px' }}>

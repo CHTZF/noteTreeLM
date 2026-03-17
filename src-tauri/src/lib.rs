@@ -21,7 +21,8 @@ use commands::{
     download::*, graph::*, import::*, search::*,
     knowledge_import::{create_import_session, list_import_sessions, delete_import_session,
                        fetch_site_outline, import_page, check_page_updates, get_session_pages,
-                       query_knowledge},
+                       query_knowledge, query_kb, set_session_auto_update},
+    knowledge_import::auto_check_all_sessions,
     settings::{get_settings, save_personal_settings, get_system_settings, save_system_settings, get_api_key, set_api_key,
                get_vault_last_note, set_vault_last_note, check_vcredist,
                get_last_chat_conversation_id, set_last_chat_conversation_id,
@@ -116,6 +117,9 @@ pub fn run() {
                     warmup_llama_server(&state, &app_handle),
                     warmup_embedding_server(&state, &app_handle),
                 );
+
+                // 自動更新：掃描開啟 auto_update 的 import sessions
+                auto_check_all_sessions(&app_handle, &state).await;
             });
 
             Ok(())
@@ -191,6 +195,8 @@ pub fn run() {
             check_page_updates,
             get_session_pages,
             query_knowledge,
+            query_kb,
+            set_session_auto_update,
             // Voice
             transcribe_audio,
             stop_whisper_server,

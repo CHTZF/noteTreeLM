@@ -5,7 +5,7 @@ import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
 import {
   faPlus, faTrash, faArrowsRotate, faDownload,
   faSpinner, faGlobe, faChevronLeft, faChevronRight,
-  faFileLines, faPaperPlane, faDatabase,
+  faFileLines, faPaperPlane, faDatabase, faCheckCircle, faListCheck,
 } from '@fortawesome/free-solid-svg-icons'
 import { toast } from '../common/Toast'
 import { useDebugStore } from '../../stores/debugStore'
@@ -21,6 +21,7 @@ interface ImportSession {
   root_folder: string
   status: string
   created_at: number
+  auto_update?: boolean
 }
 
 interface ImportSessionSummary extends ImportSession {
@@ -88,6 +89,17 @@ export default function ImportPanel({ onOpenNote }: Props) {
   }, [addLog])
 
   useEffect(() => { loadSessions() }, [loadSessions])
+
+  // 監聽自動更新通知
+  useEffect(() => {
+    const unlisten = listen<{ session_id: string; count: number }>('import:updates_available', e => {
+      const { session_id, count } = e.payload
+      const s = sessions.find(s => s.session_id === session_id)
+      const name = s?.site_name || session_id
+      toast.success(`${name} 有 ${count} 頁已更新，可重新匯入`)
+    })
+    return () => { unlisten.then(f => f()) }
+  }, [sessions])
 
   // ── Conversation persistence ─────────────────────────────────────────────────
   const saveMessagesToDb = useCallback(async (convId: string, msgs: KBMessage[]) => {
@@ -651,6 +663,10 @@ function SourceManagePanel({
   const [loadingPages, setLoadingPages] = useState(false)
   const [analyzingSession, setAnalyzingSession] = useState<string | null>(null)
   const [importingIds, setImportingIds] = useState<Set<string>>(new Set())
+  // Batch verify state
+  const [noteStatuses, setNoteStatuses] = useState<Record<string, string>>({})
+  const [verifyMode, setVerifyMode] = useState(false)
+  const [verifyIdx, setVerifyIdx] = useState(0)
 
   useEffect(() => {
     if (activeSession) {
@@ -703,6 +719,29 @@ function SourceManagePanel({
     for (const p of pending) await handleImportPage(p)
   }
 
+  const handleSetNoteStatus = async (page: PageRow, status: 'verified' | 'deprecated') => {
+    if (!page.note_path) return
+    try {
+      await invoke('set_note_status', { path: page.note_path, status })
+      setNoteStatuses(prev => ({ ...prev, [page.page_id]: status }))
+    } catch (e) {
+      toast.error(`設定狀態失敗：${fmtError(e)}`)
+    }
+  }
+
+  // Pages that are imported (have note_path) — candidates for verification
+  const importedPages = pages.filter(p => p.status === 'imported' && p.note_path)
+  // Current verify target page
+  const currentVerifyPage = importedPages[verifyIdx] ?? null
+  const verifyTotal = importedPages.length
+  const verifiedCount = importedPages.filter(p =>
+    noteStatuses[p.page_id] === 'verified' || noteStatuses[p.page_id] === 'deprecated'
+  ).length
+
+  const advanceVerify = () => {
+    setVerifyIdx(i => Math.min(i + 1, verifyTotal - 1))
+  }
+
   return (
     <div style={{
       position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column',
@@ -739,6 +778,15 @@ function SourceManagePanel({
             >
               <FontAwesomeIcon icon={faDownload} />
             </button>
+            {importedPages.length > 0 && (
+              <button
+                title={`批次驗證（${importedPages.length} 頁已匯入）`}
+                onClick={() => { setVerifyMode(true); setVerifyIdx(0) }}
+                style={{ ...iconBtn, color: 'var(--color-accent)' }}
+              >
+                <FontAwesomeIcon icon={faListCheck} />
+              </button>
+            )}
           </>
         )}
         <button onClick={onClose} style={{ ...iconBtn, marginLeft: 4 }}>✕</button>
@@ -772,6 +820,25 @@ function SourceManagePanel({
                   {s.imported_pages}/{s.total_pages} 頁 · {s.seed_url}
                 </div>
               </div>
+              <label
+                title="自動更新（啟動時偵測變更）"
+                onClick={e => e.stopPropagation()}
+                style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', fontSize: 11, color: 'var(--color-text-muted)' }}
+              >
+                <input
+                  type="checkbox"
+                  checked={s.auto_update ?? false}
+                  onChange={async e => {
+                    const v = e.target.checked
+                    try {
+                      await invoke('set_session_auto_update', { sessionId: s.session_id, autoUpdate: v })
+                      await onSessionsChange()
+                    } catch { /* ignore */ }
+                  }}
+                  style={{ accentColor: 'var(--color-accent)', cursor: 'pointer' }}
+                />
+                自動
+              </label>
               <button
                 title="刪除來源"
                 onClick={e => { e.stopPropagation(); onDelete(s.session_id) }}
@@ -781,6 +848,119 @@ function SourceManagePanel({
               </button>
             </div>
           ))}
+        </div>
+      ) : verifyMode ? (
+        /* ── Batch Verify Mode ── */
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+          {/* Progress bar */}
+          <div style={{ padding: '8px 14px 0', flexShrink: 0 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--color-text-muted)', marginBottom: 4 }}>
+              <span>已處理 {verifiedCount} / {verifyTotal}</span>
+              <button onClick={() => setVerifyMode(false)} style={{ ...iconBtn, fontSize: 11, padding: '0 4px' }}>
+                返回列表
+              </button>
+            </div>
+            <div style={{ height: 3, borderRadius: 2, background: 'var(--color-border)', overflow: 'hidden' }}>
+              <div style={{
+                height: '100%', borderRadius: 2,
+                width: `${verifyTotal > 0 ? verifiedCount / verifyTotal * 100 : 0}%`,
+                background: 'var(--color-accent)', transition: 'width 0.2s ease',
+              }} />
+            </div>
+          </div>
+
+          {currentVerifyPage ? (
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', padding: '16px 14px', gap: 12 }}>
+              {/* Page info */}
+              <div style={{
+                padding: '12px 14px', borderRadius: 8, background: 'var(--color-bg-elevated)',
+                border: '1px solid var(--color-border)',
+              }}>
+                <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--color-text-primary)', marginBottom: 4 }}>
+                  {currentVerifyPage.title || currentVerifyPage.url}
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--color-text-muted)', wordBreak: 'break-all' }}>
+                  {currentVerifyPage.note_path}
+                </div>
+                {noteStatuses[currentVerifyPage.page_id] && (
+                  <div style={{
+                    marginTop: 8, fontSize: 11, fontWeight: 600,
+                    color: noteStatuses[currentVerifyPage.page_id] === 'verified'
+                      ? 'var(--color-success)' : 'var(--color-text-muted)',
+                  }}>
+                    {noteStatuses[currentVerifyPage.page_id] === 'verified' ? '✓ 已驗證' : '✗ 已棄用'}
+                  </div>
+                )}
+              </div>
+
+              {/* Action buttons */}
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button
+                  onClick={async () => {
+                    await handleSetNoteStatus(currentVerifyPage, 'verified')
+                    advanceVerify()
+                  }}
+                  style={{
+                    flex: 1, padding: '9px', borderRadius: 7, border: 'none', cursor: 'pointer',
+                    background: 'color-mix(in srgb, var(--color-success) 15%, transparent)',
+                    color: 'var(--color-success)', fontWeight: 600, fontSize: 13,
+                  }}
+                >
+                  ✓ 驗證
+                </button>
+                <button
+                  onClick={async () => {
+                    await handleSetNoteStatus(currentVerifyPage, 'deprecated')
+                    advanceVerify()
+                  }}
+                  style={{
+                    flex: 1, padding: '9px', borderRadius: 7, border: 'none', cursor: 'pointer',
+                    background: 'color-mix(in srgb, var(--color-text-muted) 12%, transparent)',
+                    color: 'var(--color-text-muted)', fontWeight: 600, fontSize: 13,
+                  }}
+                >
+                  ✗ 棄用
+                </button>
+                <button
+                  onClick={advanceVerify}
+                  style={{
+                    flex: 1, padding: '9px', borderRadius: 7, border: '1px solid var(--color-border)',
+                    cursor: 'pointer', background: 'transparent',
+                    color: 'var(--color-text-secondary)', fontSize: 13,
+                  }}
+                >
+                  → 跳過
+                </button>
+              </div>
+
+              {/* Navigation */}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <button
+                  disabled={verifyIdx === 0}
+                  onClick={() => setVerifyIdx(i => Math.max(0, i - 1))}
+                  style={{ ...iconBtn, opacity: verifyIdx === 0 ? 0.3 : 1 }}
+                >
+                  <FontAwesomeIcon icon={faChevronLeft} style={{ fontSize: 11 }} /> 上一頁
+                </button>
+                <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>
+                  {verifyIdx + 1} / {verifyTotal}
+                </span>
+                <button
+                  disabled={verifyIdx >= verifyTotal - 1}
+                  onClick={advanceVerify}
+                  style={{ ...iconBtn, opacity: verifyIdx >= verifyTotal - 1 ? 0.3 : 1 }}
+                >
+                  下一頁 <FontAwesomeIcon icon={faChevronRight} style={{ fontSize: 11 }} />
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center',
+              flexDirection: 'column', gap: 10, color: 'var(--color-text-muted)', fontSize: 13 }}>
+              <FontAwesomeIcon icon={faCheckCircle} style={{ fontSize: 28, color: 'var(--color-success)' }} />
+              <div>所有頁面已處理完畢</div>
+            </div>
+          )}
         </div>
       ) : (
         /* Pages list */
@@ -820,6 +1000,29 @@ function SourceManagePanel({
                     : <FontAwesomeIcon icon={faDownload} />}
                 </button>
               )}
+              {p.status === 'imported' && p.note_path && (() => {
+                const ns = noteStatuses[p.page_id]
+                if (ns === 'verified') return (
+                  <span style={{ fontSize: 10, color: 'var(--color-success)', fontWeight: 600 }}>✓</span>
+                )
+                if (ns === 'deprecated') return (
+                  <span style={{ fontSize: 10, color: 'var(--color-text-muted)', fontWeight: 600 }}>✗</span>
+                )
+                return (
+                  <div style={{ display: 'flex', gap: 3 }}>
+                    <button
+                      onClick={() => handleSetNoteStatus(p, 'verified')}
+                      style={{ ...iconBtn, fontSize: 10, padding: '2px 5px', color: 'var(--color-success)' }}
+                      title="標記為已驗證"
+                    >✓</button>
+                    <button
+                      onClick={() => handleSetNoteStatus(p, 'deprecated')}
+                      style={{ ...iconBtn, fontSize: 10, padding: '2px 5px', color: 'var(--color-text-muted)' }}
+                      title="標記為已棄用"
+                    >✗</button>
+                  </div>
+                )
+              })()}
             </div>
           ))}
         </div>

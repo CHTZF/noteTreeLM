@@ -1860,6 +1860,8 @@ pub async fn reindex_vault_chunks(
 pub async fn search_vault_chunks(
     state: State<'_, AppState>,
     query: String,
+    #[allow(non_snake_case)]
+    verifiedOnly: Option<bool>,
 ) -> Result<String, AppError> {
     use std::collections::{HashMap, HashSet};
 
@@ -1868,6 +1870,7 @@ pub async fn search_vault_chunks(
     }
     let db = state.db.clone();
     let vault_id = state.get_vault_id().await?;
+    let verified_only = verifiedOnly.unwrap_or(false);
 
     #[derive(Deserialize)]
     struct ChunkRow {
@@ -1876,12 +1879,19 @@ pub async fn search_vault_chunks(
         content: String,
     }
 
+    // status filter clause (appended to all queries when verified_only)
+    let status_clause = if verified_only { " AND status = 'verified'" } else { "" };
+
     // 0. 確認 chunks 表有資料（快速診斷）
     {
         #[derive(Deserialize)]
         struct CountRow { count: u64 }
+        let count_q = format!(
+            "SELECT count() AS count FROM chunks WHERE vault_id = $vid{} GROUP ALL",
+            status_clause
+        );
         let mut r = db
-            .query("SELECT count() AS count FROM chunks WHERE vault_id = $vid GROUP ALL")
+            .query(&count_q)
             .bind(("vid", vault_id.clone()))
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1905,15 +1915,17 @@ pub async fn search_vault_chunks(
             vec_diag = Some("vector_fail");
             vec![]
         } else {
+            let vec_q = format!(
+                "SELECT file_path, section, content,
+                        vector::similarity::cosine(embedding, $qvec) AS score
+                 FROM chunks
+                 WHERE vault_id = $vid AND embedding != NONE{}
+                 ORDER BY score DESC
+                 LIMIT 10",
+                status_clause
+            );
             let mut resp = db
-                .query(
-                    "SELECT file_path, section, content,
-                            vector::similarity::cosine(embedding, $qvec) AS score
-                     FROM chunks
-                     WHERE vault_id = $vid AND embedding != NONE
-                     ORDER BY score DESC
-                     LIMIT 10"
-                )
+                .query(&vec_q)
                 .bind(("vid", vault_id.clone()))
                 .bind(("qvec", qvec))
                 .await
@@ -1932,12 +1944,14 @@ pub async fn search_vault_chunks(
 
     // 2. Fallback A：BM25 全文搜尋
     let chunk_rows: Vec<ChunkRow> = if chunk_rows.is_empty() {
+        let bm25_q = format!(
+            "SELECT file_path, section, content FROM chunks
+             WHERE vault_id = $vid AND content @1@ $query{}
+             LIMIT 10",
+            status_clause
+        );
         let mut resp = db
-            .query(
-                "SELECT file_path, section, content FROM chunks
-                 WHERE vault_id = $vid AND content @1@ $query
-                 LIMIT 10"
-            )
+            .query(&bm25_q)
             .bind(("vid", vault_id.clone()))
             .bind(("query", query.trim().to_owned()))
             .await
@@ -1951,13 +1965,15 @@ pub async fn search_vault_chunks(
 
     // 3. Fallback B：字串包含搜尋（保底）
     let chunk_rows: Vec<ChunkRow> = if chunk_rows.is_empty() {
+        let contains_q = format!(
+            "SELECT file_path, section, content FROM chunks
+             WHERE vault_id = $vid
+               AND string::contains(string::lowercase(content), string::lowercase($query)){}
+             LIMIT 10",
+            status_clause
+        );
         let mut resp = db
-            .query(
-                "SELECT file_path, section, content FROM chunks
-                 WHERE vault_id = $vid
-                   AND string::contains(string::lowercase(content), string::lowercase($query))
-                 LIMIT 10"
-            )
+            .query(&contains_q)
             .bind(("vid", vault_id.clone()))
             .bind(("query", query.trim().to_owned()))
             .await

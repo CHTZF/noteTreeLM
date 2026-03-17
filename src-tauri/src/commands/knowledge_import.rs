@@ -1,4 +1,4 @@
-use crate::{commands::ai::{ensure_server_running, read_api_key_sync}, db::{queries, surreal::SurrealDb}, error::AppError, state::AppState};
+use crate::{commands::ai::{ensure_server_running, read_api_key_sync, get_embedding}, db::{queries, surreal::SurrealDb}, error::AppError, state::AppState};
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -564,6 +564,105 @@ pub async fn delete_import_session(
         .map_err(|e| AppError::Database(e.to_string()))?;
 
     Ok(())
+}
+
+/// Toggle auto_update for an import session.
+#[tauri::command]
+pub async fn set_session_auto_update(
+    state: State<'_, AppState>,
+    session_id: String,
+    auto_update: bool,
+) -> Result<(), AppError> {
+    let vault_id = state.get_vault_id().await?;
+    state.db
+        .query("UPDATE import_sessions SET auto_update = $v WHERE vault_id = $vid AND session_id = $sid")
+        .bind(("v", auto_update))
+        .bind(("vid", vault_id))
+        .bind(("sid", session_id))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}
+
+/// Called on app startup: check_page_updates for sessions with auto_update = true.
+/// Emits `import:updates_available { session_id, count }` for each session with changes.
+pub async fn auto_check_all_sessions(app: &AppHandle, state: &AppState) {
+    let vault_id = match state.get_vault_id().await {
+        Ok(v) if !v.is_empty() => v,
+        _ => return,
+    };
+
+    #[derive(serde::Deserialize)]
+    struct SessionRow { session_id: String }
+
+    let mut resp = match state.db
+        .query("SELECT session_id FROM import_sessions WHERE vault_id = $vid AND auto_update = true")
+        .bind(("vid", vault_id.clone()))
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    let sessions: Vec<SessionRow> = resp.take(0).unwrap_or_default();
+    if sessions.is_empty() { return; }
+
+    let client = match reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (compatible; noteTreeLM/0.1; knowledge-import)")
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    for s in sessions {
+        let sid = s.session_id.clone();
+        let app2 = app.clone();
+        let db2 = state.db.clone();
+        let vid2 = vault_id.clone();
+        let client2 = client.clone();
+
+        tokio::spawn(async move {
+            #[derive(serde::Deserialize)]
+            struct PageRow { url: String, content_hash: Option<String>, http_etag: Option<String> }
+
+            let mut resp = match db2.query(
+                "SELECT url, content_hash, http_etag FROM import_pages
+                 WHERE vault_id = $vid AND session_id = $sid AND status = 'imported'"
+            )
+            .bind(("vid", vid2.clone()))
+            .bind(("sid", sid.clone()))
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+
+            let pages: Vec<PageRow> = resp.take(0).unwrap_or_default();
+            let mut changed = 0usize;
+
+            for page in pages {
+                if let Ok(head) = client2.head(&page.url).send().await {
+                    let cur_etag = head.headers()
+                        .get("etag")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    if let (Some(stored), Some(cur)) = (&page.http_etag, &cur_etag) {
+                        if stored == cur { continue; }
+                    }
+                    changed += 1;
+                }
+            }
+
+            if changed > 0 {
+                let _ = app2.emit("import:updates_available", serde_json::json!({
+                    "session_id": sid,
+                    "count": changed,
+                }));
+            }
+        });
+    }
 }
 
 /// Crawl the seed URL and discover all same-domain links.
@@ -1240,3 +1339,218 @@ async fn run_knowledge_query(
     Ok(())
 }
 
+// ── KB Assistant（vault-wide verified-only RAG）────────────────────────────
+
+/// Vault-wide KB Q&A：只搜 verified chunks，嚴格只用知識庫內容回答，附來源引用。
+/// Events: knowledge:token, knowledge:refs, knowledge:done
+#[tauri::command]
+pub async fn query_kb(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    query_id: String,
+    question: String,
+) -> Result<(), AppError> {
+    let vault_id = state.get_vault_id().await?;
+    let db = state.db.clone();
+    let app_state = state.inner().clone();
+    let qid = query_id.clone();
+    let app_clone = app.clone();
+
+    tokio::spawn(async move {
+        if let Err(e) = run_kb_query(&app_clone, &db, &vault_id, &question, &qid, &app_state).await {
+            let _ = app_clone.emit("knowledge:done", serde_json::json!({
+                "query_id": &qid,
+                "error": e.to_string()
+            }));
+        }
+    });
+    Ok(())
+}
+
+async fn run_kb_query(
+    app: &AppHandle,
+    db: &SurrealDb,
+    vault_id: &str,
+    question: &str,
+    query_id: &str,
+    app_state: &AppState,
+) -> Result<(), AppError> {
+    #[derive(serde::Deserialize)]
+    struct ChunkRow { file_path: String, section: String, content: String }
+
+    // 1. Vector search → BM25 → contains（只搜 verified）
+    let emb_port = *app_state.embedding_actual_port.lock().await;
+    let emb_url = emb_port.map(|p| format!("http://127.0.0.1:{}", p));
+    let client = reqwest::Client::new();
+
+    let chunks: Vec<ChunkRow> = if let Some(ref url) = emb_url {
+        let qvec = get_embedding(&client, url, question).await;
+        if !qvec.is_empty() {
+            let mut resp = db.query(
+                "SELECT file_path, section, content FROM chunks
+                 WHERE vault_id = $vid AND embedding != NONE AND status = 'verified'
+                 ORDER BY vector::similarity::cosine(embedding, $qvec) DESC LIMIT 8"
+            )
+            .bind(("vid", vault_id.to_owned()))
+            .bind(("qvec", qvec))
+            .await.map_err(|e| AppError::Database(e.to_string()))?;
+            let rows: Vec<ChunkRow> = resp.take(0).unwrap_or_default();
+            rows
+        } else { vec![] }
+    } else { vec![] };
+
+    let chunks: Vec<ChunkRow> = if chunks.is_empty() {
+        let mut resp = db.query(
+            "SELECT file_path, section, content FROM chunks
+             WHERE vault_id = $vid AND status = 'verified' AND content @1@ $q
+             LIMIT 8"
+        )
+        .bind(("vid", vault_id.to_owned()))
+        .bind(("q", question.to_owned()))
+        .await.map_err(|e| AppError::Database(e.to_string()))?;
+        resp.take(0).unwrap_or_default()
+    } else { chunks };
+
+    let chunks: Vec<ChunkRow> = if chunks.is_empty() {
+        let mut resp = db.query(
+            "SELECT file_path, section, content FROM chunks
+             WHERE vault_id = $vid AND status = 'verified'
+               AND string::contains(string::lowercase(content), string::lowercase($q))
+             LIMIT 8"
+        )
+        .bind(("vid", vault_id.to_owned()))
+        .bind(("q", question.to_owned()))
+        .await.map_err(|e| AppError::Database(e.to_string()))?;
+        resp.take(0).unwrap_or_default()
+    } else { chunks };
+
+    if chunks.is_empty() {
+        let msg = "知識庫中沒有相關的已驗證資料，無法回答此問題。請先匯入並驗證相關知識。";
+        let _ = app.emit("knowledge:token", serde_json::json!({ "query_id": query_id, "content": msg }));
+        let _ = app.emit("knowledge:done", serde_json::json!({ "query_id": query_id }));
+        return Ok(());
+    }
+
+    // 2. Build refs (chunk-level, with section anchor)
+    let refs: Vec<KnowledgeRef> = chunks.iter().map(|c| {
+        let fname = c.file_path.split('/').last().unwrap_or("").trim_end_matches(".md");
+        let title = if c.section.is_empty() {
+            fname.to_string()
+        } else {
+            format!("{} § {}", fname, c.section)
+        };
+        let path = if c.section.is_empty() {
+            c.file_path.clone()
+        } else {
+            format!("{}#{}", c.file_path, c.section)
+        };
+        let excerpt: String = c.content.chars().take(160).collect();
+        KnowledgeRef { path, title, excerpt }
+    }).collect();
+
+    let _ = app.emit("knowledge:refs", serde_json::json!({ "query_id": query_id, "refs": refs }));
+
+    // 3. STRICT system prompt
+    let context = chunks.iter().enumerate().map(|(i, c)| {
+        let loc = if c.section.is_empty() {
+            c.file_path.clone()
+        } else {
+            format!("{} § {}", c.file_path, c.section)
+        };
+        let excerpt: String = c.content.chars().take(1500).collect();
+        format!("[{}] 來源：{}\n{}", i + 1, loc, excerpt)
+    }).collect::<Vec<_>>().join("\n\n---\n\n");
+
+    let system = format!(
+        "你是嚴格的知識庫問答助手。\
+        規則：\
+        1. 只能根據以下「知識庫片段」回答，禁止使用訓練資料中的知識。\
+        2. 每個陳述必須以 [1]、[2] 等格式標示來源編號。\
+        3. 若知識庫片段中找不到答案，必須明確說「知識庫中沒有此資訊」，不得猜測或補充。\
+        4. 用繁體中文回答。\n\n知識庫片段：\n\n{}",
+        context
+    );
+
+    // 4. AI streaming
+    let provider = queries::get_setting(db, "ai_provider").await.unwrap_or_default().unwrap_or_default();
+    let model = queries::get_setting(db, "ai_model").await.unwrap_or_default().unwrap_or_default();
+    let api_key = read_api_key_sync(&provider);
+
+    let response = if provider == "anthropic" {
+        let body = serde_json::json!({
+            "model": if model.is_empty() { "claude-3-5-haiku-20241022" } else { model.as_str() },
+            "max_tokens": 1024, "system": system, "stream": true,
+            "messages": [{ "role": "user", "content": question }],
+        });
+        client.post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", &api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&body).timeout(std::time::Duration::from_secs(120))
+            .send().await.map_err(|e| AppError::AI(e.to_string()))?
+    } else if !provider.is_empty() {
+        let base_url = queries::get_setting(db, "ai_base_url").await.unwrap_or_default()
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        let body = serde_json::json!({
+            "model": if model.is_empty() { "gpt-4o" } else { model.as_str() },
+            "messages": [{ "role": "system", "content": system }, { "role": "user", "content": question }],
+            "stream": true, "temperature": 0.1, "max_tokens": 1024,
+        });
+        let mut req = client.post(format!("{}/chat/completions", base_url.trim_end_matches('/')))
+            .json(&body).timeout(std::time::Duration::from_secs(120));
+        if !api_key.is_empty() { req = req.header("Authorization", format!("Bearer {}", api_key)); }
+        req.send().await.map_err(|e| AppError::AI(e.to_string()))?
+    } else {
+        let base_url = ensure_server_running(app_state, app).await?;
+        let body = serde_json::json!({
+            "model": "local",
+            "messages": [{ "role": "system", "content": system }, { "role": "user", "content": question }],
+            "stream": true, "temperature": 0.1, "max_tokens": 1024,
+        });
+        client.post(format!("{}/v1/chat/completions", base_url))
+            .json(&body).timeout(std::time::Duration::from_secs(120))
+            .send().await.map_err(|e| AppError::AI(e.to_string()))?
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(AppError::AI(format!("LLM 回應錯誤 {}：{}", status, text)));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut sse_buf = String::new();
+    let is_anthropic = provider == "anthropic";
+
+    while let Some(item) = stream.next().await {
+        let bytes = item.map_err(|e| AppError::AI(e.to_string()))?;
+        sse_buf.push_str(&String::from_utf8_lossy(&bytes));
+        while let Some(end) = sse_buf.find("\n\n") {
+            let event = sse_buf[..end].to_string();
+            sse_buf = sse_buf[end + 2..].to_string();
+            for line in event.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if data.trim() == "[DONE]" { continue; }
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                        let content = if is_anthropic {
+                            if json["type"] == "content_block_delta" {
+                                json["delta"]["text"].as_str().map(|s| s.to_string())
+                            } else { None }
+                        } else {
+                            json["choices"][0]["delta"]["content"].as_str().map(|s| s.to_string())
+                        };
+                        if let Some(text) = content {
+                            if !text.is_empty() {
+                                let _ = app.emit("knowledge:token", serde_json::json!({
+                                    "query_id": query_id, "content": text
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = app.emit("knowledge:done", serde_json::json!({ "query_id": query_id }));
+    Ok(())
+}
