@@ -29,6 +29,13 @@ interface ImportSessionSummary extends ImportSession {
   imported_pages: number
 }
 
+interface KBCardSuggestion {
+  title: string
+  template: 'concept' | 'procedure' | 'reference'
+  content: string
+  reason: string
+}
+
 interface Props {
   onOpenNote?: (path: string) => void
 }
@@ -508,6 +515,7 @@ export default function ImportPanel({ onOpenNote }: Props) {
           onSessionsChange={loadSessions}
           onDelete={handleDeleteSession}
           addLog={addLog}
+          onOpenNote={onOpenNote}
         />
       )}
     </div>
@@ -649,7 +657,7 @@ interface PageRow {
 }
 
 function SourceManagePanel({
-  sessions, focusSession, onClose, onSessionsChange, onDelete, addLog,
+  sessions, focusSession, onClose, onSessionsChange, onDelete, addLog, onOpenNote,
 }: {
   sessions: ImportSessionSummary[]
   focusSession: ImportSessionSummary | null
@@ -657,12 +665,17 @@ function SourceManagePanel({
   onSessionsChange: () => Promise<void>
   onDelete: (id: string) => void
   addLog: (cat: string, level: 'info' | 'warn' | 'error', msg: string) => void
+  onOpenNote?: (path: string) => void
 }) {
   const [activeSession, setActiveSession] = useState<ImportSessionSummary | null>(focusSession)
   const [pages, setPages] = useState<PageRow[]>([])
   const [loadingPages, setLoadingPages] = useState(false)
   const [analyzingSession, setAnalyzingSession] = useState<string | null>(null)
   const [importingIds, setImportingIds] = useState<Set<string>>(new Set())
+  // AI KB card suggestions
+  const [suggestingPageId, setSuggestingPageId] = useState<string | null>(null)
+  const [suggestions, setSuggestions] = useState<KBCardSuggestion[]>([])
+  const [creatingCardTitle, setCreatingCardTitle] = useState<string | null>(null)
   // Batch verify state
   const [noteStatuses, setNoteStatuses] = useState<Record<string, string>>({})
   const [verifyMode, setVerifyMode] = useState(false)
@@ -698,10 +711,21 @@ function SourceManagePanel({
 
   const handleImportPage = async (page: PageRow) => {
     setImportingIds(s => new Set(s).add(page.page_id))
+    setSuggestions([])
     try {
       await invoke('import_page', { sessionId: page.session_id, pageId: page.page_id })
       setPages(prev => prev.map(p => p.page_id === page.page_id ? { ...p, status: 'imported' } : p))
       await onSessionsChange()
+      // 非同步觸發 AI 建議（不阻塞匯入流程）
+      setSuggestingPageId(page.page_id)
+      invoke<KBCardSuggestion[]>('suggest_kb_cards', {
+        sessionId: page.session_id,
+        pageId: page.page_id,
+      }).then(cards => {
+        if (cards.length > 0) setSuggestions(cards)
+      }).catch(() => { /* 建議失敗不影響匯入 */ }).finally(() => {
+        setSuggestingPageId(null)
+      })
     } catch (e: unknown) {
       const msg = fmtError(e)
       addLog('import', 'error', `匯入失敗：${msg}`)
@@ -726,6 +750,20 @@ function SourceManagePanel({
       setNoteStatuses(prev => ({ ...prev, [page.page_id]: status }))
     } catch (e) {
       toast.error(`設定狀態失敗：${fmtError(e)}`)
+    }
+  }
+
+  const handleCreateCard = async (card: KBCardSuggestion) => {
+    setCreatingCardTitle(card.title)
+    try {
+      const path = await invoke<string>('create_note', { title: card.title, content: card.content })
+      toast.success(`已建立「${card.title}」`)
+      setSuggestions(prev => prev.filter(s => s.title !== card.title))
+      onOpenNote?.(path)
+    } catch (e) {
+      toast.error(`建立筆記失敗：${fmtError(e)}`)
+    } finally {
+      setCreatingCardTitle(null)
     }
   }
 
@@ -1025,6 +1063,78 @@ function SourceManagePanel({
               })()}
             </div>
           ))}
+        </div>
+      )}
+
+      {/* AI KB card suggestions */}
+      {(suggestingPageId !== null || suggestions.length > 0) && (
+        <div style={{
+          borderTop: '1px solid var(--color-border)',
+          background: 'var(--color-bg-secondary)',
+          padding: '10px 14px',
+          flexShrink: 0,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-text-secondary)', display: 'flex', alignItems: 'center', gap: 6 }}>
+              {suggestingPageId !== null && <FontAwesomeIcon icon={faSpinner} spin style={{ fontSize: 10 }} />}
+              🤖 AI 知識卡片建議
+            </div>
+            {suggestions.length > 0 && (
+              <button
+                onClick={() => setSuggestions([])}
+                style={{ ...iconBtn, fontSize: 10, padding: '2px 5px' }}
+                title="關閉建議"
+              >✕</button>
+            )}
+          </div>
+          {suggestions.map((card) => {
+            const templateLabel = card.template === 'concept' ? '概念' : card.template === 'procedure' ? '步驟' : '參考'
+            const templateColor = card.template === 'concept' ? 'var(--color-accent)' : card.template === 'procedure' ? 'var(--color-success)' : 'var(--color-warning, #e5a50a)'
+            return (
+              <div
+                key={card.title}
+                style={{
+                  background: 'var(--color-bg-primary)',
+                  border: '1px solid var(--color-border)',
+                  borderRadius: 6,
+                  padding: '8px 10px',
+                  marginBottom: 6,
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  gap: 8,
+                }}
+              >
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
+                    <span style={{
+                      fontSize: 10, fontWeight: 700, padding: '1px 5px',
+                      borderRadius: 3, background: templateColor + '22',
+                      color: templateColor, flexShrink: 0,
+                    }}>{templateLabel}</span>
+                    <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {card.title}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--color-text-muted)', lineHeight: 1.4 }}>{card.reason}</div>
+                </div>
+                <button
+                  disabled={creatingCardTitle === card.title}
+                  onClick={() => handleCreateCard(card)}
+                  style={{ ...iconBtn, fontSize: 11, padding: '3px 8px', color: 'var(--color-accent)', flexShrink: 0, whiteSpace: 'nowrap' }}
+                  title="建立筆記"
+                >
+                  {creatingCardTitle === card.title
+                    ? <FontAwesomeIcon icon={faSpinner} spin />
+                    : '+ 建立'}
+                </button>
+              </div>
+            )
+          })}
+          {suggestingPageId !== null && suggestions.length === 0 && (
+            <div style={{ fontSize: 11, color: 'var(--color-text-muted)', textAlign: 'center', padding: '4px 0' }}>
+              AI 正在分析知識點…
+            </div>
+          )}
         </div>
       )}
     </div>

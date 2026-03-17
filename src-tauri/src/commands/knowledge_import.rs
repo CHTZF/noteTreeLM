@@ -1351,6 +1351,207 @@ async fn run_knowledge_query(
     Ok(())
 }
 
+// ── KB Card Suggestion ────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KBCardSuggestion {
+    pub title: String,
+    pub template: String,   // "concept" | "procedure" | "reference"
+    pub content: String,    // 預填的 markdown 內容（含 frontmatter）
+    pub reason: String,     // 為什麼建議這張卡片
+}
+
+/// 根據已匯入頁面的內容，用 LLM 建議 2-4 個值得建立的知識卡片。
+#[tauri::command]
+pub async fn suggest_kb_cards(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    page_id: String,
+) -> Result<Vec<KBCardSuggestion>, AppError> {
+    let vault_id = state.get_vault_id().await?;
+    let db = &state.db;
+
+    // 取得頁面的 note_path
+    #[derive(Deserialize)]
+    struct PagePath { note_path: Option<String> }
+    let mut r = db.query(
+        "SELECT note_path FROM import_pages WHERE vault_id = $vid AND page_id = $pid LIMIT 1"
+    ).bind(("vid", vault_id.clone())).bind(("pid", page_id.clone()))
+    .await.map_err(|e| AppError::Database(e.to_string()))?;
+    let rows: Vec<PagePath> = r.take(0).unwrap_or_default();
+    let note_path = rows.into_iter().next()
+        .and_then(|p| p.note_path)
+        .ok_or_else(|| AppError::Import("頁面尚未匯入".to_string()))?;
+
+    // 讀取 note 內容
+    let vault_path = state.get_vault_path().await;
+    let abs = std::path::PathBuf::from(&vault_path).join(&note_path);
+    let content = tokio::fs::read_to_string(&abs).await
+        .map_err(|e| AppError::Import(format!("讀取筆記失敗：{}", e)))?;
+
+    // 截取前 3000 字元，避免 context 過長
+    let excerpt = if content.len() > 3000 { &content[..3000] } else { &content };
+
+    let system_prompt = r#"你是一個知識管理專家。根據用戶提供的文章，建議 2-4 個值得建立的知識卡片。
+每張卡片必須是以下三種類型之一：
+- concept（概念定義）：適合解釋一個術語、概念或原理
+- procedure（操作步驟）：適合記錄一個操作流程或步驟
+- reference（參考資料）：適合整理一個主題的參考摘要
+
+回傳嚴格的 JSON 陣列格式（不要有任何其他文字）：
+[
+  {
+    "title": "卡片標題",
+    "template": "concept | procedure | reference",
+    "content": "完整的 markdown 內容（含 frontmatter）",
+    "reason": "為什麼這個知識值得建立成獨立卡片"
+  }
+]
+
+content 欄位格式範例（concept）：
+---
+status: draft
+tags: [concept]
+---
+
+# 標題
+
+## 定義
+
+> 簡短定義
+
+## 詳細說明
+
+（從文章中提取的核心內容）
+
+## 相關概念
+
+-
+
+## 來源
+
+- 原文標題"#;
+
+    let user_content = format!("請根據以下文章建議知識卡片：\n\n{}", excerpt);
+
+    // 呼叫 LLM
+    let base_url = ensure_server_running(state.inner(), &app).await?;
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_content},
+        ],
+        "max_tokens": 2048,
+        "temperature": 0.3,
+        "stream": false,
+    });
+
+    let response = client
+        .post(format!("{}/v1/chat/completions", base_url))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await
+        .map_err(|e| AppError::AI(format!("LLM 請求失敗：{}", e)))?;
+
+    let json: serde_json::Value = response.json().await
+        .map_err(|e| AppError::AI(format!("回應解析失敗：{}", e)))?;
+
+    let raw = json["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    // 嘗試解析 JSON（LLM 可能在前後加說明文字，找 [ ... ]）
+    let json_start = raw.find('[').unwrap_or(0);
+    let json_end = raw.rfind(']').map(|i| i + 1).unwrap_or(raw.len());
+    let json_str = &raw[json_start..json_end];
+
+    let suggestions: Vec<KBCardSuggestion> = serde_json::from_str(json_str)
+        .unwrap_or_default();
+
+    Ok(suggestions)
+}
+
+/// 搜尋已驗證 KB chunks，回傳格式化的 context 字串供注入 system prompt。
+/// 依序嘗試：向量 → BM25 → contains（僅 verified）。
+/// 找到結果時回傳 Some(context)，找不到回傳 None。
+pub async fn search_kb_context(
+    db: &SurrealDb,
+    vault_id: &str,
+    query: &str,
+    embedding_url: Option<&str>,
+) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct ChunkRow { file_path: String, section: String, content: String }
+
+    let client = reqwest::Client::new();
+
+    // 1. Vector
+    let chunks: Vec<ChunkRow> = if let Some(url) = embedding_url {
+        let qvec = get_embedding(&client, url, query).await;
+        if !qvec.is_empty() {
+            let mut r = db.query(
+                "SELECT file_path, section, content,
+                        vector::similarity::cosine(embedding, $qvec) AS score
+                 FROM chunks
+                 WHERE vault_id = $vid AND embedding != NONE AND status = 'verified'
+                 ORDER BY score DESC LIMIT 5"
+            ).bind(("vid", vault_id.to_owned())).bind(("qvec", qvec))
+            .await.ok()?;
+            r.take(0).unwrap_or_default()
+        } else { vec![] }
+    } else { vec![] };
+
+    // 2. BM25
+    let chunks: Vec<ChunkRow> = if chunks.is_empty() {
+        let mut r = db.query(
+            "SELECT file_path, section, content FROM chunks
+             WHERE vault_id = $vid AND status = 'verified' AND content @1@ $q LIMIT 5"
+        ).bind(("vid", vault_id.to_owned())).bind(("q", query.to_owned()))
+        .await.ok()?;
+        r.take(0).unwrap_or_default()
+    } else { chunks };
+
+    // 3. Contains
+    let chunks: Vec<ChunkRow> = if chunks.is_empty() {
+        let mut r = db.query(
+            "SELECT file_path, section, content FROM chunks
+             WHERE vault_id = $vid AND status = 'verified'
+               AND string::contains(string::lowercase(content), string::lowercase($q))
+             LIMIT 5"
+        ).bind(("vid", vault_id.to_owned())).bind(("q", query.to_owned()))
+        .await.ok()?;
+        r.take(0).unwrap_or_default()
+    } else { chunks };
+
+    if chunks.is_empty() { return None; }
+
+    let mut context = String::from(
+        "## 知識庫參考資料（已驗證）\n\
+         以下內容來自你的知識庫，請優先參考，引用時標注 [KB: 來源]：\n\n"
+    );
+    for (i, c) in chunks.iter().enumerate() {
+        let fname = c.file_path.split('/').last().unwrap_or("").trim_end_matches(".md");
+        let source = if c.section.is_empty() {
+            fname.to_string()
+        } else {
+            format!("{} § {}", fname, c.section)
+        };
+        let snippet = if c.content.len() > 400 {
+            format!("{}…", &c.content[..400])
+        } else {
+            c.content.clone()
+        };
+        context.push_str(&format!("[{}] 來源：{}\n{}\n\n", i + 1, source, snippet));
+    }
+    context.push_str("---\n若知識庫內容足以回答請標注來源；不足時可補充，但請區分知識庫來源與你的推論。\n");
+    Some(context)
+}
+
 /// 診斷：列出目前 vault 的 chunks 狀態分佈 + 最近 5 筆 verified chunk 摘要
 #[tauri::command]
 pub async fn debug_kb_chunks(state: State<'_, AppState>) -> Result<String, AppError> {

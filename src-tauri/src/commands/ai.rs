@@ -585,6 +585,41 @@ pub async fn invoke_agent(
         }
     }
 
+    // 3.5 KB context injection（vault 可用 + use_kb 未明確關閉時）
+    let use_kb_flag = true; // 預設開啟；未來可由前端參數控制
+    if use_kb_flag {
+        if let Some(ref vid) = vault_id_opt {
+            let emb_url: Option<String> = {
+                let port = *state.embedding_actual_port.lock().await;
+                port.map(|p| format!("http://127.0.0.1:{}", p))
+            };
+            // 取最後一條 user 訊息作為搜尋 query
+            let kb_query = messages_json.iter().rev()
+                .find(|m| m["role"].as_str() == Some("user"))
+                .and_then(|m| m["content"].as_str())
+                .unwrap_or(&input)
+                .to_string();
+            if let Some(kb_ctx) = crate::commands::knowledge_import::search_kb_context(
+                &state.db, vid, &kb_query, emb_url.as_deref()
+            ).await {
+                // 注入到 system prompt（追加到既有 system 或新增）
+                let sys_idx = messages_json.iter().position(|m| m["role"].as_str() == Some("system"));
+                if let Some(idx) = sys_idx {
+                    let existing = messages_json[idx]["content"].as_str().unwrap_or("").to_string();
+                    messages_json[idx] = serde_json::json!({
+                        "role": "system",
+                        "content": format!("{}\n\n{}", existing, kb_ctx)
+                    });
+                } else {
+                    messages_json.insert(0, serde_json::json!({
+                        "role": "system",
+                        "content": kb_ctx
+                    }));
+                }
+            }
+        }
+    }
+
     // 4. 建立 ToolRegistry（vault 可用時注入工具）
     let registry = if !vault_path.is_empty() && vault_id_opt.is_some() {
         crate::tools::build_vault_registry(
@@ -793,6 +828,7 @@ pub async fn invoke_agent(
 #[tauri::command]
 pub async fn stream_chat_external(
     app: AppHandle,
+    state: State<'_, AppState>,
     messages: Vec<ChatMessage>,
     system: Option<String>,
     provider: String,
@@ -800,9 +836,32 @@ pub async fn stream_chat_external(
     model: String,
     api_key: String,
 ) -> Result<String, AppError> {
+    // KB context injection（同 invoke_agent）
+    let enriched_system: Option<String> = {
+        let vault_id = state.get_vault_id().await.ok();
+        if let Some(ref vid) = vault_id {
+            let emb_url: Option<String> = {
+                let port = *state.embedding_actual_port.lock().await;
+                port.map(|p| format!("http://127.0.0.1:{}", p))
+            };
+            let kb_query = messages.iter().rev()
+                .find(|m| m.role == "user")
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+            if !kb_query.is_empty() {
+                if let Some(kb_ctx) = crate::commands::knowledge_import::search_kb_context(
+                    &state.db, vid, &kb_query, emb_url.as_deref()
+                ).await {
+                    let base = system.as_deref().unwrap_or("");
+                    Some(if base.is_empty() { kb_ctx } else { format!("{}\n\n{}", base, kb_ctx) })
+                } else { system.clone() }
+            } else { system.clone() }
+        } else { system.clone() }
+    };
+
     match provider.as_str() {
-        "anthropic" => stream_external_anthropic(messages, system, model, api_key, app).await,
-        _ => stream_external_openai_compat(messages, system, model, base_url, api_key, app).await,
+        "anthropic" => stream_external_anthropic(messages, enriched_system, model, api_key, app).await,
+        _ => stream_external_openai_compat(messages, enriched_system, model, base_url, api_key, app).await,
     }
 }
 
