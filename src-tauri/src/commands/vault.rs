@@ -9,6 +9,12 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use tauri::State;
 
+/// 若 embedding server 正在運行，回傳其 base URL；否則回傳 None。
+async fn embedding_url(state: &AppState) -> Option<String> {
+    let port = *state.embedding_actual_port.lock().await;
+    port.map(|p| format!("http://127.0.0.1:{}", p))
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Note {
     pub path: String,
@@ -168,7 +174,8 @@ pub async fn create_note(
 
     // 建立 chunks（忽略失敗，不影響主流程）
     let chunks = chunker::chunk_note(&rel_path, &content, now_ms);
-    let _ = chunker::upsert_chunks(&db, &vault_id, &chunks).await;
+    let emb_url = embedding_url(&state).await;
+    let _ = chunker::upsert_chunks(&db, &vault_id, &chunks, emb_url.as_deref()).await;
 
     Ok(Note {
         path: rel_path,
@@ -253,7 +260,8 @@ pub async fn update_note(
 
     // 更新 chunks
     let chunks = chunker::chunk_note(&path, &content, now_ms);
-    let _ = chunker::upsert_chunks(&db, &vault_id, &chunks).await;
+    let emb_url = embedding_url(&state).await;
+    let _ = chunker::upsert_chunks(&db, &vault_id, &chunks, emb_url.as_deref()).await;
 
     Ok(())
 }
@@ -1765,15 +1773,86 @@ async fn scan_dir(
     Ok(())
 }
 
-/// 重新建立整個 vault 的 chunk 索引（首次啟動舊 vault 或手動觸發）
+/// 取得 chunk 索引統計（用於前端顯示進度）
+#[tauri::command]
+pub async fn get_index_stats(state: State<'_, AppState>) -> Result<serde_json::Value, AppError> {
+    use serde_json::json;
+    let db = &state.db;
+    let vault_id = match state.get_vault_id().await {
+        Ok(v) => v,
+        Err(_) => return Ok(json!({ "total": 0, "indexed": 0 })),
+    };
+
+    #[derive(Deserialize)]
+    struct CountRow { count: u64 }
+
+    let mut r1 = db
+        .query("SELECT count() AS count FROM notes WHERE vault_id = $vid GROUP ALL")
+        .bind(("vid", vault_id.clone()))
+        .await.map_err(|e| AppError::Database(e.to_string()))?;
+    let total_rows: Vec<CountRow> = r1.take(0).unwrap_or_default();
+    let total = total_rows.first().map(|r| r.count).unwrap_or(0);
+
+    // 有至少一個帶 embedding 的 chunk 的筆記數（vector indexed）
+    let mut r2 = db
+        .query("SELECT count() AS count FROM (SELECT DISTINCT file_path FROM chunks WHERE vault_id = $vid AND embedding != NONE) GROUP ALL")
+        .bind(("vid", vault_id.clone()))
+        .await.map_err(|e| AppError::Database(e.to_string()))?;
+    let emb_rows: Vec<CountRow> = r2.take(0).unwrap_or_default();
+    let embedded = emb_rows.first().map(|r| r.count).unwrap_or(0);
+
+    // 有至少一個 chunk 的筆記數（FTS indexed）
+    let mut r3 = db
+        .query("SELECT count() AS count FROM (SELECT DISTINCT file_path FROM chunks WHERE vault_id = $vid) GROUP ALL")
+        .bind(("vid", vault_id.clone()))
+        .await.map_err(|e| AppError::Database(e.to_string()))?;
+    let chunk_rows: Vec<CountRow> = r3.take(0).unwrap_or_default();
+    let chunked = chunk_rows.first().map(|r| r.count).unwrap_or(0);
+
+    Ok(json!({ "total": total, "chunked": chunked, "embedded": embedded }))
+}
+
+/// 重新建立整個 vault 的 chunk 索引，逐筆 emit 進度事件
 #[tauri::command]
 pub async fn reindex_vault_chunks(
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<usize, AppError> {
+    use serde::Serialize;
+    use tauri::Emitter;
+
+    #[derive(Serialize, Clone)]
+    struct ReindexProgress { done: usize, total: usize, path: String }
+
+    #[derive(Deserialize)]
+    struct NotePathContent { path: String, content: String }
+
     let db = state.db.clone();
     let vault_id = state.get_vault_id().await?;
-    let count = chunker::reindex_all(&db, &vault_id).await?;
-    Ok(count)
+    let emb_url = embedding_url(&state).await;
+
+    let mut resp = db
+        .query("SELECT path, content FROM notes WHERE vault_id = $vid")
+        .bind(("vid", vault_id.clone()))
+        .await.map_err(|e| AppError::Database(e.to_string()))?;
+    let notes: Vec<NotePathContent> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+
+    let total = notes.len();
+    let now = chrono::Utc::now().timestamp_millis();
+
+    for (i, note) in notes.iter().enumerate() {
+        let _ = app.emit("reindex:progress", ReindexProgress {
+            done: i,
+            total,
+            path: note.path.clone(),
+        });
+        let chunks = chunker::chunk_note(&note.path, &note.content, now);
+        chunker::upsert_chunks(&db, &vault_id, &chunks, emb_url.as_deref()).await?;
+    }
+
+    // 完成
+    let _ = app.emit("reindex:progress", ReindexProgress { done: total, total, path: String::new() });
+    Ok(total)
 }
 
 /// 語意搜尋：chunk FTS + 1-hop graph expansion（供前端 SemanticSearchPanel 使用）
@@ -1790,7 +1869,6 @@ pub async fn search_vault_chunks(
     let db = state.db.clone();
     let vault_id = state.get_vault_id().await?;
 
-    // 1. FTS search on chunks using SurrealDB BM25
     #[derive(Deserialize)]
     struct ChunkRow {
         file_path: String,
@@ -1798,24 +1876,106 @@ pub async fn search_vault_chunks(
         content: String,
     }
 
-    let mut resp = db
-        .query(
-            "SELECT file_path, section, content FROM chunks
-             WHERE vault_id = $vid AND content @@ $query
-             ORDER BY search::score(1) DESC
-             LIMIT 10"
-        )
-        .bind(("vid", vault_id.clone()))
-        .bind(("query", query.trim().to_owned()))
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-    let chunk_rows: Vec<ChunkRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
-
-    if chunk_rows.is_empty() {
-        return Ok(String::new());
+    // 0. 確認 chunks 表有資料（快速診斷）
+    {
+        #[derive(Deserialize)]
+        struct CountRow { count: u64 }
+        let mut r = db
+            .query("SELECT count() AS count FROM chunks WHERE vault_id = $vid GROUP ALL")
+            .bind(("vid", vault_id.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let rows: Vec<CountRow> = r.take(0).unwrap_or_default();
+        let total = rows.first().map(|r| r.count).unwrap_or(0);
+        if total == 0 {
+            return Ok("🔍 no_index".to_string());
+        }
     }
 
-    // 2. Collect matched file paths
+    // 1. 嘗試向量搜尋（若 embedding server 正在運行且 query 可被 embed）
+    let emb_url = embedding_url(&state).await;
+    let client = reqwest::Client::new();
+    // vec_diag: 向量路徑的診斷（優先回報，即使後續 fallback 有結果也記錄）
+    let mut vec_diag: Option<&str> = None;
+    let mut search_method = "contains";
+
+    let chunk_rows: Vec<ChunkRow> = if let Some(ref url) = emb_url {
+        let qvec = crate::commands::ai::get_embedding(&client, url, query.trim()).await;
+        if qvec.is_empty() {
+            vec_diag = Some("vector_fail");
+            vec![]
+        } else {
+            let mut resp = db
+                .query(
+                    "SELECT file_path, section, content,
+                            vector::similarity::cosine(embedding, $qvec) AS score
+                     FROM chunks
+                     WHERE vault_id = $vid AND embedding != NONE
+                     ORDER BY score DESC
+                     LIMIT 10"
+                )
+                .bind(("vid", vault_id.clone()))
+                .bind(("qvec", qvec))
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            let rows: Vec<ChunkRow> = resp.take(0).unwrap_or_default();
+            if rows.is_empty() {
+                vec_diag = Some("no_vec_index");
+            } else {
+                search_method = "vector";
+            }
+            rows
+        }
+    } else {
+        vec![]
+    };
+
+    // 2. Fallback A：BM25 全文搜尋
+    let chunk_rows: Vec<ChunkRow> = if chunk_rows.is_empty() {
+        let mut resp = db
+            .query(
+                "SELECT file_path, section, content FROM chunks
+                 WHERE vault_id = $vid AND content @1@ $query
+                 LIMIT 10"
+            )
+            .bind(("vid", vault_id.clone()))
+            .bind(("query", query.trim().to_owned()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let rows: Vec<ChunkRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+        if !rows.is_empty() { search_method = "bm25"; }
+        rows
+    } else {
+        chunk_rows
+    };
+
+    // 3. Fallback B：字串包含搜尋（保底）
+    let chunk_rows: Vec<ChunkRow> = if chunk_rows.is_empty() {
+        let mut resp = db
+            .query(
+                "SELECT file_path, section, content FROM chunks
+                 WHERE vault_id = $vid
+                   AND string::contains(string::lowercase(content), string::lowercase($query))
+                 LIMIT 10"
+            )
+            .bind(("vid", vault_id.clone()))
+            .bind(("query", query.trim().to_owned()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let rows: Vec<ChunkRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+        if !rows.is_empty() { search_method = "contains"; }
+        rows
+    } else {
+        chunk_rows
+    };
+
+    if chunk_rows.is_empty() {
+        // 若向量路徑有診斷資訊，優先回報（比 fallback 方法名稱更有診斷意義）
+        let report = vec_diag.unwrap_or(search_method);
+        return Ok(format!("🔍 {}\nno_results", report));
+    }
+
+    // 3. Collect matched file paths
     let matched_paths: HashSet<String> = chunk_rows
         .iter()
         .map(|r| r.file_path.clone())
@@ -1888,7 +2048,10 @@ pub async fn search_vault_chunks(
     }
 
     // 5. Build response string
-    let mut lines = vec![format!("找到 {} 個相關段落：", chunk_rows.len())];
+    let mut lines = vec![
+        format!("🔍 {}", search_method),
+        format!("找到 {} 個相關段落：", chunk_rows.len()),
+    ];
     for row in &chunk_rows {
         let title = titles.get(&row.file_path).cloned().unwrap_or_else(|| row.file_path.clone());
         let snippet: String = row.content.chars().take(200).collect();

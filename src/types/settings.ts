@@ -19,6 +19,7 @@ export interface Settings {
   ai_enable_vision: boolean
   llm_model_path: string
   llama_cli_path: string
+  embedding_model_path: string
   last_open_note: string
   onboarding_done: boolean
   recent_vaults: string[]
@@ -74,6 +75,7 @@ export const DEFAULT_SETTINGS: Settings = {
   ai_enable_vision: true,
   llm_model_path: '',
   llama_cli_path: '',
+  embedding_model_path: '',
   last_open_note: '',
   onboarding_done: false,
   recent_vaults: [],

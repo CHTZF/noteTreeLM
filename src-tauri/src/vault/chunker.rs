@@ -20,6 +20,7 @@ pub struct Chunk {
     pub chunk_type: String,
     pub word_count: i64,
     pub updated_at: i64,      // milliseconds
+    pub embedding:  Option<Vec<f32>>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -93,6 +94,7 @@ pub fn chunk_note(file_path: &str, content: &str, now_ms: i64) -> Vec<Chunk> {
                 chunk_type: "text".to_string(),
                 word_count: word_count(&text),
                 updated_at: now_ms,
+                embedding:  None,
             }
         })
         .collect()
@@ -100,7 +102,13 @@ pub fn chunk_note(file_path: &str, content: &str, now_ms: i64) -> Vec<Chunk> {
 
 /// Upsert a set of chunks into the vault DB.
 /// Deletes stale chunks from the same file that are no longer present.
-pub async fn upsert_chunks(db: &SurrealDb, vault_id: &str, chunks: &[Chunk]) -> Result<(), AppError> {
+/// If `embedding_url` is Some, calls the embedding server for each chunk and stores the vector.
+pub async fn upsert_chunks(
+    db: &SurrealDb,
+    vault_id: &str,
+    chunks: &[Chunk],
+    embedding_url: Option<&str>,
+) -> Result<(), AppError> {
     if chunks.is_empty() {
         return Ok(());
     }
@@ -110,7 +118,6 @@ pub async fn upsert_chunks(db: &SurrealDb, vault_id: &str, chunks: &[Chunk]) -> 
     let ids: Vec<&str> = chunks.iter().map(|c| c.id.as_str()).collect();
 
     // Delete stale chunks (those for this file+vault not in the current set)
-    // We do this by fetching existing chunk_ids and deleting those not in ids
     #[derive(Deserialize)]
     struct ChunkIdRow { chunk_id: String }
 
@@ -132,28 +139,61 @@ pub async fn upsert_chunks(db: &SurrealDb, vault_id: &str, chunks: &[Chunk]) -> 
         }
     }
 
-    // Upsert each chunk
+    // Upsert each chunk (with optional embedding)
+    let client = reqwest::Client::new();
     for c in chunks {
-        db.query(
-            "INSERT INTO chunks (vault_id, chunk_id, file_path, section, content, links, chunk_type, word_count, updated_at)
-             VALUES ($vid, $cid, $fp, $section, $content, $links, $chunk_type, $wc, $updated_at)
-             ON DUPLICATE KEY UPDATE
-               content    = $content,
-               links      = $links,
-               word_count = $wc,
-               updated_at = $updated_at"
-        )
-        .bind(("vid", vault_id.to_owned()))
-        .bind(("cid", c.id.clone()))
-        .bind(("fp", c.file_path.clone()))
-        .bind(("section", c.section.clone()))
-        .bind(("content", c.content.clone()))
-        .bind(("links", c.links.clone()))
-        .bind(("chunk_type", c.chunk_type.clone()))
-        .bind(("wc", c.word_count))
-        .bind(("updated_at", c.updated_at))
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        let emb_vec = if let Some(url) = embedding_url {
+            let v = crate::commands::ai::get_embedding(&client, url, &c.content).await;
+            if v.is_empty() { None } else { Some(v) }
+        } else {
+            None
+        };
+
+        if let Some(vec) = emb_vec {
+            let mut r = db.query(
+                "INSERT INTO chunks (vault_id, chunk_id, file_path, section, content, links, chunk_type, word_count, updated_at, embedding)
+                 VALUES ($vid, $cid, $fp, $section, $content, $links, $chunk_type, $wc, time::now(), $emb)
+                 ON DUPLICATE KEY UPDATE
+                   content    = $content,
+                   links      = $links,
+                   word_count = $wc,
+                   updated_at = time::now(),
+                   embedding  = $emb"
+            )
+            .bind(("vid", vault_id.to_owned()))
+            .bind(("cid", c.id.clone()))
+            .bind(("fp", c.file_path.clone()))
+            .bind(("section", c.section.clone()))
+            .bind(("content", c.content.clone()))
+            .bind(("links", c.links.clone()))
+            .bind(("chunk_type", c.chunk_type.clone()))
+            .bind(("wc", c.word_count))
+            .bind(("emb", vec))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            let _ = r;
+        } else {
+            let mut r = db.query(
+                "INSERT INTO chunks (vault_id, chunk_id, file_path, section, content, links, chunk_type, word_count, updated_at)
+                 VALUES ($vid, $cid, $fp, $section, $content, $links, $chunk_type, $wc, time::now())
+                 ON DUPLICATE KEY UPDATE
+                   content    = $content,
+                   links      = $links,
+                   word_count = $wc,
+                   updated_at = time::now()"
+            )
+            .bind(("vid", vault_id.to_owned()))
+            .bind(("cid", c.id.clone()))
+            .bind(("fp", c.file_path.clone()))
+            .bind(("section", c.section.clone()))
+            .bind(("content", c.content.clone()))
+            .bind(("links", c.links.clone()))
+            .bind(("chunk_type", c.chunk_type.clone()))
+            .bind(("wc", c.word_count))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            let _ = r;
+        }
     }
     Ok(())
 }
@@ -170,7 +210,12 @@ pub async fn delete_chunks(db: &SurrealDb, vault_id: &str, file_path: &str) -> R
 
 /// Bulk reindex: re-chunk every note in the DB.
 /// Returns the number of notes processed.
-pub async fn reindex_all(db: &SurrealDb, vault_id: &str) -> Result<usize, AppError> {
+/// Pass `embedding_url` to also embed each chunk during reindex.
+pub async fn reindex_all(
+    db: &SurrealDb,
+    vault_id: &str,
+    embedding_url: Option<&str>,
+) -> Result<usize, AppError> {
     #[derive(Deserialize)]
     struct NotePathContent {
         path: String,
@@ -189,7 +234,7 @@ pub async fn reindex_all(db: &SurrealDb, vault_id: &str) -> Result<usize, AppErr
 
     for note in &notes {
         let chunks = chunk_note(&note.path, &note.content, now);
-        upsert_chunks(db, vault_id, &chunks).await?;
+        upsert_chunks(db, vault_id, &chunks, embedding_url).await?;
     }
     Ok(count)
 }

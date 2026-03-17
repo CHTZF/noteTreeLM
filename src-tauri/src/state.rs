@@ -31,6 +31,14 @@ pub struct AppState {
     pub whisper_user_stopped: Arc<AtomicBool>,
     /// 使用者主動停止旗標：true 時 ensure_server_running 不會自動重啟
     pub llama_user_stopped: Arc<AtomicBool>,
+    /// 持有 embedding-server 子進程；App 結束時 kill
+    pub embedding_server: Arc<Mutex<Option<tokio::process::Child>>>,
+    /// embedding-server 實際執行的 port
+    pub embedding_actual_port: Arc<Mutex<Option<u16>>>,
+    /// embedding-server 啟動鎖
+    pub embedding_start_lock: Arc<Mutex<()>>,
+    /// 使用者主動停止旗標：true 時 ensure_embedding_server_running 不會自動重啟
+    pub embedding_user_stopped: Arc<AtomicBool>,
     /// 全域 port 分配鎖：防止 whisper 與 llama 並發 find_free_port 時取到同一個 port
     pub port_allocator: Arc<Mutex<()>>,
     /// Agent 取消旗標：設為 true 時 invoke_agent 的 SSE 迴圈中止
@@ -56,6 +64,10 @@ impl AppState {
             whisper_start_lock: Arc::new(Mutex::new(())),
             whisper_user_stopped: Arc::new(AtomicBool::new(false)),
             llama_user_stopped: Arc::new(AtomicBool::new(false)),
+            embedding_server: Arc::new(Mutex::new(None)),
+            embedding_actual_port: Arc::new(Mutex::new(None)),
+            embedding_start_lock: Arc::new(Mutex::new(())),
+            embedding_user_stopped: Arc::new(AtomicBool::new(false)),
             port_allocator: Arc::new(Mutex::new(())),
             agent_cancel: Arc::new(AtomicBool::new(false)),
             agent_session: Arc::new(Mutex::new(None)),

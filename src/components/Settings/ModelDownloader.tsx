@@ -133,6 +133,18 @@ export const LLM_MODELS: ModelItem[] = [
   },
 ]
 
+export const EMBEDDING_MODELS: ModelItem[] = [
+  {
+    id: 'bge-m3-q4_k_m',
+    filename: 'bge-m3-q4_k_m.gguf',
+    name: 'BGE-M3 (Q4)',
+    displaySize: '~1.2 GB',
+    desc: '推薦：BAAI 多語言 embedding 模型，支援中文、英文，適合語意搜尋',
+    url: 'https://huggingface.co/gpustack/bge-m3-GGUF/resolve/main/bge-m3-Q4_K_M.gguf',
+    recommended: true,
+  },
+]
+
 // ── Formatters ─────────────────────────────────────────────────────────────────
 
 function fmtBytes(bytes: number): string {

@@ -1264,7 +1264,7 @@ function AppMain() {
             </div>
           </div>
           <div style={{ display: leftPanel === 'search' ? 'flex' : 'none', flex: 1, flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-            <SemanticSearchPanel onOpenNote={openNote} />
+            <SemanticSearchPanel onOpenNote={openNoteFromChat} />
           </div>
           <div style={{ display: leftPanel === 'debug' ? 'flex' : 'none', flex: 1, flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
             <DebugPanel />

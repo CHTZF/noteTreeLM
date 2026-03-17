@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
 interface Props {
   onOpenNote: (path: string) => void
@@ -22,19 +23,43 @@ interface SearchResult {
   direct: ChunkResult[]
   expanded: ExpandedLink[]
   rawText: string
+  method: string   // 'vector' | 'bm25' | 'contains' | 'no_index' | 'no_results'
+}
+
+interface IndexStats {
+  total: number
+  chunked: number
+  embedded: number
+}
+
+interface ReindexProgress {
+  done: number
+  total: number
+  path: string
 }
 
 // ── Parse the formatted result from tool_search_vault ─────────────────────
+const METHOD_LABEL: Record<string, string> = {
+  vector:       '向量搜尋',
+  bm25:         'BM25 全文',
+  contains:     '字串包含',
+  no_index:     '尚未建立索引',
+  no_results:   '無結果',
+  vector_fail:  '向量連線失敗',
+  no_vec_index: '尚未建立向量索引',
+}
+
 function parseResult(raw: string): SearchResult {
   const direct: ChunkResult[] = []
   const expanded: ExpandedLink[] = []
   let inExpanded = false
+  let method = 'unknown'
 
   for (const line of raw.split('\n')) {
+    if (line.startsWith('🔍 ')) { method = line.slice(3).trim(); continue }
     if (line.startsWith('📎')) { inExpanded = true; continue }
     if (!line.startsWith('- ')) continue
 
-    // Match: - **title § section** (path)\n  snippet
     const m = line.match(/^- \*\*(.+?)\*\* \(([^)]+)\)/)
     if (!m) continue
     const [, titleSection, path] = m
@@ -50,7 +75,42 @@ function parseResult(raw: string): SearchResult {
       direct.push({ path, title, section, snippet })
     }
   }
-  return { direct, expanded, rawText: raw }
+  return { direct, expanded, rawText: raw, method }
+}
+
+function VectorFailDiag() {
+  const [diag, setDiag] = useState<string | null>(null)
+  const [checking, setChecking] = useState(false)
+  return (
+    <div>
+      <div>Embedding Server 連線失敗，請檢查伺服器狀態</div>
+      <button
+        onClick={async () => {
+          setChecking(true)
+          try {
+            const r = await invoke<string>('check_embedding_endpoint')
+            setDiag(r)
+          } catch (e: any) {
+            setDiag(String(e))
+          } finally {
+            setChecking(false)
+          }
+        }}
+        style={{ marginTop: '6px', fontSize: '11px', padding: '2px 8px', borderRadius: '4px',
+          border: '1px solid var(--color-border)', background: 'transparent',
+          color: 'var(--color-text-muted)', cursor: 'pointer' }}
+      >
+        {checking ? '診斷中…' : '診斷 Endpoint'}
+      </button>
+      {diag && (
+        <pre style={{ marginTop: '6px', fontSize: '10px', color: 'var(--color-text-secondary)',
+          whiteSpace: 'pre-wrap', wordBreak: 'break-all', background: 'var(--color-bg-base)',
+          padding: '6px', borderRadius: '4px', border: '1px solid var(--color-border)' }}>
+          {diag}
+        </pre>
+      )}
+    </div>
+  )
 }
 
 export default function SemanticSearchPanel({ onOpenNote }: Props) {
@@ -58,18 +118,28 @@ export default function SemanticSearchPanel({ onOpenNote }: Props) {
   const [result, setResult]         = useState<SearchResult | null>(null)
   const [loading, setLoading]       = useState(false)
   const [indexing, setIndexing]     = useState(false)
-  const [indexed, setIndexed]       = useState<number | null>(null)
+  const [stats, setStats]           = useState<IndexStats | null>(null)
+  const [progress, setProgress]     = useState<ReindexProgress | null>(null)
   const [error, setError]           = useState<string | null>(null)
   const inputRef                    = useRef<HTMLInputElement>(null)
+  const unlistenRef                 = useRef<UnlistenFn | null>(null)
 
   useEffect(() => { inputRef.current?.focus() }, [])
+
+  const loadStats = useCallback(async () => {
+    try {
+      const s = await invoke<IndexStats>('get_index_stats')
+      setStats(s)
+    } catch {}
+  }, [])
+
+  useEffect(() => { loadStats() }, [loadStats])
 
   const handleSearch = useCallback(async () => {
     const q = query.trim()
     if (!q) return
     setLoading(true); setError(null)
     try {
-      // invoke search_vault directly (chunk-aware)
       const raw = await invoke<string>('search_vault_chunks', { query: q })
       setResult(parseResult(raw))
     } catch (e: any) {
@@ -80,14 +150,24 @@ export default function SemanticSearchPanel({ onOpenNote }: Props) {
   }, [query])
 
   const handleReindex = async () => {
-    setIndexing(true); setError(null)
+    setIndexing(true); setError(null); setProgress(null)
+
+    // 監聽進度事件
+    unlistenRef.current?.()
+    unlistenRef.current = await listen<ReindexProgress>('reindex:progress', (e) => {
+      setProgress(e.payload)
+    })
+
     try {
-      const count = await invoke<number>('reindex_vault_chunks')
-      setIndexed(count)
+      await invoke<number>('reindex_vault_chunks')
+      await loadStats()
     } catch (e: any) {
       setError(typeof e === 'string' ? e : '建立索引失敗')
     } finally {
+      unlistenRef.current?.()
+      unlistenRef.current = null
       setIndexing(false)
+      setProgress(null)
     }
   }
 
@@ -101,6 +181,10 @@ export default function SemanticSearchPanel({ onOpenNote }: Props) {
     fontSize: '13px',
     outline: 'none',
   }
+
+  const pct = progress && progress.total > 0
+    ? Math.round(progress.done / progress.total * 100)
+    : 0
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
@@ -126,13 +210,44 @@ export default function SemanticSearchPanel({ onOpenNote }: Props) {
               opacity: indexing ? 0.5 : 1,
             }}
           >
-            {indexing ? '建立中…' : '重建索引'}
+            {indexing ? '索引中…' : '重建索引'}
           </button>
         </div>
 
-        {indexed !== null && (
-          <div style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>
-            ✅ 已索引 {indexed} 篇筆記
+        {/* Stats row */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          {stats && !indexing && (
+            <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>
+              {stats.embedded > 0
+                ? <>向量 <strong style={{ color: 'var(--color-accent)' }}>{stats.embedded}</strong> / {stats.total} 篇</>
+                : <>已索引 <strong style={{ color: 'var(--color-text-secondary)' }}>{stats.chunked}</strong> / {stats.total} 篇</>
+              }
+            </span>
+          )}
+          {indexing && progress && (
+            <span style={{ fontSize: '11px', color: 'var(--color-text-muted)', flex: 1, minWidth: 0 }}>
+              {progress.done} / {progress.total}
+              {progress.path && (
+                <span style={{ marginLeft: '6px', color: 'var(--color-text-muted)', opacity: 0.7,
+                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                  display: 'inline-block', maxWidth: '140px', verticalAlign: 'bottom' }}>
+                  {progress.path.split('/').pop()}
+                </span>
+              )}
+            </span>
+          )}
+        </div>
+
+        {/* Progress bar (shown during reindex) */}
+        {indexing && (
+          <div style={{ height: '3px', borderRadius: '2px', background: 'var(--color-border)', overflow: 'hidden' }}>
+            <div style={{
+              height: '100%',
+              width: progress ? `${pct}%` : '0%',
+              background: 'var(--color-accent)',
+              borderRadius: '2px',
+              transition: 'width 0.2s ease',
+            }} />
           </div>
         )}
 
@@ -178,9 +293,41 @@ export default function SemanticSearchPanel({ onOpenNote }: Props) {
           </div>
         )}
 
+        {result && (
+          <div style={{ padding: '6px 12px 0', display: 'flex', alignItems: 'center', gap: '6px' }}>
+            <span style={{
+              fontSize: '10px', padding: '1px 6px', borderRadius: '8px',
+              background: result.method === 'vector'
+                ? 'color-mix(in srgb, var(--color-accent) 15%, transparent)'
+                : result.method === 'bm25'
+                ? 'color-mix(in srgb, var(--color-success) 15%, transparent)'
+                : result.method === 'no_index' || result.method === 'no_results' || result.method === 'no_vec_index' || result.method === 'vector_fail'
+                ? 'color-mix(in srgb, var(--color-warning) 15%, transparent)'
+                : 'color-mix(in srgb, var(--color-text-muted) 15%, transparent)',
+              color: result.method === 'vector'
+                ? 'var(--color-accent)'
+                : result.method === 'bm25'
+                ? 'var(--color-success)'
+                : result.method === 'no_index' || result.method === 'no_results' || result.method === 'no_vec_index' || result.method === 'vector_fail'
+                ? 'var(--color-warning)'
+                : 'var(--color-text-muted)',
+              border: '1px solid currentColor',
+              fontWeight: 500,
+            }}>
+              {METHOD_LABEL[result.method] ?? result.method}
+            </span>
+          </div>
+        )}
+
         {result && result.direct.length === 0 && result.expanded.length === 0 && (
           <div style={{ padding: '20px 12px', textAlign: 'center', color: 'var(--color-text-muted)', fontSize: '13px' }}>
-            未找到相關段落
+            {result.method === 'no_index'
+              ? '尚未建立索引，請點上方「重建索引」'
+              : result.method === 'no_vec_index'
+              ? '尚未建立向量索引，請確認 Embedding Server 已啟動後重建索引'
+              : result.method === 'vector_fail'
+              ? <VectorFailDiag />
+              : '未找到相關段落'}
           </div>
         )}
 
@@ -189,7 +336,7 @@ export default function SemanticSearchPanel({ onOpenNote }: Props) {
             {result.direct.map((item, i) => (
               <div
                 key={i}
-                onClick={() => onOpenNote(item.path)}
+                onClick={() => onOpenNote(item.section ? `${item.path}#${item.section}` : item.path)}
                 style={{
                   padding: '8px 12px',
                   cursor: 'pointer',

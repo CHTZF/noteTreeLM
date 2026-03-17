@@ -5,7 +5,7 @@ import { open } from '@tauri-apps/plugin-dialog'
 import { useSettingsStore, SYSTEM_KEYS, SystemSettings } from '../../stores/settingsStore'
 import { useAuthStore } from '../../stores/authStore'
 import { Settings, DEFAULT_SETTINGS } from '../../types/settings'
-import ModelDownloader, { WHISPER_MODELS, LLM_MODELS } from './ModelDownloader'
+import ModelDownloader, { WHISPER_MODELS, LLM_MODELS, EMBEDDING_MODELS } from './ModelDownloader'
 import { toast } from '../common/Toast'
 
 function fmtBytes(bytes: number): string {
@@ -103,8 +103,10 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
 
   const [whisperStatus, setWhisperStatus] = useState<ServerStatus>('unknown')
   const [llamaStatus, setLlamaStatus] = useState<ServerStatus>('unknown')
+  const [embeddingStatus, setEmbeddingStatus] = useState<ServerStatus>('unknown')
   const [whisperBusy, setWhisperBusy] = useState(false)
   const [llamaBusy, setLlamaBusy] = useState(false)
+  const [embeddingBusy, setEmbeddingBusy] = useState(false)
   // Whisper 推論速度測試（毫秒/秒音頻，即 RTF × 1000）
   const [whisperBenchmarkMs, setWhisperBenchmarkMs] = useState<number | null>(null)
   const [whisperBenchmarking, setWhisperBenchmarking] = useState(false)
@@ -178,6 +180,8 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
       setWhisperStatus(ws as ServerStatus)
       const ls = await invoke<string>('get_llama_server_status').catch(() => 'stopped')
       setLlamaStatus(ls as ServerStatus)
+      const es = await invoke<string>('get_embedding_server_status').catch(() => 'stopped')
+      setEmbeddingStatus(es as ServerStatus)
     }
     refresh()
     const id = setInterval(refresh, 3000)
@@ -1444,6 +1448,41 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                 value={draft.llm_model_path}
                 onChange={(v) => up({ llm_model_path: v })}
                 disabled={llamaStatus === 'running'}
+              />
+
+              {/* ── Embedding Server ───────────────────────────────────────── */}
+              <SectionDivider />
+              <ServerCard
+                name="Embedding Server（語意搜尋）"
+                status={embeddingStatus}
+                busy={embeddingBusy}
+                onStart={async () => {
+                  setEmbeddingBusy(true)
+                  await saveSystem(draft).catch(() => {})
+                  await invoke('start_embedding_server').catch(() => {})
+                  setEmbeddingBusy(false)
+                }}
+                onStop={async () => {
+                  setEmbeddingBusy(true)
+                  await invoke('stop_embedding_server').catch(() => {})
+                  setEmbeddingBusy(false)
+                }}
+                onRestart={async () => {
+                  setEmbeddingBusy(true)
+                  await saveSystem(draft).catch(() => {})
+                  await invoke('restart_embedding_server').catch(() => {})
+                  setEmbeddingBusy(false)
+                }}
+              />
+              <SectionDivider />
+              <SectionHeader label="Embedding 模型管理" locked={embeddingStatus === 'running'} />
+              <ModelDownloader
+                models={EMBEDDING_MODELS}
+                title="Embedding 模型"
+                kind="llm"
+                value={draft.embedding_model_path}
+                onChange={(v) => up({ embedding_model_path: v })}
+                disabled={embeddingStatus === 'running'}
               />
             </>}
 

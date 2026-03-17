@@ -10,6 +10,8 @@ use commands::auth::{login, logout, get_session, change_password, start_google_o
 use commands::{
     ai::{stream_chat_external, process_with_llm, stop_llama_server, warmup_llama_server,
          get_llama_server_status, start_llama_server, restart_llama_server,
+         warmup_embedding_server, get_embedding_server_status, start_embedding_server,
+         stop_embedding_server, restart_embedding_server, check_embedding_endpoint,
          save_memory_session, query_memory, add_memory_rule,
          get_memory_rules, delete_memory_rule, confirm_write_tool,
          test_vault_tool, run_tool_pipeline, cancel_tool_test, cancel_agent, invoke_agent,
@@ -98,7 +100,7 @@ pub fn run() {
                                 let db = state.db.clone();
                                 let vid = vp.clone();
                                 tokio::spawn(async move {
-                                    let _ = vault::chunker::reindex_all(&db, &vid).await;
+                                    let _ = vault::chunker::reindex_all(&db, &vid, None).await;
                                 });
                             }
                             let stop_tx = vault::watcher::start_watcher(app_handle.clone(), path);
@@ -112,6 +114,7 @@ pub fn run() {
                 tokio::join!(
                     warmup_whisper_server(&state, &app_handle),
                     warmup_llama_server(&state, &app_handle),
+                    warmup_embedding_server(&state, &app_handle),
                 );
             });
 
@@ -172,6 +175,7 @@ pub fn run() {
             delete_trash_items,
             // Search / Chunks
             search,
+            get_index_stats,
             reindex_vault_chunks,
             search_vault_chunks,
             // Graph
@@ -204,6 +208,11 @@ pub fn run() {
             get_llama_server_status,
             start_llama_server,
             restart_llama_server,
+            get_embedding_server_status,
+            start_embedding_server,
+            stop_embedding_server,
+            restart_embedding_server,
+            check_embedding_endpoint,
             save_memory_session,
             query_memory,
             add_memory_rule,
@@ -253,6 +262,10 @@ pub fn run() {
                         }
                         let mut whisper_guard = state.whisper_server.lock().await;
                         if let Some(mut child) = whisper_guard.take() {
+                            let _ = child.kill().await;
+                        }
+                        let mut embedding_guard = state.embedding_server.lock().await;
+                        if let Some(mut child) = embedding_guard.take() {
                             let _ = child.kill().await;
                         }
                     });

@@ -249,29 +249,63 @@ pub(crate) async fn ensure_server_running(
     ))
 }
 
-/// 呼叫 llama-server /embedding endpoint，取得單一文字的 embedding 向量
+/// 呼叫 llama-server embedding endpoint，取得單一文字的 embedding 向量
+/// 依序嘗試：/v1/embeddings（OpenAI 格式）→ /embedding（legacy 格式）
 /// 失敗時回傳空 Vec（非致命錯誤，由呼叫端 fallback）
 pub async fn get_embedding(client: &reqwest::Client, base_url: &str, text: &str) -> Vec<f32> {
-    let body = serde_json::json!({ "content": text });
-    let resp = client
-        .post(format!("{}/embedding", base_url))
-        .json(&body)
-        .timeout(Duration::from_secs(10))
+    fn extract_vec(json: &serde_json::Value) -> Vec<f32> {
+        // OpenAI 格式: {"data": [{"embedding": [...]}]}
+        if let Some(arr) = json["data"][0]["embedding"].as_array() {
+            let v: Vec<f32> = arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
+            if !v.is_empty() { return v; }
+        }
+        // legacy 格式: {"embedding": [...]}
+        if let Some(arr) = json["embedding"].as_array() {
+            let v: Vec<f32> = arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
+            if !v.is_empty() { return v; }
+        }
+        // array 格式: [{"embedding": [...]}]
+        if let Some(first) = json.as_array().and_then(|a| a.first()) {
+            if let Some(arr) = first["embedding"].as_array() {
+                let v: Vec<f32> = arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
+                if !v.is_empty() { return v; }
+            }
+        }
+        vec![]
+    }
+
+    // 1. /v1/embeddings (OpenAI 相容，現代 llama-server 主要端點)
+    if let Ok(resp) = client
+        .post(format!("{}/v1/embeddings", base_url))
+        .json(&serde_json::json!({ "input": text }))
+        .timeout(Duration::from_secs(30))
         .send()
-        .await;
-    let resp = match resp {
-        Ok(r) if r.status().is_success() => r,
-        _ => return vec![],
-    };
-    let json: serde_json::Value = match resp.json().await {
-        Ok(v) => v,
-        Err(_) => return vec![],
-    };
-    // llama-server /embedding 回傳格式：{"embedding": [f32, ...]}
-    json["embedding"]
-        .as_array()
-        .map(|arr| arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect())
-        .unwrap_or_default()
+        .await
+    {
+        if resp.status().is_success() {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                let v = extract_vec(&json);
+                if !v.is_empty() { return v; }
+            }
+        }
+    }
+
+    // 2. /embedding (legacy)
+    if let Ok(resp) = client
+        .post(format!("{}/embedding", base_url))
+        .json(&serde_json::json!({ "content": text }))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                return extract_vec(&json);
+            }
+        }
+    }
+
+    vec![]
 }
 
 /// 計算多個 embedding 向量的 centroid（平均向量），並做 L2 正規化
@@ -1030,6 +1064,265 @@ pub async fn restart_llama_server(
         }
     }
     ensure_server_running(state.inner(), &app).await?;
+    Ok(())
+}
+
+// ─── Embedding Server ─────────────────────────────────────────────────────────
+
+/// 從 DB 讀取 embedding-server 的二進位路徑與模型路徑（與 llama 共用 llama_cli_path）
+async fn resolve_embedding_config(state: &AppState) -> Result<(PathBuf, String), AppError> {
+    let db = &state.db;
+    let server_path = queries::get_setting(db, "llama_cli_path")
+        .await?
+        .unwrap_or_default();
+    let model_path = queries::get_setting(db, "embedding_model_path")
+        .await?
+        .unwrap_or_default();
+    if server_path.is_empty() {
+        return Err(AppError::AI("尚未設定 llama-server 執行檔路徑".to_string()));
+    }
+    if model_path.is_empty() {
+        return Err(AppError::AI("尚未設定 Embedding 模型路徑".to_string()));
+    }
+    let mut bin = PathBuf::from(&server_path);
+    #[cfg(windows)]
+    if !bin.exists() && bin.extension().is_none() {
+        let candidate = bin.with_extension("exe");
+        if candidate.exists() { bin = candidate; }
+    }
+    if !bin.exists() {
+        return Err(AppError::AI(format!("找不到 llama-server：{}", bin.display())));
+    }
+    Ok((bin, model_path))
+}
+
+/// 確保 embedding-server 正在運行；若未啟動則自動 spawn
+/// 回傳 base URL（例如 "http://127.0.0.1:8082"）
+pub(crate) async fn ensure_embedding_server_running(
+    state: &AppState,
+    app: &AppHandle,
+) -> Result<String, AppError> {
+    if state.embedding_user_stopped.load(Ordering::SeqCst) {
+        return Err(AppError::AI("embedding-server 已手動停止".to_string()));
+    }
+    let _start_lock = state.embedding_start_lock.lock().await;
+    let (bin, model_path) = resolve_embedding_config(state).await?;
+
+    let port = {
+        let _alloc_lock = state.port_allocator.lock().await;
+        let mut guard = state.embedding_actual_port.lock().await;
+        if let Some(p) = *guard {
+            p
+        } else {
+            let p = find_free_port(8082);
+            *guard = Some(p);
+            p
+        }
+    };
+
+    let base_url = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+
+    {
+        let guard = state.embedding_server.lock().await;
+        if guard.is_some() {
+            let alive = client
+                .get(format!("{}/health", base_url))
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false);
+            if alive { return Ok(base_url); }
+            let _ = app.emit("llm:stderr", "[embed] 伺服器意外退出，重新啟動…");
+        }
+    }
+
+    let _ = app.emit("llm:stderr", format!(
+        "[embed] 啟動 embedding-server：{}\n  模型：{}\n  埠：{}", bin.display(), model_path, port
+    ));
+
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.args([
+        "--model", &model_path,
+        "--port", &port.to_string(),
+        "--host", "127.0.0.1",
+        "--ctx-size", "512",
+        "--parallel", "4",
+        "--embeddings",   // b3000+ 使用複數；舊版用 --embedding
+        "--pooling", "cls", // BGE 系列模型需要 CLS pooling
+    ])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let mut child = cmd.spawn()
+        .map_err(|e| AppError::AI(format!("embedding-server 啟動失敗：{}", e)))?;
+
+    if let Some(mut stderr) = child.stderr.take() {
+        let app_stderr = app.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 256];
+            loop {
+                match stderr.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => { let _ = app_stderr.emit("llm:stderr", String::from_utf8_lossy(&buf[..n]).as_ref()); }
+                }
+            }
+        });
+    }
+
+    { *state.embedding_server.lock().await = Some(child); }
+
+    let _ = app.emit("llm:stderr", "[embed] 等待模型載入…");
+    for i in 0..60u32 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        {
+            let mut guard = state.embedding_server.lock().await;
+            match guard.as_mut() {
+                None => return Err(AppError::AI("embedding-server 已手動停止".to_string())),
+                Some(child) => {
+                    if let Ok(Some(_)) = child.try_wait() {
+                        *guard = None;
+                        return Err(AppError::AI("embedding-server 意外退出，請確認模型路徑。".to_string()));
+                    }
+                }
+            }
+        }
+        let ready = client
+            .get(format!("{}/health", base_url))
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if ready {
+            let _ = app.emit("llm:stderr", format!("[embed] 就緒（等待 {} 秒）", i + 1));
+            return Ok(base_url);
+        }
+    }
+    Err(AppError::AI("embedding-server 啟動超時（60 秒）".to_string()))
+}
+
+/// App 啟動時預熱 embedding-server（若已設定模型）
+pub async fn warmup_embedding_server(state: &AppState, app: &AppHandle) {
+    let configured = matches!(
+        queries::get_setting(&state.db, "llama_cli_path").await,
+        Ok(Some(ref p)) if !p.is_empty()
+    ) && matches!(
+        queries::get_setting(&state.db, "embedding_model_path").await,
+        Ok(Some(ref p)) if !p.is_empty()
+    );
+    if !configured { return; }
+    if let Err(e) = ensure_embedding_server_running(state, app).await {
+        let _ = app.emit("llm:stderr", format!("[embed:error] {}", e));
+    }
+}
+
+#[tauri::command]
+pub async fn get_embedding_server_status(state: State<'_, AppState>) -> Result<String, AppError> {
+    let port = match *state.embedding_actual_port.lock().await {
+        Some(p) => p,
+        None => return Ok("stopped".to_string()),
+    };
+    let base_url = format!("http://127.0.0.1:{}", port);
+    let healthy = reqwest::Client::new()
+        .get(format!("{}/health", base_url))
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+    if healthy { return Ok("running".to_string()); }
+    let mut guard = state.embedding_server.lock().await;
+    match guard.as_mut() {
+        None => Ok("stopped".to_string()),
+        Some(child) => match child.try_wait() {
+            Ok(None) => Ok("loading".to_string()),
+            _ => { *guard = None; Ok("stopped".to_string()) }
+        },
+    }
+}
+
+/// 診斷用：測試 embedding server 的端點，回傳狀態碼與回應摘要
+#[tauri::command]
+pub async fn check_embedding_endpoint(state: State<'_, AppState>) -> Result<String, AppError> {
+    let port = match *state.embedding_actual_port.lock().await {
+        Some(p) => p,
+        None => return Ok("embedding_actual_port = None（server 未在 state 中登記）".to_string()),
+    };
+    let base_url = format!("http://127.0.0.1:{}", port);
+    let client = reqwest::Client::new();
+    let mut out = format!("base_url: {}\n", base_url);
+
+    // GET /health - 確認是什麼 server
+    match client.get(format!("{}/health", base_url)).timeout(Duration::from_secs(5)).send().await {
+        Err(e) => { out += &format!("GET /health: 失敗 — {}\n", e); }
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            let snippet = if text.len() > 200 { format!("{}…", &text[..200]) } else { text };
+            out += &format!("GET /health: HTTP {} | {}\n", status, snippet);
+        }
+    }
+
+    // POST 兩個 embedding endpoint
+    for (label, url, body) in [
+        ("/v1/embeddings", format!("{}/v1/embeddings", base_url), serde_json::json!({"input":"test"})),
+        ("/embedding",     format!("{}/embedding",     base_url), serde_json::json!({"content":"test"})),
+    ] {
+        match client.post(&url).json(&body).timeout(Duration::from_secs(10)).send().await {
+            Err(e) => { out += &format!("POST {}: 請求失敗 — {}\n", label, e); }
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let text = resp.text().await.unwrap_or_default();
+                let snippet = if text.len() > 300 { format!("{}…", &text[..300]) } else { text };
+                out += &format!("POST {}: HTTP {} | {}\n", label, status, snippet);
+            }
+        }
+    }
+
+    // 確認 embedding_server 子進程是否存在
+    let has_child = state.embedding_server.lock().await.is_some();
+    out += &format!("embedding_server child process: {}\n", if has_child { "Some（有子進程）" } else { "None（無子進程）" });
+
+    Ok(out)
+}
+
+#[tauri::command]
+pub async fn start_embedding_server(state: State<'_, AppState>, app: AppHandle) -> Result<(), AppError> {
+    state.embedding_user_stopped.store(false, Ordering::SeqCst);
+    ensure_embedding_server_running(state.inner(), &app).await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn stop_embedding_server(state: State<'_, AppState>) -> Result<(), AppError> {
+    state.embedding_user_stopped.store(true, Ordering::SeqCst);
+    let mut guard = state.embedding_server.lock().await;
+    if let Some(mut child) = guard.take() {
+        child.kill().await.ok();
+        child.wait().await.ok();
+    }
+    *state.embedding_actual_port.lock().await = None;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn restart_embedding_server(state: State<'_, AppState>, app: AppHandle) -> Result<(), AppError> {
+    state.embedding_user_stopped.store(false, Ordering::SeqCst);
+    {
+        let mut guard = state.embedding_server.lock().await;
+        if let Some(mut child) = guard.take() {
+            child.kill().await.ok();
+            child.wait().await.ok();
+        }
+    }
+    ensure_embedding_server_running(state.inner(), &app).await?;
     Ok(())
 }
 

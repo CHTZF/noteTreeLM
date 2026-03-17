@@ -24,6 +24,7 @@ pub struct Settings {
     pub ai_enable_vision: bool,
     pub llm_model_path: String,
     pub llama_cli_path: String,
+    pub embedding_model_path: String,
     pub last_open_note: String,
     pub onboarding_done: bool,
     pub recent_vaults: Vec<String>,
@@ -95,6 +96,7 @@ pub async fn get_settings(state: State<'_, AppState>, username: String) -> Resul
         ai_enable_vision: gget!("ai_enable_vision", "true") == "true",
         llm_model_path: gget!("llm_model_path", ""),
         llama_cli_path: gget!("llama_cli_path", ""),
+        embedding_model_path: gget!("embedding_model_path", ""),
         // Personal keys — read from user_settings
         last_open_note: get!("last_open_note", ""),
         onboarding_done: get!("onboarding_done", "false") == "true",
@@ -147,6 +149,7 @@ pub async fn get_system_settings(state: State<'_, AppState>) -> Result<SystemSet
         whisper_auto_insert: gget!("whisper_auto_insert", "true") == "true",
         llm_model_path: gget!("llm_model_path", ""),
         llama_cli_path: gget!("llama_cli_path", ""),
+        embedding_model_path: gget!("embedding_model_path", ""),
     })
 }
 
@@ -166,6 +169,7 @@ pub struct SystemSettings {
     pub whisper_auto_insert: bool,
     pub llm_model_path: String,
     pub llama_cli_path: String,
+    pub embedding_model_path: String,
 }
 
 #[tauri::command]
@@ -196,6 +200,7 @@ pub async fn save_system_settings(
     gsave!("whisper_auto_insert", settings.whisper_auto_insert);
     gsave!("llm_model_path", settings.llm_model_path.trim());
     gsave!("llama_cli_path", settings.llama_cli_path.trim());
+    gsave!("embedding_model_path", settings.embedding_model_path.trim());
 
     // 切換 vault（非空時）
     if !settings.system_current_vault_path.is_empty() {
@@ -276,7 +281,7 @@ async fn handle_vault_switch(app: AppHandle, state: AppState, new_path: String) 
                 let db = state.db.clone();
                 let vid = new_path.clone();
                 tokio::spawn(async move {
-                    let _ = crate::vault::chunker::reindex_all(&db, &vid).await;
+                    let _ = crate::vault::chunker::reindex_all(&db, &vid, None).await;
                 });
             }
             let stop_tx = vault::watcher::start_watcher(app, path);
