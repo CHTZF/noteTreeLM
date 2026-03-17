@@ -81,6 +81,9 @@ export default function ImportPanel({ onOpenNote }: Props) {
   const [showManage, setShowManage] = useState(false)
   const [managingSession, setManagingSession] = useState<ImportSessionSummary | null>(null)
 
+  // ── Main tab ─────────────────────────────────────────────────────────────────
+  const [mainTab, setMainTab] = useState<'qa' | 'dashboard'>('qa')
+
   // ── Load sessions ────────────────────────────────────────────────────────────
   const loadSessions = useCallback(async () => {
     setLoadingSessions(true)
@@ -426,8 +429,27 @@ export default function ImportPanel({ onOpenNote }: Props) {
           >
             <FontAwesomeIcon icon={showSidebar ? faChevronLeft : faChevronRight} style={{ fontSize: 11 }} />
           </button>
+          {/* Tab buttons */}
+          <div style={{ display: 'flex', gap: 2, background: 'var(--color-bg-elevated)', borderRadius: 6, padding: 2 }}>
+            {(['qa', 'dashboard'] as const).map(tab => (
+              <button
+                key={tab}
+                onClick={() => setMainTab(tab)}
+                style={{
+                  ...iconBtn,
+                  fontSize: 11, padding: '3px 10px',
+                  color: mainTab === tab ? 'var(--color-accent)' : 'var(--color-text-muted)',
+                  background: mainTab === tab ? 'var(--color-bg)' : 'transparent',
+                  fontWeight: mainTab === tab ? 600 : 400,
+                  borderRadius: 4,
+                }}
+              >
+                {tab === 'qa' ? '問答' : '統計'}
+              </button>
+            ))}
+          </div>
           <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-primary)', flex: 1 }}>
-            {selectedSession
+            {mainTab === 'dashboard' ? '知識庫統計' : selectedSession
               ? `${selectedSession.site_name || new URL(selectedSession.seed_url).hostname}`
               : '知識庫問答'}
           </span>
@@ -448,62 +470,66 @@ export default function ImportPanel({ onOpenNote }: Props) {
           </button>
         </div>
 
-        {/* Messages */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 16 }}>
-          {messages.length === 0 && (
-            <WelcomeScreen sessions={sessions} onSelectSession={setSelectedSessionIdStore} />
-          )}
-          {messages.map(msg => (
-            <MessageBubble
-              key={msg.id}
-              message={msg}
-              onOpenNote={onOpenNote}
-            />
-          ))}
-          <div ref={messagesEndRef} />
-        </div>
-
-        {/* Input */}
-        <div style={{
-          padding: '10px 16px', borderTop: '1px solid var(--color-border)',
-          background: 'var(--color-bg)', flexShrink: 0,
-        }}>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
-            <textarea
-              ref={inputRef}
-              value={input}
-              onChange={e => setInput(e.target.value)}
-              onKeyDown={e => {
-                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleQuery() }
-              }}
-              placeholder={sessions.length === 0
-                ? '請先新增來源並匯入頁面…'
-                : `向知識庫提問…${selectedSession ? `（僅查詢 ${selectedSession.site_name || '此來源'}）` : ''}`}
-              disabled={isQuerying || sessions.length === 0}
-              rows={1}
-              style={{
-                flex: 1, resize: 'none', minHeight: 36, maxHeight: 120,
-                background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)',
-                borderRadius: 8, padding: '8px 12px', fontSize: 13,
-                color: 'var(--color-text-primary)', outline: 'none',
-                lineHeight: 1.5, fontFamily: 'inherit',
-                opacity: (isQuerying || sessions.length === 0) ? 0.6 : 1,
-              }}
-            />
-            <button
-              onClick={handleQuery}
-              disabled={!input.trim() || isQuerying || sessions.length === 0}
-              style={{
-                width: 36, height: 36, flexShrink: 0,
-                background: 'var(--color-accent)', border: 'none', borderRadius: 8,
-                color: '#fff', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                opacity: (!input.trim() || isQuerying || sessions.length === 0) ? 0.5 : 1,
-              }}
-            >
-              <FontAwesomeIcon icon={isQuerying ? faSpinner : faPaperPlane} spin={isQuerying} style={{ fontSize: 13 }} />
-            </button>
+        {mainTab === 'dashboard' ? (
+          <KBDashboard />
+        ) : (<>
+          {/* Messages */}
+          <div style={{ flex: 1, overflowY: 'auto', padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {messages.length === 0 && (
+              <WelcomeScreen sessions={sessions} onSelectSession={setSelectedSessionIdStore} />
+            )}
+            {messages.map(msg => (
+              <MessageBubble
+                key={msg.id}
+                message={msg}
+                onOpenNote={onOpenNote}
+              />
+            ))}
+            <div ref={messagesEndRef} />
           </div>
-        </div>
+
+          {/* Input */}
+          <div style={{
+            padding: '10px 16px', borderTop: '1px solid var(--color-border)',
+            background: 'var(--color-bg)', flexShrink: 0,
+          }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
+              <textarea
+                ref={inputRef}
+                value={input}
+                onChange={e => setInput(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleQuery() }
+                }}
+                placeholder={sessions.length === 0
+                  ? '請先新增來源並匯入頁面…'
+                  : `向知識庫提問…${selectedSession ? `（僅查詢 ${selectedSession.site_name || '此來源'}）` : ''}`}
+                disabled={isQuerying || sessions.length === 0}
+                rows={1}
+                style={{
+                  flex: 1, resize: 'none', minHeight: 36, maxHeight: 120,
+                  background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)',
+                  borderRadius: 8, padding: '8px 12px', fontSize: 13,
+                  color: 'var(--color-text-primary)', outline: 'none',
+                  lineHeight: 1.5, fontFamily: 'inherit',
+                  opacity: (isQuerying || sessions.length === 0) ? 0.6 : 1,
+                }}
+              />
+              <button
+                onClick={handleQuery}
+                disabled={!input.trim() || isQuerying || sessions.length === 0}
+                style={{
+                  width: 36, height: 36, flexShrink: 0,
+                  background: 'var(--color-accent)', border: 'none', borderRadius: 8,
+                  color: '#fff', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  opacity: (!input.trim() || isQuerying || sessions.length === 0) ? 0.5 : 1,
+                }}
+              >
+                <FontAwesomeIcon icon={isQuerying ? faSpinner : faPaperPlane} spin={isQuerying} style={{ fontSize: 13 }} />
+              </button>
+            </div>
+          </div>
+        </>)}
       </div>
 
       {/* ── Source Management Overlay ── */}
@@ -1137,6 +1163,155 @@ function SourceManagePanel({
           )}
         </div>
       )}
+    </div>
+  )
+}
+
+// ── KB Dashboard ─────────────────────────────────────────────────────────────
+
+interface KBStats {
+  total_notes: number
+  verified: number
+  draft: number
+  deprecated: number
+  no_status: number
+  topics: Array<{ name: string; count: number }>
+  daily_trend: Array<{ date: string; total: number; verified: number }>
+}
+
+function KBDashboard() {
+  const [stats, setStats] = useState<KBStats | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    setLoading(true)
+    invoke<KBStats>('get_kb_stats')
+      .then(s => { setStats(s); setError(null) })
+      .catch(e => setError(fmtError(e)))
+      .finally(() => setLoading(false))
+  }, [])
+
+  if (loading) return (
+    <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--color-text-muted)', fontSize: 13 }}>
+      <FontAwesomeIcon icon={faSpinner} spin style={{ marginRight: 8 }} /> 載入中…
+    </div>
+  )
+  if (error) return (
+    <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--color-danger, #e06c75)', fontSize: 13, padding: 24 }}>
+      {error}
+    </div>
+  )
+  if (!stats) return null
+
+  const total = stats.total_notes
+  const verified = stats.verified
+  const draft = stats.draft
+  const deprecated = stats.deprecated
+  const noStatus = stats.no_status
+
+  // Coverage = verified / total
+  const coverage = total > 0 ? Math.round(verified / total * 100) : 0
+
+  // Bar chart helpers
+  const maxTopic = Math.max(...stats.topics.map(t => t.count), 1)
+  const trendMax = Math.max(...stats.daily_trend.map(d => d.total), 1)
+
+  // Only show last 14 days in chart for readability
+  const trendData = stats.daily_trend.slice(-14)
+
+  return (
+    <div style={{ flex: 1, overflowY: 'auto', padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 20 }}>
+
+      {/* Status summary cards */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10 }}>
+        {[
+          { label: '總筆記', value: total, color: 'var(--color-text-secondary)' },
+          { label: '✓ 已驗證', value: verified, color: 'var(--color-success)' },
+          { label: '✎ 草稿', value: draft, color: 'var(--color-accent)' },
+          { label: '✗ 棄用', value: deprecated, color: 'var(--color-text-muted)' },
+        ].map(({ label, value, color }) => (
+          <div key={label} style={{
+            background: 'var(--color-bg-elevated)', borderRadius: 8,
+            padding: '12px 14px', border: '1px solid var(--color-border)',
+          }}>
+            <div style={{ fontSize: 22, fontWeight: 700, color }}>{value}</div>
+            <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 2 }}>{label}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Coverage bar */}
+      <div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+          <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-text-secondary)' }}>知識覆蓋率</span>
+          <span style={{ fontSize: 12, color: 'var(--color-success)', fontWeight: 600 }}>{coverage}%</span>
+        </div>
+        <div style={{ height: 8, background: 'var(--color-border)', borderRadius: 4, overflow: 'hidden' }}>
+          <div style={{
+            height: '100%', width: `${coverage}%`,
+            background: 'var(--color-success)', borderRadius: 4,
+            transition: 'width 0.4s ease',
+          }} />
+        </div>
+        <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 4 }}>
+          {verified} 已驗證 / {total} 筆，{noStatus} 筆尚無狀態
+        </div>
+      </div>
+
+      {/* Topics */}
+      {stats.topics.length > 0 && (
+        <div>
+          <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-text-secondary)', marginBottom: 10 }}>主題分佈（資料夾）</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {stats.topics.map(t => (
+              <div key={t.name} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div style={{ width: 90, fontSize: 11, color: 'var(--color-text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flexShrink: 0 }}
+                  title={t.name}>{t.name}</div>
+                <div style={{ flex: 1, height: 6, background: 'var(--color-border)', borderRadius: 3, overflow: 'hidden' }}>
+                  <div style={{
+                    height: '100%',
+                    width: `${Math.round(t.count / maxTopic * 100)}%`,
+                    background: 'var(--color-accent)',
+                    borderRadius: 3,
+                  }} />
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--color-text-muted)', width: 28, textAlign: 'right', flexShrink: 0 }}>{t.count}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Daily trend (last 14 days) */}
+      <div>
+        <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-text-secondary)', marginBottom: 10 }}>最近 14 天趨勢</div>
+        <div style={{ display: 'flex', alignItems: 'flex-end', gap: 3, height: 60 }}>
+          {trendData.map(d => {
+            const barH = trendMax > 0 ? Math.max(2, Math.round(d.total / trendMax * 55)) : 2
+            const verH = trendMax > 0 && d.total > 0 ? Math.round(d.verified / d.total * barH) : 0
+            const label = d.date.slice(5) // MM-DD
+            return (
+              <div key={d.date} style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }} title={`${d.date}\n總計:${d.total} 驗證:${d.verified}`}>
+                <div style={{ width: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', height: 55, justifyContent: 'flex-end' }}>
+                  <div style={{ width: '70%', height: barH, background: 'var(--color-border)', borderRadius: 2, position: 'relative', overflow: 'hidden' }}>
+                    <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, height: verH, background: 'var(--color-success)' }} />
+                  </div>
+                </div>
+                <div style={{ fontSize: 9, color: 'var(--color-text-muted)', transform: 'rotate(-30deg)', transformOrigin: 'top center', whiteSpace: 'nowrap' }}>{label}</div>
+              </div>
+            )
+          })}
+        </div>
+        <div style={{ display: 'flex', gap: 12, marginTop: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, color: 'var(--color-text-muted)' }}>
+            <div style={{ width: 10, height: 6, background: 'var(--color-border)', borderRadius: 1 }} /> 總計
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, color: 'var(--color-text-muted)' }}>
+            <div style={{ width: 10, height: 6, background: 'var(--color-success)', borderRadius: 1 }} /> 已驗證
+          </div>
+        </div>
+      </div>
     </div>
   )
 }

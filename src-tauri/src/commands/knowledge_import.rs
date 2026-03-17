@@ -1802,3 +1802,118 @@ async fn run_kb_query(
     let _ = app.emit("knowledge:done", serde_json::json!({ "query_id": query_id }));
     Ok(())
 }
+
+// ── KB Dashboard ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct KBStats {
+    pub total_notes: i64,
+    pub verified: i64,
+    pub draft: i64,
+    pub deprecated: i64,
+    pub no_status: i64,
+    pub topics: Vec<KBTopic>,
+    pub daily_trend: Vec<KBDayEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KBTopic {
+    pub name: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KBDayEntry {
+    pub date: String,
+    pub total: i64,
+    pub verified: i64,
+}
+
+/// 回傳知識庫統計：筆記狀態分佈、資料夾主題分佈、最近 30 天每日統計。
+#[tauri::command]
+pub async fn get_kb_stats(state: State<'_, AppState>) -> Result<KBStats, AppError> {
+    let vault_id = state.get_vault_id().await?;
+    let db = &state.db;
+
+    #[derive(serde::Deserialize)]
+    struct NoteRow { file_path: String, status: String, updated_at: i64 }
+
+    let mut r = db.query(
+        "SELECT file_path, status, updated_at FROM chunks \
+         WHERE vault_id = $vid \
+         GROUP BY file_path, status, updated_at"
+    ).bind(("vid", vault_id.clone()))
+    .await.map_err(|e| AppError::Database(e.to_string()))?;
+    let all_chunks: Vec<NoteRow> = r.take(0).unwrap_or_default();
+
+    use std::collections::HashMap;
+    let mut note_map: HashMap<String, NoteRow> = HashMap::new();
+    for row in all_chunks {
+        note_map.entry(row.file_path.clone()).or_insert(row);
+    }
+    let notes: Vec<NoteRow> = note_map.into_values().collect();
+
+    let total_notes = notes.len() as i64;
+    let mut verified = 0i64;
+    let mut draft = 0i64;
+    let mut deprecated = 0i64;
+    let mut no_status = 0i64;
+
+    let mut topic_map: HashMap<String, i64> = HashMap::new();
+
+    use chrono::{Local, Duration, NaiveDate};
+    let today = Local::now().date_naive();
+    let cutoff_ms = (Local::now() - Duration::days(30)).timestamp_millis();
+    let mut day_total: HashMap<NaiveDate, i64> = HashMap::new();
+    let mut day_verified: HashMap<NaiveDate, i64> = HashMap::new();
+
+    for note in &notes {
+        match note.status.as_str() {
+            "verified" => verified += 1,
+            "draft" => draft += 1,
+            "deprecated" => deprecated += 1,
+            _ => no_status += 1,
+        }
+
+        let topic = note.file_path
+            .trim_start_matches('/')
+            .split('/')
+            .next()
+            .unwrap_or("其他")
+            .to_string();
+        *topic_map.entry(topic).or_insert(0) += 1;
+
+        if note.updated_at >= cutoff_ms {
+            let dt = chrono::DateTime::from_timestamp_millis(note.updated_at)
+                .map(|d| d.with_timezone(&Local).date_naive())
+                .unwrap_or(today);
+            *day_total.entry(dt).or_insert(0) += 1;
+            if note.status == "verified" {
+                *day_verified.entry(dt).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut topics: Vec<KBTopic> = topic_map.into_iter()
+        .map(|(name, count)| KBTopic { name, count })
+        .collect();
+    topics.sort_by(|a, b| b.count.cmp(&a.count));
+    topics.truncate(10);
+
+    let daily_trend: Vec<KBDayEntry> = (0..30i64).map(|i| {
+        let d = today - Duration::days(29 - i);
+        let total = *day_total.get(&d).unwrap_or(&0);
+        let v = *day_verified.get(&d).unwrap_or(&0);
+        KBDayEntry { date: d.format("%Y-%m-%d").to_string(), total, verified: v }
+    }).collect();
+
+    Ok(KBStats {
+        total_notes,
+        verified,
+        draft,
+        deprecated,
+        no_status,
+        topics,
+        daily_trend,
+    })
+}
