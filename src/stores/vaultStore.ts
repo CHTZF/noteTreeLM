@@ -237,18 +237,36 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
   },
 
   setupWatchers: async () => {
-    const unlisteners = await Promise.all([
-      listen('vault:note-created', () => get().loadNotes()),
-      listen('vault:note-updated', () => get().loadNotes()),
-      listen('vault:note-deleted', () => get().loadNotes()),
-      listen('vault:note-renamed', () => get().loadNotes()),
-      // Agent 工具測試台寫入 commit 後觸發（create_note / update_note / create_folder）
-      // 工具直接寫磁碟不更新 DB，需先 scan_vault 重建索引再 loadNotes
-      listen('vault:changed', async () => {
+    // Debounced loadNotes: multiple rapid events (e.g. bulk import) collapse into one call
+    let loadTimer: ReturnType<typeof setTimeout> | null = null
+    const debouncedLoad = () => {
+      if (loadTimer) clearTimeout(loadTimer)
+      loadTimer = setTimeout(() => { loadTimer = null; get().loadNotes() }, 150)
+    }
+
+    let scanTimer: ReturnType<typeof setTimeout> | null = null
+    const debouncedScan = () => {
+      if (scanTimer) clearTimeout(scanTimer)
+      scanTimer = setTimeout(async () => {
+        scanTimer = null
         await invoke('scan_vault').catch(() => {})
         await get().loadNotes()
-      }),
+      }, 150)
+    }
+
+    const unlisteners = await Promise.all([
+      listen('vault:note-created', debouncedLoad),
+      listen('vault:note-updated', debouncedLoad),
+      listen('vault:note-deleted', debouncedLoad),
+      listen('vault:note-renamed', debouncedLoad),
+      // Agent 工具測試台寫入 commit 後觸發（create_note / update_note / create_folder）
+      // 工具直接寫磁碟不更新 DB，需先 scan_vault 重建索引再 loadNotes
+      listen('vault:changed', debouncedScan),
     ])
-    return () => unlisteners.forEach((u) => u())
+    return () => {
+      if (loadTimer) clearTimeout(loadTimer)
+      if (scanTimer) clearTimeout(scanTimer)
+      unlisteners.forEach((u) => u())
+    }
   },
 }))
