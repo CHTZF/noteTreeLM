@@ -770,6 +770,7 @@ pub async fn fetch_site_outline(
 /// Import a single page as a markdown note.
 #[tauri::command]
 pub async fn import_page(
+    app: AppHandle,
     state: State<'_, AppState>,
     session_id: String,
     page_id: String,
@@ -943,6 +944,10 @@ pub async fn import_page(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
     }
+
+    // DB insert 完成後主動通知前端刷新 vault tree（避免 watcher 先於 DB insert 觸發的競態）
+    let abs_note = std::path::PathBuf::from(&vault_path).join(&rel_note_path);
+    let _ = app.emit("vault:note-created", vec![abs_note.to_string_lossy().to_string()]);
 
     Ok(ImportPageResult {
         note_path: rel_note_path,

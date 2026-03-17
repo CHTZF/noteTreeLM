@@ -11,6 +11,7 @@ import { toast } from '../common/Toast'
 import { useDebugStore } from '../../stores/debugStore'
 import { useAuthStore } from '../../stores/authStore'
 import { useKnowledgeChatStore, type KBMessage, type KnowledgeRef } from '../../stores/knowledgeChatStore'
+import { useVaultStore } from '../../stores/vaultStore'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -720,6 +721,7 @@ function SourceManagePanel({
   const [pages, setPages] = useState<PageRow[]>([])
   const [loadingPages, setLoadingPages] = useState(false)
   const [analyzingSession, setAnalyzingSession] = useState<string | null>(null)
+  const loadNotes = useVaultStore(s => s.loadNotes)
   const [importingIds, setImportingIds] = useState<Set<string>>(new Set())
   // AI KB card suggestions (persisted in DB)
   const [suggestingPageId, setSuggestingPageId] = useState<string | null>(null)
@@ -819,6 +821,8 @@ function SourceManagePanel({
       })
       // 從 DB 刪除此建議
       await invoke('dismiss_kb_suggestion', { suggestionId: card.suggestion_id })
+      // 主動刷新 vault tree（create_note 已完成 DB insert，此時 loadNotes 可取得最新資料）
+      await loadNotes()
       toast.success(`已建立「${card.title}」`)
       setSuggestions(prev => prev.filter(s => s.suggestion_id !== card.suggestion_id))
       onOpenNote?.(note.path)
