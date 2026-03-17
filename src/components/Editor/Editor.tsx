@@ -11,6 +11,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { useEditorStore } from '../../stores/editorStore'
 import { useVaultStore } from '../../stores/vaultStore'
 import { useSettingsStore } from '../../stores/settingsStore'
+import { NOTE_TEMPLATES } from '../../utils/noteTemplates'
 import { wikilinkPlugin } from './plugins/wikilinks'
 import { livePreviewPlugin, livePreviewTheme, setLiveEditQuickCopyHandler, setLiveEditImageHandler } from './plugins/livePreview'
 import type { EditorAction } from './Toolbar'
@@ -60,7 +61,7 @@ export default function Editor({ onOpenNote }: EditorProps) {
   const liveCompartment = useRef(new Compartment())
 
   const { currentPath, content, isDirty, viewMode, setContent, setDirty, setViewMode,
-          pendingContent, clearPendingContent, pendingAnchor, setPendingAnchor } = useEditorStore()
+          pendingContent, clearPendingContent, pendingAnchor, setPendingAnchor, applyExternalWrite } = useEditorStore()
   const { readNote, updateNote } = useVaultStore()
   const { settings } = useSettingsStore()
 
@@ -694,7 +695,31 @@ export default function Editor({ onOpenNote }: EditorProps) {
 
         {/* 浮動模式切換按鈕（live 模式右上角顯示「預覽」，Source 模式顯示「編輯」+「預覽」） */}
         {viewMode === 'live' && currentPath && (
-          <div style={{ position: 'absolute', top: '10px', right: '16px', zIndex: 10 }}>
+          <div style={{ position: 'absolute', top: '10px', right: '16px', zIndex: 10, display: 'flex', gap: '6px', alignItems: 'center' }}>
+            <select
+              defaultValue=""
+              onChange={e => {
+                const id = e.target.value
+                if (!id) return
+                e.target.value = ''
+                const tmpl = NOTE_TEMPLATES.find(t => t.id === id)
+                if (!tmpl) return
+                const title = currentPath.split('/').pop()?.replace(/\.(md|markdown|mdx)$/i, '') ?? '未命名'
+                if (content.trim() && !window.confirm(`套用「${tmpl.label}」模板會取代現有內容，確定嗎？`)) return
+                applyExternalWrite(tmpl.content(title))
+              }}
+              title="套用筆記模板"
+              style={{
+                padding: '4px 8px', borderRadius: '6px', fontSize: '12px',
+                background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)',
+                color: 'var(--color-text-secondary)', cursor: 'pointer', opacity: 0.75,
+              }}
+            >
+              <option value="" disabled>套用模板…</option>
+              {NOTE_TEMPLATES.map(t => (
+                <option key={t.id} value={t.id}>{t.label}</option>
+              ))}
+            </select>
             <button
               onClick={() => setViewMode('preview')}
               title="切換為預覽模式"

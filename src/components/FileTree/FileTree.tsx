@@ -18,35 +18,6 @@ import { toast } from '../common/Toast'
 import { ask } from '@tauri-apps/plugin-dialog'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 
-// ── Knowledge Templates ───────────────────────────────────────────────────────
-
-const NOTE_TEMPLATES = [
-  {
-    id: 'blank',
-    label: '空白',
-    content: (_title: string) => '',
-  },
-  {
-    id: 'concept',
-    label: '概念定義',
-    content: (title: string) =>
-      `---\nstatus: draft\ntags: [concept]\n---\n\n# ${title}\n\n## 定義\n\n> \n\n## 詳細說明\n\n\n\n## 相關概念\n\n- \n\n## 來源\n\n- \n`,
-  },
-  {
-    id: 'procedure',
-    label: '操作步驟',
-    content: (title: string) =>
-      `---\nstatus: draft\ntags: [procedure]\n---\n\n# ${title}\n\n## 前置條件\n\n- \n\n## 步驟\n\n1. \n2. \n3. \n\n## 注意事項\n\n- \n`,
-  },
-  {
-    id: 'reference',
-    label: '參考資料',
-    content: (title: string) =>
-      `---\nstatus: draft\ntags: [reference]\n---\n\n# ${title}\n\n## 摘要\n\n\n\n## 重點整理\n\n- \n\n## 原始連結\n\n- \n`,
-  },
-] as const
-
-type TemplateId = typeof NOTE_TEMPLATES[number]['id']
 
 
 // ── 檔案類型 icon + 顏色映射（VSCode Material Icon Theme 風格）────────────
@@ -309,7 +280,6 @@ export default function FileTree({ onOpenNote, onOpenNoteInNewTab }: FileTreePro
   const { settings } = useSettingsStore()
   const [showNoteInput, setShowNoteInput] = useState(false)
   const [noteInputTitle, setNoteInputTitle] = useState('')
-  const [selectedTemplate, setSelectedTemplate] = useState<TemplateId>('blank')
   const [showFolderInput, setShowFolderInput] = useState(false)
   const [folderInputName, setFolderInputName] = useState('')
   const treeRef = useRef<HTMLDivElement>(null)
@@ -339,9 +309,7 @@ export default function FileTree({ onOpenNote, onOpenNoteInNewTab }: FileTreePro
     const title = noteInputTitle.trim()
     setShowNoteInput(false); setNoteInputTitle('')
     if (!title) return
-    const tmpl = NOTE_TEMPLATES.find(t => t.id === selectedTemplate)
-    const content = tmpl && selectedTemplate !== 'blank' ? tmpl.content(title) : undefined
-    try { const note = await createNote(title, undefined, content); onOpenNote(note.path); toast.success(`已建立「${title}」`) }
+    try { const note = await createNote(title); onOpenNote(note.path); toast.success(`已建立「${title}」`) }
     catch (e: any) { toast.error(e.message || '建立失敗') }
   }
   const handleFolderSubmit = async () => {
@@ -381,22 +349,7 @@ export default function FileTree({ onOpenNote, onOpenNoteInNewTab }: FileTreePro
       </div>
 
       {showNoteInput && (
-        <div style={{ padding: '6px 8px', borderBottom: '1px solid var(--color-border)', display: 'flex', flexDirection: 'column', gap: 5 }}>
-          {/* Template picker */}
-          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-            {NOTE_TEMPLATES.map(t => (
-              <button
-                key={t.id}
-                onClick={() => setSelectedTemplate(t.id)}
-                style={{
-                  padding: '2px 7px', borderRadius: 10, fontSize: 11, cursor: 'pointer', border: 'none',
-                  background: selectedTemplate === t.id ? 'var(--color-accent)' : 'var(--color-bg-elevated)',
-                  color: selectedTemplate === t.id ? '#fff' : 'var(--color-text-secondary)',
-                  fontWeight: selectedTemplate === t.id ? 600 : 400,
-                }}
-              >{t.label}</button>
-            ))}
-          </div>
+        <div style={{ padding: '6px 8px', borderBottom: '1px solid var(--color-border)' }}>
           <input ref={noteInputRef} value={noteInputTitle} onChange={(e) => setNoteInputTitle(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter') handleNoteSubmit(); if (e.key === 'Escape') { setShowNoteInput(false); setNoteInputTitle('') } }}
             onBlur={handleNoteSubmit} placeholder="筆記標題…"

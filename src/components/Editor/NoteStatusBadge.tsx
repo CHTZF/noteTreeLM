@@ -54,7 +54,30 @@ export default function NoteStatusBadge() {
 
   // Only show for .md files
   if (!currentPath || !/\.(md|markdown|mdx)$/i.test(currentPath)) return null
-  if (!localStatus) return null
+
+  // No status yet — show a compact dropdown to set one
+  if (!localStatus) {
+    return (
+      <select
+        disabled={loading}
+        value=""
+        onChange={e => { if (e.target.value) handleSetStatus(e.target.value as NoteStatus) }}
+        title="設定知識狀態，讓知識庫助手可以使用此筆記"
+        style={{
+          fontSize: '11px', padding: '2px 6px', borderRadius: '10px',
+          color: 'var(--color-text-muted)',
+          background: 'transparent',
+          border: '1px dashed var(--color-border)',
+          cursor: 'pointer', opacity: loading ? 0.6 : 1,
+        }}
+      >
+        <option value="">+ 知識狀態</option>
+        <option value="draft">草稿</option>
+        <option value="verified">已驗證</option>
+        <option value="deprecated">已棄用</option>
+      </select>
+    )
+  }
 
   const cfg = STATUS_CONFIG[localStatus]
 
@@ -73,7 +96,7 @@ export default function NoteStatusBadge() {
         <button
           disabled={loading}
           onClick={() => handleSetStatus('verified')}
-          title="標記為已驗證"
+          title="標記為已驗證，知識庫助手可使用此筆記"
           style={{
             fontSize: '11px', padding: '2px 7px', borderRadius: '10px',
             color: 'var(--color-success)',
@@ -102,6 +125,24 @@ export default function NoteStatusBadge() {
           }}
         >
           取消驗證
+        </button>
+      )}
+
+      {(localStatus === 'draft' || localStatus === 'verified') && (
+        <button
+          disabled={loading}
+          onClick={() => handleSetStatus('deprecated')}
+          title="標記為已棄用"
+          style={{
+            fontSize: '11px', padding: '2px 7px', borderRadius: '10px',
+            color: 'var(--color-text-muted)',
+            background: 'transparent',
+            border: '1px solid var(--color-border)',
+            cursor: loading ? 'wait' : 'pointer', opacity: loading ? 0.6 : 0.5,
+            whiteSpace: 'nowrap',
+          }}
+        >
+          棄用
         </button>
       )}
     </div>

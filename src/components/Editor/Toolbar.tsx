@@ -1,4 +1,6 @@
 import { useEditorStore } from '../../stores/editorStore'
+import NoteStatusBadge from './NoteStatusBadge'
+import { NOTE_TEMPLATES } from '../../utils/noteTemplates'
 
 export type EditorAction = 'bold' | 'italic' | 'h1' | 'h2' | 'wikilink' | 'image' | 'quick_copy'
 
@@ -14,7 +16,7 @@ interface ToolbarProps {
 export default function Toolbar({
   canGoBack, canGoForward, onBack, onForward, onAction, onSave,
 }: ToolbarProps) {
-  const { isDirty, viewMode, setViewMode } = useEditorStore()
+  const { isDirty, viewMode, setViewMode, currentPath, content, applyExternalWrite } = useEditorStore()
 
   const btn = (label: string, title: string, action: () => void, active = false) => (
     <button
@@ -32,7 +34,21 @@ export default function Toolbar({
     >{label}</button>
   )
 
+  const handleApplyTemplate = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const id = e.target.value
+    if (!id) return
+    e.target.value = ''
+    const tmpl = NOTE_TEMPLATES.find(t => t.id === id)
+    if (!tmpl) return
+    const title = currentPath
+      ? currentPath.split('/').pop()?.replace(/\.(md|markdown|mdx)$/i, '') ?? '未命名'
+      : '未命名'
+    if (content.trim() && !window.confirm(`套用「${tmpl.label}」模板會取代現有內容，確定嗎？`)) return
+    applyExternalWrite(tmpl.content(title))
+  }
+
   const isEditing = viewMode === 'editor' || viewMode === 'live'
+  const isMdFile = !!currentPath && /\.(md|markdown|mdx)$/i.test(currentPath)
 
   return (
     <div style={{
@@ -62,7 +78,32 @@ export default function Toolbar({
         {btn('📋', '插入快捷複製', () => onAction('quick_copy'))}
       </>}
 
+      {/* 模板選擇：編輯模式 + .md 檔才顯示 */}
+      {isEditing && isMdFile && (
+        <>
+          <div style={{ width: '1px', height: '20px', background: 'var(--color-border)', margin: '0 4px' }} />
+          <select
+            defaultValue=""
+            onChange={handleApplyTemplate}
+            title="套用筆記模板"
+            style={{
+              fontSize: '12px', padding: '2px 4px', borderRadius: '4px',
+              background: 'transparent', border: '1px solid var(--color-border)',
+              color: 'var(--color-text-secondary)', cursor: 'pointer',
+            }}
+          >
+            <option value="" disabled>套用模板…</option>
+            {NOTE_TEMPLATES.map(t => (
+              <option key={t.id} value={t.id}>{t.label}</option>
+            ))}
+          </select>
+        </>
+      )}
+
       <div style={{ flex: 1 }} />
+
+      {/* 知識狀態 badge */}
+      <NoteStatusBadge />
 
       {/* 未儲存指示 */}
       {isDirty && (

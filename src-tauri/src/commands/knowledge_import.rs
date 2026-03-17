@@ -855,9 +855,10 @@ pub async fn import_page(
     let body_md = html_to_markdown_rich(&html);
 
     // Build full note content with frontmatter
+    // status: verified — 使用者明確選擇匯入即視為已策展/驗證，KB 助手可直接使用
     let now_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let note_content = format!(
-        "---\ntitle: {}\nsource: {}\nimported: {}\n---\n\n{}\n",
+        "---\ntitle: {}\nsource: {}\nimported: {}\nstatus: verified\n---\n\n{}\n",
         title,
         page.url,
         now_date,
@@ -882,6 +883,17 @@ pub async fn import_page(
     tokio::fs::create_dir_all(&abs_dir).await?;
     let abs_note_path = std::path::PathBuf::from(&vault_path).join(&rel_note_path);
     tokio::fs::write(&abs_note_path, note_content.as_bytes()).await?;
+
+    // 立即建立/更新 chunks（不等 file watcher），帶 embedding
+    {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let chunks = crate::vault::chunker::chunk_note(&rel_note_path, &note_content, now_ms);
+        let emb_url: Option<String> = {
+            let port = *state.embedding_actual_port.lock().await;
+            port.map(|p| format!("http://127.0.0.1:{}", p))
+        };
+        let _ = crate::vault::chunker::upsert_chunks(db, &vault_id, &chunks, emb_url.as_deref()).await;
+    }
 
     // Sync note to DB
     let now_dt = surrealdb::sql::Datetime::from(chrono::Utc::now());
@@ -1339,6 +1351,39 @@ async fn run_knowledge_query(
     Ok(())
 }
 
+/// 診斷：列出目前 vault 的 chunks 狀態分佈 + 最近 5 筆 verified chunk 摘要
+#[tauri::command]
+pub async fn debug_kb_chunks(state: State<'_, AppState>) -> Result<String, AppError> {
+    let vault_id = state.get_vault_id().await?;
+    let db = &state.db;
+    let mut out = format!("vault_id: {}\n", vault_id);
+
+    #[derive(serde::Deserialize)]
+    struct StatusCount { status: String, count: i64 }
+    let mut r1 = db.query(
+        "SELECT status, count() AS count FROM chunks WHERE vault_id = $vid GROUP BY status"
+    ).bind(("vid", vault_id.clone())).await.map_err(|e| AppError::Database(e.to_string()))?;
+    let rows: Vec<StatusCount> = r1.take(0).unwrap_or_default();
+    if rows.is_empty() {
+        out += "chunks: 無任何資料（vault 尚未建立 chunks 索引）\n";
+    } else {
+        out += "chunks 狀態分佈:\n";
+        for r in &rows { out += &format!("  status={:?}  count={}\n", r.status, r.count); }
+    }
+
+    #[derive(serde::Deserialize)]
+    struct SampleChunk { file_path: String, section: String, status: String, updated_at: Option<String> }
+    let mut r2 = db.query(
+        "SELECT file_path, section, status, updated_at FROM chunks WHERE vault_id = $vid ORDER BY updated_at DESC LIMIT 5"
+    ).bind(("vid", vault_id.clone())).await.map_err(|e| AppError::Database(e.to_string()))?;
+    let samples: Vec<SampleChunk> = r2.take(0).unwrap_or_default();
+    out += &format!("最近 {} 筆 chunks:\n", samples.len());
+    for s in &samples {
+        out += &format!("  {} [{}] status={:?}\n", s.file_path, s.section, s.status);
+    }
+    Ok(out)
+}
+
 // ── KB Assistant（vault-wide verified-only RAG）────────────────────────────
 
 /// Vault-wide KB Q&A：只搜 verified chunks，嚴格只用知識庫內容回答，附來源引用。
@@ -1387,9 +1432,11 @@ async fn run_kb_query(
         let qvec = get_embedding(&client, url, question).await;
         if !qvec.is_empty() {
             let mut resp = db.query(
-                "SELECT file_path, section, content FROM chunks
+                "SELECT file_path, section, content,
+                        vector::similarity::cosine(embedding, $qvec) AS score
+                 FROM chunks
                  WHERE vault_id = $vid AND embedding != NONE AND status = 'verified'
-                 ORDER BY vector::similarity::cosine(embedding, $qvec) DESC LIMIT 8"
+                 ORDER BY score DESC LIMIT 8"
             )
             .bind(("vid", vault_id.to_owned()))
             .bind(("qvec", qvec))

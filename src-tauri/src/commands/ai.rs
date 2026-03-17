@@ -290,10 +290,58 @@ pub async fn get_embedding(client: &reqwest::Client, base_url: &str, text: &str)
         }
     }
 
-    // 2. /embedding (legacy)
+    // 2. /v1/embeddings with model field (部分版本需要帶 model 欄位)
+    if let Ok(resp) = client
+        .post(format!("{}/v1/embeddings", base_url))
+        .json(&serde_json::json!({ "input": text, "model": "embedding" }))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                let v = extract_vec(&json);
+                if !v.is_empty() { return v; }
+            }
+        }
+    }
+
+    // 3. /embeddings (無 v1 前綴)
+    if let Ok(resp) = client
+        .post(format!("{}/embeddings", base_url))
+        .json(&serde_json::json!({ "input": text }))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                let v = extract_vec(&json);
+                if !v.is_empty() { return v; }
+            }
+        }
+    }
+
+    // 4. /embedding (legacy, content 欄位)
     if let Ok(resp) = client
         .post(format!("{}/embedding", base_url))
         .json(&serde_json::json!({ "content": text }))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                let v = extract_vec(&json);
+                if !v.is_empty() { return v; }
+            }
+        }
+    }
+
+    // 5. /embedding (legacy, input 欄位)
+    if let Ok(resp) = client
+        .post(format!("{}/embedding", base_url))
+        .json(&serde_json::json!({ "input": text }))
         .timeout(Duration::from_secs(30))
         .send()
         .await
@@ -1149,7 +1197,8 @@ pub(crate) async fn ensure_embedding_server_running(
         "--host", "127.0.0.1",
         "--ctx-size", "512",
         "--parallel", "4",
-        "--embeddings",   // b3000+ 使用複數；舊版用 --embedding
+        "--embeddings",   // b3000+ 複數旗標
+        "--embedding",    // 舊版單數旗標（同時傳，server 忽略不認識的）
         "--pooling", "cls", // BGE 系列模型需要 CLS pooling
     ])
     .stdin(std::process::Stdio::null())
@@ -1270,10 +1319,13 @@ pub async fn check_embedding_endpoint(state: State<'_, AppState>) -> Result<Stri
         }
     }
 
-    // POST 兩個 embedding endpoint
+    // POST 所有已知 embedding endpoint
     for (label, url, body) in [
-        ("/v1/embeddings", format!("{}/v1/embeddings", base_url), serde_json::json!({"input":"test"})),
-        ("/embedding",     format!("{}/embedding",     base_url), serde_json::json!({"content":"test"})),
+        ("/v1/embeddings",            format!("{}/v1/embeddings", base_url), serde_json::json!({"input":"test"})),
+        ("/v1/embeddings+model",      format!("{}/v1/embeddings", base_url), serde_json::json!({"input":"test","model":"embedding"})),
+        ("/embeddings",               format!("{}/embeddings",    base_url), serde_json::json!({"input":"test"})),
+        ("/embedding(content)",       format!("{}/embedding",     base_url), serde_json::json!({"content":"test"})),
+        ("/embedding(input)",         format!("{}/embedding",     base_url), serde_json::json!({"input":"test"})),
     ] {
         match client.post(&url).json(&body).timeout(Duration::from_secs(10)).send().await {
             Err(e) => { out += &format!("POST {}: 請求失敗 — {}\n", label, e); }
@@ -2333,15 +2385,24 @@ pub async fn set_note_status(
     // Sync to DB
     let vault_id = state.get_vault_id().await?;
     let _ = state.db.query(
-        "UPDATE notes SET content = $content, status = $status WHERE vault_id = $vid AND path = $path"
+        "UPDATE notes SET content = $content WHERE vault_id = $vid AND path = $path"
     )
-    .bind(("content", new_content))
-    .bind(("status", status.clone()))
+    .bind(("content", new_content.clone()))
     .bind(("vid", vault_id.clone()))
     .bind(("path", path.clone()))
     .await;
-    // Sync status to all chunks for this file
-    let _ = crate::vault::chunker::update_chunks_status(&state.db, &vault_id, &path, &status).await;
+    // Re-upsert chunks（確保 chunks 存在，並帶正確 status）
+    // update_chunks_status 只更新已存在的 chunks；若 chunk 從未建立過則無效。
+    // 改用 upsert_chunks 確保 chunks 一定存在，再由 parse_frontmatter_status 讀取 status。
+    {
+        let now_ms = chrono::Local::now().timestamp_millis();
+        let chunks = crate::vault::chunker::chunk_note(&path, &new_content, now_ms);
+        let emb_url: Option<String> = {
+            let port = *state.embedding_actual_port.lock().await;
+            port.map(|p| format!("http://127.0.0.1:{}", p))
+        };
+        let _ = crate::vault::chunker::upsert_chunks(&state.db, &vault_id, &chunks, emb_url.as_deref()).await;
+    }
     Ok(())
 }
 

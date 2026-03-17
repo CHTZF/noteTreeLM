@@ -14,7 +14,7 @@ export interface ConversationSummary {
 }
 
 interface Props {
-  mode: 'chat' | 'live_chat'
+  mode: 'chat' | 'live_chat' | 'kb_assist'
   selectedId: string | null
   onSelect: (id: string) => void
   onNew: (id: string) => void
