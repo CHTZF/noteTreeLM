@@ -22,6 +22,7 @@ import ChatPanel from './components/Chat/ChatPanel'
 import FileViewer from './components/FileViewer/FileViewer'
 import PreviewPanel from './components/Editor/PreviewPanel'
 import LiveChatPanel from './components/LiveChat/LiveChatPanel'
+import NoteStatusBadge from './components/Editor/NoteStatusBadge'
 import QuickOpen from './components/QuickOpen/QuickOpen'
 import SettingsModal from './components/Settings/SettingsModal'
 import { AgentToolContent } from './components/AgentTools/AgentToolPanel'
@@ -976,12 +977,15 @@ function AppMain() {
           dragOverTabId={dragOverTabId}
           rightContent={
             leaf.tabs.length > 0 ? (
-              <button
-                className="icon-menubar-btn"
-                title="關閉此面板"
-                onClick={() => closePane(leaf.id)}
-                style={{ fontSize: '16px', width: '19px', flexShrink: 0 }}
-              >×</button>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                {isFocused && <NoteStatusBadge />}
+                <button
+                  className="icon-menubar-btn"
+                  title="關閉此面板"
+                  onClick={() => closePane(leaf.id)}
+                  style={{ fontSize: '16px', width: '19px', flexShrink: 0 }}
+                >×</button>
+              </div>
             ) : undefined
           }
         />

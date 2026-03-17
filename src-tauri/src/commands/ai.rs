@@ -1667,9 +1667,9 @@ pub(crate) async fn tool_search_vault(query: &str, vault_db: &SurrealDb, vault_i
 
     // 3. Fallback：notes 全文搜尋（比較條件查詢 / chunk 為空時）
     #[derive(Deserialize)]
-    struct NoteRow { path: String, title: String }
+    struct NoteRow { path: String, title: String, status: Option<String> }
     let mut resp = vault_db.query(
-        "SELECT path, title FROM notes WHERE vault_id = $vid AND (title @1@ $q OR content @2@ $q) ORDER BY search::score(1) + search::score(2) DESC LIMIT 15"
+        "SELECT path, title, status FROM notes WHERE vault_id = $vid AND (title @1@ $q OR content @2@ $q) ORDER BY search::score(1) + search::score(2) DESC LIMIT 15"
     )
     .bind(("vid", vault_id.to_owned()))
     .bind(("q", fts_query.clone()))
@@ -1686,6 +1686,10 @@ pub(crate) async fn tool_search_vault(query: &str, vault_db: &SurrealDb, vault_i
             for row in &rows {
                 let path = &row.path;
                 let title = &row.title;
+                let status_badge = match row.status.as_deref() {
+                    Some("verified") => " ✓",
+                    _ => "",
+                };
 
                 // Fetch content for snippet/comparison
                 #[derive(Deserialize)]
@@ -1720,7 +1724,7 @@ pub(crate) async fn tool_search_vault(query: &str, vault_db: &SurrealDb, vault_i
                     }
                 } else { String::new() };
 
-                result_lines.push(format!("- **{}** ({})\n  {}", title, path, snippet));
+                result_lines.push(format!("- **{}{}** ({})\n  {}", title, status_badge, path, snippet));
             }
             if result_lines.is_empty() {
                 format!("在「{}」相關筆記中，未找到數值{}的項目", fts_query,
@@ -1801,10 +1805,11 @@ async fn search_chunks_with_graph(vault_db: &SurrealDb, vault_id: &str, fts_quer
         .chain(expanded_paths.iter().cloned()).collect();
 
     let mut titles: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut statuses: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for path in &all_paths {
-        #[derive(Deserialize)] struct TitleRow { title: String }
+        #[derive(Deserialize)] struct TitleRow { title: String, status: Option<String> }
         let mut tr = vault_db.query(
-            "SELECT title FROM notes WHERE vault_id = $vid AND path = $path LIMIT 1"
+            "SELECT title, status FROM notes WHERE vault_id = $vid AND path = $path LIMIT 1"
         )
         .bind(("vid", vault_id.to_owned()))
         .bind(("path", path.clone()))
@@ -1814,6 +1819,7 @@ async fn search_chunks_with_graph(vault_db: &SurrealDb, vault_id: &str, fts_quer
             .and_then(|rows| rows.into_iter().next())
         {
             titles.insert(path.clone(), t.title);
+            if let Some(s) = t.status { statuses.insert(path.clone(), s); }
         }
     }
 
@@ -1825,22 +1831,86 @@ async fn search_chunks_with_graph(vault_db: &SurrealDb, vault_id: &str, fts_quer
         let section = &row.section;
         let content = &row.content;
         let title = titles.get(path).cloned().unwrap_or_else(|| path.clone());
+        let status_badge = match statuses.get(path).map(|s| s.as_str()) {
+            Some("verified") => " ✓",
+            _ => "",
+        };
 
         let snippet: String = content.chars().take(200).collect();
         let section_label = if section.is_empty() { String::new() } else { format!(" § {}", section) };
-        result_lines.push(format!("- **{}{}** ({})\n  {}…", title, section_label, path, snippet.trim()));
+        result_lines.push(format!("- **{}{}{}** ({})\n  {}…", title, status_badge, section_label, path, snippet.trim()));
     }
 
     if !expanded_paths.is_empty() {
         result_lines.push(String::from("\n📎 相關連結筆記（透過 wikilink 擴展）："));
         for path in &expanded_paths {
             let title = titles.get(path).cloned().unwrap_or_else(|| path.clone());
-            result_lines.push(format!("- **{}** ({})", title, path));
+            let status_badge = match statuses.get(path).map(|s| s.as_str()) {
+                Some("verified") => " ✓",
+                _ => "",
+            };
+            result_lines.push(format!("- **{}{}** ({})", title, status_badge, path));
         }
     }
 
     Ok(format!("找到 {} 個相關段落：\n{}", chunk_rows.len(), result_lines.join("\n")))
 }
+
+// ── Frontmatter helpers ────────────────────────────────────────────────────
+
+/// Inject `status: draft` + `created_by: ai` into frontmatter if no `status` field yet.
+/// If content already has `status:`, leave it unchanged.
+fn inject_ai_frontmatter(content: &str) -> String {
+    let after = if content.starts_with("---\r\n") {
+        5
+    } else if content.starts_with("---\n") {
+        4
+    } else {
+        // No frontmatter — create one
+        return format!("---\nstatus: draft\ncreated_by: ai\n---\n\n{}", content);
+    };
+    if let Some(end_offset) = content[after..].find("\n---") {
+        let fm = &content[after..after + end_offset];
+        if fm.lines().any(|l| l.trim_start().starts_with("status:")) {
+            return content.to_string(); // Already has status — don't touch
+        }
+        let rest = &content[after + end_offset..]; // starts with "\n---..."
+        format!("---\nstatus: draft\ncreated_by: ai\n{}{}", fm, rest)
+    } else {
+        format!("---\nstatus: draft\ncreated_by: ai\n---\n\n{}", content)
+    }
+}
+
+/// Set (or insert) a single key in frontmatter. Creates frontmatter if absent.
+pub(crate) fn set_frontmatter_key(content: &str, key: &str, value: &str) -> String {
+    let prefix = format!("{}:", key);
+    let new_line = format!("{}: {}", key, value);
+    let after = if content.starts_with("---\r\n") {
+        5
+    } else if content.starts_with("---\n") {
+        4
+    } else {
+        return format!("---\n{}: {}\n---\n\n{}", key, value, content);
+    };
+    if let Some(end_offset) = content[after..].find("\n---") {
+        let fm = &content[after..after + end_offset];
+        let rest = &content[after + end_offset..];
+        let lines: Vec<&str> = fm.lines().collect();
+        let idx = lines.iter().position(|l| l.trim_start().starts_with(&prefix));
+        let new_fm = if let Some(i) = idx {
+            let mut v = lines.clone();
+            v[i] = &new_line;
+            v.join("\n")
+        } else {
+            format!("{}\n{}", new_line, fm)
+        };
+        format!("---\n{}{}", new_fm, rest)
+    } else {
+        format!("---\n{}: {}\n---\n\n{}", key, value, content)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// 建立新筆記（自動建立父資料夾）
 pub(crate) async fn tool_create_note(
@@ -1856,7 +1926,8 @@ pub(crate) async fn tool_create_note(
     if let Some(parent) = abs_path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
-    if let Err(e) = tokio::fs::write(&abs_path, content).await {
+    let final_content = inject_ai_frontmatter(content);
+    if let Err(e) = tokio::fs::write(&abs_path, &final_content).await {
         return format!("建立失敗：{}", e);
     }
     // 同步到 notes table
@@ -1866,20 +1937,21 @@ pub(crate) async fn tool_create_note(
             chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms).unwrap_or_default()
         );
         let title = {
-            let first = content.lines().find(|l| !l.trim().is_empty()).unwrap_or(rel_path);
+            let first = final_content.lines().find(|l| !l.trim().is_empty() && !l.starts_with("---") && !l.contains(':'))
+                .unwrap_or(rel_path);
             first.trim_start_matches('#').trim().to_string()
         };
-        let wc = content.split_whitespace().count() as i64;
-        let checksum = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
+        let wc = final_content.split_whitespace().count() as i64;
+        let checksum = format!("{:x}", sha2::Sha256::digest(final_content.as_bytes()));
         let _ = db.query(
-            "INSERT INTO notes (vault_id, path, title, content, word_count, created_at, modified_at, checksum) \
-             VALUES ($vid, $path, $title, $content, $wc, $now, $now, $cs) \
-             ON DUPLICATE KEY UPDATE title = $title, content = $content, word_count = $wc, modified_at = $now, checksum = $cs"
+            "INSERT INTO notes (vault_id, path, title, content, status, word_count, created_at, modified_at, checksum) \
+             VALUES ($vid, $path, $title, $content, 'draft', $wc, $now, $now, $cs) \
+             ON DUPLICATE KEY UPDATE title = $title, content = $content, status = 'draft', word_count = $wc, modified_at = $now, checksum = $cs"
         )
         .bind(("vid", vault_id.clone()))
         .bind(("path", rel_path.to_owned()))
         .bind(("title", title))
-        .bind(("content", content.to_owned()))
+        .bind(("content", final_content.clone()))
         .bind(("wc", wc))
         .bind(("now", now_dt))
         .bind(("cs", checksum))
@@ -1899,26 +1971,28 @@ pub(crate) async fn tool_update_note(
         Ok(p) => p,
         Err(e) => return e,
     };
-    if let Err(e) = tokio::fs::write(&abs_path, content).await {
+    let final_content = inject_ai_frontmatter(content);
+    if let Err(e) = tokio::fs::write(&abs_path, &final_content).await {
         return format!("更新失敗：{}", e);
     }
-    // 同步到 notes table
+    // 同步到 notes table（AI 修改過的筆記重置為 draft，需重新驗證）
     if let Some((db, vault_id)) = db_ctx {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let now_dt = surrealdb::sql::Datetime::from(
             chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms).unwrap_or_default()
         );
         let title = {
-            let first = content.lines().find(|l| !l.trim().is_empty()).unwrap_or(rel_path);
+            let first = final_content.lines().find(|l| !l.trim().is_empty() && !l.starts_with("---") && !l.contains(':'))
+                .unwrap_or(rel_path);
             first.trim_start_matches('#').trim().to_string()
         };
-        let wc = content.split_whitespace().count() as i64;
-        let checksum = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
+        let wc = final_content.split_whitespace().count() as i64;
+        let checksum = format!("{:x}", sha2::Sha256::digest(final_content.as_bytes()));
         let _ = db.query(
-            "UPDATE notes SET content = $content, title = $title, word_count = $wc, modified_at = $now, checksum = $cs \
+            "UPDATE notes SET content = $content, title = $title, status = 'draft', word_count = $wc, modified_at = $now, checksum = $cs \
              WHERE vault_id = $vid AND path = $path"
         )
-        .bind(("content", content.to_owned()))
+        .bind(("content", final_content.clone()))
         .bind(("title", title))
         .bind(("wc", wc))
         .bind(("now", now_dt))
@@ -1940,6 +2014,40 @@ pub(crate) async fn tool_create_folder(rel_path: &str, vault_path: &str) -> Stri
         Ok(_) => format!("✅ 已建立資料夾：{}", rel_path),
         Err(e) => format!("建立失敗：{}", e),
     }
+}
+
+/// 設定筆記 status frontmatter（draft | verified | deprecated）
+/// 同時更新 notes DB table 的 status 欄位
+#[tauri::command]
+pub async fn set_note_status(
+    state: State<'_, AppState>,
+    path: String,
+    status: String,
+) -> Result<(), AppError> {
+    if !matches!(status.as_str(), "draft" | "verified" | "deprecated") {
+        return Err(AppError::AI(format!("Invalid status: {}", status)));
+    }
+    let vault_path = state.get_vault_path().await;
+    if vault_path.is_empty() {
+        return Err(AppError::AI("Vault not configured".to_string()));
+    }
+    let abs = std::path::Path::new(&vault_path).join(&path);
+    let content = tokio::fs::read_to_string(&abs).await
+        .map_err(|e| AppError::AI(format!("Read failed: {}", e)))?;
+    let new_content = set_frontmatter_key(&content, "status", &status);
+    tokio::fs::write(&abs, &new_content).await
+        .map_err(|e| AppError::AI(format!("Write failed: {}", e)))?;
+    // Sync to DB
+    let vault_id = state.get_vault_id().await?;
+    let _ = state.db.query(
+        "UPDATE notes SET content = $content, status = $status WHERE vault_id = $vid AND path = $path"
+    )
+    .bind(("content", new_content))
+    .bind(("status", status))
+    .bind(("vid", vault_id))
+    .bind(("path", path))
+    .await;
+    Ok(())
 }
 
 /// 判斷工具是否為寫入操作（需要使用者確認）

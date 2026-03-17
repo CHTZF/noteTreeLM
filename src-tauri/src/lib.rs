@@ -13,7 +13,7 @@ use commands::{
          save_memory_session, query_memory, add_memory_rule,
          get_memory_rules, delete_memory_rule, confirm_write_tool,
          test_vault_tool, run_tool_pipeline, cancel_tool_test, cancel_agent, invoke_agent,
-         get_intent_keywords, save_intent_keywords, delete_intent_row},
+         get_intent_keywords, save_intent_keywords, delete_intent_row, set_note_status},
     conversation::{create_conversation, list_conversations, get_conversation,
                    delete_conversation, update_conversation_title, save_conversation_messages},
     download::*, graph::*, import::*, search::*,
@@ -211,6 +211,7 @@ pub fn run() {
             delete_memory_rule,
             cancel_agent,
             invoke_agent,
+            set_note_status,
             // Conversation management
             create_conversation,
             list_conversations,
