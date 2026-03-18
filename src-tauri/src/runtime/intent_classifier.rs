@@ -1,6 +1,3 @@
-use serde::Deserialize;
-
-use crate::db::surreal::SurrealDb;
 use crate::runtime::types::EmbedFn;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -8,21 +5,11 @@ pub enum Intent {
     Interrupt,
     Cancel,
     Confirm,
-    /// 記憶查詢意圖：路由至 MemoryAgent（非串流 LLM loop）
-    Memory,
     ToolUse,
     Chat,
 }
 
-pub struct IntentClassifier {
-    db: SurrealDb,
-}
-
-#[derive(Deserialize)]
-struct KwRow {
-    intent: String,
-    keywords: String,
-}
+pub struct IntentClassifier;
 
 /// 計算兩個 L2-normalized 向量的 cosine similarity
 fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
@@ -34,55 +21,11 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
 
 impl IntentClassifier {
 
-    pub fn new(db: SurrealDb) -> Self {
-        Self { db }
+    pub fn new() -> Self {
+        Self
     }
 
-    pub async fn classify(&self, input: &str) -> Intent {
-
-        let input_trimmed = input.trim();
-        let input_lower = input_trimmed.to_lowercase();
-
-        // 查詢所有 intent_keywords 列
-        let mut resp = match self.db.query("SELECT intent, keywords FROM intent_keywords").await.ok() {
-            Some(r) => r,
-            None => return Intent::ToolUse,
-        };
-        let rows: Vec<KwRow> = resp.take(0).unwrap_or_default();
-
-        for row in rows {
-            let intent_str = row.intent;
-            let keywords_json = row.keywords;
-
-            let keywords: Vec<String> = match serde_json::from_str(&keywords_json) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            for kw in &keywords {
-                let kw_lower = kw.to_lowercase();
-                let kw_chars = kw.chars().count();
-
-                // 短關鍵字（≤5字）用精確比對，長的用子字串比對
-                let matched = if kw_chars <= 5 {
-                    input_trimmed == kw.as_str() || input_lower == kw_lower
-                } else {
-                    input_lower.contains(&kw_lower)
-                };
-
-                if matched {
-                    return match intent_str.as_str() {
-                        "CANCEL"    => Intent::Cancel,
-                        "INTERRUPT" => Intent::Interrupt,
-                        "CONFIRM"   => Intent::Confirm,
-                        "MEMORY"    => Intent::Memory,
-                        _           => Intent::Chat,
-                    };
-                }
-            }
-        }
-
-        // 預設：當作工具呼叫任務
+    pub async fn classify(&self, _input: &str) -> Intent {
         Intent::ToolUse
     }
 

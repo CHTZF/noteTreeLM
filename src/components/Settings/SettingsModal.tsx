@@ -34,12 +34,7 @@ interface MemoryRuleEntry {
   created_at: number
 }
 
-interface IntentKeywordsRow {
-  intent: string
-  keywords: string[]
-}
-
-type Tab = 'account' | 'general' | 'ai' | 'voice' | 'local' | 'advanced' | 'raw' | 'intent' | 'memory'
+type Tab = 'account' | 'general' | 'ai' | 'voice' | 'local' | 'advanced' | 'raw' | 'memory'
 type ServerStatus = 'unknown' | 'running' | 'loading' | 'stopped'
 
 // Provider → 預設模型清單
@@ -74,6 +69,9 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
   )
   const [apiKey, setApiKeyLocal] = useState('')
   const [apiKeySaved, setApiKeySaved] = useState(false)
+  const [braveApiKey, setBraveApiKey] = useState('')
+  const [braveApiKeySaved, setBraveApiKeySaved] = useState(false)
+  const [braveUsage, setBraveUsage] = useState<{ used: number; limit: number; reset_label: string } | null>(null)
   const [isSaving, setIsSaving] = useState(false)
   const [recordingKey, setRecordingKey] = useState<string | null>(null)
 
@@ -134,11 +132,6 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
   const [newRulePattern, setNewRulePattern] = useState('')
   const [newRuleValue, setNewRuleValue] = useState('')
 
-  const [intentKeywords, setIntentKeywords] = useState<IntentKeywordsRow[]>([])
-  const [intentLoading, setIntentLoading] = useState(false)
-  const [newKwInput, setNewKwInput] = useState<Record<string, string>>({})
-  const [newIntentName, setNewIntentName] = useState('')
-
   // Account tab state
   const [currentPassword, setCurrentPassword] = useState('')
   const [newPassword, setNewPassword] = useState('')
@@ -172,6 +165,12 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
     else
       setApiKeyLocal('')
   }, [draft.ai_provider])
+
+  useEffect(() => {
+    getApiKey('brave_search').then((k) => setBraveApiKey(k || ''))
+    invoke<{ used: number; limit: number; reset_label: string }>('get_brave_search_usage')
+      .then(setBraveUsage).catch(() => {})
+  }, [])
 
   useEffect(() => {
     if (tab !== 'voice' && tab !== 'local') return
@@ -344,47 +343,6 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
     setNewRuleValue('')
   }
 
-  useEffect(() => {
-    if (tab !== 'intent') return
-    setIntentLoading(true)
-    invoke<IntentKeywordsRow[]>('get_intent_keywords')
-      .then(setIntentKeywords)
-      .catch(() => setIntentKeywords([]))
-      .finally(() => setIntentLoading(false))
-  }, [tab])
-
-  const handleAddKeyword = async (intent: string) => {
-    const kw = (newKwInput[intent] ?? '').trim()
-    if (!kw) return
-    const row = intentKeywords.find(r => r.intent === intent)
-    if (!row) return
-    const updated = [...row.keywords, kw]
-    await invoke('save_intent_keywords', { intent, keywords: updated }).catch(() => {})
-    setIntentKeywords(prev => prev.map(r => r.intent === intent ? { ...r, keywords: updated } : r))
-    setNewKwInput(prev => ({ ...prev, [intent]: '' }))
-  }
-
-  const handleDeleteKeyword = async (intent: string, kw: string) => {
-    const row = intentKeywords.find(r => r.intent === intent)
-    if (!row) return
-    const updated = row.keywords.filter(k => k !== kw)
-    await invoke('save_intent_keywords', { intent, keywords: updated }).catch(() => {})
-    setIntentKeywords(prev => prev.map(r => r.intent === intent ? { ...r, keywords: updated } : r))
-  }
-
-  const handleDeleteIntentRow = async (intent: string) => {
-    await invoke('delete_intent_row', { intent }).catch(() => {})
-    setIntentKeywords(prev => prev.filter(r => r.intent !== intent))
-  }
-
-  const handleAddIntentRow = async () => {
-    const name = newIntentName.trim().toUpperCase()
-    if (!name || intentKeywords.some(r => r.intent === name)) return
-    await invoke('save_intent_keywords', { intent: name, keywords: [] }).catch(() => {})
-    setIntentKeywords(prev => [...prev, { intent: name, keywords: [] }])
-    setNewIntentName('')
-  }
-
   const patternTypeLabel = (pt: string) => {
     if (pt === 'temporal_exact_days') return '固定天數'
     if (pt === 'temporal_unit') return '時間單位'
@@ -450,6 +408,16 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
     await setApiKey(draft.ai_provider, apiKey)
     setApiKeySaved(true)
     setTimeout(() => setApiKeySaved(false), 2000)
+  }
+
+  const handleSaveBraveApiKey = async () => {
+    await setApiKey('brave_search', braveApiKey)
+    // Persist key_id to DB — usage queries will use DB, never keychain directly
+    await invoke('sync_brave_key_id', { key: braveApiKey }).catch(() => {})
+    setBraveApiKeySaved(true)
+    setTimeout(() => setBraveApiKeySaved(false), 2000)
+    invoke<{ used: number; limit: number; reset_label: string }>('get_brave_search_usage')
+      .then(setBraveUsage).catch(() => {})
   }
 
   // ── Sub-components ──────────────────────────────────────────────
@@ -569,7 +537,7 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
 
   const tabs: [Tab, string][] = mode === 'system'
     ? [['ai', '外部 AI'], ['voice', 'Whisper'], ['local', 'Local LLM'], ['raw', '設定檔']]
-    : [['account', '帳號'], ['general', '一般'], ['advanced', '進階'], ['intent', '意圖關鍵字'], ['memory', '記憶規則'], ['raw', '設定檔']]
+    : [['account', '帳號'], ['general', '一般'], ['advanced', '進階'], ['memory', '記憶規則'], ['raw', '設定檔']]
 
   const handleChangePassword = async () => {
     if (!newPassword || newPassword !== confirmPassword) {
@@ -901,6 +869,54 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                     </button>
                   ))}
                 </div>
+              </div>
+
+              <div style={{ marginBottom: '16px' }}>
+                <label style={{ fontSize: '13px', color: 'var(--color-text-primary)', display: 'block', marginBottom: '4px' }}>
+                  Brave Search API Key
+                </label>
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '0 0 6px', lineHeight: 1.4 }}>
+                  Chat Agent 呼叫 web_search 工具時使用。至 <a href="https://api.search.brave.com" target="_blank" rel="noreferrer" style={{ color: 'var(--color-accent)' }}>api.search.brave.com</a> 申請免費 API Key（1,000 次/月）。
+                </p>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <input
+                    type="password"
+                    value={braveApiKey}
+                    onChange={(e) => setBraveApiKey(e.target.value)}
+                    placeholder="BSA…"
+                    style={{ ...inputStyle, flex: 1 }}
+                  />
+                  <button
+                    onClick={handleSaveBraveApiKey}
+                    style={{
+                      height: '32px', padding: '0 14px', borderRadius: '6px',
+                      background: braveApiKeySaved ? 'var(--color-success)' : 'var(--color-accent)',
+                      color: '#fff', fontSize: '13px', flexShrink: 0, transition: 'background 0.2s', cursor: 'pointer',
+                    }}
+                  >{braveApiKeySaved ? '已儲存 ✓' : '儲存 Key'}</button>
+                </div>
+                {braveUsage && (() => {
+                  const pct = Math.min(braveUsage.used / braveUsage.limit, 1)
+                  const isExhausted = braveUsage.used >= braveUsage.limit
+                  const barColor = isExhausted ? 'var(--color-error, #ff453a)' : pct >= 0.8 ? 'var(--color-warning, #ff9f0a)' : 'var(--color-accent)'
+                  return (
+                    <div style={{ marginTop: '10px' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
+                        <span style={{ fontSize: '11px', color: isExhausted ? 'var(--color-error, #ff453a)' : 'var(--color-text-muted)' }}>
+                          {isExhausted
+                            ? `已達每月搜尋上限，${braveUsage.reset_label}重置`
+                            : `本月已使用 ${braveUsage.used} / ${braveUsage.limit} 次`}
+                        </span>
+                        <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>
+                          {Math.round(pct * 100)}%
+                        </span>
+                      </div>
+                      <div style={{ height: '4px', borderRadius: '2px', background: 'var(--color-border)', overflow: 'hidden' }}>
+                        <div style={{ height: '100%', width: `${pct * 100}%`, background: barColor, borderRadius: '2px', transition: 'width 0.3s' }} />
+                      </div>
+                    </div>
+                  )
+                })()}
               </div>
 
               {/* ── 快捷鍵 ────────────────────────────────────────────────── */}
@@ -1506,78 +1522,6 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                     開啟後右側面板會新增 Debug 分頁，顯示語音錄音的詳細事件日誌。
                   </p>
                 )}
-              </div>
-            </>}
-
-            {tab === 'intent' && <>
-              {/* Header row */}
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
-                <span style={{ fontSize: '13px', fontWeight: 500, color: 'var(--color-text-primary)' }}>意圖關鍵字</span>
-                {intentLoading && <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>載入中…</span>}
-              </div>
-              <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '0 0 14px', lineHeight: 1.5 }}>
-                設定觸發各意圖的關鍵字。短關鍵字（≤5字）用精確比對，長的用子字串比對。
-              </p>
-
-              {/* Intent rows */}
-              {intentKeywords.map(row => (
-                <div key={row.intent} style={{ marginBottom: '12px', border: '1px solid var(--color-border)', borderRadius: '8px', padding: '10px 12px' }}>
-                  {/* Intent name + delete button */}
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
-                    <span style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-text-secondary)', letterSpacing: '0.06em', fontFamily: 'monospace' }}>{row.intent}</span>
-                    <button
-                      onClick={() => handleDeleteIntentRow(row.intent)}
-                      style={{ padding: '2px 8px', borderRadius: '4px', fontSize: '11px', background: 'transparent', border: '1px solid var(--color-border)', color: 'var(--color-text-muted)', cursor: 'pointer' }}
-                      onMouseEnter={e => { e.currentTarget.style.borderColor = '#e06c75'; e.currentTarget.style.color = '#e06c75' }}
-                      onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--color-border)'; e.currentTarget.style.color = 'var(--color-text-muted)' }}
-                    >刪除意圖</button>
-                  </div>
-
-                  {/* Keyword chips */}
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', alignItems: 'center' }}>
-                    {row.keywords.map(kw => (
-                      <span key={kw} style={{ display: 'inline-flex', alignItems: 'center', gap: '3px', padding: '2px 8px', borderRadius: '12px', background: 'var(--color-bg-elevated)', border: '1px solid var(--color-border)', fontSize: '12px', color: 'var(--color-text-primary)' }}>
-                        {kw}
-                        <button
-                          onClick={() => handleDeleteKeyword(row.intent, kw)}
-                          style={{ marginLeft: '2px', lineHeight: 1, fontSize: '13px', color: 'var(--color-text-muted)', background: 'none', border: 'none', cursor: 'pointer', padding: '0' }}
-                          onMouseEnter={e => { e.currentTarget.style.color = '#e06c75' }}
-                          onMouseLeave={e => { e.currentTarget.style.color = 'var(--color-text-muted)' }}
-                        >×</button>
-                      </span>
-                    ))}
-
-                    {/* Inline add keyword input */}
-                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                      <input
-                        value={newKwInput[row.intent] ?? ''}
-                        onChange={e => setNewKwInput(prev => ({ ...prev, [row.intent]: e.target.value }))}
-                        onKeyDown={e => { if (e.key === 'Enter') handleAddKeyword(row.intent) }}
-                        placeholder="新增關鍵字"
-                        style={{ height: '24px', padding: '0 8px', borderRadius: '12px', border: '1px dashed var(--color-border)', background: 'transparent', color: 'var(--color-text-primary)', fontSize: '12px', outline: 'none', width: '90px' }}
-                      />
-                      <button
-                        onClick={() => handleAddKeyword(row.intent)}
-                        style={{ padding: '2px 8px', borderRadius: '12px', fontSize: '11px', background: 'var(--color-accent-dim)', border: '1px solid var(--color-accent)', color: 'var(--color-accent)', cursor: 'pointer' }}
-                      >+</button>
-                    </span>
-                  </div>
-                </div>
-              ))}
-
-              {/* Add new intent */}
-              <div style={{ display: 'flex', gap: '6px', marginTop: '8px', alignItems: 'center' }}>
-                <input
-                  value={newIntentName}
-                  onChange={e => setNewIntentName(e.target.value.toUpperCase())}
-                  onKeyDown={e => { if (e.key === 'Enter') handleAddIntentRow() }}
-                  placeholder="新增意圖名稱（如 MEMORY）"
-                  style={{ flex: 1, height: '30px', padding: '0 10px', borderRadius: '6px', border: '1px solid var(--color-border)', background: 'var(--color-bg-elevated)', color: 'var(--color-text-primary)', fontSize: '12px', outline: 'none' }}
-                />
-                <button
-                  onClick={handleAddIntentRow}
-                  style={{ padding: '4px 12px', borderRadius: '6px', fontSize: '12px', background: 'var(--color-accent-dim)', border: '1px solid var(--color-accent)', color: 'var(--color-accent)', cursor: 'pointer', whiteSpace: 'nowrap' }}
-                >+ 新增意圖</button>
               </div>
             </>}
 

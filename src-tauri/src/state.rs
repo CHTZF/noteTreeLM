@@ -47,6 +47,8 @@ pub struct AppState {
     pub agent_session: Arc<Mutex<Option<String>>>,
     /// 工具測試台取消旗標：設為 true 時 run_tool_pipeline 的步驟迴圈中止
     pub tool_test_cancel: Arc<AtomicBool>,
+    /// 搜尋方式選擇通道（call_external_ai 工具暫停，等待前端選擇 web_search 或 call_external_ai）
+    pub search_method_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
 }
 
 impl AppState {
@@ -72,6 +74,7 @@ impl AppState {
             agent_cancel: Arc::new(AtomicBool::new(false)),
             agent_session: Arc::new(Mutex::new(None)),
             tool_test_cancel: Arc::new(AtomicBool::new(false)),
+            search_method_tx: Arc::new(Mutex::new(None)),
         }
     }
 

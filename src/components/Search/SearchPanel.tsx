@@ -2,6 +2,12 @@ import { useState, useRef, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { SearchResult } from '../../types/models'
 
+interface CachedPage {
+  title: string
+  url: string
+  content_md: string
+}
+
 interface SearchPanelProps {
   onOpenNote: (path: string) => void
 }
@@ -134,6 +140,18 @@ export default function SearchPanel({ onOpenNote }: SearchPanelProps) {
   const [searchError, setSearchError] = useState<string | null>(null)
   const [viewMode, setViewMode] = useState<'list' | 'tree'>('list')
   const debounceRef = useRef<ReturnType<typeof setTimeout>>()
+  const [selectedPage, setSelectedPage] = useState<CachedPage | null>(null)
+  const [loadingPage, setLoadingPage] = useState<string | null>(null)  // source_url being loaded
+
+  const openCachedPage = useCallback(async (source_url: string) => {
+    setLoadingPage(source_url)
+    try {
+      const page = await invoke<CachedPage | null>('get_cached_page', { sourceUrl: source_url })
+      if (page) setSelectedPage(page)
+    } catch { /* ignore */ } finally {
+      setLoadingPage(null)
+    }
+  }, [])
 
   const doSearch = useCallback(async (q: string) => {
     if (!q.trim()) { setResults([]); setIsSearching(false); setSearchError(null); return }
@@ -173,6 +191,11 @@ export default function SearchPanel({ onOpenNote }: SearchPanelProps) {
     color: 'var(--color-text-muted)',
     border: '1px solid var(--color-border)',
     transition: 'all 0.15s',
+  }
+
+  // ── Cached page viewer ───────────────────────────────────────────────────────
+  if (selectedPage) {
+    return <CachedPageViewer page={selectedPage} onBack={() => setSelectedPage(null)} />
   }
 
   return (
@@ -217,12 +240,17 @@ export default function SearchPanel({ onOpenNote }: SearchPanelProps) {
         {viewMode === 'list' && results.map((r) => (
           <div
             key={r.path}
-            onClick={() => onOpenNote(r.path)}
-            style={{ padding: '8px 12px', cursor: 'pointer', borderBottom: '1px solid var(--color-border-subtle)', minWidth: 0, overflow: 'hidden' }}
+            onClick={() => r.source_url ? openCachedPage(r.source_url) : onOpenNote(r.path)}
+            style={{ padding: '8px 12px', cursor: 'pointer', borderBottom: '1px solid var(--color-border-subtle)', minWidth: 0, overflow: 'hidden', opacity: loadingPage === r.source_url ? 0.5 : 1 }}
             onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--color-bg-hover)')}
             onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
           >
-            <div style={{ fontSize: '13px', color: 'var(--color-text-primary)', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.title}</div>
+            <div style={{ fontSize: '13px', color: 'var(--color-text-primary)', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 5 }}>
+              {r.source_url && (
+                <span style={{ fontSize: '10px', padding: '1px 5px', borderRadius: '3px', background: 'var(--color-accent-dim)', color: 'var(--color-accent)', flexShrink: 0 }}>網頁</span>
+              )}
+              {r.title}
+            </div>
             <div style={{ fontSize: '12px', color: 'var(--color-text-muted)', marginTop: '3px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.snippet}</div>
           </div>
         ))}
@@ -230,6 +258,45 @@ export default function SearchPanel({ onOpenNote }: SearchPanelProps) {
         {viewMode === 'tree' && treeRoots.map(node => (
           <TreeNodeView key={node.fullPath} node={node} depth={0} onOpenNote={onOpenNote} />
         ))}
+      </div>
+    </div>
+  )
+}
+
+// ── Cached page viewer component ──────────────────────────────────────────────
+
+function stripFrontmatter(md: string): string {
+  if (!md.startsWith('---')) return md
+  const end = md.indexOf('---', 3)
+  return end === -1 ? md : md.slice(end + 3).trimStart()
+}
+
+function CachedPageViewer({ page, onBack }: { page: CachedPage; onBack: () => void }) {
+  const body = stripFrontmatter(page.content_md)
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minWidth: 0, overflow: 'hidden' }}>
+      {/* Header */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', borderBottom: '1px solid var(--color-border)', flexShrink: 0 }}>
+        <button
+          onClick={onBack}
+          style={{ background: 'none', border: 'none', color: 'var(--color-text-muted)', cursor: 'pointer', fontSize: '13px', padding: '2px 6px', borderRadius: 4, display: 'flex', alignItems: 'center', gap: 4 }}
+        >
+          ← 返回
+        </button>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--color-text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{page.title}</div>
+          <div style={{ fontSize: '10px', color: 'var(--color-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginTop: 1 }}>{page.url}</div>
+        </div>
+      </div>
+      {/* Body */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: '12px 14px', minWidth: 0 }}>
+        {body ? (
+          <pre style={{ margin: 0, fontSize: '12px', lineHeight: 1.7, color: 'var(--color-text-primary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'inherit' }}>
+            {body}
+          </pre>
+        ) : (
+          <div style={{ color: 'var(--color-text-muted)', fontSize: '12px', textAlign: 'center', paddingTop: 24 }}>尚無快取內容</div>
+        )}
       </div>
     </div>
   )

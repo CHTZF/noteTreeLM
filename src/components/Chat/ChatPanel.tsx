@@ -13,6 +13,8 @@ import ConversationList from './ConversationList'
 interface Message {
   role: 'user' | 'assistant' | 'tool' | 'notice'
   content: string
+  webRefs?: Array<{ path: string; title: string; excerpt: string }>
+  savedWeb?: boolean
 }
 
 export default function ChatPanel({ liveChatActive = false, onActiveChange, onOpenNote }: { liveChatActive?: boolean; onActiveChange?: (active: boolean) => void; onOpenNote?: (path: string) => void }) {
@@ -33,9 +35,11 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const useNoteContext = !!settings.chat_auto_include_note
   const writeConfirmMode = (settings.write_confirm_mode ?? 'always') as 'always' | 'once' | 'never'
   const [pendingWriteDisplay, setPendingWriteDisplay] = useState<string | null>(null)
+  const [pendingSearchMethod, setPendingSearchMethod] = useState<{ query: string } | null>(null)
   const [error, setError] = useState('')
   const [isCompressing, setIsCompressing] = useState(false)
   const [lastMemoryPath, setLastMemoryPath] = useState<string | null>(null)
+  const [savingWebMsgIdx, setSavingWebMsgIdx] = useState<number | null>(null)
 
   // ─── Voice overlay ────────────────────────────────────────────────────────────
   const [voiceTranscript, setVoiceTranscript]   = useState('')
@@ -61,6 +65,9 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const [noteSuggestions, setNoteSuggestions] = useState<{ absPath: string; label: string }[]>([])
   const noteSuggestionsRef = useRef<{ absPath: string; label: string }[]>([])
   useEffect(() => { noteSuggestionsRef.current = noteSuggestions }, [noteSuggestions])
+
+  // Track web refs from agent:web_refs (call_external_ai / web_search) for "儲存為知識"
+  const pendingWebRefsRef = useRef<Array<{ path: string; title: string; excerpt: string }>>([])
 
   const log = useCallback((msg: string) => addLog('chat', 'info', msg), [addLog])
   const err = useCallback((msg: string) => addLog('chat', 'error', msg), [addLog])
@@ -309,6 +316,11 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     await invoke('confirm_write_tool', { approved })
   }, [writeConfirmMode])
 
+  const handleSearchMethodChoice = useCallback(async (method: string) => {
+    setPendingSearchMethod(null)
+    await invoke('confirm_search_method', { method })
+  }, [])
+
   const send = useCallback(async () => {
     const text = input.trim()
     if (!text || isStreaming) return
@@ -336,10 +348,13 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     let unlistenWriteReq: (() => void) | undefined
     let unlistenNoteRefs: (() => void) | undefined
     let unlistenOpenNote: (() => void) | undefined
+    let unlistenSearchMethod: (() => void) | undefined
+    let unlistenWebRefs: (() => void) | undefined
 
     // Clear previous suggestions at the start of each send
     setNoteSuggestions([])
     noteSuggestionsRef.current = []
+    pendingWebRefsRef.current = []
 
     try {
       const notePart =
@@ -392,6 +407,11 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         setPendingWriteDisplay(display)
       })
 
+      // 監聽搜尋方式選擇請求
+      unlistenSearchMethod = await listen<{ query: string }>('agent:search_method_request', (event) => {
+        setPendingSearchMethod(event.payload)
+      })
+
       unlistenToken = await listen<string>('llm:token', (event) => {
         streamingRef.current += event.payload
         tokenCountRef.current += event.payload.length
@@ -402,6 +422,9 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       })
       unlistenDone = await listen('llm:done', () => {
         log(`⏹ llm:done 事件收到，共 ${tokenCountRef.current} 字元`)
+      })
+      unlistenWebRefs = await listen<Array<{ path: string; title: string; excerpt: string }>>('agent:web_refs', (e) => {
+        pendingWebRefsRef.current = [...pendingWebRefsRef.current, ...e.payload]
       })
 
       log('  呼叫 invoke("invoke_agent")')
@@ -414,7 +437,10 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
 
       const finalContent = responseText || streamingRef.current
       log(`✓ invoke_agent 完成，回覆 ${finalContent.length} 字元`)
-      setMessages((prev) => [...prev, { role: 'assistant', content: finalContent }])
+      const webRefs = pendingWebRefsRef.current.length > 0
+        ? pendingWebRefsRef.current
+        : undefined
+      setMessages((prev) => [...prev, { role: 'assistant', content: finalContent, webRefs }])
     } catch (e: unknown) {
       const msg =
         typeof e === 'string'
@@ -431,7 +457,10 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       unlistenWriteReq?.()
       unlistenNoteRefs?.()
       unlistenOpenNote?.()
+      unlistenSearchMethod?.()
+      unlistenWebRefs?.()
       setPendingWriteDisplay(null)
+      setPendingSearchMethod(null)
       setIsStreaming(false)
       setStreamingText('')
       streamingRef.current = ''
@@ -452,6 +481,27 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     streamingRef.current = ''
     setLastMemoryPath(null)
   }
+
+  const handleSaveWeb = useCallback(async (msgIndex: number, msg: Message) => {
+    if (!msg.webRefs?.length) return
+    setSavingWebMsgIdx(msgIndex)
+    try {
+      const title = msg.webRefs[0]?.title || '知識項目'
+      await invoke('save_knowledge_item', {
+        sessionId: 'chat',
+        title,
+        aiSummary: msg.content,
+        sourceRefs: msg.webRefs,
+      })
+      setMessages(prev => prev.map((m, i) => i === msgIndex ? { ...m, savedWeb: true } : m))
+      toast.success(`已儲存「${title}」`)
+    } catch (e: unknown) {
+      const errMsg = typeof e === 'string' ? e : e instanceof Error ? e.message : String(e)
+      toast.error(`儲存失敗：${errMsg}`)
+    } finally {
+      setSavingWebMsgIdx(null)
+    }
+  }, [])
 
   // 填入：若仍在錄音/辨識中則先停止，完成後填入輸入框
   const handleVoiceConfirm = useCallback(() => {
@@ -709,7 +759,12 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
           )}
 
           {messages.map((msg, i) => (
-            <MessageBubble key={i} message={msg} />
+            <MessageBubble
+              key={i}
+              message={msg}
+              onSaveWeb={msg.webRefs?.length ? () => handleSaveWeb(i, msg) : undefined}
+              savingWeb={savingWebMsgIdx === i}
+            />
           ))}
 
           {/* 串流中 / agent 思考中的 assistant 泡泡 */}
@@ -751,6 +806,32 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
                 {note.label}
               </button>
             ))}
+          </div>
+        )}
+
+        {/* 搜尋方式選擇 Bubble */}
+        {pendingSearchMethod && (
+          <div style={{
+            margin: '0 8px 8px', padding: '10px 14px', borderRadius: '8px',
+            background: 'var(--color-bg-elevated)', border: '1px solid var(--color-accent)',
+            fontSize: '13px', flexShrink: 0,
+          }}>
+            <div style={{ marginBottom: '6px', color: 'var(--color-text-secondary)', fontSize: '12px' }}>
+              請選擇搜尋方式
+            </div>
+            <div style={{ marginBottom: '8px', color: 'var(--color-text-primary)', fontSize: '12px', fontFamily: 'var(--font-mono, monospace)' }}>
+              查詢：{pendingSearchMethod.query}
+            </div>
+            <div style={{ display: 'flex', gap: '6px' }}>
+              <button
+                onClick={() => handleSearchMethodChoice('web_search')}
+                style={{ padding: '4px 12px', borderRadius: '4px', background: 'var(--color-accent)', color: '#fff', border: 'none', cursor: 'pointer', fontSize: '12px' }}
+              >網路搜尋</button>
+              <button
+                onClick={() => handleSearchMethodChoice('call_external_ai')}
+                style={{ padding: '4px 12px', borderRadius: '4px', background: 'transparent', color: 'var(--color-text-secondary)', border: '1px solid var(--color-border)', cursor: 'pointer', fontSize: '12px' }}
+              >外部 AI</button>
+            </div>
           </div>
         )}
 
@@ -891,9 +972,13 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
 function MessageBubble({
   message,
   streaming,
+  onSaveWeb,
+  savingWeb,
 }: {
   message: Message
   streaming?: boolean
+  onSaveWeb?: () => void
+  savingWeb?: boolean
 }) {
   const isUser = message.role === 'user'
   const isTool = message.role === 'tool'
@@ -930,25 +1015,36 @@ function MessageBubble({
 
   return (
     <div style={{ display: 'flex', justifyContent: isUser ? 'flex-end' : 'flex-start' }}>
-      <div style={{
-        maxWidth: '85%', padding: '8px 12px',
-        borderRadius: isUser ? '12px 12px 4px 12px' : '12px 12px 12px 4px',
-        background: isUser ? 'var(--color-accent)' : 'var(--color-bg-elevated)',
-        color: isUser ? 'white' : 'var(--color-text-primary)',
-        fontSize: '13px', lineHeight: 1.6, wordBreak: 'break-word',
-        border: isUser ? 'none' : '1px solid var(--color-border)',
-        whiteSpace: 'pre-wrap',
-      }}>
-        {message.content}
-        {streaming && (
-          <span style={{
-            display: 'inline-block', width: '2px', height: '14px',
-            background: 'var(--color-accent)', marginLeft: '2px', verticalAlign: 'text-bottom',
-            animation: 'blink 1s step-start infinite',
-          }} />
-        )}
-        {streaming && (
-          <style>{`@keyframes blink { 0%, 100% { opacity: 1 } 50% { opacity: 0 } }`}</style>
+      <div style={{ maxWidth: '85%', display: 'flex', flexDirection: 'column', alignItems: isUser ? 'flex-end' : 'flex-start' }}>
+        <div style={{
+          padding: '8px 12px',
+          borderRadius: isUser ? '12px 12px 4px 12px' : '12px 12px 12px 4px',
+          background: isUser ? 'var(--color-accent)' : 'var(--color-bg-elevated)',
+          color: isUser ? 'white' : 'var(--color-text-primary)',
+          fontSize: '13px', lineHeight: 1.6, wordBreak: 'break-word',
+          border: isUser ? 'none' : '1px solid var(--color-border)',
+          whiteSpace: 'pre-wrap',
+        }}>
+          {message.content}
+          {streaming && (
+            <span style={{
+              display: 'inline-block', width: '2px', height: '14px',
+              background: 'var(--color-accent)', marginLeft: '2px', verticalAlign: 'text-bottom',
+              animation: 'blink 1s step-start infinite',
+            }} />
+          )}
+          {streaming && (
+            <style>{`@keyframes blink { 0%, 100% { opacity: 1 } 50% { opacity: 0 } }`}</style>
+          )}
+        </div>
+        {!isUser && !isTool && !isNotice && onSaveWeb && (
+          <button
+            className={message.savedWeb ? 'import-panel-v2__saved-btn' : 'import-panel-v2__save-btn'}
+            onClick={message.savedWeb ? undefined : onSaveWeb}
+            disabled={savingWeb || message.savedWeb}
+          >
+            {message.savedWeb ? '✓ 已儲存' : savingWeb ? '儲存中…' : '儲存為知識'}
+          </button>
         )}
       </div>
     </div>

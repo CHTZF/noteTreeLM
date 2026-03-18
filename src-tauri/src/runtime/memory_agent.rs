@@ -320,12 +320,14 @@ pub(crate) async fn format_memory_rows(rows: &[(String, String, i64)], prefix: &
 }
 
 /// Agent 工具：查詢記憶筆記（回傳格式化純文字，供 LLM 直接使用）
+/// 若提供 `emb_url`，優先使用向量相似度搜尋；無 embedding 時 fallback 至 FTS。
 pub(crate) async fn tool_query_memory(
     keywords: Vec<String>,
     since: Option<String>,
     limit: Option<usize>,
     vault_db: &SurrealDb,
     vault_id: &str,
+    emb_url: Option<&str>,
 ) -> String {
     let limit = limit.unwrap_or(3).min(10) as i64;
 
@@ -338,6 +340,57 @@ pub(crate) async fn tool_query_memory(
                 .unwrap_or(0)
         })
     });
+
+    // ── Vector search path (when keywords given + embedding server available) ──
+    if !keywords.is_empty() {
+        if let Some(emb_url) = emb_url {
+            let query_text = keywords.join(" ");
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .ok();
+            if let Some(client) = client {
+                let query_vec = crate::commands::ai::get_embedding(&client, emb_url, &query_text).await;
+                if !query_vec.is_empty() {
+                    #[derive(Deserialize)]
+                    struct VecRow { file_path: String, content: String, score: f64 }
+                    let min_ts = since_ts.unwrap_or(0);
+                    let mut resp = vault_db.query(
+                        "SELECT file_path, content, vector::similarity::cosine(embedding, $vec) AS score \
+                         FROM chunks WHERE vault_id = $vid \
+                         AND string::starts_with(file_path, 'memories/') \
+                         AND embedding IS NOT NONE \
+                         AND updated_at >= $min_ts \
+                         ORDER BY score DESC LIMIT $lim"
+                    )
+                    .bind(("vid", vault_id.to_owned()))
+                    .bind(("vec", query_vec))
+                    .bind(("min_ts", min_ts))
+                    .bind(("lim", limit))
+                    .await.ok();
+
+                    let vec_rows: Vec<VecRow> = resp.as_mut()
+                        .and_then(|r| r.take::<Vec<VecRow>>(0).ok())
+                        .unwrap_or_default();
+
+                    if !vec_rows.is_empty() {
+                        // Deduplicate by file_path, keep top chunk per file
+                        let mut seen = std::collections::HashSet::new();
+                        let mut deduped: Vec<(String, String, i64)> = Vec::new();
+                        for row in vec_rows {
+                            if seen.insert(row.file_path.clone()) {
+                                // Use score * 1e12 as pseudo-timestamp for ordering
+                                deduped.push((row.file_path, row.content, (row.score * 1e12) as i64));
+                            }
+                        }
+                        if !deduped.is_empty() {
+                            return format_memory_rows(&deduped, "", vault_db, vault_id).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[derive(Deserialize)]
     struct NoteRow { path: String, title: String, modified_at: i64 }

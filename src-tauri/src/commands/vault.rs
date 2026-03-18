@@ -1355,6 +1355,8 @@ async fn trash_single_note(
         .bind(("path", note_path.to_owned()))
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+    // 刪除 chunks，避免搜尋到已刪除的筆記
+    let _ = chunker::delete_chunks(db, vault_id, note_path).await;
 
     let item_id = uuid::Uuid::new_v4().to_string();
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -1619,20 +1621,22 @@ pub async fn delete_trash_items(
 
     for id in &ids {
         #[derive(Deserialize)]
-        struct FilenameRow { trash_filename: String }
+        struct TrashRow { trash_filename: String, original_path: String }
         let mut resp = db
-            .query("SELECT trash_filename FROM trash_items WHERE vault_id = $vid AND item_id = $id LIMIT 1")
+            .query("SELECT trash_filename, original_path FROM trash_items WHERE vault_id = $vid AND item_id = $id LIMIT 1")
             .bind(("vid", vault_id.clone()))
             .bind(("id", id.clone()))
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
-        let rows: Vec<FilenameRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+        let rows: Vec<TrashRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
 
         if let Some(row) = rows.into_iter().next() {
             let file_path = trash_dir.join(&row.trash_filename);
             if file_path.exists() {
                 let _ = tokio::fs::remove_file(&file_path).await;
             }
+            // 清除殘留 chunks（正常 trash 流程已刪，這裡作為防護網）
+            let _ = chunker::delete_chunks(&db, &vault_id, &row.original_path).await;
         }
         db.query("DELETE FROM trash_items WHERE vault_id = $vid AND item_id = $id")
             .bind(("vid", vault_id.clone()))

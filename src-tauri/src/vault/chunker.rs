@@ -162,27 +162,38 @@ pub async fn upsert_chunks(
         }
     }
 
-    // Upsert each chunk (with optional embedding)
+    // Embed all chunks in parallel (instead of sequentially)
     let client = reqwest::Client::new();
-    for c in chunks {
-        let emb_vec = if let Some(url) = embedding_url {
-            let v = crate::commands::ai::get_embedding(&client, url, &c.content).await;
-            if v.is_empty() { None } else { Some(v) }
-        } else {
-            None
-        };
+    let embeddings: Vec<Option<Vec<f32>>> = if let Some(url) = embedding_url {
+        let url_str = url.to_string();
+        let futs: Vec<_> = chunks.iter().map(|c| {
+            let client = client.clone();
+            let url = url_str.clone();
+            let content = c.content.clone();
+            async move {
+                let v = crate::commands::ai::get_embedding(&client, &url, &content).await;
+                if v.is_empty() { None } else { Some(v) }
+            }
+        }).collect();
+        futures::future::join_all(futs).await
+    } else {
+        vec![None; chunks.len()]
+    };
+
+    // Delete then insert each chunk.
+    // Avoids ON DUPLICATE KEY UPDATE which triggers a SurrealDB FTS B-tree bug
+    // (duplicate insert key panic) when the chunks table has a BM25 index.
+    for (c, emb_vec) in chunks.iter().zip(embeddings.into_iter()) {
+        db.query("DELETE FROM chunks WHERE vault_id = $vid AND chunk_id = $cid")
+            .bind(("vid", vault_id.to_owned()))
+            .bind(("cid", c.id.clone()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         if let Some(vec) = emb_vec {
-            let mut r = db.query(
+            db.query(
                 "INSERT INTO chunks (vault_id, chunk_id, file_path, section, content, links, chunk_type, word_count, updated_at, embedding, status)
-                 VALUES ($vid, $cid, $fp, $section, $content, $links, $chunk_type, $wc, time::now(), $emb, $status)
-                 ON DUPLICATE KEY UPDATE
-                   content    = $content,
-                   links      = $links,
-                   word_count = $wc,
-                   updated_at = time::now(),
-                   embedding  = $emb,
-                   status     = $status"
+                 VALUES ($vid, $cid, $fp, $section, $content, $links, $chunk_type, $wc, time::now(), $emb, $status)"
             )
             .bind(("vid", vault_id.to_owned()))
             .bind(("cid", c.id.clone()))
@@ -196,17 +207,10 @@ pub async fn upsert_chunks(
             .bind(("status", c.status.clone()))
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
-            let _ = r;
         } else {
-            let mut r = db.query(
+            db.query(
                 "INSERT INTO chunks (vault_id, chunk_id, file_path, section, content, links, chunk_type, word_count, updated_at, status)
-                 VALUES ($vid, $cid, $fp, $section, $content, $links, $chunk_type, $wc, time::now(), $status)
-                 ON DUPLICATE KEY UPDATE
-                   content    = $content,
-                   links      = $links,
-                   word_count = $wc,
-                   updated_at = time::now(),
-                   status     = $status"
+                 VALUES ($vid, $cid, $fp, $section, $content, $links, $chunk_type, $wc, time::now(), $status)"
             )
             .bind(("vid", vault_id.to_owned()))
             .bind(("cid", c.id.clone()))
@@ -219,7 +223,6 @@ pub async fn upsert_chunks(
             .bind(("status", c.status.clone()))
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
-            let _ = r;
         }
     }
     Ok(())

@@ -515,6 +515,37 @@ fn external_ai_tool_definition() -> serde_json::Value {
     }])
 }
 
+/// 從 DB 讀取外部 AI 設定並執行查詢（供 ToolRegistry 的 call_external_ai 工具使用）
+pub(crate) async fn call_external_ai_via_db(
+    query: &str,
+    db: &SurrealDb,
+    app: &AppHandle,
+) -> String {
+    let provider = queries::get_setting(db, "ai_provider")
+        .await.unwrap_or_default().unwrap_or_default();
+    let base_url = queries::get_setting(db, "ai_base_url")
+        .await.unwrap_or_default()
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    let model = queries::get_setting(db, "ai_model")
+        .await.unwrap_or_default()
+        .unwrap_or_else(|| "gpt-4o".to_string());
+    let api_key = read_api_key_sync(&provider);
+    let config = ExtAiConfig { provider, base_url, model, api_key };
+    call_external_ai_tool(query, &config, app).await
+}
+
+/// 前端選擇搜尋方式後呼叫（解除 call_external_ai 工具的暫停狀態）
+#[tauri::command]
+pub async fn confirm_search_method(
+    state: State<'_, AppState>,
+    method: String,
+) -> Result<(), AppError> {
+    if let Some(tx) = state.search_method_tx.lock().await.take() {
+        let _ = tx.send(method);
+    }
+    Ok(())
+}
+
 /// 取消正在進行的 Agent 串流（設定取消旗標，同時拒絕待確認的寫入工具）
 #[tauri::command]
 pub async fn cancel_agent(state: State<'_, AppState>) -> Result<(), AppError> {
@@ -585,48 +616,20 @@ pub async fn invoke_agent(
         }
     }
 
-    // 3.5 KB context injection（vault 可用 + use_kb 未明確關閉時）
-    let use_kb_flag = true; // 預設開啟；未來可由前端參數控制
-    if use_kb_flag {
-        if let Some(ref vid) = vault_id_opt {
-            let emb_url: Option<String> = {
-                let port = *state.embedding_actual_port.lock().await;
-                port.map(|p| format!("http://127.0.0.1:{}", p))
-            };
-            // 取最後一條 user 訊息作為搜尋 query
-            let kb_query = messages_json.iter().rev()
-                .find(|m| m["role"].as_str() == Some("user"))
-                .and_then(|m| m["content"].as_str())
-                .unwrap_or(&input)
-                .to_string();
-            if let Some(kb_ctx) = crate::commands::knowledge_import::search_kb_context(
-                &state.db, vid, &kb_query, emb_url.as_deref()
-            ).await {
-                // 注入到 system prompt（追加到既有 system 或新增）
-                let sys_idx = messages_json.iter().position(|m| m["role"].as_str() == Some("system"));
-                if let Some(idx) = sys_idx {
-                    let existing = messages_json[idx]["content"].as_str().unwrap_or("").to_string();
-                    messages_json[idx] = serde_json::json!({
-                        "role": "system",
-                        "content": format!("{}\n\n{}", existing, kb_ctx)
-                    });
-                } else {
-                    messages_json.insert(0, serde_json::json!({
-                        "role": "system",
-                        "content": kb_ctx
-                    }));
-                }
-            }
-        }
-    }
-
     // 4. 建立 ToolRegistry（vault 可用時注入工具）
+    let reg_emb_url: Option<String> = {
+        let port = *state.embedding_actual_port.lock().await;
+        port.map(|p| format!("http://127.0.0.1:{}", p))
+    };
+    let search_method_tx = Arc::clone(&state.search_method_tx);
     let registry = if !vault_path.is_empty() && vault_id_opt.is_some() {
         crate::tools::build_vault_registry(
             vault_path.clone(),
             vault_db.clone(),
             vault_id_opt.clone().unwrap_or_default(),
             app.clone(),
+            reg_emb_url,
+            search_method_tx,
         )
     } else {
         Arc::new(ToolRegistry::new())
@@ -784,7 +787,7 @@ pub async fn invoke_agent(
 
     let agent = Agent::new(
         Dispatcher::new(registry),
-        IntentClassifier::new(state.db.clone()),
+        IntentClassifier::new(),
         llm_fn,
         confirm_write,
         emit_fn,
@@ -1650,18 +1653,21 @@ fn vault_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "query_memory",
-                "description": "查詢過去整理的對話記憶筆記。當使用者提到之前討論過的話題、或需要參考過去對話內容時使用。回傳符合的記憶筆記清單（含時間與摘要片段）。",
+                "description": "查詢過去整理的對話記憶筆記。當使用者提到之前討論的話題、或需要回顧歷史對話時使用。\
+【時間參數轉換規則】若使用者提到時間範圍，請將自然語言轉成 since 的 ISO 日期：\
+今天→今日日期、昨天→前一天、本週→本週一、本月→本月1號、上個月→上月1號、N天前→對應日期；\
+若無時間限制則省略 since。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "keywords": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "搜尋關鍵字列表，例如 [\"Rust\", \"async\", \"Tauri\"]"
+                            "description": "語意搜尋關鍵字列表，例如 [\"Rust\", \"async\", \"Tauri\"]；若無特定主題可傳空陣列"
                         },
                         "since": {
                             "type": "string",
-                            "description": "可選，只查詢此日期之後的記憶，格式 YYYY-MM-DD"
+                            "description": "可選，只查詢此日期之後的記憶，格式 YYYY-MM-DD。例：昨天→前一天日期，本月→本月01日"
                         },
                         "limit": {
                             "type": "integer",
@@ -1685,6 +1691,25 @@ fn vault_tools() -> serde_json::Value {
                         "query": {
                             "type": "string",
                             "description": "發送給外部 AI 的完整問題或指令"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "在網路上搜尋最新資訊。當本地知識庫缺乏相關內容、或需要最新資訊時使用。\
+搜尋結果會自動在背景加入「匯入知識」，使用者稍後可在匯入中心查看完整來源。\
+不要用來查詢 Vault 筆記（請用 search_vault）。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "搜尋關鍵字或問題（建議使用具體關鍵字）"
                         }
                     },
                     "required": ["query"]
@@ -2421,7 +2446,8 @@ pub(crate) async fn tool_create_folder(rel_path: &str, vault_path: &str) -> Stri
 }
 
 /// 設定筆記 status frontmatter（draft | verified | deprecated）
-/// 同時更新 notes DB table 的 status 欄位
+/// 對 vault 筆記：讀寫磁碟 + 更新 notes table + chunks。
+/// 對 KB import 頁面（無磁碟檔案）：讀寫 import_pages.content_md + 更新 chunks。
 #[tauri::command]
 pub async fn set_note_status(
     state: State<'_, AppState>,
@@ -2431,25 +2457,61 @@ pub async fn set_note_status(
     if !matches!(status.as_str(), "draft" | "verified" | "deprecated") {
         return Err(AppError::AI(format!("Invalid status: {}", status)));
     }
-    let vault_path = state.get_vault_path().await;
-    if vault_path.is_empty() {
-        return Err(AppError::AI("Vault not configured".to_string()));
-    }
-    let abs = std::path::Path::new(&vault_path).join(&path);
-    let content = tokio::fs::read_to_string(&abs).await
-        .map_err(|e| AppError::AI(format!("Read failed: {}", e)))?;
-    let new_content = set_frontmatter_key(&content, "status", &status);
-    tokio::fs::write(&abs, &new_content).await
-        .map_err(|e| AppError::AI(format!("Write failed: {}", e)))?;
-    // Sync to DB
     let vault_id = state.get_vault_id().await?;
-    let _ = state.db.query(
-        "UPDATE notes SET content = $content WHERE vault_id = $vid AND path = $path"
-    )
-    .bind(("content", new_content.clone()))
-    .bind(("vid", vault_id.clone()))
-    .bind(("path", path.clone()))
-    .await;
+    let vault_path = state.get_vault_path().await;
+
+    // Try reading from disk first; fall back to import_pages.content_md for KB-only pages
+    let abs = if !vault_path.is_empty() {
+        Some(std::path::Path::new(&vault_path).join(&path))
+    } else {
+        None
+    };
+
+    let on_disk = abs.as_ref().map(|p| p.exists()).unwrap_or(false);
+
+    let new_content: String = if on_disk {
+        let abs_path = abs.as_ref().unwrap();
+        let content = tokio::fs::read_to_string(abs_path).await
+            .map_err(|e| AppError::AI(format!("Read failed: {}", e)))?;
+        let updated = set_frontmatter_key(&content, "status", &status);
+        tokio::fs::write(abs_path, &updated).await
+            .map_err(|e| AppError::AI(format!("Write failed: {}", e)))?;
+        // Sync to notes table
+        let _ = state.db.query(
+            "UPDATE notes SET content = $content WHERE vault_id = $vid AND path = $path"
+        )
+        .bind(("content", updated.clone()))
+        .bind(("vid", vault_id.clone()))
+        .bind(("path", path.clone()))
+        .await;
+        updated
+    } else {
+        // KB import page — read/write content_md in import_pages
+        #[derive(serde::Deserialize)]
+        struct ContentRow { content_md: Option<String> }
+        let mut resp = state.db.query(
+            "SELECT content_md FROM import_pages WHERE vault_id = $vid AND note_path = $path LIMIT 1"
+        )
+        .bind(("vid", vault_id.clone()))
+        .bind(("path", path.clone()))
+        .await
+        .map_err(|e| AppError::AI(format!("DB read failed: {}", e)))?;
+        let rows: Vec<ContentRow> = resp.take(0).unwrap_or_default();
+        let content = rows.into_iter().next()
+            .and_then(|r| r.content_md)
+            .unwrap_or_else(|| format!("---\nstatus: {}\n---\n\n", status));
+        let updated = set_frontmatter_key(&content, "status", &status);
+        // Write back to import_pages
+        let _ = state.db.query(
+            "UPDATE import_pages SET content_md = $content WHERE vault_id = $vid AND note_path = $path"
+        )
+        .bind(("content", updated.clone()))
+        .bind(("vid", vault_id.clone()))
+        .bind(("path", path.clone()))
+        .await;
+        updated
+    };
+
     // Re-upsert chunks（確保 chunks 存在，並帶正確 status）
     {
         let now_ms = chrono::Local::now().timestamp_millis();
@@ -2572,7 +2634,7 @@ async fn execute_vault_tool(
             let since = args["since"].as_str().map(String::from);
             let limit = args["limit"].as_u64().map(|v| v as usize);
             match vault_db {
-                Some((db, vid)) => tool_query_memory(keywords, since, limit, db, vid).await,
+                Some((db, vid)) => tool_query_memory(keywords, since, limit, db, vid, None).await,
                 None => "Vault 資料庫未就緒".to_string(),
             }
         }
@@ -2690,61 +2752,6 @@ pub async fn delete_memory_rule(state: State<'_, AppState>, id: i64) -> Result<(
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
     }
-    Ok(())
-}
-
-// ─── Intent Keywords CRUD ─────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-pub struct IntentKeywordsRow {
-    pub intent: String,
-    pub keywords: Vec<String>,
-}
-
-/// 取得所有 intent_keywords 列（供設定頁面顯示）
-#[tauri::command]
-pub async fn get_intent_keywords(
-    state: State<'_, AppState>,
-) -> Result<Vec<IntentKeywordsRow>, AppError> {
-    #[derive(Deserialize)]
-    struct IkRow { intent: String, keywords: Vec<String> }
-    let mut resp = state.db.query(
-        "SELECT intent, keywords FROM intent_keywords ORDER BY intent"
-    )
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-    let rows: Vec<IkRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
-    Ok(rows.into_iter().map(|r| IntentKeywordsRow { intent: r.intent, keywords: r.keywords }).collect())
-}
-
-/// 新增或更新一個 intent 的完整 keywords 列表
-#[tauri::command]
-pub async fn save_intent_keywords(
-    state: State<'_, AppState>,
-    intent: String,
-    keywords: Vec<String>,
-) -> Result<(), AppError> {
-    state.db.query(
-        "INSERT INTO intent_keywords (intent, keywords) VALUES ($intent, $keywords)
-         ON DUPLICATE KEY UPDATE keywords = $keywords"
-    )
-    .bind(("intent", intent.clone()))
-    .bind(("keywords", keywords.clone()))
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-    Ok(())
-}
-
-/// 刪除整個 intent 列（包含其所有 keywords）
-#[tauri::command]
-pub async fn delete_intent_row(
-    state: State<'_, AppState>,
-    intent: String,
-) -> Result<(), AppError> {
-    state.db.query("DELETE FROM intent_keywords WHERE intent = $intent")
-        .bind(("intent", intent.clone()))
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
     Ok(())
 }
 

@@ -17,17 +17,28 @@ export interface KBMessage {
 }
 
 interface KnowledgeChatStore {
-  messages: KBMessage[]
+  messagesBySession: Record<string, KBMessage[]>
   selectedSessionId: string | null
-  setMessages: (updater: (prev: KBMessage[]) => KBMessage[]) => void
+  activeKbSessionId: string | null
+  setMessages: (sessionKey: string, updater: (prev: KBMessage[]) => KBMessage[]) => void
   setSelectedSessionId: (id: string | null) => void
-  clearMessages: () => void
+  setActiveKbSessionId: (id: string | null) => void
+  clearMessages: (sessionKey: string) => void
 }
 
 export const useKnowledgeChatStore = create<KnowledgeChatStore>(set => ({
-  messages: [],
+  messagesBySession: {},
   selectedSessionId: null,
-  setMessages: updater => set(s => ({ messages: updater(s.messages) })),
+  activeKbSessionId: null,
+  setMessages: (sessionKey, updater) => set(s => ({
+    messagesBySession: {
+      ...s.messagesBySession,
+      [sessionKey]: updater(s.messagesBySession[sessionKey] ?? []),
+    },
+  })),
   setSelectedSessionId: id => set({ selectedSessionId: id }),
-  clearMessages: () => set({ messages: [] }),
+  setActiveKbSessionId: id => set({ activeKbSessionId: id }),
+  clearMessages: sessionKey => set(s => ({
+    messagesBySession: { ...s.messagesBySession, [sessionKey]: [] },
+  })),
 }))

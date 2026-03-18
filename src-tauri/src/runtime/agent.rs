@@ -10,7 +10,6 @@ use crate::db::surreal::SurrealDb;
 
 use super::dispatcher::Dispatcher;
 use super::intent_classifier::{Intent, IntentClassifier};
-use super::memory_agent::MemoryAgent;
 use super::planner::Planner;
 use super::transaction::Transaction;
 use super::types::{ConfirmWriteFn, EmbedFn, EmitEventFn, LlmFn, PrefetchFn, TxDebugEvent};
@@ -32,7 +31,7 @@ pub struct Agent {
     current_session: Arc<Mutex<Option<String>>>,
     /// 預設工具列表（ToolUse/Chat 路徑使用；None = 不傳工具給 LLM）
     vault_tools: Option<Value>,
-    /// 記憶預取回呼（Intent::Memory 路徑的初始種子；None = 無 vault DB）
+    /// 記憶預取回呼（注入 system prompt 初始種子；None = 無 vault DB）
     prefetch_memory: Option<PrefetchFn>,
     /// Embedding 回呼（用於 plan_announce centroid 計算）
     embed_fn: EmbedFn,
@@ -188,69 +187,19 @@ impl Agent {
             String::new()
         };
 
-        // 對 Chat/ToolUse 意圖：將記憶上下文追加到現有 system prompt 尾端
-        // （Memory 意圖會在下方整個替換 messages[0]，此處注入會被覆蓋，故暫不插入）
-        let intent = self.intent_classifier.classify(&user_input).await;
-
-        match intent {
-            // ── 取消 / 中斷 ───────────────────────────────────────────
-            Intent::Cancel | Intent::Interrupt => {
-                self.stream_cancel.store(true, Ordering::Relaxed);
-                (self.emit)("agent:cancelled".into(), Value::Null);
-                // 必須 emit llm:done，否則前端 sendToLLM 的 unlistenDone 永遠不觸發 → UI 卡在 thinking
-                (self.emit)("llm:done".into(), Value::String(String::new()));
-                return Ok(String::new());
-            }
-
-            // ── 確認（行內確認由 confirm_write 閉包處理；此處略過）────
-            Intent::Confirm => {
-                // 必須 emit llm:done，否則前端 sendToLLM 的 unlistenDone 永遠不觸發 → UI 卡在 thinking
-                (self.emit)("llm:done".into(), Value::String(String::new()));
-                return Ok(String::new());
-            }
-
-            // ── 記憶查詢 → 替換 system prompt + 限縮工具，走串流 loop ─
-            Intent::Memory => {
-                // 串聯優化：使用頂端已預取的記憶作為初始種子注入 MemoryAgent system prompt
-                // LLM 可直接利用此上下文回答，或再呼叫 query_memory 工具深化搜尋
-                let base_system = MemoryAgent::build_system_prompt();
-                let memory_system = if prefetched.is_empty() {
-                    base_system
-                } else {
-                    format!(
-                        "{}\n\n【預先擷取的記憶上下文（可直接使用，也可再呼叫 query_memory 深化搜尋）】\n{}",
-                        base_system, prefetched
-                    )
-                };
-
-                if messages.first().and_then(|m| m["role"].as_str()) == Some("system") {
-                    messages[0] = serde_json::json!({"role": "system", "content": memory_system});
-                } else {
-                    messages.insert(0, serde_json::json!({"role": "system", "content": memory_system}));
-                }
-                self.stream_cancel.store(false, Ordering::Relaxed);
-                let session_id = Uuid::new_v4().to_string();
-                *self.current_session.lock().await = Some(session_id.clone());
-                self.run_streaming_loop(messages, Some(MemoryAgent::tools_definition()), session_id).await
-            }
-
-            // ── 工具使用 / 對話 → 多輪串流 LLM loop ─────────────────
-            Intent::ToolUse | Intent::Chat => {
-                // 將預取的記憶上下文追加到現有 system prompt 尾端
-                if !prefetched.is_empty() {
-                    let section = format!("\n\n以下是相關的過去對話記憶（供參考）：\n{}", prefetched);
-                    if let Some(sys) = messages.first_mut().filter(|m| m["role"] == "system") {
-                        let old = sys["content"].as_str().unwrap_or("").to_string();
-                        sys["content"] = Value::String(old + &section);
-                    }
-                }
-                self.stream_cancel.store(false, Ordering::Relaxed);
-                let session_id = Uuid::new_v4().to_string();
-                *self.current_session.lock().await = Some(session_id.clone());
-                let tools = if use_tools { self.vault_tools.clone() } else { None };
-                self.run_streaming_loop(messages, tools, session_id).await
+        // 將預取的記憶上下文追加到現有 system prompt 尾端
+        if !prefetched.is_empty() {
+            let section = format!("\n\n以下是相關的過去對話記憶（供參考）：\n{}", prefetched);
+            if let Some(sys) = messages.first_mut().filter(|m| m["role"] == "system") {
+                let old = sys["content"].as_str().unwrap_or("").to_string();
+                sys["content"] = Value::String(old + &section);
             }
         }
+        self.stream_cancel.store(false, Ordering::Relaxed);
+        let session_id = Uuid::new_v4().to_string();
+        *self.current_session.lock().await = Some(session_id.clone());
+        let tools = if use_tools { self.vault_tools.clone() } else { None };
+        self.run_streaming_loop(messages, tools, session_id).await
     }
 
     /// 多輪 LLM 串流 loop（最多 5 輪工具呼叫）

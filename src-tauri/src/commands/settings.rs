@@ -309,6 +309,36 @@ pub async fn set_vault_last_note(
     queries::set_vault_last_note(&state.db, &vault_path, &note_path).await
 }
 
+/// 取得 KB 聊天訊息（存於 settings 表，key = kb_chat_messages:{session_id}）
+#[tauri::command]
+pub async fn get_kb_chat_messages(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<String>, AppError> {
+    let key = format!("kb_chat_messages:{}", session_id);
+    queries::get_setting(&state.db, &key).await
+}
+
+/// 儲存 KB 聊天訊息
+#[tauri::command]
+pub async fn save_kb_chat_messages(
+    state: State<'_, AppState>,
+    session_id: String,
+    messages_json: String,
+) -> Result<(), AppError> {
+    let key = format!("kb_chat_messages:{}", session_id);
+    if messages_json.is_empty() || messages_json == "[]" {
+        // Clear by deleting the key
+        state.db.query("DELETE FROM settings WHERE key = $key")
+            .bind(("key", key))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    } else {
+        queries::set_setting(&state.db, &key, &messages_json).await?;
+    }
+    Ok(())
+}
+
 /// 通用版：依 mode 取得上次對話 ID（供 live_chat / knowledge_qa 等 panel 使用）
 #[tauri::command]
 pub async fn get_last_mode_conversation_id(
@@ -379,6 +409,8 @@ pub async fn set_api_key(provider: String, key: String) -> Result<(), AppError> 
     if key.is_empty() {
         entry.delete_password().ok();
     } else {
+        // macOS Keychain: set_password fails if item already exists — delete first
+        entry.delete_password().ok();
         entry.set_password(&key)
             .map_err(|e| AppError::Settings(e.to_string()))?;
     }

@@ -1,4 +1,5 @@
 use crate::{commands::ai::{ensure_server_running, read_api_key_sync, get_embedding}, db::{queries, surreal::SurrealDb}, error::AppError, state::AppState};
+use chrono::Datelike as _;
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -72,7 +73,7 @@ struct SessionRow {
     created_at: surrealdb::sql::Datetime,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct PageRow {
     page_id: String,
     session_id: String,
@@ -102,6 +103,13 @@ impl From<PageRow> for ImportPage {
             last_crawled: r.last_crawled.map(|dt| dt.timestamp_millis()),
         }
     }
+}
+
+/// Imported page item used for RAG context building.
+struct PageItem {
+    url: String,
+    title: String,
+    content: String,
 }
 
 // ── URL validation (mirrors import.rs) ──────────────────────────────────────
@@ -540,7 +548,7 @@ pub async fn list_import_sessions(
     Ok(summaries)
 }
 
-/// Delete an import session and all its pages.
+/// Delete an import session and all its pages (including chunks and KB suggestions).
 #[tauri::command]
 pub async fn delete_import_session(
     state: State<'_, AppState>,
@@ -551,6 +559,35 @@ pub async fn delete_import_session(
     let vid = vault_id.to_owned();
     let sid = session_id.to_owned();
 
+    // Collect virtual note_paths so we can delete their chunks
+    #[derive(serde::Deserialize)]
+    struct PathRow { note_path: Option<String> }
+    let mut resp = db
+        .query("SELECT note_path FROM import_pages WHERE vault_id = $vid AND session_id = $sid")
+        .bind(("vid", vid.to_owned()))
+        .bind(("sid", sid.to_owned()))
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let path_rows: Vec<PathRow> = resp.take(0).unwrap_or_default();
+    let note_paths: Vec<String> = path_rows.into_iter().filter_map(|r| r.note_path).collect();
+
+    // Delete chunks for all pages in this session
+    for note_path in &note_paths {
+        db.query("DELETE chunks WHERE vault_id = $vid AND file_path = $fp")
+            .bind(("vid", vid.to_owned()))
+            .bind(("fp", note_path.to_owned()))
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+    }
+
+    // Delete KB suggestions for this session
+    db.query("DELETE kb_suggestions WHERE vault_id = $vid AND session_id = $sid")
+        .bind(("vid", vid.to_owned()))
+        .bind(("sid", sid.to_owned()))
+        .await
+        .ok(); // non-fatal if table doesn't exist yet
+
+    // Delete pages and session
     db.query("DELETE import_pages WHERE vault_id = $vid AND session_id = $sid")
         .bind(("vid", vid.to_owned()))
         .bind(("sid", sid.to_owned()))
@@ -763,61 +800,126 @@ pub async fn fetch_site_outline(
         .map_err(|e| AppError::Database(e.to_string()))?;
     }
 
+    // ── Populate sitemap_titles immediately (no embedding), return fast ─────
+    // Embedding is spawned in background so the command returns in ~1-2s.
+    for (url, title, _, depth) in &pages_to_insert {
+        let entry_id = Uuid::new_v4().to_string();
+        db.query(
+            "INSERT INTO sitemap_titles (vault_id, session_id, entry_id, url, title, depth) \
+             VALUES ($vid, $sid, $eid, $url, $title, $depth) \
+             ON DUPLICATE KEY UPDATE title = $title"
+        )
+        .bind(("vid", vid.to_owned())).bind(("sid", sid.to_owned()))
+        .bind(("eid", entry_id)).bind(("url", url.to_owned()))
+        .bind(("title", title.to_owned())).bind(("depth", *depth))
+        .await.map_err(|e| AppError::Database(e.to_string()))?;
+    }
+
+    // Background: embed titles and update sitemap_titles with vectors
+    let emb_url: Option<String> = {
+        let port = *state.embedding_actual_port.lock().await;
+        port.map(|p| format!("http://127.0.0.1:{}", p))
+    };
+    if let Some(base_url) = emb_url {
+        let db2 = db.clone();
+        let pages_clone: Vec<(String, String, i64)> = pages_to_insert
+            .iter().map(|(u, t, _, d)| (u.clone(), t.clone(), *d)).collect();
+        let vid2 = vid.clone();
+        let sid2 = sid.clone();
+        tokio::spawn(async move {
+            let emb_client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default();
+            let futs: Vec<_> = pages_clone.iter().map(|(_, title, _)| {
+                let c = emb_client.clone();
+                let u = base_url.clone();
+                let t = title.clone();
+                async move {
+                    let v = crate::commands::ai::get_embedding(&c, &u, &t).await;
+                    if v.is_empty() { None } else { Some(v) }
+                }
+            }).collect();
+            let embeddings = futures::future::join_all(futs).await;
+            for ((url, title, depth), emb_opt) in pages_clone.iter().zip(embeddings.into_iter()) {
+                if let Some(emb) = emb_opt {
+                    let _ = db2.query(
+                        "UPDATE sitemap_titles SET embedding = $emb \
+                         WHERE vault_id = $vid AND session_id = $sid AND url = $url"
+                    )
+                    .bind(("vid", vid2.clone())).bind(("sid", sid2.clone()))
+                    .bind(("url", url.clone())).bind(("emb", emb))
+                    .await;
+                }
+                let _ = depth; // suppress unused warning
+                let _ = title;
+            }
+        });
+    }
+
     // Return all pages for this session
     get_session_pages(state, session_id).await
 }
 
-/// Import a single page as a markdown note.
-#[tauri::command]
-pub async fn import_page(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    session_id: String,
-    page_id: String,
+/// Lightweight on-demand fetch for Q&A: HTTP fetch → markdown → store content_md.
+/// No chunking, no embedding, no mutex — just what the RAG query needs.
+async fn fetch_page_content_for_qa(
+    db: &SurrealDb,
+    vault_id: &str,
+    page: &PageRow,
+) -> Result<(), AppError> {
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (compatible; noteTreeLM/0.1; knowledge-import)")
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| AppError::Import(e.to_string()))?;
+
+    let response = client
+        .get(page.url.as_str())
+        .send()
+        .await
+        .map_err(|e| AppError::Import(e.to_string()))?;
+
+    let html = response.text().await.map_err(|e| AppError::Import(e.to_string()))?;
+
+    let title = {
+        let t = extract_title(&html);
+        if t.is_empty() { page.title.clone() } else { t }
+    };
+    let body_md = html_to_markdown_rich(&html);
+    let now_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let content_md = format!(
+        "---\ntitle: {}\nsource: {}\nimported: {}\nstatus: verified\n---\n\n{}\n",
+        title, page.url, now_date, body_md
+    );
+    let new_hash = sha256_hex(&content_md);
+    let now_dt = surrealdb::sql::Datetime::from(chrono::Utc::now());
+
+    db.query(
+        "UPDATE import_pages SET status = 'imported', title = $title, content_md = $content, \
+         content_hash = $hash, last_crawled = $now \
+         WHERE vault_id = $vid AND page_id = $pid",
+    )
+    .bind(("title", title))
+    .bind(("content", content_md))
+    .bind(("hash", new_hash))
+    .bind(("now", now_dt))
+    .bind(("vid", vault_id.to_owned()))
+    .bind(("pid", page.page_id.clone()))
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(())
+}
+
+/// Core import logic — used by the `import_page` Tauri command.
+async fn import_page_inner(
+    db: &SurrealDb,
+    vault_id: &str,
+    page: &PageRow,
+    root_folder: &str,
+    emb_url: Option<&str>,
 ) -> Result<ImportPageResult, AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let vault_path = state.get_vault_path().await;
-    if vault_path.is_empty() {
-        return Err(AppError::Vault("尚未設定 Vault 路徑".to_string()));
-    }
-    let db = &state.db;
-    let vid = vault_id.to_owned();
-    let sid = session_id.to_owned();
-    let pid = page_id.to_owned();
-
-    // Load page record
-    let mut page_resp = db
-        .query(
-            "SELECT page_id, session_id, url, title, parent_url, depth, note_path, content_hash, http_etag, status, last_crawled \
-             FROM import_pages WHERE vault_id = $vid AND page_id = $pid LIMIT 1",
-        )
-        .bind(("vid", vid.to_owned()))
-        .bind(("pid", pid.to_owned()))
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-    let page_rows: Vec<PageRow> = page_resp.take(0).unwrap_or_default();
-    let page = page_rows.into_iter().next().ok_or_else(|| {
-        AppError::Import(format!("Page not found: {}", page_id))
-    })?;
-
-    // Load session to get root_folder
-    let mut sess_resp = db
-        .query(
-            "SELECT session_id, seed_url, site_name, root_folder, status, created_at \
-             FROM import_sessions WHERE vault_id = $vid AND session_id = $sid LIMIT 1",
-        )
-        .bind(("vid", vid.to_owned()))
-        .bind(("sid", sid.to_owned()))
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-    let sess_rows: Vec<SessionRow> = sess_resp.take(0).unwrap_or_default();
-    let session = sess_rows.into_iter().next().ok_or_else(|| {
-        AppError::Import(format!("Session not found: {}", session_id))
-    })?;
-
-    // Fetch the page
     let parsed_url = validate_url(&page.url)?;
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (compatible; noteTreeLM/0.1; knowledge-import)")
@@ -837,123 +939,127 @@ pub async fn import_page(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let html = response
-        .text()
-        .await
-        .map_err(|e| AppError::Import(e.to_string()))?;
+    let html = response.text().await.map_err(|e| AppError::Import(e.to_string()))?;
 
-    // Extract title
     let title = {
         let t = extract_title(&html);
-        if t.is_empty() {
-            page.title.clone()
-        } else {
-            t
-        }
+        if t.is_empty() { page.title.clone() } else { t }
     };
 
-    // Convert HTML to markdown
     let body_md = html_to_markdown_rich(&html);
-
-    // Build full note content with frontmatter
-    // status: verified — 使用者明確選擇匯入即視為已策展/驗證，KB 助手可直接使用
     let now_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let note_content = format!(
         "---\ntitle: {}\nsource: {}\nimported: {}\nstatus: verified\n---\n\n{}\n",
-        title,
-        page.url,
-        now_date,
-        body_md
+        title, page.url, now_date, body_md
     );
 
-    // Compute hash
     let new_hash = sha256_hex(&note_content);
-    let was_updated = page
-        .content_hash
-        .as_ref()
-        .map(|h| h != &new_hash)
-        .unwrap_or(false);
+    let was_updated = page.content_hash.as_ref().map(|h| h != &new_hash).unwrap_or(false);
 
-    // Build note path
     let slug = slugify(&title);
-    let note_filename = format!("{}.md", slug);
-    let rel_note_path = format!("{}/{}", session.root_folder, note_filename);
+    let rel_note_path = format!("{}/{}.md", root_folder, slug);
 
-    // Write to disk
-    let abs_dir = std::path::PathBuf::from(&vault_path).join(&session.root_folder);
-    tokio::fs::create_dir_all(&abs_dir).await?;
-    let abs_note_path = std::path::PathBuf::from(&vault_path).join(&rel_note_path);
-    tokio::fs::write(&abs_note_path, note_content.as_bytes()).await?;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let chunks = crate::vault::chunker::chunk_note(&rel_note_path, &note_content, now_ms);
+    let _ = crate::vault::chunker::upsert_chunks(db, vault_id, &chunks, emb_url).await;
 
-    // 立即建立/更新 chunks（不等 file watcher），帶 embedding
-    {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let chunks = crate::vault::chunker::chunk_note(&rel_note_path, &note_content, now_ms);
-        let emb_url: Option<String> = {
-            let port = *state.embedding_actual_port.lock().await;
-            port.map(|p| format!("http://127.0.0.1:{}", p))
-        };
-        let _ = crate::vault::chunker::upsert_chunks(db, &vault_id, &chunks, emb_url.as_deref()).await;
-    }
-
-    // Sync note to DB
     let now_dt = surrealdb::sql::Datetime::from(chrono::Utc::now());
-    db.query(
-        "INSERT INTO notes (vault_id, path, title, content, word_count, created_at, modified_at, checksum) \
-         VALUES ($vid, $path, $title, $content, $wc, $now, $now, $checksum) \
-         ON DUPLICATE KEY UPDATE title = $title, content = $content, word_count = $wc, modified_at = $now, checksum = $checksum"
-    )
-    .bind(("vid", vid.to_owned()))
-    .bind(("path", rel_note_path.to_owned()))
-    .bind(("title", title.to_owned()))
-    .bind(("content", note_content.to_owned()))
-    .bind(("wc", note_content.split_whitespace().count() as i64))
-    .bind(("now", now_dt))
-    .bind(("checksum", new_hash.to_owned()))
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
-    // Update import_pages record
-    let now_dt2 = surrealdb::sql::Datetime::from(chrono::Utc::now());
-    let hash_val = new_hash.to_owned();
-    let path_val = rel_note_path.to_owned();
+    let vid = vault_id.to_owned();
+    let pid = page.page_id.clone();
 
     if let Some(etag_val) = etag {
         db.query(
-            "UPDATE import_pages SET status = 'imported', note_path = $path, content_hash = $hash, \
-             http_etag = $etag, last_crawled = $now WHERE vault_id = $vid AND page_id = $pid"
+            "UPDATE import_pages SET status = 'imported', note_path = $path, content_md = $content, \
+             content_hash = $hash, http_etag = $etag, last_crawled = $now \
+             WHERE vault_id = $vid AND page_id = $pid",
         )
-        .bind(("path", path_val))
-        .bind(("hash", hash_val))
-        .bind(("etag", etag_val))
-        .bind(("now", now_dt2))
-        .bind(("vid", vid.to_owned()))
-        .bind(("pid", pid))
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .bind(("path", rel_note_path.clone())).bind(("content", note_content))
+        .bind(("hash", new_hash)).bind(("etag", etag_val))
+        .bind(("now", now_dt)).bind(("vid", vid)).bind(("pid", pid))
+        .await.map_err(|e| AppError::Database(e.to_string()))?;
     } else {
         db.query(
-            "UPDATE import_pages SET status = 'imported', note_path = $path, content_hash = $hash, \
-             last_crawled = $now WHERE vault_id = $vid AND page_id = $pid"
+            "UPDATE import_pages SET status = 'imported', note_path = $path, content_md = $content, \
+             content_hash = $hash, last_crawled = $now \
+             WHERE vault_id = $vid AND page_id = $pid",
         )
-        .bind(("path", path_val))
-        .bind(("hash", hash_val))
-        .bind(("now", now_dt2))
-        .bind(("vid", vid.to_owned()))
-        .bind(("pid", pid))
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .bind(("path", rel_note_path.clone())).bind(("content", note_content))
+        .bind(("hash", new_hash)).bind(("now", now_dt)).bind(("vid", vid)).bind(("pid", pid))
+        .await.map_err(|e| AppError::Database(e.to_string()))?;
     }
 
-    // DB insert 完成後主動通知前端刷新 vault tree（避免 watcher 先於 DB insert 觸發的競態）
-    let abs_note = std::path::PathBuf::from(&vault_path).join(&rel_note_path);
-    let _ = app.emit("vault:note-created", vec![abs_note.to_string_lossy().to_string()]);
+    Ok(ImportPageResult { note_path: rel_note_path, title, was_updated })
+}
 
-    Ok(ImportPageResult {
-        note_path: rel_note_path,
-        title,
-        was_updated,
-    })
+/// Import a single page — stores content in DB only (no vault file written).
+#[tauri::command]
+pub async fn import_page(
+    state: State<'_, AppState>,
+    session_id: String,
+    page_id: String,
+) -> Result<ImportPageResult, AppError> {
+    let vault_id = state.get_vault_id().await?;
+    let db = &state.db;
+    let vid = vault_id.to_owned();
+
+    let mut page_resp = db
+        .query(
+            "SELECT page_id, session_id, url, title, parent_url, depth, note_path, content_hash, http_etag, status, last_crawled \
+             FROM import_pages WHERE vault_id = $vid AND page_id = $pid LIMIT 1",
+        )
+        .bind(("vid", vid.clone())).bind(("pid", page_id.clone()))
+        .await.map_err(|e| AppError::Database(e.to_string()))?;
+    let page = page_resp.take::<Vec<PageRow>>(0).unwrap_or_default()
+        .into_iter().next()
+        .ok_or_else(|| AppError::Import(format!("Page not found: {}", page_id)))?;
+
+    let mut sess_resp = db
+        .query(
+            "SELECT session_id, seed_url, site_name, root_folder, status, created_at \
+             FROM import_sessions WHERE vault_id = $vid AND session_id = $sid LIMIT 1",
+        )
+        .bind(("vid", vid.clone())).bind(("sid", session_id.clone()))
+        .await.map_err(|e| AppError::Database(e.to_string()))?;
+    let session = sess_resp.take::<Vec<SessionRow>>(0).unwrap_or_default()
+        .into_iter().next()
+        .ok_or_else(|| AppError::Import(format!("Session not found: {}", session_id)))?;
+
+    // Import without embedding so the command returns fast (~1-2s instead of 1+ min).
+    // Embedding is spawned as a background task and doesn't block the response.
+    let result = import_page_inner(db, &vault_id, &page, &session.root_folder, None).await?;
+
+    // Spawn background embedding for the just-imported note
+    let emb_url: Option<String> = {
+        let port = *state.embedding_actual_port.lock().await;
+        port.map(|p| format!("http://127.0.0.1:{}", p))
+    };
+    if let Some(url) = emb_url {
+        let db2 = state.db.clone();
+        let note_path = result.note_path.clone();
+        let vault_id2 = vault_id.clone();
+        let page_id2 = page_id.clone();
+        tokio::spawn(async move {
+            // Read content_md from import_pages and embed its chunks
+            #[derive(serde::Deserialize)]
+            struct ContentRow { content_md: Option<String> }
+            if let Ok(mut r) = db2.query(
+                "SELECT content_md FROM import_pages WHERE vault_id = $vid AND page_id = $pid LIMIT 1"
+            )
+                .bind(("vid", vault_id2.clone()))
+                .bind(("pid", page_id2))
+                .await
+            {
+                let rows: Vec<ContentRow> = r.take(0).unwrap_or_default();
+                if let Some(Some(content)) = rows.into_iter().next().map(|r| r.content_md) {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let chunks = crate::vault::chunker::chunk_note(&note_path, &content, now_ms);
+                    let _ = crate::vault::chunker::upsert_chunks(&db2, &vault_id2, &chunks, Some(&url)).await;
+                }
+            }
+        });
+    }
+
+    Ok(result)
 }
 
 /// Check which already-imported pages have updated content.
@@ -1121,6 +1227,229 @@ pub async fn query_knowledge(
     Ok(())
 }
 
+/// Search already-imported pages relevant to `question`.
+/// Strategy: FTS → title CONTAINS fallback → all imported pages for session.
+async fn find_relevant_imported_pages(
+    db: &SurrealDb,
+    vault_id: &str,
+    session_id: Option<&str>,
+    question: &str,
+) -> Vec<PageItem> {
+    #[derive(serde::Deserialize)]
+    struct PRow { url: String, title: String, content_md: Option<String>, #[allow(dead_code)] last_crawled: Option<surrealdb::sql::Datetime> }
+
+    let all_imported: Vec<PRow> = if let Some(sid) = session_id {
+        db.query(
+            "SELECT url, title, content_md, last_crawled FROM import_pages \
+             WHERE vault_id = $vid AND session_id = $sid AND status = 'imported' \
+             ORDER BY last_crawled DESC LIMIT 20",
+        )
+        .bind(("vid", vault_id.to_owned())).bind(("sid", sid.to_owned()))
+        .await.ok().and_then(|mut r| r.take::<Vec<PRow>>(0).ok()).unwrap_or_default()
+    } else {
+        db.query(
+            "SELECT url, title, content_md, last_crawled FROM import_pages \
+             WHERE vault_id = $vid AND status = 'imported' \
+             ORDER BY last_crawled DESC LIMIT 20",
+        )
+        .bind(("vid", vault_id.to_owned()))
+        .await.ok().and_then(|mut r| r.take::<Vec<PRow>>(0).ok()).unwrap_or_default()
+    };
+
+    if all_imported.is_empty() {
+        return vec![];
+    }
+
+    // ── Try FTS first (may fail silently on some DB versions) ────────────────
+    let fts_results: Vec<PRow> = if let Some(sid) = session_id {
+        db.query(
+            "SELECT url, title, content_md FROM import_pages \
+             WHERE vault_id = $vid AND session_id = $sid AND status = 'imported' \
+             AND (title @1@ $q OR content_md @2@ $q) \
+             ORDER BY search::score(1) + search::score(2) DESC LIMIT 6",
+        )
+        .bind(("vid", vault_id.to_owned())).bind(("sid", sid.to_owned()))
+        .bind(("q", question.to_owned()))
+        .await.ok().and_then(|mut r| r.take::<Vec<PRow>>(0).ok()).unwrap_or_default()
+    } else {
+        db.query(
+            "SELECT url, title, content_md FROM import_pages \
+             WHERE vault_id = $vid AND status = 'imported' \
+             AND (title @1@ $q OR content_md @2@ $q) \
+             ORDER BY search::score(1) + search::score(2) DESC LIMIT 6",
+        )
+        .bind(("vid", vault_id.to_owned())).bind(("q", question.to_owned()))
+        .await.ok().and_then(|mut r| r.take::<Vec<PRow>>(0).ok()).unwrap_or_default()
+    };
+    if !fts_results.is_empty() {
+        return fts_results.into_iter()
+            .filter_map(|p| p.content_md.map(|c| PageItem { url: p.url, title: p.title, content: c }))
+            .collect();
+    }
+
+    // ── Fallback: keyword scoring in Rust over all_imported ─────────────────
+    let q_lower = question.to_lowercase();
+    let keywords: Vec<&str> = q_lower
+        .split(|c: char| !c.is_alphanumeric() && !(('\u{4E00}'..='\u{9FFF}').contains(&c)))
+        .filter(|w| w.len() >= 1)
+        .collect();
+
+    let mut scored: Vec<(usize, PRow)> = all_imported.into_iter()
+        .filter(|p| p.content_md.is_some())
+        .map(|p| {
+            let title_lower = p.title.to_lowercase();
+            let content_lower = p.content_md.as_deref().unwrap_or("").to_lowercase();
+            let score = keywords.iter().filter(|kw| {
+                title_lower.contains(*kw) || content_lower.contains(*kw)
+            }).count();
+            (score, p)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+
+    // Return top 4 with content, or if no keyword match just top 4 by recency
+    let results: Vec<PageItem> = scored.into_iter()
+        .take(4)
+        .filter_map(|(_, p)| p.content_md.map(|c| PageItem { url: p.url, title: p.title, content: c }))
+        .collect();
+    results
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() { return 0.0; }
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { dot / (norm_a * norm_b) }
+}
+
+/// Find pending pages whose sitemap title is most relevant to `question`.
+/// Uses pre-embedded sitemap_titles (populated during fetch_site_outline).
+/// Falls back to FTS on title if embeddings are unavailable.
+async fn find_matching_pending_pages(
+    db: &SurrealDb,
+    vault_id: &str,
+    session_id: Option<&str>,
+    question: &str,
+    emb_url: Option<&str>,
+) -> Vec<PageRow> {
+    // ── Vector search on pre-embedded sitemap_titles ──────────────────────────
+    if let Some(base_url) = emb_url {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
+        let query_vec = crate::commands::ai::get_embedding(&client, base_url, question).await;
+        if !query_vec.is_empty() {
+            #[derive(serde::Deserialize)]
+            struct SitemapHit { url: String }
+            let hits: Vec<SitemapHit> = if let Some(sid) = session_id {
+                db.query(
+                    "SELECT url, vector::similarity::cosine(embedding, $vec) AS score \
+                     FROM sitemap_titles \
+                     WHERE vault_id = $vid AND session_id = $sid AND embedding IS NOT NONE \
+                     ORDER BY score DESC LIMIT 10",
+                )
+                .bind(("vid", vault_id.to_owned())).bind(("sid", sid.to_owned()))
+                .bind(("vec", query_vec))
+                .await.ok().and_then(|mut r| r.take::<Vec<SitemapHit>>(0).ok()).unwrap_or_default()
+            } else {
+                db.query(
+                    "SELECT url, vector::similarity::cosine(embedding, $vec) AS score \
+                     FROM sitemap_titles WHERE vault_id = $vid AND embedding IS NOT NONE \
+                     ORDER BY score DESC LIMIT 10",
+                )
+                .bind(("vid", vault_id.to_owned())).bind(("vec", query_vec))
+                .await.ok().and_then(|mut r| r.take::<Vec<SitemapHit>>(0).ok()).unwrap_or_default()
+            };
+
+            if !hits.is_empty() {
+                let top_urls: Vec<String> = hits.into_iter().take(3).map(|h| h.url).collect();
+                let pages: Vec<PageRow> = if let Some(sid) = session_id {
+                    db.query(
+                        "SELECT page_id, session_id, url, title, parent_url, depth, \
+                         note_path, content_hash, http_etag, status, last_crawled \
+                         FROM import_pages \
+                         WHERE vault_id = $vid AND session_id = $sid \
+                         AND status = 'pending' AND url IN $urls",
+                    )
+                    .bind(("vid", vault_id.to_owned())).bind(("sid", sid.to_owned()))
+                    .bind(("urls", top_urls))
+                    .await.ok().and_then(|mut r| r.take::<Vec<PageRow>>(0).ok()).unwrap_or_default()
+                } else {
+                    db.query(
+                        "SELECT page_id, session_id, url, title, parent_url, depth, \
+                         note_path, content_hash, http_etag, status, last_crawled \
+                         FROM import_pages WHERE vault_id = $vid AND status = 'pending' AND url IN $urls",
+                    )
+                    .bind(("vid", vault_id.to_owned())).bind(("urls", top_urls))
+                    .await.ok().and_then(|mut r| r.take::<Vec<PageRow>>(0).ok()).unwrap_or_default()
+                };
+                if !pages.is_empty() { return pages; }
+            }
+        }
+    }
+
+    // ── Fallback: FTS on sitemap_titles ───────────────────────────────────────
+    #[derive(serde::Deserialize)]
+    struct SitemapFts { url: String }
+    let fts_hits: Vec<SitemapFts> = if let Some(sid) = session_id {
+        db.query(
+            "SELECT url FROM sitemap_titles \
+             WHERE vault_id = $vid AND session_id = $sid AND title @1@ $q \
+             ORDER BY search::score(1) DESC LIMIT 3",
+        )
+        .bind(("vid", vault_id.to_owned())).bind(("sid", sid.to_owned()))
+        .bind(("q", question.to_owned()))
+        .await.ok().and_then(|mut r| r.take::<Vec<SitemapFts>>(0).ok()).unwrap_or_default()
+    } else {
+        db.query(
+            "SELECT url FROM sitemap_titles \
+             WHERE vault_id = $vid AND title @1@ $q ORDER BY search::score(1) DESC LIMIT 3",
+        )
+        .bind(("vid", vault_id.to_owned())).bind(("q", question.to_owned()))
+        .await.ok().and_then(|mut r| r.take::<Vec<SitemapFts>>(0).ok()).unwrap_or_default()
+    };
+
+    // ── Final fallback: keyword match on import_pages.title in Rust ─────────
+    // (covers both pending pages and works without FTS or sitemap_titles)
+    let all_pending: Vec<PageRow> = if let Some(sid) = session_id {
+        db.query(
+            "SELECT page_id, session_id, url, title, parent_url, depth, \
+             note_path, content_hash, http_etag, status, last_crawled \
+             FROM import_pages WHERE vault_id = $vid AND session_id = $sid \
+             AND status = 'pending' LIMIT 100",
+        )
+        .bind(("vid", vault_id.to_owned())).bind(("sid", sid.to_owned()))
+        .await.ok().and_then(|mut r| r.take::<Vec<PageRow>>(0).ok()).unwrap_or_default()
+    } else {
+        db.query(
+            "SELECT page_id, session_id, url, title, parent_url, depth, \
+             note_path, content_hash, http_etag, status, last_crawled \
+             FROM import_pages WHERE vault_id = $vid AND status = 'pending' LIMIT 100",
+        )
+        .bind(("vid", vault_id.to_owned()))
+        .await.ok().and_then(|mut r| r.take::<Vec<PageRow>>(0).ok()).unwrap_or_default()
+    };
+
+    if all_pending.is_empty() { return vec![]; }
+
+    let q_lower = question.to_lowercase();
+    let keywords: Vec<&str> = q_lower
+        .split(|c: char| !c.is_alphanumeric() && !(('\u{4E00}'..='\u{9FFF}').contains(&c)))
+        .filter(|w| w.len() >= 1)
+        .collect();
+    if keywords.is_empty() { return vec![]; }
+
+    let mut scored: Vec<(usize, PageRow)> = all_pending.into_iter().map(|page| {
+        let title_lower = page.title.to_lowercase();
+        let score = keywords.iter().filter(|kw| title_lower.contains(*kw)).count();
+        (score, page)
+    }).collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.into_iter().filter(|(s, _)| *s > 0).take(3).map(|(_, p)| p).collect()
+}
+
 async fn run_knowledge_query(
     app: &AppHandle,
     db: &SurrealDb,
@@ -1130,80 +1459,76 @@ async fn run_knowledge_query(
     query_id: &str,
     app_state: &AppState,
 ) -> Result<(), AppError> {
-    // 1. Determine path prefix
-    let path_prefix = if let Some(sid) = session_id {
-        #[derive(Deserialize)]
-        struct FolderRow { root_folder: String }
-        let mut resp = db.query(
-            "SELECT root_folder FROM import_sessions WHERE vault_id = $vid AND session_id = $sid LIMIT 1"
-        )
-        .bind(("vid", vault_id.to_owned()))
-        .bind(("sid", sid.to_owned()))
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-        let rows: Vec<FolderRow> = resp.take(0).unwrap_or_default();
-        rows.into_iter().next().map(|r| r.root_folder).unwrap_or_else(|| "imports".to_string())
-    } else {
-        "imports".to_string()
+    // ── Get embedding URL (only used for sitemap title vector search) ────────
+    let emb_url: Option<String> = {
+        let port = *app_state.embedding_actual_port.lock().await;
+        port.map(|p| format!("http://127.0.0.1:{}", p))
     };
 
-    // 2. BM25 search
-    #[derive(Deserialize)]
-    struct NoteSearchRow { path: String, title: String, content: String }
+    // ── 1. FTS search on already-imported pages ────────────────────────────────
+    let mut notes = find_relevant_imported_pages(db, vault_id, session_id, question).await;
 
-    let prefix_slash = format!("{}/", path_prefix);
-    #[derive(Deserialize)]
-    struct NoteSearchRowScored { path: String, title: String, content: String, #[allow(dead_code)] score: Option<f64> }
-
-    let scored_notes: Vec<NoteSearchRowScored> = db
-        .query(
-            "SELECT path, title, content, search::score(1) AS score FROM notes \
-             WHERE vault_id = $vid AND string::starts_with(path, $prefix) \
-             AND (title @1@ $q OR content @1@ $q) \
-             ORDER BY score DESC LIMIT 6",
-        )
-        .bind(("vid", vault_id.to_owned()))
-        .bind(("prefix", prefix_slash.clone()))
-        .bind(("q", question.to_owned()))
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .take(0)
-        .unwrap_or_default();
-
-    let mut notes: Vec<NoteSearchRow> = scored_notes.into_iter().map(|r| NoteSearchRow { path: r.path, title: r.title, content: r.content }).collect();
-
-    // Fallback: most recent notes if FTS found nothing
+    // ── 2. On-demand import of matching pending pages if no content found ──────
     if notes.is_empty() {
-        #[derive(Deserialize)]
-        struct NoteRecentRow { path: String, title: String, content: String, #[allow(dead_code)] modified_at: Option<surrealdb::sql::Datetime> }
+        let pending = find_matching_pending_pages(db, vault_id, session_id, question, emb_url.as_deref()).await;
+        if !pending.is_empty() {
+            let titles: Vec<&str> = pending.iter().map(|p| p.title.as_str()).collect();
+            let _ = app.emit("knowledge:importing_pages", serde_json::json!({
+                "query_id": query_id,
+                "titles": &titles,
+            }));
 
-        let recent: Vec<NoteRecentRow> = db
-            .query(
-                "SELECT path, title, content, modified_at FROM notes \
-                 WHERE vault_id = $vid AND string::starts_with(path, $prefix) \
-                 ORDER BY modified_at DESC LIMIT 5",
-            )
-            .bind(("vid", vault_id.to_owned()))
-            .bind(("prefix", prefix_slash))
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?
-            .take(0)
-            .unwrap_or_default();
+            // Fetch all pending pages sequentially to avoid concurrent write issues
+            let mut import_errors: Vec<String> = Vec::new();
+            for page in &pending {
+                if let Err(e) = fetch_page_content_for_qa(db, vault_id, page).await {
+                    import_errors.push(format!("{}: {}", page.title, e));
+                }
+            }
+            if !import_errors.is_empty() {
+                log::warn!("[knowledge] on-demand import errors: {:?}", import_errors);
+            }
 
-        notes = recent.into_iter().map(|r| NoteSearchRow { path: r.path, title: r.title, content: r.content }).collect();
+            // Re-search with newly imported content
+            notes = find_relevant_imported_pages(db, vault_id, session_id, question).await;
+
+            // Debug: if still empty, emit diagnostic info
+            if notes.is_empty() {
+                #[derive(serde::Deserialize)]
+                struct DebugRow { page_id: String, status: String, title: String, has_content: bool }
+                let debug_rows: Vec<DebugRow> = db.query(
+                    "SELECT page_id, status, title, content_md != NONE AS has_content \
+                     FROM import_pages WHERE vault_id = $vid AND session_id = $sid LIMIT 10"
+                )
+                .bind(("vid", vault_id.to_owned()))
+                .bind(("sid", session_id.unwrap_or("").to_owned()))
+                .await.ok()
+                .and_then(|mut r| r.take::<Vec<DebugRow>>(0).ok())
+                .unwrap_or_default();
+                let debug_info: Vec<String> = debug_rows.iter()
+                    .map(|r| format!("[{}] status={} has_content={} title={}", r.page_id, r.status, r.has_content, r.title))
+                    .collect();
+                log::warn!("[knowledge] still empty after import. pages for session: {:?}. import_errors: {:?}", debug_info, import_errors);
+                let _ = app.emit("knowledge:debug", serde_json::json!({
+                    "query_id": query_id,
+                    "pages": debug_info,
+                    "import_errors": import_errors,
+                }));
+            }
+        }
     }
 
     if notes.is_empty() {
-        let msg = "目前沒有已匯入的知識點，請先新增來源並匯入頁面。";
+        let msg = "目前沒有相關的知識點。請嘗試重新表述問題，或到「管理來源」手動匯入更多頁面。";
         let _ = app.emit("knowledge:token", serde_json::json!({ "query_id": query_id, "content": msg }));
         let _ = app.emit("knowledge:done", serde_json::json!({ "query_id": query_id }));
         return Ok(());
     }
 
-    // 3. Build refs (emitted immediately so UI can show sources while LLM streams)
+    // 2. Build refs (emitted immediately so UI can show sources while LLM streams)
     let refs: Vec<KnowledgeRef> = notes.iter().map(|n| {
         let title = if n.title.is_empty() {
-            n.path.split('/').last().unwrap_or("").to_string()
+            n.url.clone()
         } else {
             n.title.clone()
         };
@@ -1214,12 +1539,12 @@ async fn run_knowledge_query(
             n.content.clone()
         };
         let excerpt: String = body.chars().take(180).collect();
-        KnowledgeRef { path: n.path.clone(), title, excerpt }
+        KnowledgeRef { path: n.url.clone(), title, excerpt }
     }).collect();
 
     let _ = app.emit("knowledge:refs", serde_json::json!({ "query_id": query_id, "refs": refs }));
 
-    // 4. Build RAG context
+    // 3. Build RAG context
     let is_cross_note = {
         let q = question.to_lowercase();
         q.contains("比較") || q.contains("對比") || q.contains("異同") || q.contains("差異")
@@ -1397,23 +1722,17 @@ pub async fn suggest_kb_cards(
     let vault_id = state.get_vault_id().await?;
     let db = &state.db;
 
-    // 取得頁面的 note_path
+    // 取得頁面 content_md（DB 儲存，不讀磁碟）
     #[derive(Deserialize)]
-    struct PagePath { note_path: Option<String> }
+    struct PageContent { content_md: Option<String> }
     let mut r = db.query(
-        "SELECT note_path FROM import_pages WHERE vault_id = $vid AND page_id = $pid LIMIT 1"
+        "SELECT content_md FROM import_pages WHERE vault_id = $vid AND page_id = $pid LIMIT 1"
     ).bind(("vid", vault_id.clone())).bind(("pid", page_id.clone()))
     .await.map_err(|e| AppError::Database(e.to_string()))?;
-    let rows: Vec<PagePath> = r.take(0).unwrap_or_default();
-    let note_path = rows.into_iter().next()
-        .and_then(|p| p.note_path)
-        .ok_or_else(|| AppError::Import("頁面尚未匯入".to_string()))?;
-
-    // 讀取 note 內容
-    let vault_path = state.get_vault_path().await;
-    let abs = std::path::PathBuf::from(&vault_path).join(&note_path);
-    let content = tokio::fs::read_to_string(&abs).await
-        .map_err(|e| AppError::Import(format!("讀取筆記失敗：{}", e)))?;
+    let rows: Vec<PageContent> = r.take(0).unwrap_or_default();
+    let content = rows.into_iter().next()
+        .and_then(|p| p.content_md)
+        .ok_or_else(|| AppError::Import("頁面尚未匯入或內容不存在".to_string()))?;
 
     // 截取前 3000 字元，避免 context 過長
     let excerpt = if content.len() > 3000 { &content[..3000] } else { &content };
@@ -1615,6 +1934,211 @@ pub struct KBSuggestionRecord {
     pub created_at: i64,
 }
 
+// ── Wikilink injection helper ─────────────────────────────────────────────────
+
+/// Inject [[wikilinks]] to sibling session notes into card content.
+///
+/// Strategy:
+/// 1. For each sibling title, if it appears verbatim in the body (outside frontmatter),
+///    wrap the first occurrence with [[title]].
+/// 2. Collect all sibling titles that either got wikilinked inline OR appear as keywords
+///    in the existing "## 相關概念" section (if present).
+/// 3. Fill/append a "## 相關筆記" section with all wikilinked siblings.
+fn inject_wikilinks_to_siblings(content: &str, sibling_titles: &[(String, String)]) -> String {
+    if sibling_titles.is_empty() {
+        return content.to_string();
+    }
+
+    // Split frontmatter from body
+    let (frontmatter, body) = if content.starts_with("---") {
+        // Find the closing ---
+        if let Some(end_offset) = content[3..].find("\n---") {
+            let split = 3 + end_offset + 4; // after the closing ---
+            // Consume the trailing newline if any
+            let split = if content.as_bytes().get(split) == Some(&b'\n') { split + 1 } else { split };
+            (&content[..split], &content[split..])
+        } else {
+            ("", content)
+        }
+    } else {
+        ("", content)
+    };
+
+    let mut body_str = body.to_string();
+    let mut linked_titles: Vec<&str> = Vec::new();
+
+    for (title, _path) in sibling_titles {
+        let wikilink = format!("[[{}]]", title);
+        // Already wikilinked in body?
+        if body_str.contains(&wikilink) {
+            linked_titles.push(title.as_str());
+            continue;
+        }
+        // Find verbatim title occurrence in body (case-sensitive for CJK safety)
+        if let Some(pos) = body_str.find(title.as_str()) {
+            // Don't double-wrap
+            let before = &body_str[..pos];
+            if !before.ends_with("[[") {
+                let after = body_str[pos + title.len()..].to_string();
+                body_str = format!("{}[[{}]]{}", before, title, after);
+                linked_titles.push(title.as_str());
+            }
+        } else {
+            // Title not found inline — still include in 相關筆記 section
+            linked_titles.push(title.as_str());
+        }
+    }
+
+    if linked_titles.is_empty() {
+        return format!("{}{}", frontmatter, body_str);
+    }
+
+    // Fill "## 相關概念" placeholder bullets OR append "## 相關筆記"
+    let related_section = linked_titles.iter()
+        .map(|t| format!("- [[{}]]", t))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Replace empty "## 相關概念\n\n-\n" placeholder generated by LLM
+    if body_str.contains("## 相關概念\n\n-\n") {
+        body_str = body_str.replacen(
+            "## 相關概念\n\n-\n",
+            &format!("## 相關概念\n\n{}\n", related_section),
+            1,
+        );
+    } else if body_str.contains("## 相關概念\n\n- \n") {
+        body_str = body_str.replacen(
+            "## 相關概念\n\n- \n",
+            &format!("## 相關概念\n\n{}\n", related_section),
+            1,
+        );
+    } else if !body_str.contains("## 相關筆記") {
+        // Append new section
+        body_str.push_str(&format!("\n## 相關筆記\n\n{}\n", related_section));
+    }
+
+    format!("{}{}", frontmatter, body_str)
+}
+
+/// Create a vault note from a KB card suggestion, auto-injecting wikilinks
+/// to other notes already created from the same session.
+/// Also marks the suggestion as created (stores note_path) and dismisses it.
+#[tauri::command]
+pub async fn create_kb_card_note(
+    state: State<'_, AppState>,
+    suggestion_id: String,
+    session_id: String,
+    title: String,
+    content: String,
+) -> Result<String, AppError> {
+    let vault_id = state.get_vault_id().await?;
+    let vault_path = state.get_vault_path().await;
+    if vault_path.is_empty() {
+        return Err(AppError::Vault("尚未設定 Vault 路徑".to_string()));
+    }
+
+    // Query all notes already created from this session's AI cards
+    #[derive(serde::Deserialize)]
+    struct SiblingRow { title: String, created_note_path: Option<String> }
+    let mut resp = state.db.query(
+        "SELECT title, created_note_path FROM kb_suggestions \
+         WHERE vault_id = $vid AND session_id = $sess \
+         AND created_note_path != NONE AND suggestion_id != $me"
+    )
+    .bind(("vid", vault_id.clone()))
+    .bind(("sess", session_id.clone()))
+    .bind(("me", suggestion_id.clone()))
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    let siblings: Vec<SiblingRow> = resp.take(0).unwrap_or_default();
+
+    let sibling_titles: Vec<(String, String)> = siblings.into_iter()
+        .filter_map(|s| s.created_note_path.map(|p| (s.title, p)))
+        .collect();
+
+    // Inject wikilinks into content
+    let final_content = inject_wikilinks_to_siblings(&content, &sibling_titles);
+
+    // Create vault note (mirrors create_note logic)
+    let safe_title: String = title.chars()
+        .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .collect();
+    let filename = format!("{}.md", safe_title.trim());
+    let rel_path = filename.clone();
+
+    let abs_path = std::path::PathBuf::from(&vault_path).join(&rel_path);
+    tokio::fs::write(&abs_path, final_content.as_bytes()).await?;
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now_dt = surrealdb::sql::Datetime::from(
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms).unwrap_or_default()
+    );
+    let checksum = {
+        let hash = Sha256::digest(final_content.as_bytes());
+        format!("{:x}", hash)
+    };
+    let word_count = final_content.split_whitespace().count() as i64;
+
+    state.db.query(
+        "INSERT INTO notes (vault_id, path, title, content, word_count, created_at, modified_at, checksum)
+         VALUES ($vid, $path, $title, $content, $wc, $now, $now, $cs)"
+    )
+    .bind(("vid", vault_id.clone()))
+    .bind(("path", rel_path.clone()))
+    .bind(("title", title.clone()))
+    .bind(("content", final_content.clone()))
+    .bind(("wc", word_count))
+    .bind(("now", now_dt))
+    .bind(("cs", checksum))
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Build chunks + embeddings
+    {
+        let chunks = crate::vault::chunker::chunk_note(&rel_path, &final_content, now_ms);
+        let emb_url: Option<String> = {
+            let port = *state.embedding_actual_port.lock().await;
+            port.map(|p| format!("http://127.0.0.1:{}", p))
+        };
+        let _ = crate::vault::chunker::upsert_chunks(&state.db, &vault_id, &chunks, emb_url.as_deref()).await;
+    }
+
+    // Mark suggestion as created (store note_path) and remove from suggestions list
+    let _ = state.db.query(
+        "UPDATE kb_suggestions SET created_note_path = $path \
+         WHERE vault_id = $vid AND suggestion_id = $sid"
+    )
+    .bind(("path", rel_path.clone()))
+    .bind(("vid", vault_id.clone()))
+    .bind(("sid", suggestion_id.clone()))
+    .await;
+
+    // Also backfill wikilinks in already-created sibling notes that mention this new title
+    // (only update the vault file and notes DB — lightweight, non-blocking)
+    let new_title = title.clone();
+    let new_wikilink = format!("[[{}]]", new_title);
+    for (sib_title, sib_path) in &sibling_titles {
+        let _ = sib_title; // used via already-created path
+        let abs_sib = std::path::PathBuf::from(&vault_path).join(sib_path);
+        if let Ok(sib_content) = tokio::fs::read_to_string(&abs_sib).await {
+            // Only update if the new title appears in sibling but isn't already wikilinked
+            if sib_content.contains(new_title.as_str()) && !sib_content.contains(&new_wikilink) {
+                let updated = inject_wikilinks_to_siblings(&sib_content, &[(new_title.clone(), rel_path.clone())]);
+                let _ = tokio::fs::write(&abs_sib, &updated).await;
+                let _ = state.db.query(
+                    "UPDATE notes SET content = $c WHERE vault_id = $vid AND path = $p"
+                )
+                .bind(("c", updated))
+                .bind(("vid", vault_id.clone()))
+                .bind(("p", sib_path.to_owned()))
+                .await;
+            }
+        }
+    }
+
+    Ok(rel_path)
+}
+
 /// 搜尋已驗證 KB chunks，回傳格式化的 context 字串供注入 system prompt。
 /// 依序嘗試：向量 → BM25 → contains（僅 verified）。
 /// 找到結果時回傳 Some(context)，找不到回傳 None。
@@ -1691,13 +2215,343 @@ pub async fn search_kb_context(
     Some(context)
 }
 
-/// 診斷：列出目前 vault 的 chunks 狀態分佈 + 最近 5 筆 verified chunk 摘要
+// ── Knowledge Items ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KnowledgeItem {
+    pub item_id: String,
+    pub vault_id: String,
+    pub session_id: String,
+    pub title: String,
+    pub source_refs: Vec<KnowledgeRef>,
+    pub ai_summary: String,
+    pub created_at: i64, // ms timestamp
+}
+
+/// Save an AI response + source refs as a knowledge item.
+/// Spawns a background task to chunk + embed the combined source content.
+#[tauri::command]
+pub async fn save_knowledge_item(
+    state: State<'_, AppState>,
+    session_id: String,
+    title: String,
+    ai_summary: String,
+    source_refs: Vec<KnowledgeRef>,
+) -> Result<KnowledgeItem, AppError> {
+    let vault_id = state.get_vault_id().await?;
+    let db = &state.db;
+    let item_id = Uuid::new_v4().to_string();
+    let vid = vault_id.clone();
+    let sid = session_id.clone();
+
+    db.query(
+        "INSERT INTO knowledge_items (vault_id, item_id, session_id, title, source_refs, ai_summary, created_at) \
+         VALUES ($vid, $iid, $sid, $title, $refs, $summary, time::now())"
+    )
+    .bind(("vid", vid.clone())).bind(("iid", item_id.clone()))
+    .bind(("sid", sid.clone())).bind(("title", title.clone()))
+    .bind(("refs", source_refs.clone())).bind(("summary", ai_summary.clone()))
+    .await.map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Background: fetch source page content and chunk + embed into `chunks` table
+    let emb_url: Option<String> = {
+        let port = *state.embedding_actual_port.lock().await;
+        port.map(|p| format!("http://127.0.0.1:{}", p))
+    };
+    if let Some(emb_url) = emb_url {
+        let db2 = state.db.clone();
+        let vid2 = vault_id.clone();
+        let iid = item_id.clone();
+        let summary = ai_summary.clone();
+        let ref_urls: Vec<String> = source_refs.iter().map(|r| r.path.clone()).collect();
+        tokio::spawn(async move {
+            #[derive(serde::Deserialize)]
+            struct ContentRow { title: String, content_md: Option<String> }
+            // Fetch all referenced page contents
+            let mut combined = format!("# AI 整理摘要\n\n{}\n\n", summary);
+            for url in &ref_urls {
+                if let Ok(mut r) = db2.query(
+                    "SELECT title, content_md FROM import_pages \
+                     WHERE vault_id = $vid AND url = $url LIMIT 1"
+                )
+                .bind(("vid", vid2.clone())).bind(("url", url.clone()))
+                .await {
+                    let rows: Vec<ContentRow> = r.take(0).unwrap_or_default();
+                    if let Some(row) = rows.into_iter().next() {
+                        if let Some(md) = row.content_md {
+                            combined.push_str(&format!("## {}\n\n{}\n\n", row.title, md));
+                        }
+                    }
+                }
+            }
+            let file_path = format!("knowledge_items/{}.md", iid);
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let chunks = crate::vault::chunker::chunk_note(&file_path, &combined, now_ms);
+            // Store chunks with item_id reference
+            for chunk in &chunks {
+                let _ = db2.query(
+                    "INSERT INTO chunks \
+                     (vault_id, chunk_id, file_path, section, content, links, chunk_type, word_count, updated_at, item_id) \
+                     VALUES ($vid, $cid, $fp, $section, $content, $links, $chunk_type, $wc, time::now(), $iid) \
+                     ON DUPLICATE KEY UPDATE content = $content, item_id = $iid, updated_at = time::now()"
+                )
+                .bind(("vid", vid2.clone())).bind(("cid", chunk.id.clone()))
+                .bind(("fp", chunk.file_path.clone())).bind(("section", chunk.section.clone()))
+                .bind(("content", chunk.content.clone())).bind(("links", chunk.links.clone()))
+                .bind(("chunk_type", chunk.chunk_type.clone())).bind(("wc", chunk.word_count))
+                .bind(("iid", iid.clone()))
+                .await.ok();
+            }
+            // Now embed them using the chunker (re-upsert with embedding)
+            let _ = crate::vault::chunker::upsert_chunks(&db2, &vid2, &chunks, Some(&emb_url)).await;
+        });
+    }
+
+    let created_at = chrono::Utc::now().timestamp_millis();
+    Ok(KnowledgeItem {
+        item_id,
+        vault_id,
+        session_id,
+        title,
+        source_refs,
+        ai_summary,
+        created_at,
+    })
+}
+
+/// List all knowledge items for the current vault, newest first.
+#[tauri::command]
+pub async fn list_knowledge_items(
+    state: State<'_, AppState>,
+) -> Result<Vec<KnowledgeItem>, AppError> {
+    let vault_id = state.get_vault_id().await?;
+    let db = &state.db;
+
+    #[derive(Deserialize)]
+    struct KIRow {
+        item_id: String,
+        vault_id: String,
+        session_id: String,
+        title: String,
+        source_refs: Vec<KnowledgeRef>,
+        ai_summary: String,
+        created_at: surrealdb::sql::Datetime,
+    }
+    let mut resp = db.query(
+        "SELECT item_id, vault_id, session_id, title, source_refs, ai_summary, created_at \
+         FROM knowledge_items WHERE vault_id = $vid ORDER BY created_at DESC"
+    )
+    .bind(("vid", vault_id))
+    .await.map_err(|e| AppError::Database(e.to_string()))?;
+    let rows: Vec<KIRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(rows.into_iter().map(|r| {
+        let created_at = r.created_at.timestamp_millis();
+        KnowledgeItem {
+            item_id: r.item_id, vault_id: r.vault_id, session_id: r.session_id,
+            title: r.title, source_refs: r.source_refs, ai_summary: r.ai_summary, created_at,
+        }
+    }).collect())
+}
+
+/// Get a single knowledge item by item_id.
+#[tauri::command]
+pub async fn get_knowledge_item(
+    state: State<'_, AppState>,
+    item_id: String,
+) -> Result<KnowledgeItem, AppError> {
+    let vault_id = state.get_vault_id().await?;
+    let db = &state.db;
+
+    #[derive(Deserialize)]
+    struct KIRow {
+        item_id: String,
+        vault_id: String,
+        session_id: String,
+        title: String,
+        source_refs: Option<String>,
+        ai_summary: String,
+        created_at: surrealdb::sql::Datetime,
+    }
+    let mut resp = db.query(
+        "SELECT item_id, vault_id, session_id, title, source_refs, ai_summary, created_at \
+         FROM knowledge_items WHERE vault_id = $vid AND item_id = $iid LIMIT 1"
+    )
+    .bind(("vid", vault_id)).bind(("iid", item_id.clone()))
+    .await.map_err(|e| AppError::Database(e.to_string()))?;
+    let row = resp.take::<Vec<KIRow>>(0).map_err(|e| AppError::Database(e.to_string()))?
+        .into_iter().next()
+        .ok_or_else(|| AppError::Import(format!("knowledge item not found: {}", item_id)))?;
+
+    let source_refs: Vec<KnowledgeRef> = row.source_refs
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    Ok(KnowledgeItem {
+        item_id: row.item_id, vault_id: row.vault_id, session_id: row.session_id,
+        title: row.title, source_refs, ai_summary: row.ai_summary,
+        created_at: row.created_at.timestamp_millis(),
+    })
+}
+
+/// Delete a knowledge item and its chunks.
+#[tauri::command]
+pub async fn delete_knowledge_item(
+    state: State<'_, AppState>,
+    item_id: String,
+) -> Result<(), AppError> {
+    let vault_id = state.get_vault_id().await?;
+    let db = &state.db;
+    let vid = vault_id.clone();
+    let iid = item_id.clone();
+    db.query("DELETE FROM knowledge_items WHERE vault_id = $vid AND item_id = $iid")
+        .bind(("vid", vid.clone())).bind(("iid", iid.clone()))
+        .await.map_err(|e| AppError::Database(e.to_string()))?;
+    db.query("DELETE FROM chunks WHERE vault_id = $vid AND item_id = $iid")
+        .bind(("vid", vid)).bind(("iid", iid))
+        .await.map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}
+
+/// Rename a knowledge item title.
+#[tauri::command]
+pub async fn rename_knowledge_item(
+    state: State<'_, AppState>,
+    item_id: String,
+    title: String,
+) -> Result<(), AppError> {
+    let vault_id = state.get_vault_id().await?;
+    let db = &state.db;
+    db.query("UPDATE knowledge_items SET title = $title WHERE vault_id = $vid AND item_id = $iid")
+        .bind(("title", title))
+        .bind(("vid", vault_id))
+        .bind(("iid", item_id))
+        .await.map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}
+
+/// Generate AI card suggestions for a knowledge item.
+/// Streams results via Tauri events: kb:suggestion_token, kb:suggestion_done.
+#[tauri::command]
+pub async fn suggest_kb_cards_for_item(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    item_id: String,
+) -> Result<(), AppError> {
+    let vault_id = state.get_vault_id().await?;
+    let db = &state.db;
+
+    // Load the knowledge item
+    #[derive(Deserialize)]
+    struct KIRow { title: String, ai_summary: String, source_refs: Option<String> }
+    let mut resp = db.query(
+        "SELECT title, ai_summary, source_refs FROM knowledge_items \
+         WHERE vault_id = $vid AND item_id = $iid LIMIT 1"
+    )
+    .bind(("vid", vault_id.clone())).bind(("iid", item_id.clone()))
+    .await.map_err(|e| AppError::Database(e.to_string()))?;
+    let row = resp.take::<Vec<KIRow>>(0).unwrap_or_default().into_iter().next()
+        .ok_or_else(|| AppError::Import(format!("knowledge item not found: {}", item_id)))?;
+
+    let source_refs: Vec<KnowledgeRef> = row.source_refs
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let refs_text = source_refs.iter()
+        .map(|r| format!("- [{}]({})", r.title, r.path))
+        .collect::<Vec<_>>().join("\n");
+
+    let prompt = format!(
+        "根據以下知識內容，建議 3-5 個值得建立的知識卡片標題與一句話說明。\
+         每張卡片一行，格式：「標題：說明」。\n\n\
+         ## 標題\n{}\n\n## AI 整理摘要\n{}\n\n## 來源\n{}",
+        row.title, row.ai_summary, refs_text
+    );
+
+    // Reuse the same LLM infrastructure as suggest_kb_cards
+    let base_url = crate::commands::ai::ensure_server_running(state.inner(), &app).await
+        .map_err(|e| AppError::AI(e.to_string()))?;
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": true, "temperature": 0.7, "max_tokens": 512,
+    });
+    let response = client
+        .post(format!("{}/v1/chat/completions", base_url))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(60))
+        .send().await.map_err(|e| AppError::AI(e.to_string()))?;
+
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| AppError::AI(e.to_string()))?;
+        let text = String::from_utf8_lossy(&chunk);
+        for line in text.lines() {
+            let line = line.trim_start_matches("data: ");
+            if line == "[DONE]" || line.is_empty() { continue; }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(token) = val["choices"][0]["delta"]["content"].as_str() {
+                    let _ = app.emit("kb:suggestion_token", serde_json::json!({
+                        "item_id": &item_id, "content": token
+                    }));
+                }
+            }
+        }
+    }
+    let _ = app.emit("kb:suggestion_done", serde_json::json!({ "item_id": &item_id }));
+    Ok(())
+}
+
+/// 診斷：列出目前 vault 的 import sessions + pages 狀態 + chunks 分佈
 #[tauri::command]
 pub async fn debug_kb_chunks(state: State<'_, AppState>) -> Result<String, AppError> {
     let vault_id = state.get_vault_id().await?;
     let db = &state.db;
-    let mut out = format!("vault_id: {}\n", vault_id);
+    let mut out = format!("=== debug_kb_chunks ===\nvault_id: {}\n\n", vault_id);
 
+    // ── Import sessions ──────────────────────────────────────────────────────
+    #[derive(serde::Deserialize)]
+    struct SessRow { session_id: String, seed_url: String, site_name: String, status: String }
+    let mut rs = db.query(
+        "SELECT session_id, seed_url, site_name, status FROM import_sessions WHERE vault_id = $vid LIMIT 10"
+    ).bind(("vid", vault_id.clone())).await.map_err(|e| AppError::Database(e.to_string()))?;
+    let sessions: Vec<SessRow> = rs.take(0).unwrap_or_default();
+    out += &format!("--- import_sessions ({} 筆) ---\n", sessions.len());
+    for s in &sessions {
+        out += &format!("  [{}] {} | {} | status={}\n", s.session_id, s.site_name, s.seed_url, s.status);
+    }
+    out += "\n";
+
+    // ── Import pages per session ──────────────────────────────────────────────
+    #[derive(serde::Deserialize)]
+    struct PageDebugRow {
+        page_id: String,
+        session_id: String,
+        url: String,
+        title: String,
+        status: String,
+        content_md: Option<String>,
+        #[allow(dead_code)]
+        last_crawled: Option<serde_json::Value>,
+    }
+    let mut rp = db.query(
+        "SELECT page_id, session_id, url, title, status, content_md, last_crawled \
+         FROM import_pages WHERE vault_id = $vid ORDER BY last_crawled DESC LIMIT 30"
+    ).bind(("vid", vault_id.clone())).await.map_err(|e| AppError::Database(e.to_string()))?;
+    let pages: Vec<PageDebugRow> = rp.take(0).unwrap_or_default();
+    out += &format!("--- import_pages ({} 筆, newest first) ---\n", pages.len());
+    for p in &pages {
+        let md_info = match &p.content_md {
+            None => "content_md=None".to_string(),
+            Some(s) if s.is_empty() => "content_md=Some(\"\")".to_string(),
+            Some(s) => format!("content_md_len={}", s.len()),
+        };
+        out += &format!(
+            "  [{}] sess={} | status={} | {} | {}\n  title: {}\n",
+            p.page_id, p.session_id, p.status, md_info, p.url, p.title
+        );
+    }
+    out += "\n";
+
+    // ── Chunks ───────────────────────────────────────────────────────────────
     #[derive(serde::Deserialize)]
     struct StatusCount { status: String, count: i64 }
     let mut r1 = db.query(
@@ -1707,17 +2561,18 @@ pub async fn debug_kb_chunks(state: State<'_, AppState>) -> Result<String, AppEr
     if rows.is_empty() {
         out += "chunks: 無任何資料（vault 尚未建立 chunks 索引）\n";
     } else {
-        out += "chunks 狀態分佈:\n";
+        out += "--- chunks 狀態分佈 ---\n";
         for r in &rows { out += &format!("  status={:?}  count={}\n", r.status, r.count); }
     }
+    out += "\n";
 
     #[derive(serde::Deserialize)]
-    struct SampleChunk { file_path: String, section: String, status: String, updated_at: Option<String> }
+    struct SampleChunk { file_path: String, section: String, status: String, updated_at: Option<serde_json::Value> }
     let mut r2 = db.query(
         "SELECT file_path, section, status, updated_at FROM chunks WHERE vault_id = $vid ORDER BY updated_at DESC LIMIT 5"
     ).bind(("vid", vault_id.clone())).await.map_err(|e| AppError::Database(e.to_string()))?;
     let samples: Vec<SampleChunk> = r2.take(0).unwrap_or_default();
-    out += &format!("最近 {} 筆 chunks:\n", samples.len());
+    out += &format!("--- 最近 {} 筆 chunks ---\n", samples.len());
     for s in &samples {
         out += &format!("  {} [{}] status={:?}\n", s.file_path, s.section, s.status);
     }
@@ -2170,4 +3025,397 @@ pub async fn mark_note_reviewed(
     .bind(("fp", path))
     .await.map_err(|e| AppError::Database(e.to_string()))?;
     Ok(())
+}
+
+// ── Web Search Tool ───────────────────────────────────────────────────────────
+
+const BRAVE_SEARCH_MONTHLY_LIMIT: u32 = 1000;
+
+/// Current month string, e.g. "2026-03".
+fn current_month_str() -> String {
+    chrono::Utc::now().format("%Y-%m").to_string()
+}
+
+/// "x月1號" reset label for the *next* month.
+fn next_month_reset_label() -> String {
+    let now = chrono::Utc::now();
+    let next_month = if now.month() == 12 { 1 } else { now.month() + 1 };
+    format!("{}月1號", next_month)
+}
+
+/// Short identifier derived from API key (first 8 hex chars of SHA-256).
+/// Used to namespace per-key counters without storing the key itself.
+fn brave_key_id(api_key: &str) -> String {
+    sha256_hex(api_key)[..8].to_string()
+}
+
+/// How many Brave searches have been used this calendar month for the given API key.
+pub async fn get_brave_used(db: &SurrealDb, key_id: &str) -> u32 {
+    let month_key = format!("brave_search_month_{}", key_id);
+    let used_key  = format!("brave_search_used_{}", key_id);
+    let stored_month = queries::get_setting(db, &month_key)
+        .await.ok().flatten().unwrap_or_default();
+    if stored_month != current_month_str() {
+        return 0;
+    }
+    queries::get_setting(db, &used_key)
+        .await.ok().flatten()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Increment the monthly Brave search counter for the given API key,
+/// resetting automatically when the month changes.
+async fn increment_brave_used(db: &SurrealDb, key_id: &str) {
+    let month_key = format!("brave_search_month_{}", key_id);
+    let used_key  = format!("brave_search_used_{}", key_id);
+    let month = current_month_str();
+    let stored_month = queries::get_setting(db, &month_key)
+        .await.ok().flatten().unwrap_or_default();
+    let new_used = if stored_month != month {
+        let _ = queries::set_setting(db, &month_key, &month).await;
+        1u32
+    } else {
+        get_brave_used(db, key_id).await + 1
+    };
+    let _ = queries::set_setting(db, &used_key, &new_used.to_string()).await;
+}
+
+/// Read Brave Search API key from OS keyring.
+fn read_brave_api_key() -> Option<String> {
+    keyring::Entry::new("com.notetreelm.app", "brave_search")
+        .ok()
+        .and_then(|e| e.get_password().ok())
+        .filter(|k| !k.is_empty())
+}
+
+/// Search via Brave Search API. Returns Ok(results) or Err(human-readable reason).
+async fn brave_search(api_key: &str, query: &str) -> Result<Vec<(String, String, String)>, String> {
+    #[derive(serde::Deserialize)]
+    struct BraveResult {
+        title: Option<String>,
+        url: Option<String>,
+        description: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct BraveWeb {
+        results: Option<Vec<BraveResult>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct BraveResponse {
+        web: Option<BraveWeb>,
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("建立 HTTP client 失敗：{}", e))?;
+
+    // Do NOT send Accept-Encoding: gzip — reqwest lacks the gzip feature,
+    // so manually requesting gzip would result in undecodable responses.
+    let response = client
+        .get("https://api.search.brave.com/res/v1/web/search")
+        .header("Accept", "application/json")
+        .header("X-Subscription-Token", api_key)
+        .query(&[("q", query), ("count", "5")])
+        .send()
+        .await
+        .map_err(|e| format!("網路請求失敗：{}", e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Brave API 回傳 HTTP {}：{}", status, body));
+    }
+
+    let resp: BraveResponse = response.json().await
+        .map_err(|e| format!("解析 Brave API 回應失敗：{}", e))?;
+
+    let results = resp.web
+        .and_then(|w| w.results)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| {
+            let title = r.title.unwrap_or_default();
+            let url = r.url.unwrap_or_default();
+            let snippet = r.description.unwrap_or_default();
+            if url.is_empty() { None } else { Some((title, url, snippet)) }
+        })
+        .collect();
+
+    Ok(results)
+}
+
+/// Import search result URLs in the background into a new import session.
+async fn background_import_search_results(
+    db: SurrealDb,
+    vault_id: String,
+    query: String,
+    urls: Vec<(String, String)>, // (url, title)
+    app: AppHandle,
+    emb_url: Option<String>,
+) {
+    if urls.is_empty() {
+        return;
+    }
+
+    let session_id = Uuid::new_v4().to_string();
+    let q_short: String = query.chars().take(30).collect();
+    let site_name = format!("搜尋：{}", q_short);
+    let root_folder = format!("imports/search-{}", &session_id[..8]);
+
+    // Create import session
+    if db
+        .query(
+            "INSERT INTO import_sessions \
+             (vault_id, session_id, conversation_id, seed_url, site_name, root_folder, status, created_at, updated_at) \
+             VALUES ($vid, $sid, '', $seed, $sname, $rfolder, 'active', time::now(), time::now())",
+        )
+        .bind(("vid", vault_id.clone()))
+        .bind(("sid", session_id.clone()))
+        .bind(("seed", format!("search:{}", query)))
+        .bind(("sname", site_name.clone()))
+        .bind(("rfolder", root_folder.clone()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let client = match reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (compatible; noteTreeLM/0.1; knowledge-import)")
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let now_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+    for (url, title) in &urls {
+        // Security check: block internal addresses
+        if validate_url(url).is_err() {
+            continue;
+        }
+
+        let page_id = Uuid::new_v4().to_string();
+
+        let _ = db
+            .query(
+                "INSERT INTO import_pages \
+                 (vault_id, page_id, session_id, url, title, depth, status, created_at) \
+                 VALUES ($vid, $pid, $sid, $url, $title, 0, 'pending', time::now())",
+            )
+            .bind(("vid", vault_id.clone()))
+            .bind(("pid", page_id.clone()))
+            .bind(("sid", session_id.clone()))
+            .bind(("url", url.clone()))
+            .bind(("title", title.clone()))
+            .await;
+
+        // Fetch and convert page
+        let html = match client.get(url).send().await {
+            Ok(resp) => match resp.text().await {
+                Ok(t) => t,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+
+        let actual_title = {
+            let t = extract_title(&html);
+            if t.is_empty() { title.clone() } else { t }
+        };
+
+        let body_md = html_to_markdown_rich(&html);
+        let note_content = format!(
+            "---\ntitle: {}\nsource: {}\nimported: {}\nstatus: verified\n---\n\n{}\n",
+            actual_title, url, now_date, body_md
+        );
+
+        let slug = slugify(&actual_title);
+        let note_path = format!("{}/{}.md", root_folder, slug);
+        let new_hash = sha256_hex(&note_content);
+
+        // Store chunks
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let chunks = crate::vault::chunker::chunk_note(&note_path, &note_content, now_ms);
+        let _ = crate::vault::chunker::upsert_chunks(&db, &vault_id, &chunks, emb_url.as_deref()).await;
+
+        // Update import_pages record
+        let now_dt = surrealdb::sql::Datetime::from(chrono::Utc::now());
+        let _ = db
+            .query(
+                "UPDATE import_pages SET status = 'imported', note_path = $path, content_md = $content, \
+                 content_hash = $hash, last_crawled = $now \
+                 WHERE vault_id = $vid AND page_id = $pid",
+            )
+            .bind(("path", note_path))
+            .bind(("content", note_content))
+            .bind(("hash", new_hash))
+            .bind(("now", now_dt))
+            .bind(("vid", vault_id.clone()))
+            .bind(("pid", page_id))
+            .await;
+    }
+
+    // Notify frontend so Import Center can refresh
+    let _ = app.emit(
+        "import:session_created",
+        serde_json::json!({
+            "session_id": session_id,
+            "site_name": site_name,
+        }),
+    );
+}
+
+/// Web search tool called by the Agent.
+/// Searches via Brave Search API and spawns a background import of the top results.
+pub async fn tool_web_search(
+    db: &SurrealDb,
+    vault_id: &str,
+    query: &str,
+    app: &AppHandle,
+    emb_url: Option<&str>,
+) -> String {
+    let api_key = match read_brave_api_key() {
+        Some(k) => k,
+        None => return "請至設定頁面設定 Brave Search API Key".to_string(),
+    };
+    let key_id = brave_key_id(&api_key);
+
+    // Check monthly quota before making the request
+    let used = get_brave_used(db, &key_id).await;
+    if used >= BRAVE_SEARCH_MONTHLY_LIMIT {
+        return format!(
+            "已達每月搜尋上限（{}/{}），{}重置。",
+            used, BRAVE_SEARCH_MONTHLY_LIMIT, next_month_reset_label()
+        );
+    }
+
+    let results = match brave_search(&api_key, query).await {
+        Ok(r) => r,
+        Err(e) => return format!("Brave Search 請求失敗：{}", e),
+    };
+
+    // Increment counter on successful response
+    if !results.is_empty() {
+        increment_brave_used(db, &key_id).await;
+    }
+
+    if results.is_empty() {
+        return format!(
+            "Brave Search 未回傳「{}」的搜尋結果（回應成功但結果為空）。",
+            query
+        );
+    }
+
+    // Spawn background import (non-blocking)
+    {
+        let top_urls: Vec<(String, String)> = results
+            .iter()
+            .take(3)
+            .map(|(title, url, _)| (url.clone(), title.clone()))
+            .collect();
+        let db = db.clone();
+        let vid = vault_id.to_string();
+        let q = query.to_string();
+        let app = app.clone();
+        let emb = emb_url.map(str::to_string);
+        tokio::spawn(async move {
+            background_import_search_results(db, vid, q, top_urls, app, emb).await;
+        });
+    }
+
+    // Emit web refs for frontend "儲存為知識" button
+    {
+        let refs: Vec<serde_json::Value> = results.iter().take(3)
+            .map(|(title, url, snippet)| serde_json::json!({"path": url, "title": title, "excerpt": snippet}))
+            .collect();
+        let _ = app.emit("agent:web_refs", serde_json::json!(refs));
+    }
+
+    // Format results for LLM
+    let formatted = results
+        .iter()
+        .enumerate()
+        .map(|(i, (title, url, snippet))| {
+            format!("[{}] **{}**\n{}\n來源：{}", i + 1, title, snippet, url)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    format!(
+        "搜尋「{}」的結果：\n\n{}\n\n（已在背景將搜尋結果加入「匯入知識」，稍後可在匯入中心查看。）",
+        query, formatted
+    )
+}
+
+// ── Cached Page Viewer ────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct CachedPage {
+    pub title: String,
+    pub url: String,
+    pub content_md: String,
+}
+
+/// Fetch cached page content from import_pages by URL, for in-app viewer.
+#[tauri::command]
+pub async fn get_cached_page(
+    state: State<'_, AppState>,
+    source_url: String,
+) -> Result<Option<CachedPage>, AppError> {
+    let vault_id = state.get_vault_id().await?;
+    let db = &state.db;
+
+    #[derive(serde::Deserialize)]
+    struct Row { title: String, url: String, content_md: Option<String> }
+
+    let mut resp = db.query(
+        "SELECT title, url, content_md FROM import_pages \
+         WHERE vault_id = $vid AND url = $url LIMIT 1"
+    )
+    .bind(("vid", vault_id))
+    .bind(("url", source_url))
+    .await.map_err(|e| AppError::Database(e.to_string()))?;
+
+    let row = resp.take::<Vec<Row>>(0).unwrap_or_default().into_iter().next();
+    Ok(row.map(|r| CachedPage {
+        title: r.title,
+        url: r.url,
+        content_md: r.content_md.unwrap_or_default(),
+    }))
+}
+
+// ── Brave Search Usage ────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct BraveUsageInfo {
+    pub used: u32,
+    pub limit: u32,
+    pub reset_label: String, // e.g. "4月1號"
+}
+
+/// Called by the frontend after saving a new Brave API key.
+/// Computes the key_id and persists it in DB so future usage queries don't need keychain access.
+#[tauri::command]
+pub async fn sync_brave_key_id(state: State<'_, AppState>, key: String) -> Result<(), AppError> {
+    let kid = if key.is_empty() { String::new() } else { brave_key_id(&key) };
+    queries::set_setting(&state.db, "brave_current_key_id", &kid).await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_brave_search_usage(state: State<'_, AppState>) -> Result<BraveUsageInfo, AppError> {
+    // Read key_id from DB — no keychain access needed here
+    let key_id = queries::get_setting(&state.db, "brave_current_key_id")
+        .await.ok().flatten().unwrap_or_default();
+    let used = if key_id.is_empty() { 0 } else { get_brave_used(&state.db, &key_id).await };
+    Ok(BraveUsageInfo {
+        used,
+        limit: BRAVE_SEARCH_MONTHLY_LIMIT,
+        reset_label: next_month_reset_label(),
+    })
 }

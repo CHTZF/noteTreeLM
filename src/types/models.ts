@@ -47,6 +47,7 @@ export interface SearchResult {
   title: string
   snippet: string
   score: number
+  source_url?: string  // set when result is from knowledge import (imports/ path)
 }
 
 export interface DeleteResult {

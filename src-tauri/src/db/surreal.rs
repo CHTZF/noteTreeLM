@@ -25,13 +25,41 @@ pub async fn init_db(app_data_dir: &Path) -> crate::error::Result<SurrealDb> {
 
     apply_schema(&db).await?;
 
-    Ok(Arc::new(db))
+    let db_arc = Arc::new(db);
+
+    // One-time migration: rebuild FTS indexes to repair corruption caused by
+    // the old ON DUPLICATE KEY UPDATE pattern. Runs only once; after that the
+    // migration flag "migration:fts_rebuild_v1" is set in the KV store.
+    {
+        let db2 = Arc::clone(&db_arc);
+        tokio::spawn(async move {
+            #[derive(serde::Deserialize)]
+            struct KvRow { value: String }
+            let already_done: bool = db2
+                .query("SELECT value FROM kv WHERE key = 'migration:fts_rebuild_v1' LIMIT 1")
+                .await
+                .ok()
+                .and_then(|mut r| r.take::<Vec<KvRow>>(0).ok())
+                .map(|rows| !rows.is_empty())
+                .unwrap_or(false);
+
+            if !already_done {
+                let _ = db2.query("REBUILD INDEX ft_chunks ON chunks;").await;
+                let _ = db2.query("REBUILD INDEX ft_import_pages ON import_pages;").await;
+                let _ = db2
+                    .query("INSERT INTO kv (key, value) VALUES ('migration:fts_rebuild_v1', 'done') ON DUPLICATE KEY UPDATE value = 'done'")
+                    .await;
+            }
+        });
+    }
+
+    Ok(db_arc)
 }
 
 /// 定義所有 table / index
 /// 使用 IF NOT EXISTS 語義（SurrealDB DEFINE … OVERWRITE 僅在需要更新時用）
 async fn apply_schema(db: &Surreal<Db>) -> crate::error::Result<()> {
-    let stmts: &[&str] = &[
+    let stmts: &[&str] = &[ // joined into one batch query below
         // ── 帳號層 ──────────────────────────────────────────────────
         "DEFINE TABLE IF NOT EXISTS users SCHEMAFULL;",
         "DEFINE FIELD IF NOT EXISTS username   ON users TYPE string;",
@@ -259,21 +287,57 @@ async fn apply_schema(db: &Surreal<Db>) -> crate::error::Result<()> {
         "DEFINE FIELD IF NOT EXISTS parent_url    ON import_pages TYPE option<string>;",
         "DEFINE FIELD IF NOT EXISTS depth         ON import_pages TYPE int DEFAULT 0;",
         "DEFINE FIELD IF NOT EXISTS note_path     ON import_pages TYPE option<string>;",
+        "DEFINE FIELD IF NOT EXISTS content_md   ON import_pages TYPE option<string>;",
         "DEFINE FIELD IF NOT EXISTS content_hash  ON import_pages TYPE option<string>;",
         "DEFINE FIELD IF NOT EXISTS http_etag     ON import_pages TYPE option<string>;",
         "DEFINE FIELD IF NOT EXISTS status        ON import_pages TYPE string DEFAULT 'pending';",
         "DEFINE FIELD IF NOT EXISTS last_crawled  ON import_pages TYPE option<datetime>;",
         "DEFINE FIELD IF NOT EXISTS created_at    ON import_pages TYPE datetime DEFAULT time::now();",
         "DEFINE INDEX IF NOT EXISTS idx_import_pages_session ON import_pages FIELDS vault_id, session_id;",
-        "DEFINE INDEX IF NOT EXISTS idx_import_pages_url     ON import_pages FIELDS vault_id, url UNIQUE;",
+        // OVERWRITE: changed from (vault_id, url) to (vault_id, session_id, url) so each session
+        // can hold its own copy of a URL without conflicting with other sessions.
+        "DEFINE INDEX OVERWRITE idx_import_pages_url ON import_pages FIELDS vault_id, session_id, url UNIQUE;",
         "DEFINE INDEX IF NOT EXISTS idx_import_pages_id      ON import_pages FIELDS vault_id, page_id UNIQUE;",
+        // BM25 FTS on import_pages content (for Q&A without embeddings)
+        "DEFINE INDEX IF NOT EXISTS ft_import_pages ON import_pages FIELDS title, content_md SEARCH ANALYZER note_analyzer BM25;",
+
+        // ── Sitemap Titles（per-session 標題向量，用於 pending 頁查詢） ─
+        "DEFINE TABLE IF NOT EXISTS sitemap_titles SCHEMAFULL;",
+        "DEFINE FIELD IF NOT EXISTS entry_id   ON sitemap_titles TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS session_id ON sitemap_titles TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS vault_id   ON sitemap_titles TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS url        ON sitemap_titles TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS title      ON sitemap_titles TYPE string DEFAULT '';",
+        "DEFINE FIELD IF NOT EXISTS depth      ON sitemap_titles TYPE int DEFAULT 0;",
+        "DEFINE FIELD IF NOT EXISTS embedding  ON sitemap_titles TYPE option<array<float>>;",
+        "DEFINE INDEX IF NOT EXISTS idx_sitemap_session  ON sitemap_titles FIELDS vault_id, session_id;",
+        "DEFINE INDEX IF NOT EXISTS idx_sitemap_entry_id ON sitemap_titles FIELDS vault_id, entry_id UNIQUE;",
+        // FTS fallback on title
+        "DEFINE INDEX IF NOT EXISTS ft_sitemap_titles ON sitemap_titles FIELDS title SEARCH ANALYZER note_analyzer BM25;",
+
+        // ── Knowledge Items（使用者明確儲存的知識） ──────────────────
+        "DEFINE TABLE IF NOT EXISTS knowledge_items SCHEMAFULL;",
+        "DEFINE FIELD IF NOT EXISTS item_id       ON knowledge_items TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS vault_id      ON knowledge_items TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS session_id    ON knowledge_items TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS title         ON knowledge_items TYPE string DEFAULT '';",
+        "DEFINE FIELD IF NOT EXISTS source_refs   ON knowledge_items TYPE array DEFAULT [];",
+        "DEFINE FIELD IF NOT EXISTS ai_summary    ON knowledge_items TYPE string DEFAULT '';",
+        "DEFINE FIELD IF NOT EXISTS created_at    ON knowledge_items TYPE datetime DEFAULT time::now();",
+        "DEFINE INDEX IF NOT EXISTS idx_ki_vault_id  ON knowledge_items FIELDS vault_id, item_id UNIQUE;",
+        "DEFINE INDEX IF NOT EXISTS idx_ki_session   ON knowledge_items FIELDS vault_id, session_id;",
+        "DEFINE INDEX IF NOT EXISTS idx_ki_created   ON knowledge_items FIELDS vault_id, created_at;",
+
+        // chunks 表新增 item_id 欄位（關聯 knowledge_items；vault note chunks 為 NULL）
+        "DEFINE FIELD IF NOT EXISTS item_id ON chunks TYPE option<string>;",
+        "DEFINE INDEX IF NOT EXISTS idx_chunks_item_id ON chunks FIELDS vault_id, item_id;",
     ];
 
-    for stmt in stmts {
-        db.query(*stmt)
-            .await
-            .map_err(|e| crate::error::AppError::Database(format!("schema error ({stmt}): {e}")))?;
-    }
+    // Batch all DDL into one query to avoid N sequential round-trips.
+    let batch = stmts.join("\n");
+    db.query(batch)
+        .await
+        .map_err(|e| crate::error::AppError::Database(format!("schema error: {e}")))?;
 
     // 插入預設設定（只在 key 不存在時插入）
     insert_default_settings(db).await?;

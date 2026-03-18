@@ -1027,7 +1027,7 @@ function AppMain() {
                 />
               )}
               {t.path === IMPORT_TAB && (
-                <ImportPanel onOpenNote={openNoteFromChat} />
+                <ImportPanel />
               )}
               {t.path === KB_ASSIST_TAB && (
                 <KnowledgeAssistant onOpenNote={openNoteFromChat} />

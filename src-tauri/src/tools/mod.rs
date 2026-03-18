@@ -13,8 +13,9 @@ use tokio::sync::Mutex;
 
 use crate::commands::ai::{
     resolve_vault_path, tool_create_folder, tool_create_note, tool_list_structure,
-    tool_read_note, tool_search_vault, tool_update_note,
+    tool_read_note, tool_search_vault, tool_update_note, call_external_ai_via_db,
 };
+use crate::commands::knowledge_import::tool_web_search;
 use crate::db::surreal::SurrealDb;
 use crate::runtime::memory_agent::{add_memory_rule_to_db, tool_query_memory};
 use crate::runtime::tool_registry::ToolRegistry;
@@ -32,6 +33,8 @@ pub fn build_vault_registry(
     vault_db: SurrealDb,
     vault_id: String,
     app: AppHandle,
+    emb_url: Option<String>,
+    search_method_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
 ) -> Arc<ToolRegistry> {
     let mut registry = ToolRegistry::new();
 
@@ -96,6 +99,7 @@ pub fn build_vault_registry(
     {
         let db = vault_db.clone();
         let vid = vault_id.clone();
+        let emb = emb_url.clone();
         registry.register(
             "query_memory".into(),
             Tool {
@@ -112,8 +116,9 @@ pub fn build_vault_registry(
                     let limit = args["limit"].as_u64().map(|v| v as usize);
                     let db = db.clone();
                     let vid = vid.clone();
+                    let emb = emb.clone();
                     Box::pin(async move {
-                        Ok(Value::String(tool_query_memory(keywords, since, limit, &db, &vid).await))
+                        Ok(Value::String(tool_query_memory(keywords, since, limit, &db, &vid, emb.as_deref()).await))
                     })
                 }),
                 rollback: None,
@@ -295,7 +300,84 @@ pub fn build_vault_registry(
         );
     }
 
-    // TODO: call_external_ai — 需要 ExtAiConfig，待後續整合
+    // call_external_ai — 呼叫前暫停，等待前端選擇 web_search 或 call_external_ai
+    {
+        let db = vault_db.clone();
+        let vid = vault_id.clone();
+        let app = app.clone();
+        let emb = emb_url.clone();
+        let tx = search_method_tx.clone();
+        registry.register(
+            "call_external_ai".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let query = args["query"].as_str().unwrap_or("").to_string();
+                    let db = db.clone();
+                    let vid = vid.clone();
+                    let app = app.clone();
+                    let emb = emb.clone();
+                    let tx = tx.clone();
+                    Box::pin(async move {
+                        // 通知前端選擇搜尋方式
+                        let _ = app.emit("agent:search_method_request", serde_json::json!({
+                            "query": query
+                        }));
+
+                        // 等待前端回覆（60s timeout → 預設 call_external_ai）
+                        let method = {
+                            let (ch_tx, ch_rx) = tokio::sync::oneshot::channel::<String>();
+                            *tx.lock().await = Some(ch_tx);
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(60),
+                                ch_rx,
+                            )
+                            .await
+                            .unwrap_or(Ok("call_external_ai".to_string()))
+                            .unwrap_or_else(|_| "call_external_ai".to_string())
+                        };
+
+                        let result = if method == "web_search" {
+                            tool_web_search(&db, &vid, &query, &app, emb.as_deref()).await
+                        } else {
+                            // Emit synthetic web_refs so frontend can show "儲存為知識"
+                            let _ = app.emit("agent:web_refs", serde_json::json!([
+                                {"path": "", "title": query, "excerpt": ""}
+                            ]));
+                            call_external_ai_via_db(&query, &db, &app).await
+                        };
+                        Ok(Value::String(result))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // web_search — 搜尋 DuckDuckGo Lite，結果自動背景匯入知識庫（唯讀，無 rollback）
+    {
+        let db = vault_db.clone();
+        let vid = vault_id.clone();
+        let app = app.clone();
+        let emb = emb_url.clone();
+        registry.register(
+            "web_search".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let query = args["query"].as_str().unwrap_or("").to_string();
+                    let db = db.clone();
+                    let vid = vid.clone();
+                    let app = app.clone();
+                    let emb = emb.clone();
+                    Box::pin(async move {
+                        Ok(Value::String(
+                            tool_web_search(&db, &vid, &query, &app, emb.as_deref()).await,
+                        ))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
 
     Arc::new(registry)
 }
