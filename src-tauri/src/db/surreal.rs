@@ -331,6 +331,24 @@ async fn apply_schema(db: &Surreal<Db>) -> crate::error::Result<()> {
         // chunks 表新增 item_id 欄位（關聯 knowledge_items；vault note chunks 為 NULL）
         "DEFINE FIELD IF NOT EXISTS item_id ON chunks TYPE option<string>;",
         "DEFINE INDEX IF NOT EXISTS idx_chunks_item_id ON chunks FIELDS vault_id, item_id;",
+
+        // ── agent_skills：使用者從知識項目啟用的行為規範，注入 agent system prompt ──
+        "DEFINE TABLE IF NOT EXISTS agent_skills SCHEMAFULL;",
+        "DEFINE FIELD IF NOT EXISTS skill_id             ON agent_skills TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS vault_id             ON agent_skills TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS knowledge_item_id    ON agent_skills TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS title                ON agent_skills TYPE string DEFAULT '';",
+        "DEFINE FIELD IF NOT EXISTS trigger              ON agent_skills TYPE string DEFAULT '';",
+        "DEFINE FIELD IF NOT EXISTS behavior             ON agent_skills TYPE string DEFAULT '';",
+        "DEFINE FIELD IF NOT EXISTS auto_tool_calls      ON agent_skills TYPE array<string> DEFAULT [];",
+        "DEFINE FIELD IF NOT EXISTS is_active            ON agent_skills TYPE bool DEFAULT true;",
+        "DEFINE FIELD IF NOT EXISTS trigger_count        ON agent_skills TYPE int DEFAULT 0;",
+        "DEFINE FIELD IF NOT EXISTS last_triggered_at    ON agent_skills TYPE option<datetime>;",
+        "DEFINE FIELD IF NOT EXISTS trigger_embedding    ON agent_skills TYPE option<array<float>>;",
+        "DEFINE FIELD IF NOT EXISTS created_at           ON agent_skills TYPE datetime DEFAULT time::now();",
+        "DEFINE INDEX IF NOT EXISTS idx_agent_skills_vault  ON agent_skills FIELDS vault_id, skill_id UNIQUE;",
+        "DEFINE INDEX IF NOT EXISTS idx_agent_skills_ki     ON agent_skills FIELDS vault_id, knowledge_item_id;",
+        "DEFINE INDEX IF NOT EXISTS idx_agent_skills_active ON agent_skills FIELDS vault_id, is_active;",
     ];
 
     // Batch all DDL into one query to avoid N sequential round-trips.

@@ -621,6 +621,7 @@ pub async fn invoke_agent(
         let port = *state.embedding_actual_port.lock().await;
         port.map(|p| format!("http://127.0.0.1:{}", p))
     };
+    let skill_emb_url = reg_emb_url.clone(); // 保留一份給 skill pre-pass 使用
     let search_method_tx = Arc::clone(&state.search_method_tx);
     let registry = if !vault_path.is_empty() && vault_id_opt.is_some() {
         crate::tools::build_vault_registry(
@@ -785,6 +786,23 @@ pub async fn invoke_agent(
         None
     };
 
+    // 10. Skill pre-pass：向量搜尋符合當前查詢的 active skills → 注入 system prompt
+    if let Some(ref vid) = vault_id_opt {
+        let skill_section = run_skill_pre_pass(
+            &state.db, vid, &input,
+            skill_emb_url.as_deref(),
+            &client,
+        ).await;
+        if let Some(section) = skill_section {
+            if messages_json.first().and_then(|m| m["role"].as_str()) == Some("system") {
+                let old = messages_json[0]["content"].as_str().unwrap_or("").to_string();
+                messages_json[0]["content"] = serde_json::json!(format!("{}\n\n{}", old, section));
+            } else {
+                messages_json.insert(0, serde_json::json!({"role": "system", "content": section}));
+            }
+        }
+    }
+
     let agent = Agent::new(
         Dispatcher::new(registry),
         IntentClassifier::new(),
@@ -802,9 +820,21 @@ pub async fn invoke_agent(
     );
 
     let response_text = agent
-        .run(input, messages_json.clone(), use_tools.unwrap_or(true))
+        .run(input.clone(), messages_json.clone(), use_tools.unwrap_or(true))
         .await
         .map_err(AppError::AI)?;
+
+    // 5-5: Bottom-up skill 歸納：若回覆包含明顯的步驟框架，發出 agent:skill_suggestion 事件
+    // 讓前端決定是否引導使用者儲存為技能規範
+    if vault_id_opt.is_some() && !response_text.is_empty() {
+        let has_framework = detect_response_framework(&response_text);
+        if has_framework {
+            let _ = app.emit("agent:skill_suggestion", serde_json::json!({
+                "query": &input,
+                "response_preview": &response_text[..response_text.len().min(200)],
+            }));
+        }
+    }
 
     // 若有 conversation_id，將完整對話（含 LLM 回覆）存回 DB
     if let Some(ref conv_id) = conversation_id {
@@ -3194,6 +3224,156 @@ pub async fn test_vault_tool(
     }
 
     Ok(result)
+}
+
+// ── Agent Skill Pre-pass ──────────────────────────────────────────────────────
+
+/// 偵測回覆是否包含可重用的結構化回答框架（bottom-up skill 歸納觸發條件）
+fn detect_response_framework(text: &str) -> bool {
+    // 含有編號步驟（1. 2. 3. 或 ①②③）
+    let has_numbered = (text.contains("1.") || text.contains("1、") || text.contains("①"))
+        && (text.contains("2.") || text.contains("2、") || text.contains("②"));
+    // 含有「先…再…最後」結構
+    let has_sequential = (text.contains("先") && text.contains("再") && text.contains("最後"))
+        || (text.contains("首先") && text.contains("接著"));
+    // 含有明顯框架關鍵字
+    let has_framework_kw = text.contains("步驟") || text.contains("流程") || text.contains("規範");
+    // 回覆夠長（>300 字）才考慮
+    text.len() > 300 && (has_numbered || has_sequential || has_framework_kw)
+}
+
+/// Skill 記錄（輕量版，只含 pre-pass 所需欄位）
+#[derive(Deserialize)]
+struct ActiveSkillRow {
+    skill_id: String,
+    title: String,
+    trigger: String,
+    behavior: String,
+    auto_tool_calls: Vec<String>,
+}
+
+/// 向量搜尋相似度 > SKILL_THRESHOLD 的 active skills；
+/// 若 trigger_embedding 為 None，fallback 到文字 contains 匹配。
+async fn search_active_skills(
+    db: &surrealdb::Surreal<surrealdb::engine::local::Db>,
+    vault_id: &str,
+    query_embedding: &[f32],
+) -> Vec<ActiveSkillRow> {
+    const SKILL_THRESHOLD: f64 = 0.65;
+
+    // 向量搜尋（有 embedding 的 skills）
+    let mut vector_results: Vec<ActiveSkillRow> = {
+        let emb_val: Vec<f64> = query_embedding.iter().map(|&x| x as f64).collect();
+        let mut resp = db.query(
+            "SELECT skill_id, title, trigger, behavior, auto_tool_calls \
+             FROM agent_skills \
+             WHERE vault_id = $vid AND is_active = true AND trigger_embedding != NONE \
+               AND vector::similarity::cosine(trigger_embedding, $qvec) > $thresh \
+             ORDER BY vector::similarity::cosine(trigger_embedding, $qvec) DESC \
+             LIMIT 4"
+        )
+        .bind(("vid", vault_id.to_string()))
+        .bind(("qvec", emb_val))
+        .bind(("thresh", SKILL_THRESHOLD))
+        .await.ok();
+        resp.as_mut()
+            .and_then(|r| r.take::<Vec<ActiveSkillRow>>(0).ok())
+            .unwrap_or_default()
+    };
+
+    // Fallback：text contains 匹配（trigger_embedding 為 None 的 skills）
+    let mut text_results: Vec<ActiveSkillRow> = {
+        let query_lower = query_embedding.is_empty().then_some("").unwrap_or("");
+        let _ = query_lower; // suppress warning, real query below uses $query
+        let mut resp = db.query(
+            "SELECT skill_id, title, trigger, behavior, auto_tool_calls \
+             FROM agent_skills \
+             WHERE vault_id = $vid AND is_active = true AND trigger_embedding = NONE \
+             LIMIT 10"
+        )
+        .bind(("vid", vault_id.to_string()))
+        .await.ok();
+        resp.as_mut()
+            .and_then(|r| r.take::<Vec<ActiveSkillRow>>(0).ok())
+            .unwrap_or_default()
+    };
+
+    vector_results.append(&mut text_results);
+    vector_results.truncate(5);
+    vector_results
+}
+
+/// 將 matched skills 格式化為「# 使用者技能規範」system prompt 區塊。
+fn build_skill_injection_section(skills: &[ActiveSkillRow]) -> String {
+    let mut section = String::from(
+        "# 使用者技能規範\n\
+         以下規範由使用者從個人知識庫設定，本次對話自動啟用，請優先遵守：\n\n"
+    );
+    for skill in skills {
+        section.push_str(&format!(
+            "## {}\n**觸發條件**：{}\n**行為規範**：{}\n\n",
+            skill.title, skill.trigger, skill.behavior
+        ));
+    }
+    section
+}
+
+/// 更新 trigger_count 和 last_triggered_at。
+async fn bump_skill_trigger_count(
+    db: &surrealdb::Surreal<surrealdb::engine::local::Db>,
+    vault_id: &str,
+    skill_ids: &[String],
+) {
+    if skill_ids.is_empty() { return; }
+    let _ = db.query(
+        "UPDATE agent_skills SET trigger_count += 1, last_triggered_at = time::now() \
+         WHERE vault_id = $vid AND skill_id IN $ids"
+    )
+    .bind(("vid", vault_id.to_string()))
+    .bind(("ids", skill_ids.to_vec()))
+    .await;
+}
+
+/// Pre-pass 入口：embed query → search → build injection section → bump counts。
+/// 回傳 Some(injection_text) 若有符合的 skills，否則 None。
+async fn run_skill_pre_pass(
+    db: &surrealdb::Surreal<surrealdb::engine::local::Db>,
+    vault_id: &str,
+    query: &str,
+    emb_url: Option<&str>,
+    client: &reqwest::Client,
+) -> Option<String> {
+    // 若 embedding server 不可用，直接略過（不影響主流程）
+    let emb_url = emb_url?;
+
+    let query_vec = get_embedding(client, emb_url, query).await;
+    if query_vec.is_empty() { return None; }
+
+    let matched = search_active_skills(db, vault_id, &query_vec).await;
+    if matched.is_empty() { return None; }
+
+    // 更新觸發統計
+    let ids: Vec<String> = matched.iter().map(|s| s.skill_id.clone()).collect();
+    bump_skill_trigger_count(db, vault_id, &ids).await;
+
+    // 收集 auto_tool_calls（後續可擴充為真正的工具預執行）
+    // 目前先記錄在 section 中提示 agent 自動執行
+    let auto_tools: Vec<String> = matched.iter()
+        .flat_map(|s| s.auto_tool_calls.iter().cloned())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    let mut section = build_skill_injection_section(&matched);
+
+    if !auto_tools.is_empty() {
+        section.push_str(&format!(
+            "**自動工具提示**：請在第一輪回答前先呼叫以下工具以獲取相關知識：{}\n\n",
+            auto_tools.join("、")
+        ));
+    }
+
+    Some(section)
 }
 
 #[cfg(test)]

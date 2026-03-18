@@ -427,6 +427,18 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         pendingWebRefsRef.current = [...pendingWebRefsRef.current, ...e.payload]
       })
 
+      // Bottom-up skill 歸納：agent 偵測到結構化回答框架時，提示使用者存為技能規範
+      const unlistenSkillSuggestion = await listen<{ query: string; response_preview: string }>(
+        'agent:skill_suggestion',
+        (_e) => {
+          setMessages(prev => [...prev, {
+            role: 'notice' as const,
+            content: `💡 這個回答包含可重用的框架，是否前往「知識中心 → 我的技能規範」將此偏好設定為技能？`,
+          }])
+          unlistenSkillSuggestion()
+        }
+      )
+
       log('  呼叫 invoke("invoke_agent")')
       const responseText = await invoke<string>('invoke_agent', {
         input: text,

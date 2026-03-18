@@ -93,3 +93,28 @@ export interface FileTreeNode {
   children?: FileTreeNode[]
   note?: Note
 }
+
+// ── Agent Skills ──────────────────────────────────────────────────────────────
+
+/** LLM 建議的技能規範（尚未持久化，從 suggest_kb_cards_for_item 回傳） */
+export interface AgentSkillSuggestion {
+  title: string
+  trigger: string
+  behavior: string
+  auto_tool_calls: string[]
+}
+
+/** 持久化後的技能規範（從 DB 讀取） */
+export interface AgentSkill {
+  skill_id: string
+  vault_id: string
+  knowledge_item_id: string
+  title: string
+  trigger: string
+  behavior: string
+  auto_tool_calls: string[]
+  is_active: boolean
+  trigger_count: number
+  last_triggered_at: number | null  // ms timestamp，null = 從未觸發
+  created_at: number
+}
