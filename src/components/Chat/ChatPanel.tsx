@@ -509,6 +509,10 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
             ? `⚠ pre-routing miss: ${p.reason}${p.best_match ? ` (best: ${p.best_match})` : ''}`
             : p.step === 'repair_done'
             ? `✓ pre-routing repair_done found=${p.found} repaired=${p.repaired}`
+            : p.step === 'create_agent_called'
+            ? `🔨 create_agent called: name=${(p as any).name} trigger=${(p as any).trigger} emb=${(p as any).emb_url}`
+            : p.step === 'db_dump'
+            ? `🗄 db_dump vid=${(p as any).query_vid} | ${(p as any).agents?.map((a: any) => `${a.name}[t=${a.trigger},emb=${a.has_emb},st=${a.status},vid=${a.vid_match?'✓':'✗'},builtin=${a.builtin}]`).join(' | ') || '(no agents)'}`
             : `✓ pre-routing ${p.step}${p.dim ? ` dim=${p.dim}` : ''}`
           addLog('llm', 'info', msg)
         }

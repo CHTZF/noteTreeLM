@@ -505,6 +505,96 @@ pub fn build_vault_registry(
         );
     }
 
+    // touch_agent — Chat agent 使用：自動語意匹配現有 agent 或建立新 agent，然後執行
+    {
+        let app_ta   = app.clone();
+        let llm_late_ta = Arc::clone(&llm_fn_late);
+        let reg_late_ta = Arc::clone(&registry_late);
+        let svc_ta   = Arc::clone(&system_agent_svc);
+        let cancel_ta = cancel.clone();
+        let emb_ta   = emb_url.clone();
+
+        registry.register(
+            "touch_agent".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let task    = args["task"].as_str().unwrap_or("").to_string();
+                    let name    = args["name"].as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| task.chars().take(20).collect());
+                    let description = args["description"].as_str().unwrap_or("").to_string();
+                    let trigger = args["trigger"].as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| task.clone());
+                    let context = args["context"].as_str().unwrap_or("").to_string();
+                    let tool_names: Vec<String> = args["tool_names"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    let llm_late = Arc::clone(&llm_late_ta);
+                    let reg_late = Arc::clone(&reg_late_ta);
+                    let svc  = Arc::clone(&svc_ta);
+                    let app  = app_ta.clone();
+                    let cancel = cancel_ta.clone();
+                    let emb  = emb_ta.clone();
+                    Box::pin(async move {
+                        if task.is_empty() {
+                            return Err("touch_agent: task 必填".to_string());
+                        }
+                        let llm_fn = {
+                            let guard = llm_late.lock().await;
+                            match guard.clone() {
+                                Some(f) => f,
+                                None => return Err("touch_agent: llm_fn 尚未初始化".to_string()),
+                            }
+                        };
+                        let sub_registry = {
+                            let guard = reg_late.lock().await;
+                            match guard.clone() {
+                                Some(r) => r,
+                                None => return Err("touch_agent: registry 尚未初始化".to_string()),
+                            }
+                        };
+                        let emit: crate::runtime::types::EmitEventFn = {
+                            let app = app.clone();
+                            Arc::new(move |event: String, payload: Value| {
+                                let _ = tauri::Emitter::emit(&app, &event, payload);
+                            })
+                        };
+                        // Step 1：touch_agent METHOD — 用 task 語意找或建立 AgentDefinition
+                        let def = svc.touch_agent(
+                            name.clone(), description, trigger,
+                            tool_names, vec![], 5,
+                            emb.as_deref(), emit.clone(), &task,
+                        ).await;
+
+                        // Step 2：route — 用找到/建立的 def_id 執行 sub-agent
+                        let target = match def {
+                            Ok(ref d) => d.def_id.clone(),
+                            Err(_) => name, // fallback to hint name
+                        };
+                        let result = svc.route(
+                            crate::runtime::system_agent::AgentRequest {
+                                caller_session_id: String::new(),
+                                target,
+                                task,
+                                context,
+                            },
+                            crate::commands::ai::vault_tools(),
+                            sub_registry,
+                            llm_fn,
+                            emit,
+                            cancel,
+                            emb.as_deref(),
+                        ).await;
+                        Ok(Value::String(result))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
     // create_agent — 透過 SystemAgentService 動態建立 agent definition + skills
     {
         let svc_ca = Arc::clone(&system_agent_svc);
@@ -523,6 +613,13 @@ pub fn build_vault_registry(
                         let description = args["description"].as_str().unwrap_or("").to_string();
                         let trigger     = args["trigger"].as_str().unwrap_or("").to_string();
                         let max_rounds  = args["max_rounds"].as_i64().unwrap_or(5);
+
+                        let _ = tauri::Emitter::emit(&app, "agent:pre_route_debug", serde_json::json!({
+                            "step": "create_agent_called",
+                            "name": name,
+                            "trigger": trigger,
+                            "emb_url": emb.as_deref().unwrap_or("(none)"),
+                        }));
 
                         if name.is_empty() {
                             return Err("create_agent: name 必填".to_string());
@@ -554,7 +651,7 @@ pub fn build_vault_registry(
                             skills, max_rounds, emb.as_deref(), emit,
                         ).await {
                             Ok(def) => Ok(Value::String(format!(
-                                "已建立 Agent「{}」(def_id: {})，共 {} 個 skills。後續相似查詢將自動 pre-route 至此 agent。",
+                                "Agent「{}」就緒 (def_id: {})，共 {} 個 skills。請立即使用 call_agent 執行任務。",
                                 def.name, def.def_id, def.skill_ids.len()
                             ))),
                             Err(e) => Err(format!("create_agent 失敗: {e}")),
@@ -585,9 +682,11 @@ pub fn build_vault_registry(
                             description: String,
                             kind: String,
                             tool_names: Vec<String>,
+                            #[allow(dead_code)]
+                            created_at: surrealdb::sql::Datetime,
                         }
                         let mut resp = db.query(
-                            "SELECT def_id, name, description, kind, tool_names \
+                            "SELECT def_id, name, description, kind, tool_names, created_at \
                              FROM agent_definitions \
                              WHERE vault_id = $vid AND is_active = true \
                              ORDER BY created_at ASC"

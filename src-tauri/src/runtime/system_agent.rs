@@ -104,8 +104,7 @@ impl SystemAgentService {
     ) -> String {
         let vault_id = self.vault_id.read().await.clone();
 
-        // ── 1. 找 definition ─────────────────────────────────────────────────
-        // 先用 def_id / name 模糊匹配；若失敗再用 embedding 找最相似的 trigger
+        // ── 1. 找 definition（name 模糊匹配 → embedding fallback，含 sleep agent）──
         let def = {
             let by_name = find_agent_definition(&self.db, &vault_id, &request.target).await;
             if by_name.is_some() {
@@ -116,7 +115,7 @@ impl SystemAgentService {
                     &client, url, &request.target).await;
                 if !target_emb.is_empty() {
                     crate::commands::agent_def::find_matching_agent_definition(
-                        &self.db, &vault_id, &target_emb, 0.55, false, // include sleep for auto-wake
+                        &self.db, &vault_id, &target_emb, 0.55, false,
                     ).await
                 } else { None }
             } else { None }
@@ -133,7 +132,7 @@ impl SystemAgentService {
                     d.system_prompt.clone(),
                 )
             } else {
-                // Fallback：找不到 definition，用 target 名稱建立臨時設定
+                // Fallback：找不到 definition，使用 target 名稱建立臨時設定
                 eprintln!("[SystemAgent] 找不到 definition '{}'，使用 fallback", request.target);
                 emit(
                     "system_agent:warn".into(),
@@ -160,7 +159,7 @@ impl SystemAgentService {
                 arr.into_iter()
                     .filter(|t| {
                         let name = t["function"]["name"].as_str().unwrap_or("");
-                        if name == "call_agent" { return false; }
+                        if name == "call_agent" || name == "touch_agent" { return false; }
                         if agent_tool_names.is_empty() {
                             true
                         } else {
@@ -305,6 +304,42 @@ impl SystemAgentService {
     }
 
     /// 動態建立 Agent Definition，自動 find-or-create 所需的 skills（含 embedding）。
+    /// 用 user_ask 的 embedding 搜尋語意相似的現有 agent（閾值 0.75）；
+    /// 找到則直接複用，找不到則以傳入的參數 create 新 agent。
+    pub async fn touch_agent(
+        &self,
+        name: String,
+        description: String,
+        trigger: String,
+        tool_names: Vec<String>,
+        skills: Vec<NewSkillSpec>,
+        max_rounds: i64,
+        emb_url: Option<&str>,
+        emit: EmitEventFn,
+        user_ask: &str,
+    ) -> Result<crate::commands::agent_def::AgentDefinition, String> {
+        let vault_id = self.vault_id.read().await.clone();
+        if vault_id.is_empty() {
+            return Err("Vault 未設定".to_string());
+        }
+
+        // 1. 用 user_ask embedding 比對現有 agent（閾值 0.75，包含 sleep agent）
+        if let Some(url) = emb_url {
+            let client = reqwest::Client::new();
+            let ask_emb = crate::commands::ai::get_embedding(&client, url, user_ask).await;
+            if !ask_emb.is_empty() {
+                if let Some(existing) = crate::commands::agent_def::find_matching_agent_definition(
+                    &self.db, &vault_id, &ask_emb, 0.75, false,
+                ).await {
+                    return Ok(existing);
+                }
+            }
+        }
+
+        // 2. 找不到相似 agent → 建立新的
+        self.create_agent(name, description, trigger, tool_names, skills, max_rounds, emb_url, emit).await
+    }
+
     /// 由 `create_agent` 工具呼叫，Chat LLM 透過此方法有機地建立專用 agent。
     pub async fn create_agent(
         &self,
@@ -323,29 +358,35 @@ impl SystemAgentService {
         }
         let client = reqwest::Client::new();
 
-        // ── 0. 同名 agent dedup ───────────────────────────────────────
-        {
-            #[derive(serde::Deserialize)]
-            struct ExistingId { def_id: String }
-            let mut resp = self.db.query(
-                "SELECT def_id FROM agent_definitions \
-                 WHERE vault_id = $vid \
-                   AND string::lowercase(name) = string::lowercase($name) \
-                 LIMIT 1"
-            )
-            .bind(("vid", vault_id.clone()))
-            .bind(("name", name.clone()))
-            .await;
-            if let Ok(ref mut r) = resp {
-                if let Ok(rows) = r.take::<Vec<ExistingId>>(0) {
-                    if let Some(row) = rows.into_iter().next() {
-                        return Err(format!(
-                            "已存在同名 Agent「{}」(def_id: {})，請直接使用或透過 update_agent_definition 修改。",
-                            name, row.def_id
-                        ));
-                    }
-                }
+        // ── 0a. 計算 trigger embedding（後續 dedup 用）─────────────────
+        let trigger_emb_for_dedup: Vec<f32> = if let Some(url) = emb_url {
+            if !trigger.trim().is_empty() {
+                crate::commands::ai::get_embedding(&client, url, &trigger).await
+            } else { vec![] }
+        } else { vec![] };
+
+        // ── 0b. Embedding dedup：語意相似度 > 0.85 → 複用現有 agent ──
+        if !trigger_emb_for_dedup.is_empty() {
+            if let Some(existing) = crate::commands::agent_def::find_matching_agent_definition(
+                &self.db, &vault_id, &trigger_emb_for_dedup, 0.85, false,
+            ).await {
+                emit(
+                    "system_agent:agent_created".into(),
+                    serde_json::json!({ "def_id": existing.def_id, "name": existing.name, "reused": true }),
+                );
+                return Ok(existing);
             }
+        }
+
+        // ── 0c. 同名 dedup：直接複用，不報錯 ────────────────────────
+        if let Some(existing) = crate::commands::agent_def::find_agent_definition(
+            &self.db, &vault_id, &name,
+        ).await {
+            emit(
+                "system_agent:agent_created".into(),
+                serde_json::json!({ "def_id": existing.def_id, "name": existing.name, "reused": true }),
+            );
+            return Ok(existing);
         }
 
         // ── 1. find-or-create 每個 skill ─────────────────────────────
@@ -382,13 +423,12 @@ impl SystemAgentService {
             }
         }
 
-        // ── 2. 計算 agent 的 trigger_embedding ───────────────────────
-        let trigger_embedding: Option<Vec<f32>> = if let Some(url) = emb_url {
-            if !trigger.trim().is_empty() {
-                let vec = crate::commands::ai::get_embedding(&client, url, &trigger).await;
-                if vec.is_empty() { None } else { Some(vec) }
-            } else { None }
-        } else { None };
+        // ── 2. trigger_embedding（0a 已算好，直接複用）────────────────
+        let trigger_embedding: Option<Vec<f32>> = if trigger_emb_for_dedup.is_empty() {
+            None
+        } else {
+            Some(trigger_emb_for_dedup)
+        };
 
         // ── 3. INSERT agent_definition ───────────────────────────────
         let def_id = uuid::Uuid::new_v4().to_string();

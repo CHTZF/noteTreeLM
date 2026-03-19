@@ -711,6 +711,7 @@ pub async fn invoke_agent(
         None
     };
 
+
     // Pre-routing：若 user input 與某個 agent definition 的 trigger_embedding 相似度 > 0.75
     // 則跳過 Chat LLM，直接透過 SystemAgentService.route() 執行，節省一次 LLM 呼叫。
     //
@@ -737,6 +738,32 @@ pub async fn invoke_agent(
 
             // 生命週期管理（sleep / delete）
             crate::commands::agent_def::check_agent_lifecycle(&vault_db, vid).await;
+
+            // Agent DB 狀態 dump（debug）
+            {
+                #[derive(serde::Deserialize)]
+                struct AgentRow { name: String, trigger: String, has_emb: bool, status: String, vault_id: String, is_builtin: bool }
+                // 查全部 agent（不過濾 vault_id / is_builtin）以偵測 vault_id 不符或只有 builtin 的情況
+                if let Ok(mut resp) = vault_db.query(
+                    "SELECT name, trigger OR '' AS trigger, trigger_embedding != NONE AS has_emb, \
+                            status OR 'active' AS status, vault_id, is_builtin \
+                     FROM agent_definitions"
+                ).await {
+                    let rows: Vec<AgentRow> = resp.take(0).unwrap_or_default();
+                    let _ = app.emit("agent:pre_route_debug", serde_json::json!({
+                        "step": "db_dump",
+                        "query_vid": vid,
+                        "agents": rows.iter().map(|r| serde_json::json!({
+                            "name": r.name,
+                            "trigger": if r.trigger.is_empty() { "(empty)" } else { r.trigger.as_str() },
+                            "has_emb": r.has_emb,
+                            "status": r.status,
+                            "vid_match": r.vault_id == *vid,
+                            "builtin": r.is_builtin,
+                        })).collect::<Vec<_>>(),
+                    }));
+                }
+            }
 
             // Lazy repair：補算 trigger != '' 但 trigger_embedding = NONE 的 active agents
             {
@@ -2068,25 +2095,54 @@ pub fn vault_tools() -> serde_json::Value {
         {
             "type": "function",
             "function": {
-                "name": "call_agent",
-                "description": "透過 System Agent Service 委派任務給對應的 agent。\
-所有跨 agent 溝通都必須透過此工具，不可直接呼叫其他 agent。\
-System Agent Service 會依據 target 找到最合適的 agent definition，注入對應的 skills 與 tools，同步回傳結果。",
+                "name": "touch_agent",
+                "description": "委派任務給最合適的 agent 並執行。\
+系統會自動以 task 的語意搜尋現有 agent；找到相似 agent 則直接複用，找不到則依提示自動建立後執行。\
+無需預先知道 agent 名稱，也無需分開呼叫 create_agent 和 call_agent。",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "target": {
-                            "type": "string",
-                            "description": "agent definition 的 def_id 或名稱（模糊匹配），如 'Search Assistant'、'Writer'、'builtin-search'"
-                        },
                         "task": {
                             "type": "string",
-                            "description": "完整的子任務描述，包含所有必要資訊"
+                            "description": "完整任務描述，包含所有必要資訊（用於語意匹配與執行）"
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "（可選）agent 名稱提示，建立新 agent 時使用"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "（可選）agent 職責描述，建立新 agent 時使用"
+                        },
+                        "trigger": {
+                            "type": "string",
+                            "description": "（可選）pre-routing 觸發關鍵詞，建立新 agent 時使用"
+                        },
+                        "tool_names": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "（可選）建立新 agent 時建議使用的工具"
                         },
                         "context": {
                             "type": "string",
-                            "description": "（可選）提供給 agent 的背景資訊或約束條件"
+                            "description": "（可選）提供給 agent 的背景資訊"
                         }
+                    },
+                    "required": ["task"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "call_agent",
+                "description": "（內部使用）透過 System Agent Service 路由任務給指定 agent。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string" },
+                        "task": { "type": "string" },
+                        "context": { "type": "string" }
                     },
                     "required": ["target", "task"]
                 }
@@ -2096,38 +2152,14 @@ System Agent Service 會依據 target 找到最合適的 agent definition，注�
             "type": "function",
             "function": {
                 "name": "create_agent",
-                "description": "透過 SystemAgentService 動態建立新的 Agent Definition，並自動 find-or-create 所需的 skills（含 trigger embedding）。\
-建立完成後可立即被 pre-routing 攔截。當觀察到使用者有重複性的特定領域需求時呼叫此工具，\
-讓系統有機地累積專用 agent，加速後續同類型請求。",
+                "description": "（內部使用）建立 agent definition。",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string", "description": "Agent 名稱，簡潔易識別" },
-                        "description": { "type": "string", "description": "此 agent 的職責描述" },
-                        "trigger": {
-                            "type": "string",
-                            "description": "觸發詞（中文關鍵詞，空格分隔），用於 pre-routing embedding 比對。越具體越好，例如「搜尋筆記 查詢知識庫 找資料」"
-                        },
-                        "tool_names": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "此 agent 可使用的工具列表"
-                        },
-                        "skills": {
-                            "type": "array",
-                            "description": "要注入的 skills（不存在則自動建立）",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "title": { "type": "string" },
-                                    "trigger": { "type": "string", "description": "技能觸發條件" },
-                                    "behavior": { "type": "string", "description": "具體行為規範" },
-                                    "injection_mode": { "type": "string", "enum": ["passive", "active"] }
-                                },
-                                "required": ["title", "trigger", "behavior"]
-                            }
-                        },
-                        "max_rounds": { "type": "number", "description": "最大 LLM 輪次（預設 5）" }
+                        "name": { "type": "string" },
+                        "description": { "type": "string" },
+                        "trigger": { "type": "string" },
+                        "tool_names": { "type": "array", "items": { "type": "string" } }
                     },
                     "required": ["name", "description", "trigger", "tool_names"]
                 }
@@ -2137,8 +2169,7 @@ System Agent Service 會依據 target 找到最合適的 agent definition，注�
             "type": "function",
             "function": {
                 "name": "list_available_agents",
-                "description": "列出目前所有可用的 agent definitions（包含 builtin 和自訂）。\
-在決定要委派任務前，可先呼叫此工具查看可用的 agent，再選擇最合適的 target 呼叫 call_agent。",
+                "description": "列出目前所有可用的 agent definitions（包含自訂）。",
                 "parameters": {
                     "type": "object",
                     "properties": {},
@@ -2179,7 +2210,7 @@ System Agent Service 會依據 target 找到最合適的 agent definition，注�
 /// 直接 vault 操作全部透過 call_agent 委派給 sub-agent
 pub fn chat_meta_tools() -> serde_json::Value {
     let all = vault_tools();
-    let meta_names = ["call_agent", "list_available_agents", "create_agent", "query_memory", "create_agent_skill"];
+    let meta_names = ["touch_agent", "list_available_agents", "query_memory", "create_agent_skill"];
     let arr = all.as_array().cloned().unwrap_or_default();
     serde_json::Value::Array(
         arr.into_iter()
