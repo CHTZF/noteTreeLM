@@ -144,6 +144,17 @@ pub fn run() {
                     }
                 }
 
+                // 預載 API key 進記憶體快取（避免後續並發呼叫各自觸發 keychain）
+                if let Ok(Some(provider)) = db::queries::get_setting(&state.db, "ai_provider").await {
+                    if !provider.is_empty() {
+                        let key = keyring::Entry::new("com.notetreelm.app", &provider)
+                            .ok()
+                            .and_then(|e| e.get_password().ok())
+                            .unwrap_or_default();
+                        state.api_key_cache.lock().await.insert(provider, key);
+                    }
+                }
+
                 // 預熱 whisper-server 與 llama-server（延遲 2 秒等前端 register 監聽器）
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 tokio::join!(
