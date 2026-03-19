@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::db::surreal::SurrealDb;
 use crate::error::AppError;
+use crate::runtime::system_agent::SystemAgentService;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -49,11 +51,17 @@ pub struct AppState {
     pub tool_test_cancel: Arc<AtomicBool>,
     /// 搜尋方式選擇通道（call_external_ai 工具暫停，等待前端選擇 web_search 或 call_external_ai）
     pub search_method_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+    /// System Agent Service — rule-based broker，負責路由 call_agent 請求
+    pub system_agent: Arc<SystemAgentService>,
+    /// API key 記憶體快取：provider → key，避免重複呼叫 keychain
+    pub api_key_cache: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl AppState {
     pub fn new(db: SurrealDb) -> Self {
+        let system_agent = Arc::new(SystemAgentService::new(db.clone()));
         Self {
+            system_agent,
             db,
             vault_path: Arc::new(RwLock::new(String::new())),
             llama_server: Arc::new(Mutex::new(None)),
@@ -75,7 +83,14 @@ impl AppState {
             agent_session: Arc::new(Mutex::new(None)),
             tool_test_cancel: Arc::new(AtomicBool::new(false)),
             search_method_tx: Arc::new(Mutex::new(None)),
+            api_key_cache: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// vault_id 設定後同步更新 SystemAgentService
+    pub async fn set_vault_path_with_agent(&self, path: String) {
+        self.system_agent.set_vault_id(path.clone()).await;
+        *self.vault_path.write().await = path;
     }
 
     pub async fn get_vault_path(&self) -> String {

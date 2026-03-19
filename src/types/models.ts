@@ -96,6 +96,8 @@ export interface FileTreeNode {
 
 // ── Agent Skills ──────────────────────────────────────────────────────────────
 
+export type AgentScope = 'all' | 'main' | 'search' | 'write' | 'research' | 'memory'
+
 /** LLM 建議的技能規範（尚未持久化，從 suggest_kb_cards_for_item 回傳） */
 export interface AgentSkillSuggestion {
   title: string
@@ -103,6 +105,7 @@ export interface AgentSkillSuggestion {
   behavior: string
   auto_tool_calls: string[]
   injection_mode?: 'passive' | 'active'
+  agent_scope?: AgentScope
 }
 
 /** 持久化後的技能規範（從 DB 讀取） */
@@ -116,6 +119,7 @@ export interface AgentSkill {
   auto_tool_calls: string[]
   is_active: boolean
   injection_mode: 'passive' | 'active'  // 被動取用 | 主動注入
+  agent_scope: AgentScope               // 適用的 agent 範圍
   trigger_count: number
   last_triggered_at: number | null  // ms timestamp，null = 從未觸發
   created_at: number

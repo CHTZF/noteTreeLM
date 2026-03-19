@@ -648,7 +648,7 @@ impl Agent {
             "add_memory_rule" => format!("🧠 新增記憶規則: {}", args["pattern"].as_str().unwrap_or("")),
             "list_recent_conversations" => format!("🔎 觀察最近 {} 段對話", args["limit"].as_u64().unwrap_or(10)),
             "create_agent_skill" => format!("⚡ 建立技能：{}", args["title"].as_str().unwrap_or("")),
-            "spawn_sub_agent" => format!("🤖 委派 {} 任務：{}", args["kind"].as_str().unwrap_or(""), args["task"].as_str().unwrap_or("")),
+            "call_agent" => format!("🤖 委派給 {}：{}", args["target"].as_str().unwrap_or("agent"), args["task"].as_str().unwrap_or("")),
             _ => format!("[{}]", name),
         }
     }

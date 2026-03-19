@@ -10,7 +10,7 @@ pub type SurrealDb = Arc<Surreal<Db>>;
 
 /// Schema 版本：每次修改 apply_schema 或 insert_default_settings 時遞增，
 /// 確保已安裝的客戶端會重新執行一次 DDL，之後快取跳過。
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 5;
 
 /// 初始化 SurrealDB（embedded SurrealKV）
 /// 所有資料存於 app_data_dir/surrealdb/
@@ -328,6 +328,8 @@ async fn apply_schema(db: &Surreal<Db>) -> crate::error::Result<()> {
         "DEFINE FIELD IF NOT EXISTS last_triggered_at    ON agent_skills TYPE option<datetime>;",
         "DEFINE FIELD IF NOT EXISTS trigger_embedding    ON agent_skills TYPE option<array<float>>;",
         "DEFINE FIELD IF NOT EXISTS injection_mode       ON agent_skills TYPE string DEFAULT 'passive';",
+        // agent_scope：技能適用的 agent 範疇（'all'=全體 / 'main'=主 Agent / 'search'/'write'/'research'/'memory'=各 sub-agent）
+        "DEFINE FIELD IF NOT EXISTS agent_scope          ON agent_skills TYPE string DEFAULT 'all';",
         "DEFINE FIELD IF NOT EXISTS created_at           ON agent_skills TYPE datetime DEFAULT time::now();",
         "DEFINE INDEX IF NOT EXISTS idx_agent_skills_vault  ON agent_skills FIELDS vault_id, skill_id UNIQUE;",
         "DEFINE INDEX IF NOT EXISTS idx_agent_skills_ki     ON agent_skills FIELDS vault_id, knowledge_item_id;",
@@ -347,6 +349,27 @@ async fn apply_schema(db: &Surreal<Db>) -> crate::error::Result<()> {
         "DEFINE INDEX IF NOT EXISTS idx_agent_tools_active ON agent_tools FIELDS is_active;",
         // BM25 FTS fallback（無 embedding 時按 name+description 排序）
         "DEFINE INDEX IF NOT EXISTS ft_agent_tools ON agent_tools FIELDS name, description SEARCH ANALYZER note_analyzer BM25;",
+
+        // ── agent_definitions：使用者定義的 agent 設定（builtin + 自訂）────────
+        "DEFINE TABLE IF NOT EXISTS agent_definitions SCHEMAFULL;",
+        "DEFINE FIELD IF NOT EXISTS def_id          ON agent_definitions TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS vault_id        ON agent_definitions TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS name            ON agent_definitions TYPE string DEFAULT '';",
+        "DEFINE FIELD IF NOT EXISTS description     ON agent_definitions TYPE string DEFAULT '';",
+        "DEFINE FIELD IF NOT EXISTS kind            ON agent_definitions TYPE string DEFAULT 'sub';",
+        // kind: 'main' | 'sub' — main = chat 等入口 agent，sub = 可被路由的 sub-agent
+        "DEFINE FIELD IF NOT EXISTS skill_ids       ON agent_definitions TYPE array<string> DEFAULT [];",
+        "DEFINE FIELD IF NOT EXISTS tool_names      ON agent_definitions TYPE array<string> DEFAULT [];",
+        "DEFINE FIELD IF NOT EXISTS system_prompt   ON agent_definitions TYPE string DEFAULT '';",
+        "DEFINE FIELD IF NOT EXISTS max_rounds      ON agent_definitions TYPE int DEFAULT 5;",
+        "DEFINE FIELD IF NOT EXISTS is_active       ON agent_definitions TYPE bool DEFAULT true;",
+        "DEFINE FIELD IF NOT EXISTS is_builtin      ON agent_definitions TYPE bool DEFAULT false;",
+        // trigger：描述「這個 agent 擅長處理什麼樣的請求」，用於 pre-routing embedding 比對
+        "DEFINE FIELD IF NOT EXISTS trigger         ON agent_definitions TYPE string DEFAULT '';",
+        "DEFINE FIELD IF NOT EXISTS trigger_embedding ON agent_definitions TYPE option<array<float>>;",
+        "DEFINE FIELD IF NOT EXISTS created_at      ON agent_definitions TYPE datetime DEFAULT time::now();",
+        "DEFINE INDEX IF NOT EXISTS idx_agent_def_vault ON agent_definitions FIELDS vault_id, def_id UNIQUE;",
+        "DEFINE INDEX IF NOT EXISTS idx_agent_def_name  ON agent_definitions FIELDS vault_id, name;",
 
         // ── skill_usage_log：每次技能觸發記錄一筆，供趨勢圖使用 ──────────────
         "DEFINE TABLE IF NOT EXISTS skill_usage_log SCHEMAFULL;",
@@ -425,4 +448,5 @@ async fn insert_default_settings(db: &Surreal<Db>) -> crate::error::Result<()> {
         .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
     Ok(())
 }
+
 

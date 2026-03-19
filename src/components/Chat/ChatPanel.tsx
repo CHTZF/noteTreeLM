@@ -395,6 +395,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     let unlistenWebRefs: (() => void) | undefined
     let unlistenSkillsActivated: (() => void) = () => {}
     let unlistenSkillSuggestion: (() => void) = () => {}
+    let unlistenPreRouteDebug: (() => void) | undefined
 
     // Clear previous suggestions at the start of each send
     setNoteSuggestions([])
@@ -497,6 +498,20 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         }
       )
 
+      // Pre-routing debug trace
+      unlistenPreRouteDebug = await listen<{ step: string; reason?: string; best_match?: string; dim?: number }>(
+        'agent:pre_route_debug',
+        (e) => {
+          const p = e.payload
+          const msg = p.step === 'skip'
+            ? `⚠ pre-routing skip: ${p.reason}`
+            : p.step === 'miss'
+            ? `⚠ pre-routing miss: ${p.reason}${p.best_match ? ` (best: ${p.best_match})` : ''}`
+            : `✓ pre-routing ${p.step}${p.dim ? ` dim=${p.dim}` : ''}`
+          addLog('llm', 'info', msg)
+        }
+      )
+
       log('  呼叫 invoke("invoke_agent")')
       const responseText = await invoke<string>('invoke_agent', {
         input: text,
@@ -542,6 +557,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       unlistenWebRefs?.()
       unlistenSkillsActivated()
       unlistenSkillSuggestion()
+      unlistenPreRouteDebug?.()
       setPendingWriteDisplay(null)
       setPendingSearchMethod(null)
       setIsStreaming(false)
@@ -580,35 +596,27 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     dbgLog('reflection', 'info', '🔄 開始觀察對話模式…')
 
     let unlistenTool: (() => void) | null = null
-    let unlistenDone: (() => void) | null = null
 
     try {
-      const sessionId = await invoke<string>('stream_chat', {
-        messages: [{ role: 'user', content: '開始觀察' }],
-        system: REFLECTION_SYSTEM,
-      })
-
-      unlistenTool = await listen<{ session_id: string; display: string }>('agent:tool_call', e => {
-        if (e.payload.session_id !== sessionId) return
+      unlistenTool = await listen<{ display: string }>('agent:tool_call', e => {
         dbgLog('reflection', 'info', e.payload.display)
       })
 
-      unlistenDone = await listen<{ session_id: string; text: string; error?: string }>('llm:done', e => {
-        if (e.payload.session_id !== sessionId) return
-        if (e.payload.error) {
-          dbgLog('reflection', 'error', `❌ ${e.payload.error}`)
-        } else {
-          if (e.payload.text) dbgLog('reflection', 'info', e.payload.text)
-          dbgLog('reflection', 'info', '✅ 觀察完成')
-          window.dispatchEvent(new CustomEvent('skills-changed'))
-        }
-        unlistenTool?.()
-        unlistenDone?.()
+      // invoke_agent 是 blocking — await 到 agent loop 完成才 resolve
+      const result = await invoke<string>('invoke_agent', {
+        input: '開始觀察',
+        messages: [],
+        system: REFLECTION_SYSTEM,
+        useTools: true,
       })
+
+      if (result) dbgLog('reflection', 'info', result)
+      dbgLog('reflection', 'info', '✅ 觀察完成')
+      window.dispatchEvent(new CustomEvent('skills-changed'))
     } catch (e) {
       dbgLog('reflection', 'error', `觸發失敗：${e}`)
+    } finally {
       unlistenTool?.()
-      unlistenDone?.()
     }
   }, [])
 

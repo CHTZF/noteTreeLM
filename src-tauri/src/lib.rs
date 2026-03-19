@@ -33,6 +33,9 @@ use commands::{
                        update_agent_skill, compress_conversation_to_knowledge,
                        get_skill_usage_stats, extract_skill_from_exchange},
     knowledge_import::auto_check_all_sessions,
+    agent_def::{list_agent_definitions, save_agent_definition, update_agent_definition,
+                delete_agent_definition, toggle_agent_definition,
+                list_ephemeral_agents, clear_ephemeral_agents},
     settings::{get_settings, save_personal_settings, get_system_settings, save_system_settings, get_api_key, set_api_key,
                get_vault_last_note, set_vault_last_note, check_vcredist,
                get_last_chat_conversation_id, set_last_chat_conversation_id,
@@ -124,7 +127,7 @@ pub fn run() {
                 // 載入已設定的 vault 路徑
                 if let Ok(Some(vp)) = db::queries::get_setting(&state.db, "system_current_vault_path").await {
                     if !vp.is_empty() {
-                        state.set_vault_path(vp.clone()).await;
+                        state.set_vault_path_with_agent(vp.clone()).await;
                         let path = std::path::PathBuf::from(&vp);
                         if path.exists() {
                             // 背景補齊 chunk 索引（不阻塞啟動）
@@ -297,6 +300,14 @@ pub fn run() {
             cancel_agent,
             invoke_agent,
             set_note_status,
+            // Agent Definitions
+            list_agent_definitions,
+            save_agent_definition,
+            update_agent_definition,
+            delete_agent_definition,
+            toggle_agent_definition,
+            list_ephemeral_agents,
+            clear_ephemeral_agents,
             // Conversation management
             create_conversation,
             list_conversations,

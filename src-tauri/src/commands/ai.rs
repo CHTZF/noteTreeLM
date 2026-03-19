@@ -155,6 +155,8 @@ pub(crate) async fn ensure_server_running(
             "--parallel",
             "1",
             "--embedding",   // 開啟 /embedding endpoint（用於 intent embedding）
+            "--pooling",
+            "mean",          // 啟用 mean pooling，使 /v1/embeddings OAI 相容
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -257,6 +259,7 @@ pub(crate) async fn ensure_server_running(
 /// 依序嘗試：/v1/embeddings（OpenAI 格式）→ /embedding（legacy 格式）
 /// 失敗時回傳空 Vec（非致命錯誤，由呼叫端 fallback）
 pub async fn get_embedding(client: &reqwest::Client, base_url: &str, text: &str) -> Vec<f32> {
+
     fn extract_vec(json: &serde_json::Value) -> Vec<f32> {
         // OpenAI 格式: {"data": [{"embedding": [...]}]}
         if let Some(arr) = json["data"][0]["embedding"].as_array() {
@@ -502,6 +505,7 @@ pub(crate) async fn call_external_ai_via_db(
     query: &str,
     db: &SurrealDb,
     app: &AppHandle,
+    api_key_cache: &tokio::sync::Mutex<std::collections::HashMap<String, String>>,
 ) -> String {
     let provider = queries::get_setting(db, "ai_provider")
         .await.unwrap_or_default().unwrap_or_default();
@@ -511,7 +515,7 @@ pub(crate) async fn call_external_ai_via_db(
     let model = queries::get_setting(db, "ai_model")
         .await.unwrap_or_default()
         .unwrap_or_else(|| "gpt-4o".to_string());
-    let api_key = read_api_key_sync(&provider);
+    let api_key = read_api_key(api_key_cache, &provider).await;
     let config = ExtAiConfig { provider, base_url, model, api_key };
     call_external_ai_tool(query, &config, app).await
 }
@@ -599,10 +603,8 @@ pub async fn invoke_agent(
     }
 
     // 4. 建立 ToolRegistry（vault 可用時注入工具）
-    let reg_emb_url: Option<String> = {
-        let port = *state.embedding_actual_port.lock().await;
-        port.map(|p| format!("http://127.0.0.1:{}", p))
-    };
+    // 使用 llama-server 處理所有 agent trigger embedding（chat 就緒時必然可用）
+    let reg_emb_url: Option<String> = Some(base_url.clone());
     let skill_emb_url = reg_emb_url.clone(); // 保留一份給 skill pre-pass 使用
     let search_method_tx = Arc::clone(&state.search_method_tx);
 
@@ -621,6 +623,9 @@ pub async fn invoke_agent(
             search_method_tx,
             Arc::clone(&llm_fn_late),
             Arc::clone(&registry_late),
+            Arc::clone(&state.system_agent),
+            Some(Arc::clone(&state.agent_cancel)),
+            Arc::clone(&state.api_key_cache),
         )
     } else {
         Arc::new(ToolRegistry::new())
@@ -697,21 +702,154 @@ pub async fn invoke_agent(
     });
 
     // 8. 建立 Agent，執行
-    //    vault_tools: Agent 在 ToolUse/Chat 路徑使用（None = 無 vault 工具）
-    //    Intent::Memory 路徑由 Agent 自行注入 MemoryAgent::tools_definition()
-    //    動態工具選取：依查詢 embedding 找最相關的 top-8 工具，避免 context 爆炸。
-    //    若無 embedding server 則 fallback 回傳全部工具。
+    //    Chat 主 agent 只擁有 meta 工具（call_agent / list_available_agents / query_memory / create_agent_skill）。
+    //    直接 vault 操作透過 call_agent 委派給 sub-agents，確保 SystemAgentService 作為唯一中介。
+    //    Intent::Memory 路徑由 Agent 自行注入 MemoryAgent::tools_definition()。
     let vault_tools_opt = if !vault_path.is_empty() && vault_id_opt.is_some() {
-        let tools = find_relevant_tools_for_query(
-            &vault_db,
-            &input,
-            reg_emb_url.as_deref(),
-            8,
-        ).await;
-        Some(tools)
+        Some(chat_meta_tools())
     } else {
         None
     };
+
+    // Pre-routing：若 user input 與某個 agent definition 的 trigger_embedding 相似度 > 0.75
+    // 則跳過 Chat LLM，直接透過 SystemAgentService.route() 執行，節省一次 LLM 呼叫。
+    //
+    // 只在「全新對話」觸發：只要 messages_json 裡已存在任何 assistant 訊息，
+    // 就代表對話上下文已建立，後續訊息一律由 Chat LLM 繼續處理，
+    // 避免 embedding 攔截破壞多輪對話的連貫性。
+    let has_prior_assistant = messages_json.iter()
+        .any(|m| m["role"].as_str() == Some("assistant"));
+
+    if has_prior_assistant {
+        let _ = app.emit("agent:pre_route_debug", serde_json::json!({
+            "step": "skip", "reason": "has_prior_assistant = true，非首輪對話"
+        }));
+    }
+    if !has_prior_assistant {
+    if vault_id_opt.is_none() || vault_path.is_empty() {
+        let _ = app.emit("agent:pre_route_debug", serde_json::json!({
+            "step": "skip", "reason": "vault 未設定"
+        }));
+    }
+    if let Some(ref vid) = vault_id_opt {
+        if !vault_path.is_empty() {
+            let emb_base = base_url.as_str();
+
+            // Lazy repair：補算 trigger != '' 但 trigger_embedding = NONE 的 agents
+            {
+                #[derive(serde::Deserialize)]
+                struct NullEmbRow { def_id: String, trigger: String }
+                if let Ok(mut resp) = vault_db.query(
+                    "SELECT def_id, trigger FROM agent_definitions \
+                     WHERE vault_id = $vid AND is_active = true \
+                       AND trigger != '' AND trigger_embedding = NONE"
+                ).bind(("vid", vid.clone())).await {
+                    let rows: Vec<NullEmbRow> = resp.take(0).unwrap_or_default();
+                    let found = rows.len();
+                    let mut repaired = 0usize;
+                    for row in rows {
+                        let emb = get_embedding(&client, emb_base, &row.trigger).await;
+                        if !emb.is_empty() {
+                            let ok = vault_db.query(
+                                "UPDATE agent_definitions SET trigger_embedding = $emb \
+                                 WHERE vault_id = $vid AND def_id = $did"
+                            )
+                            .bind(("emb", emb))
+                            .bind(("vid", vid.clone()))
+                            .bind(("did", row.def_id))
+                            .await.is_ok();
+                            if ok { repaired += 1; }
+                        }
+                    }
+                    let _ = app.emit("agent:pre_route_debug", serde_json::json!({
+                        "step": "repair_done",
+                        "found": found,
+                        "repaired": repaired,
+                    }));
+                }
+            }
+
+            let user_emb = get_embedding(&client, emb_base, &input).await;
+            if user_emb.is_empty() {
+                let _ = app.emit("agent:pre_route_debug", serde_json::json!({
+                    "step": "skip", "reason": "get_embedding 回傳空向量（llama-server 異常？）"
+                }));
+            } else {
+                let _ = app.emit("agent:pre_route_debug", serde_json::json!({
+                    "step": "embedding_ok", "dim": user_emb.len()
+                }));
+            }
+            if !user_emb.is_empty() {
+                    let matched = crate::commands::agent_def::find_matching_agent_definition(
+                        &vault_db,
+                        vid,
+                        &user_emb,
+                        0.75,
+                    ).await;
+                    if matched.is_none() {
+                        // 找出有 trigger_embedding 的 agents 的 best score
+                        let best = crate::commands::agent_def::find_matching_agent_definition(
+                            &vault_db, vid, &user_emb, 0.0).await;
+                        let _ = app.emit("agent:pre_route_debug", serde_json::json!({
+                            "step": "miss",
+                            "best_match": best.as_ref().map(|b| &b.name),
+                            "reason": if best.is_some() {
+                                "最佳匹配 similarity < 0.75"
+                            } else {
+                                "DB 中沒有任何 agent 有 trigger_embedding"
+                            }
+                        }));
+                    }
+                    if let Some(def) = matched {
+                        // 設定 session + cancel flag（與 Agent::run_streaming_loop 一致）
+                        state.agent_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+                        let session_id = uuid::Uuid::new_v4().to_string();
+                        *state.agent_session.lock().await = Some(session_id.clone());
+
+                        let _ = app.emit("agent:pre_route", serde_json::json!({
+                            "def_id": def.def_id,
+                            "def_name": def.name,
+                            "session_id": session_id.clone(),
+                        }));
+
+                        let result = state.system_agent.route(
+                            crate::runtime::system_agent::AgentRequest {
+                                caller_session_id: session_id.clone(),
+                                target: def.def_id.clone(),
+                                task: input.clone(),
+                                context: String::new(),
+                            },
+                            vault_tools(),
+                            Arc::clone(&registry),
+                            llm_fn.clone(),
+                            Arc::clone(&emit_fn),
+                            Some(Arc::clone(&state.agent_cancel)),
+                            reg_emb_url.as_deref(),
+                        ).await;
+
+                        *state.agent_session.lock().await = None;
+                        (emit_fn)("llm:done".into(), serde_json::Value::String(result.clone()));
+
+                        // 若有 conversation_id，存回 DB
+                        if let Some(ref conv_id) = conversation_id {
+                            use crate::commands::conversation::{save_messages, maybe_set_title};
+                            let mut to_save: Vec<serde_json::Value> = messages_json.into_iter()
+                                .filter(|m| m["role"].as_str() != Some("system"))
+                                .collect();
+                            if !result.is_empty() {
+                                to_save.push(serde_json::json!({"role": "assistant", "content": result}));
+                            }
+                            let arr = serde_json::Value::Array(to_save);
+                            let _ = save_messages(&state.db, conv_id, &arr).await;
+                            let _ = maybe_set_title(&state.db, conv_id, &arr).await;
+                        }
+
+                        return Ok(result);
+                    }
+                }
+            }
+        }
+    } // end if !has_prior_assistant
 
     // 9. prefetch_memory：Intent::Memory 路徑的純 Rust 預取（<100ms，無 LLM）
     //    有結果 → 注入 system prompt 作為初始種子；無結果 → 空字串，LLM 自行用 query_memory 搜尋
@@ -794,6 +932,7 @@ pub async fn invoke_agent(
             &state.db, vid, &input,
             skill_emb_url.as_deref(),
             &client,
+            "main",
         ).await {
             if messages_json.first().and_then(|m| m["role"].as_str()) == Some("system") {
                 let old = messages_json[0]["content"].as_str().unwrap_or("").to_string();
@@ -834,7 +973,9 @@ pub async fn invoke_agent(
         if has_framework {
             let _ = app.emit("agent:skill_suggestion", serde_json::json!({
                 "query": &input,
-                "response_preview": &response_text[..response_text.len().min(200)],
+                "response_preview": response_text.char_indices()
+                    .nth(200).map(|(i, _)| &response_text[..i])
+                    .unwrap_or(&response_text),
             }));
         }
     }
@@ -1501,15 +1642,26 @@ struct StreamResult {
     tool_call_chunks: Vec<ToolCallAccumulator>,
 }
 
-/// 從系統 keyring 讀取 API 金鑰（同步）
-pub(crate) fn read_api_key_sync(provider: &str) -> String {
+/// 從記憶體快取讀取 API 金鑰；cache miss 時查 keychain 並回填快取
+pub(crate) async fn read_api_key(
+    cache: &tokio::sync::Mutex<std::collections::HashMap<String, String>>,
+    provider: &str,
+) -> String {
     if provider.is_empty() {
         return String::new();
     }
-    keyring::Entry::new("com.notetreelm.app", provider)
+    {
+        let c = cache.lock().await;
+        if let Some(k) = c.get(provider) {
+            return k.clone();
+        }
+    }
+    let key = keyring::Entry::new("com.notetreelm.app", provider)
         .ok()
         .and_then(|e| e.get_password().ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    cache.lock().await.insert(provider.to_string(), key.clone());
+    key
 }
 
 /// Tool：呼叫外部 AI（非串流），返回回應文字作為工具結果
@@ -1913,17 +2065,16 @@ pub fn vault_tools() -> serde_json::Value {
         {
             "type": "function",
             "function": {
-                "name": "spawn_sub_agent",
-                "description": "委派子任務給專門的 sub-agent 執行，避免 Main Agent context 爆炸。\
-當任務屬於特定領域（搜尋、寫入、研究、記憶分析）時使用。\
-sub-agent 在獨立有界 context 中執行，完成後回傳結果摘要。",
+                "name": "call_agent",
+                "description": "透過 System Agent Service 委派任務給對應的 agent。\
+所有跨 agent 溝通都必須透過此工具，不可直接呼叫其他 agent。\
+System Agent Service 會依據 target 找到最合適的 agent definition，注入對應的 skills 與 tools，同步回傳結果。",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "kind": {
+                        "target": {
                             "type": "string",
-                            "enum": ["search", "write", "research", "memory"],
-                            "description": "sub-agent 種類：search=搜尋筆記、write=建立/修改筆記、research=網路研究、memory=記憶分析"
+                            "description": "agent definition 的 def_id 或名稱（模糊匹配），如 'Search Assistant'、'Writer'、'builtin-search'"
                         },
                         "task": {
                             "type": "string",
@@ -1931,19 +2082,116 @@ sub-agent 在獨立有界 context 中執行，完成後回傳結果摘要。",
                         },
                         "context": {
                             "type": "string",
-                            "description": "（可選）提供給 sub-agent 的背景資訊或約束條件"
+                            "description": "（可選）提供給 agent 的背景資訊或約束條件"
                         }
                     },
-                    "required": ["kind", "task"]
+                    "required": ["target", "task"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "create_agent",
+                "description": "透過 SystemAgentService 動態建立新的 Agent Definition，並自動 find-or-create 所需的 skills（含 trigger embedding）。\
+建立完成後可立即被 pre-routing 攔截。當觀察到使用者有重複性的特定領域需求時呼叫此工具，\
+讓系統有機地累積專用 agent，加速後續同類型請求。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Agent 名稱，簡潔易識別" },
+                        "description": { "type": "string", "description": "此 agent 的職責描述" },
+                        "trigger": {
+                            "type": "string",
+                            "description": "觸發詞（中文關鍵詞，空格分隔），用於 pre-routing embedding 比對。越具體越好，例如「搜尋筆記 查詢知識庫 找資料」"
+                        },
+                        "tool_names": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "此 agent 可使用的工具列表"
+                        },
+                        "skills": {
+                            "type": "array",
+                            "description": "要注入的 skills（不存在則自動建立）",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "title": { "type": "string" },
+                                    "trigger": { "type": "string", "description": "技能觸發條件" },
+                                    "behavior": { "type": "string", "description": "具體行為規範" },
+                                    "injection_mode": { "type": "string", "enum": ["passive", "active"] }
+                                },
+                                "required": ["title", "trigger", "behavior"]
+                            }
+                        },
+                        "max_rounds": { "type": "number", "description": "最大 LLM 輪次（預設 5）" }
+                    },
+                    "required": ["name", "description", "trigger", "tool_names"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_available_agents",
+                "description": "列出目前所有可用的 agent definitions（包含 builtin 和自訂）。\
+在決定要委派任務前，可先呼叫此工具查看可用的 agent，再選擇最合適的 target 呼叫 call_agent。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "query_memory",
+                "description": "搜尋過去對話記憶。keywords 空陣列=取最新記憶；有關鍵字=FTS 搜尋。since 為時間下限 YYYY-MM-DD。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "keywords": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "關鍵字列表（空陣列 = 取最新記憶）"
+                        },
+                        "since": {
+                            "type": "string",
+                            "description": "時間下限，YYYY-MM-DD 格式（可選）"
+                        },
+                        "limit": {
+                            "type": "number",
+                            "description": "最多返回幾條記憶（預設 5）"
+                        }
+                    },
+                    "required": ["keywords"]
                 }
             }
         }
     ])
 }
 
+/// Chat 主 agent 只擁有的 meta 工具（不含直接 vault 操作）
+/// 直接 vault 操作全部透過 call_agent 委派給 sub-agent
+pub fn chat_meta_tools() -> serde_json::Value {
+    let all = vault_tools();
+    let meta_names = ["call_agent", "list_available_agents", "create_agent", "query_memory", "create_agent_skill"];
+    let arr = all.as_array().cloned().unwrap_or_default();
+    serde_json::Value::Array(
+        arr.into_iter()
+            .filter(|t| {
+                let name = t["function"]["name"].as_str().unwrap_or("");
+                meta_names.contains(&name)
+            })
+            .collect(),
+    )
+}
+
 // ── Tool Registry 工具 ─────────────────────────────────────────────────────
 
 /// 余弦相似度（兩向量長度不同或為空時回傳 0.0）
+#[allow(dead_code)]
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -2008,6 +2256,7 @@ pub async fn seed_agent_tools(db: &SurrealDb, emb_url: Option<&str>) {
 /// - 有 embedding 時：余弦相似度排序
 /// - 無 embedding 時：回傳全部 (fallback = vault_tools())
 /// 永遠包含 plan_announce 工具（寫入確認機制必需）。
+#[allow(dead_code)]
 pub async fn find_relevant_tools_for_query(
     db: &SurrealDb,
     query: &str,
@@ -3340,7 +3589,7 @@ pub async fn run_tool_pipeline(
         let ext_model = queries::get_setting(db, "ai_model")
             .await.unwrap_or_default()
             .unwrap_or_else(|| "gpt-4o".to_string());
-        let ext_api_key = read_api_key_sync(&ext_provider);
+        let ext_api_key = read_api_key(&state.api_key_cache, &ext_provider).await;
         ExtAiConfig { provider: ext_provider, base_url: ext_base_url, model: ext_model, api_key: ext_api_key }
     } else {
         ExtAiConfig { provider: String::new(), base_url: String::new(), model: String::new(), api_key: String::new() }
@@ -3455,8 +3704,6 @@ pub async fn test_vault_tool(
     }));
 
     // Only build ext_config for call_external_ai — other tools ignore it entirely.
-    // Avoids unnecessary keychain access (read_api_key_sync) which can block on macOS
-    // if the security framework is busy during concurrent operations.
     let ext_config = if tool_name == "call_external_ai" {
         let ext_provider = queries::get_setting(&db, "ai_provider")
             .await.unwrap_or_default().unwrap_or_default();
@@ -3466,7 +3713,7 @@ pub async fn test_vault_tool(
         let ext_model = queries::get_setting(&db, "ai_model")
             .await.unwrap_or_default()
             .unwrap_or_else(|| "gpt-4o".to_string());
-        let ext_api_key = read_api_key_sync(&ext_provider);
+        let ext_api_key = read_api_key(&state.api_key_cache, &ext_provider).await;
         ExtAiConfig { provider: ext_provider, base_url: ext_base_url, model: ext_model, api_key: ext_api_key }
     } else {
         ExtAiConfig { provider: String::new(), base_url: String::new(), model: String::new(), api_key: String::new() }
@@ -3530,22 +3777,31 @@ struct ActiveSkillRow {
     #[allow(dead_code)]
     #[serde(default = "passive_str")]
     injection_mode: String,
+    #[serde(default = "scope_all_str")]
+    agent_scope: String,
 }
 
 fn passive_str() -> String { "passive".to_string() }
+fn scope_all_str() -> String { "all".to_string() }
 
 /// 取得所有 injection_mode = 'active' 的啟用技能（永遠注入，不做 embedding 比對）。
+/// `caller_scope` 為 "main" / "search" / "write" / "research" / "memory"；
+/// 只回傳 agent_scope = 'all' 或 agent_scope = caller_scope 的技能。
 async fn fetch_always_on_skills(
     db: &surrealdb::Surreal<surrealdb::engine::local::Db>,
     vault_id: &str,
+    caller_scope: &str,
 ) -> Vec<ActiveSkillRow> {
     let mut resp = db.query(
-        "SELECT skill_id, title, trigger, behavior, auto_tool_calls, injection_mode \
+        "SELECT skill_id, title, trigger, behavior, auto_tool_calls, injection_mode, \
+                agent_scope OR 'all' AS agent_scope \
          FROM agent_skills \
          WHERE vault_id = $vid AND is_active = true AND injection_mode = 'active' \
+           AND (agent_scope = 'all' OR agent_scope = NONE OR agent_scope = $scope) \
          ORDER BY created_at ASC"
     )
     .bind(("vid", vault_id.to_string()))
+    .bind(("scope", caller_scope.to_string()))
     .await.ok();
     resp.as_mut()
         .and_then(|r| r.take::<Vec<ActiveSkillRow>>(0).ok())
@@ -3558,6 +3814,7 @@ async fn search_passive_skills(
     db: &surrealdb::Surreal<surrealdb::engine::local::Db>,
     vault_id: &str,
     query_embedding: &[f32],
+    caller_scope: &str,
 ) -> Vec<ActiveSkillRow> {
     const SKILL_THRESHOLD: f64 = 0.65;
 
@@ -3565,15 +3822,18 @@ async fn search_passive_skills(
     let mut vector_results: Vec<ActiveSkillRow> = {
         let emb_val: Vec<f64> = query_embedding.iter().map(|&x| x as f64).collect();
         let mut resp = db.query(
-            "SELECT skill_id, title, trigger, behavior, auto_tool_calls, injection_mode \
+            "SELECT skill_id, title, trigger, behavior, auto_tool_calls, injection_mode, \
+                    agent_scope OR 'all' AS agent_scope \
              FROM agent_skills \
              WHERE vault_id = $vid AND is_active = true AND injection_mode != 'active' \
+               AND (agent_scope = 'all' OR agent_scope = NONE OR agent_scope = $scope) \
                AND trigger_embedding != NONE \
                AND vector::similarity::cosine(trigger_embedding, $qvec) > $thresh \
              ORDER BY vector::similarity::cosine(trigger_embedding, $qvec) DESC \
              LIMIT 4"
         )
         .bind(("vid", vault_id.to_string()))
+        .bind(("scope", caller_scope.to_string()))
         .bind(("qvec", emb_val))
         .bind(("thresh", SKILL_THRESHOLD))
         .await.ok();
@@ -3585,13 +3845,16 @@ async fn search_passive_skills(
     // Fallback：text contains 匹配（trigger_embedding 為 None 的 passive skills）
     let mut text_results: Vec<ActiveSkillRow> = {
         let mut resp = db.query(
-            "SELECT skill_id, title, trigger, behavior, auto_tool_calls, injection_mode \
+            "SELECT skill_id, title, trigger, behavior, auto_tool_calls, injection_mode, \
+                    agent_scope OR 'all' AS agent_scope \
              FROM agent_skills \
              WHERE vault_id = $vid AND is_active = true AND injection_mode != 'active' \
+               AND (agent_scope = 'all' OR agent_scope = NONE OR agent_scope = $scope) \
                AND trigger_embedding = NONE \
              LIMIT 10"
         )
         .bind(("vid", vault_id.to_string()))
+        .bind(("scope", caller_scope.to_string()))
         .await.ok();
         resp.as_mut()
             .and_then(|r| r.take::<Vec<ActiveSkillRow>>(0).ok())
@@ -3657,9 +3920,10 @@ async fn run_skill_pre_pass(
     query: &str,
     emb_url: Option<&str>,
     client: &reqwest::Client,
+    caller_scope: &str,
 ) -> Option<(String, Vec<String>)> {
     // 1. 主動注入 skills（不需要 embedding server）
-    let always_on = fetch_always_on_skills(db, vault_id).await;
+    let always_on = fetch_always_on_skills(db, vault_id, caller_scope).await;
 
     // 2. 被動取用 skills（需要 embedding server）
     let passive = if let Some(url) = emb_url {
@@ -3667,7 +3931,7 @@ async fn run_skill_pre_pass(
         if query_vec.is_empty() {
             vec![]
         } else {
-            search_passive_skills(db, vault_id, &query_vec).await
+            search_passive_skills(db, vault_id, &query_vec, caller_scope).await
         }
     } else {
         vec![]

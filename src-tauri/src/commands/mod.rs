@@ -1,3 +1,4 @@
+pub mod agent_def;
 pub mod ai;
 pub mod auth;
 pub mod conversation;

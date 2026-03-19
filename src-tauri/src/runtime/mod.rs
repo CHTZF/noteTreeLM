@@ -6,6 +6,7 @@ pub mod intent_classifier;
 pub mod memory_agent;
 pub mod planner;
 pub mod sub_agent;
+pub mod system_agent;
 pub mod tool_registry;
 pub mod transaction;
 pub mod types;

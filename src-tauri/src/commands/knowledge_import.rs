@@ -1,4 +1,4 @@
-use crate::{commands::ai::{ensure_server_running, read_api_key_sync, get_embedding}, db::{queries, surreal::SurrealDb}, error::AppError, state::AppState};
+use crate::{commands::ai::{ensure_server_running, read_api_key, get_embedding}, db::{queries, surreal::SurrealDb}, error::AppError, state::AppState};
 use chrono::Datelike as _;
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
@@ -1582,7 +1582,7 @@ async fn run_knowledge_query(
         .await.unwrap_or_default().unwrap_or_default();
     let model = queries::get_setting(db, "ai_model")
         .await.unwrap_or_default().unwrap_or_default();
-    let api_key = read_api_key_sync(&provider);
+    let api_key = read_api_key(&app_state.api_key_cache, &provider).await;
 
     // 6. Stream tokens via appropriate provider
     let client = reqwest::Client::new();
@@ -1715,9 +1715,19 @@ pub struct AgentSkillSuggestion {
     pub auto_tool_calls: Vec<String>, // 自動呼叫的工具，限 search_vault/read_note/list_structure
     #[serde(default = "default_passive")]
     pub injection_mode: String,   // "passive"（embedding 比對）或 "active"（永遠注入）
+    #[serde(default = "default_scope_all")]
+    pub agent_scope: String,      // "all" | "main" | "search" | "write" | "research" | "memory"
 }
 
 fn default_passive() -> String { "passive".to_string() }
+fn default_scope_all() -> String { "all".to_string() }
+
+fn valid_scope(s: &str) -> &str {
+    match s {
+        "main" | "search" | "write" | "research" | "memory" => s,
+        _ => "all",
+    }
+}
 
 /// 持久化後的技能規範（從 DB 讀取）
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1731,6 +1741,7 @@ pub struct AgentSkillRecord {
     pub auto_tool_calls: Vec<String>,
     pub is_active: bool,
     pub injection_mode: String,   // "passive" | "active"
+    pub agent_scope: String,      // "all" | "main" | "search" | "write" | "research" | "memory"
     pub trigger_count: i64,
     pub last_triggered_at: Option<i64>, // ms timestamp，None = 從未觸發
     pub created_at: i64,
@@ -2473,14 +2484,15 @@ pub async fn save_agent_skill(
     trigger: String,
     behavior: String,
     auto_tool_calls: Vec<String>,
-    #[allow(unused_variables)]
     injection_mode: Option<String>,
+    agent_scope: Option<String>,
 ) -> Result<AgentSkillRecord, AppError> {
     let vault_id = state.get_vault_id().await?;
     let db = &state.db;
     let skill_id = uuid::Uuid::new_v4().to_string();
     let mode = injection_mode.unwrap_or_else(|| "passive".to_string());
     let mode = if mode == "active" { "active" } else { "passive" };
+    let scope = valid_scope(agent_scope.as_deref().unwrap_or("all")).to_string();
 
     // 計算 trigger 向量（若 embedding server 未就緒則存 None）
     let emb_url: Option<String> = {
@@ -2505,9 +2517,9 @@ pub async fn save_agent_skill(
     db.query(
         "INSERT INTO agent_skills \
          (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
-          auto_tool_calls, is_active, injection_mode, trigger_count, trigger_embedding, created_at) \
+          auto_tool_calls, is_active, injection_mode, agent_scope, trigger_count, trigger_embedding, created_at) \
          VALUES ($sid, $vid, $kid, $title, $trigger, $behavior, \
-                 $tools, true, $mode, 0, $emb, time::now())"
+                 $tools, true, $mode, $scope, 0, $emb, time::now())"
     )
     .bind(("sid", skill_id.clone()))
     .bind(("vid", vault_id.clone()))
@@ -2517,6 +2529,7 @@ pub async fn save_agent_skill(
     .bind(("behavior", behavior.clone()))
     .bind(("tools", safe_tools.clone()))
     .bind(("mode", mode.to_string()))
+    .bind(("scope", scope.clone()))
     .bind(("emb", trigger_embedding))
     .await.map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -2531,6 +2544,7 @@ pub async fn save_agent_skill(
         auto_tool_calls: safe_tools,
         is_active: true,
         injection_mode: mode.to_string(),
+        agent_scope: scope,
         trigger_count: 0,
         last_triggered_at: None,
         created_at,
@@ -2661,12 +2675,14 @@ pub async fn update_agent_skill(
     behavior: String,
     auto_tool_calls: Vec<String>,
     injection_mode: Option<String>,
+    agent_scope: Option<String>,
 ) -> Result<(), AppError> {
     let vault_id = state.get_vault_id().await?;
     let db = &state.db;
 
     let mode = injection_mode.unwrap_or_else(|| "passive".to_string());
     let mode = if mode == "active" { "active" } else { "passive" };
+    let scope = valid_scope(agent_scope.as_deref().unwrap_or("all")).to_string();
 
     let allowed = ["search_vault", "read_note", "list_structure"];
     let safe_tools: Vec<String> = auto_tool_calls.into_iter()
@@ -2689,7 +2705,7 @@ pub async fn update_agent_skill(
 
     db.query(
         "UPDATE agent_skills SET title = $title, trigger = $trigger, behavior = $behavior, \
-         auto_tool_calls = $tools, injection_mode = $mode, trigger_embedding = $emb \
+         auto_tool_calls = $tools, injection_mode = $mode, agent_scope = $scope, trigger_embedding = $emb \
          WHERE vault_id = $vid AND skill_id = $sid"
     )
     .bind(("title", title))
@@ -2697,6 +2713,7 @@ pub async fn update_agent_skill(
     .bind(("behavior", behavior))
     .bind(("tools", safe_tools))
     .bind(("mode", mode.to_string()))
+    .bind(("scope", scope))
     .bind(("emb", trigger_embedding))
     .bind(("vid", vault_id))
     .bind(("sid", skill_id))
@@ -2727,6 +2744,8 @@ pub async fn list_agent_skills(
         is_active: bool,
         #[serde(default = "default_passive")]
         injection_mode: String,
+        #[serde(default = "default_scope_all")]
+        agent_scope: String,
         trigger_count: i64,
         last_triggered_at: Option<surrealdb::sql::Datetime>,
         created_at: surrealdb::sql::Datetime,
@@ -2734,6 +2753,7 @@ pub async fn list_agent_skills(
 
     let mut query = "SELECT skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
                      auto_tool_calls, is_active, injection_mode OR 'passive' AS injection_mode, \
+                     agent_scope OR 'all' AS agent_scope, \
                      trigger_count, last_triggered_at, created_at \
                      FROM agent_skills WHERE vault_id = $vid".to_string();
     if active_only { query.push_str(" AND is_active = true"); }
@@ -2760,6 +2780,7 @@ pub async fn list_agent_skills(
         auto_tool_calls: r.auto_tool_calls,
         is_active: r.is_active,
         injection_mode: r.injection_mode,
+        agent_scope: r.agent_scope,
         trigger_count: r.trigger_count,
         last_triggered_at: r.last_triggered_at.map(|dt| {
             dt.timestamp_millis()
@@ -2979,12 +3000,13 @@ tags: [concept]
         } else { None };
 
         let mode = if skill.injection_mode == "active" { "active" } else { "passive" };
+        let scope = valid_scope(&skill.agent_scope).to_string();
         let insert_result = db.query(
             "INSERT INTO agent_skills \
              (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
-              auto_tool_calls, is_active, injection_mode, trigger_count, trigger_embedding, created_at) \
+              auto_tool_calls, is_active, injection_mode, agent_scope, trigger_count, trigger_embedding, created_at) \
              VALUES ($sid, $vid, $kid, $title, $trigger, $behavior, \
-                     $tools, false, $mode, 0, $emb, time::now())"
+                     $tools, false, $mode, $scope, 0, $emb, time::now())"
         )
         .bind(("sid", skill_id.clone()))
         .bind(("vid", vault_id.clone()))
@@ -2994,6 +3016,7 @@ tags: [concept]
         .bind(("behavior", skill.behavior.clone()))
         .bind(("tools", safe_tools.clone()))
         .bind(("mode", mode.to_string()))
+        .bind(("scope", scope.clone()))
         .bind(("emb", trigger_embedding))
         .await;
         if let Err(e) = insert_result {
@@ -3010,6 +3033,7 @@ tags: [concept]
             auto_tool_calls: safe_tools,
             is_active: false,
             injection_mode: skill.injection_mode.clone(),
+            agent_scope: scope,
             trigger_count: 0,
             last_triggered_at: None,
             created_at: now_ms,
@@ -3203,17 +3227,19 @@ auto_tool_calls 只能包含：search_vault、read_note、list_structure（或�
         } else { None };
 
         let mode = if skill.injection_mode == "active" { "active" } else { "passive" };
+        let scope = valid_scope(&skill.agent_scope).to_string();
         let _ = db.query(
             "INSERT INTO agent_skills \
              (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
-              auto_tool_calls, is_active, injection_mode, trigger_count, trigger_embedding, created_at) \
+              auto_tool_calls, is_active, injection_mode, agent_scope, trigger_count, trigger_embedding, created_at) \
              VALUES ($sid, $vid, $kid, $title, $trigger, $behavior, \
-                     $tools, false, $mode, 0, $emb, time::now())"
+                     $tools, false, $mode, $scope, 0, $emb, time::now())"
         )
         .bind(("sid", skill_id.clone())).bind(("vid", vault_id.clone()))
         .bind(("kid", item_id.clone())).bind(("title", skill.title.clone()))
         .bind(("trigger", skill.trigger.clone())).bind(("behavior", skill.behavior.clone()))
-        .bind(("tools", safe_tools.clone())).bind(("mode", mode.to_string())).bind(("emb", trigger_embedding))
+        .bind(("tools", safe_tools.clone())).bind(("mode", mode.to_string()))
+        .bind(("scope", scope.clone())).bind(("emb", trigger_embedding))
         .await;
 
         saved_skills.push(AgentSkillRecord {
@@ -3226,6 +3252,7 @@ auto_tool_calls 只能包含：search_vault、read_note、list_structure（或�
             auto_tool_calls: safe_tools,
             is_active: false,
             injection_mode: skill.injection_mode.clone(),
+            agent_scope: scope,
             trigger_count: 0,
             last_triggered_at: None,
             created_at: now_ms,
@@ -3549,7 +3576,7 @@ async fn run_kb_query(
     // 4. AI streaming
     let provider = queries::get_setting(db, "ai_provider").await.unwrap_or_default().unwrap_or_default();
     let model = queries::get_setting(db, "ai_model").await.unwrap_or_default().unwrap_or_default();
-    let api_key = read_api_key_sync(&provider);
+    let api_key = read_api_key(&app_state.api_key_cache, &provider).await;
 
     let response = if provider == "anthropic" {
         let body = serde_json::json!({

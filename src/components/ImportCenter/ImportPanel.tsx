@@ -7,7 +7,7 @@ import {
   faBookmark, faArrowLeft, faExternalLinkAlt, faLightbulb, faXmark,
   faPen, faCheck, faBolt,
 } from '@fortawesome/free-solid-svg-icons'
-import type { AgentSkill } from '../../types/models'
+import type { AgentSkill, AgentScope } from '../../types/models'
 import SkillStatsPanel from './SkillStats'
 import { toast } from '../common/Toast'
 import { useKnowledgeChatStore, type KBMessage, type KnowledgeRef } from '../../stores/knowledgeChatStore'
@@ -716,10 +716,10 @@ export default function ImportPanel() {
                     setDetailSkills(prev => prev.filter(s => s.skill_id !== id))
                     window.dispatchEvent(new CustomEvent('skills-changed'))
                   }}
-                  onUpdate={async (id, title, trigger, behavior, autoToolCalls, injectionMode) => {
-                    await invoke('update_agent_skill', { skillId: id, title, trigger, behavior, autoToolCalls, injectionMode })
+                  onUpdate={async (id, title, trigger, behavior, autoToolCalls, injectionMode, agentScope) => {
+                    await invoke('update_agent_skill', { skillId: id, title, trigger, behavior, autoToolCalls, injectionMode, agentScope })
                     setDetailSkills(prev => prev.map(s =>
-                      s.skill_id === id ? { ...s, title, trigger, behavior, auto_tool_calls: autoToolCalls, injection_mode: injectionMode as 'passive' | 'active' } : s
+                      s.skill_id === id ? { ...s, title, trigger, behavior, auto_tool_calls: autoToolCalls, injection_mode: injectionMode as 'passive' | 'active', agent_scope: agentScope } : s
                     ))
                     window.dispatchEvent(new CustomEvent('skills-changed'))
                   }}
@@ -750,6 +750,7 @@ export function SkillsHub() {
   const [newBehavior, setNewBehavior] = useState('')
   const [newTools, setNewTools] = useState<string[]>([])
   const [newInjectionMode, setNewInjectionMode] = useState<'passive' | 'active'>('passive')
+  const [newAgentScope, setNewAgentScope] = useState<AgentScope>('all')
 
   const loadSkills = useCallback(() => {
     invoke<AgentSkill[]>('list_agent_skills', { activeOnly: false })
@@ -778,10 +779,11 @@ export function SkillsHub() {
         behavior: newBehavior.trim(),
         autoToolCalls: newTools,
         injectionMode: newInjectionMode,
+        agentScope: newAgentScope,
       })
       setSkills(prev => [skill, ...prev])
       setShowCreate(false)
-      setNewTitle(''); setNewTrigger(''); setNewBehavior(''); setNewTools([]); setNewInjectionMode('passive')
+      setNewTitle(''); setNewTrigger(''); setNewBehavior(''); setNewTools([]); setNewInjectionMode('passive'); setNewAgentScope('all')
     } catch (e) {
       toast.error('建立失敗：' + fmtError(e))
     } finally {
@@ -789,10 +791,10 @@ export function SkillsHub() {
     }
   }
 
-  const handleUpdate = async (id: string, title: string, trigger: string, behavior: string, autoToolCalls: string[], injectionMode: string) => {
-    await invoke('update_agent_skill', { skillId: id, title, trigger, behavior, autoToolCalls, injectionMode })
+  const handleUpdate = async (id: string, title: string, trigger: string, behavior: string, autoToolCalls: string[], injectionMode: string, agentScope: AgentScope) => {
+    await invoke('update_agent_skill', { skillId: id, title, trigger, behavior, autoToolCalls, injectionMode, agentScope })
     setSkills(prev => prev.map(s =>
-      s.skill_id === id ? { ...s, title, trigger, behavior, auto_tool_calls: autoToolCalls, injection_mode: injectionMode as 'passive' | 'active' } : s
+      s.skill_id === id ? { ...s, title, trigger, behavior, auto_tool_calls: autoToolCalls, injection_mode: injectionMode as 'passive' | 'active', agent_scope: agentScope } : s
     ))
   }
 
@@ -860,6 +862,20 @@ export function SkillsHub() {
                   onChange={() => setNewInjectionMode(mode)}
                 />
                 {mode === 'passive' ? '被動取用（相似度比對）' : '主動注入（每次對話）'}
+              </label>
+            ))}
+          </div>
+          <div className="import-panel-v2__skill-edit-tools" style={{ marginTop: 6 }}>
+            <span className="import-panel-v2__skill-edit-label">適用範圍</span>
+            {ALL_SCOPES.map(scope => (
+              <label key={scope} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11 }}>
+                <input
+                  type="radio"
+                  name="new-agent-scope"
+                  checked={newAgentScope === scope}
+                  onChange={() => setNewAgentScope(scope)}
+                />
+                <span style={{ color: SCOPE_COLORS[scope] }}>{SCOPE_LABELS[scope]}</span>
               </label>
             ))}
           </div>
@@ -970,6 +986,18 @@ function fmtLastTriggered(ts: number | null): string | null {
 }
 
 const ALLOWED_TOOLS = ['search_vault', 'read_note', 'list_structure'] as const
+const ALL_SCOPES: AgentScope[] = ['all', 'main', 'search', 'write', 'research', 'memory']
+const SCOPE_LABELS: Record<AgentScope, string> = {
+  all: '全體', main: '主 Agent', search: '搜尋', write: '寫入', research: '研究', memory: '記憶',
+}
+const SCOPE_COLORS: Record<AgentScope, string> = {
+  all: 'var(--color-text-muted)',
+  main: 'var(--color-accent)',
+  search: '#22c55e',
+  write: '#f59e0b',
+  research: '#8b5cf6',
+  memory: '#ec4899',
+}
 
 function SkillCard({
   skill,
@@ -980,7 +1008,7 @@ function SkillCard({
   skill: AgentSkill
   onToggle: (id: string, active: boolean) => Promise<void>
   onDelete: (id: string) => Promise<void>
-  onUpdate?: (id: string, title: string, trigger: string, behavior: string, autoToolCalls: string[], injectionMode: string) => Promise<void>
+  onUpdate?: (id: string, title: string, trigger: string, behavior: string, autoToolCalls: string[], injectionMode: string, agentScope: AgentScope) => Promise<void>
 }) {
   const [toggling, setToggling] = useState(false)
   const [editing, setEditing] = useState(false)
@@ -990,6 +1018,7 @@ function SkillCard({
   const [editBehavior, setEditBehavior] = useState(skill.behavior)
   const [editTools, setEditTools] = useState<string[]>(skill.auto_tool_calls)
   const [editInjectionMode, setEditInjectionMode] = useState<'passive' | 'active'>(skill.injection_mode ?? 'passive')
+  const [editAgentScope, setEditAgentScope] = useState<AgentScope>(skill.agent_scope ?? 'all')
 
   const daysSinceTrigger = skill.last_triggered_at
     ? Math.floor((Date.now() - skill.last_triggered_at) / 86400000)
@@ -1001,7 +1030,7 @@ function SkillCard({
     if (!onUpdate) return
     setSaving(true)
     try {
-      await onUpdate(skill.skill_id, editTitle, editTrigger, editBehavior, editTools, editInjectionMode)
+      await onUpdate(skill.skill_id, editTitle, editTrigger, editBehavior, editTools, editInjectionMode, editAgentScope)
       setEditing(false)
     } finally {
       setSaving(false)
@@ -1103,6 +1132,20 @@ function SkillCard({
               </label>
             ))}
           </div>
+          <div className="import-panel-v2__skill-edit-tools" style={{ marginTop: 6 }}>
+            <span className="import-panel-v2__skill-edit-label">適用範圍</span>
+            {ALL_SCOPES.map(scope => (
+              <label key={scope} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11 }}>
+                <input
+                  type="radio"
+                  name={`scope-${skill.skill_id}`}
+                  checked={editAgentScope === scope}
+                  onChange={() => setEditAgentScope(scope)}
+                />
+                <span style={{ color: SCOPE_COLORS[scope] }}>{SCOPE_LABELS[scope]}</span>
+              </label>
+            ))}
+          </div>
           <div className="import-panel-v2__skill-edit-footer">
             <button className="import-panel-v2__skill-save-btn" onClick={handleSaveEdit} disabled={saving}>
               {saving ? <FontAwesomeIcon icon={faSpinner} spin /> : <><FontAwesomeIcon icon={faCheck} /> 儲存</>}
@@ -1114,6 +1157,7 @@ function SkillCard({
               setEditBehavior(skill.behavior)
               setEditTools(skill.auto_tool_calls)
               setEditInjectionMode(skill.injection_mode ?? 'passive')
+              setEditAgentScope(skill.agent_scope ?? 'all')
             }}>取消</button>
           </div>
         </div>
@@ -1124,7 +1168,7 @@ function SkillCard({
           {skill.auto_tool_calls.length > 0 && (
             <div className="import-panel-v2__skill-tools">自動工具：{skill.auto_tool_calls.join('、')}</div>
           )}
-          <div style={{ marginTop: 4 }}>
+          <div style={{ marginTop: 4, display: 'flex', gap: 4, flexWrap: 'wrap' }}>
             <span style={{
               fontSize: 10, padding: '1px 6px', borderRadius: 8,
               background: skill.injection_mode === 'active' ? 'rgba(99,102,241,0.15)' : 'var(--color-bg-overlay)',
@@ -1133,6 +1177,16 @@ function SkillCard({
             }}>
               {skill.injection_mode === 'active' ? '⚡ 主動注入' : '🔍 被動取用'}
             </span>
+            {(skill.agent_scope ?? 'all') !== 'all' && (
+              <span style={{
+                fontSize: 10, padding: '1px 6px', borderRadius: 8,
+                background: 'var(--color-bg-overlay)',
+                color: SCOPE_COLORS[skill.agent_scope ?? 'all'],
+                border: `1px solid ${SCOPE_COLORS[skill.agent_scope ?? 'all']}`,
+              }}>
+                {SCOPE_LABELS[skill.agent_scope ?? 'all']}
+              </span>
+            )}
           </div>
           {isStale && (
             <div className="import-panel-v2__skill-health-warn">

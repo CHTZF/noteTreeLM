@@ -392,18 +392,37 @@ pub async fn set_last_chat_conversation_id(
 }
 
 #[tauri::command]
-pub async fn get_api_key(provider: String) -> Result<Option<String>, AppError> {
+pub async fn get_api_key(
+    provider: String,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, AppError> {
+    // 先查記憶體快取
+    {
+        let cache = state.api_key_cache.lock().await;
+        if let Some(key) = cache.get(&provider) {
+            return Ok(if key.is_empty() { None } else { Some(key.clone()) });
+        }
+    }
+    // 快取 miss → 讀 keychain
     let entry = keyring::Entry::new("com.notetreelm.app", &provider)
         .map_err(|e| AppError::Settings(e.to_string()))?;
-    match entry.get_password() {
-        Ok(key) => Ok(Some(key)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(AppError::Settings(e.to_string())),
-    }
+    let result = match entry.get_password() {
+        Ok(key) => Some(key),
+        Err(keyring::Error::NoEntry) => None,
+        Err(e) => return Err(AppError::Settings(e.to_string())),
+    };
+    // 寫入快取（空字串代表「無 key」，避免下次再查 keychain）
+    let cached = result.clone().unwrap_or_default();
+    state.api_key_cache.lock().await.insert(provider, cached);
+    Ok(result)
 }
 
 #[tauri::command]
-pub async fn set_api_key(provider: String, key: String) -> Result<(), AppError> {
+pub async fn set_api_key(
+    provider: String,
+    key: String,
+    state: State<'_, AppState>,
+) -> Result<(), AppError> {
     let entry = keyring::Entry::new("com.notetreelm.app", &provider)
         .map_err(|e| AppError::Settings(e.to_string()))?;
     if key.is_empty() {
@@ -414,6 +433,8 @@ pub async fn set_api_key(provider: String, key: String) -> Result<(), AppError> 
         entry.set_password(&key)
             .map_err(|e| AppError::Settings(e.to_string()))?;
     }
+    // 同步更新快取
+    state.api_key_cache.lock().await.insert(provider, key);
     Ok(())
 }
 
