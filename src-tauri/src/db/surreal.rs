@@ -10,7 +10,7 @@ pub type SurrealDb = Arc<Surreal<Db>>;
 
 /// Schema 版本：每次修改 apply_schema 或 insert_default_settings 時遞增，
 /// 確保已安裝的客戶端會重新執行一次 DDL，之後快取跳過。
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 /// 初始化 SurrealDB（embedded SurrealKV）
 /// 所有資料存於 app_data_dir/surrealdb/
@@ -332,6 +332,21 @@ async fn apply_schema(db: &Surreal<Db>) -> crate::error::Result<()> {
         "DEFINE INDEX IF NOT EXISTS idx_agent_skills_vault  ON agent_skills FIELDS vault_id, skill_id UNIQUE;",
         "DEFINE INDEX IF NOT EXISTS idx_agent_skills_ki     ON agent_skills FIELDS vault_id, knowledge_item_id;",
         "DEFINE INDEX IF NOT EXISTS idx_agent_skills_active ON agent_skills FIELDS vault_id, is_active;",
+
+        // ── Agent Tools Registry（動態工具發現，供 find_relevant_tools 使用） ──
+        "DEFINE TABLE IF NOT EXISTS agent_tools SCHEMAFULL;",
+        "DEFINE FIELD IF NOT EXISTS tool_id     ON agent_tools TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS name        ON agent_tools TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS description ON agent_tools TYPE string DEFAULT '';",
+        "DEFINE FIELD IF NOT EXISTS schema_json ON agent_tools TYPE string DEFAULT '';",
+        "DEFINE FIELD IF NOT EXISTS embedding   ON agent_tools TYPE option<array<float>>;",
+        "DEFINE FIELD IF NOT EXISTS is_active   ON agent_tools TYPE bool DEFAULT true;",
+        "DEFINE FIELD IF NOT EXISTS is_builtin  ON agent_tools TYPE bool DEFAULT true;",
+        "DEFINE FIELD IF NOT EXISTS created_at  ON agent_tools TYPE datetime DEFAULT time::now();",
+        "DEFINE INDEX IF NOT EXISTS idx_agent_tools_name   ON agent_tools FIELDS name UNIQUE;",
+        "DEFINE INDEX IF NOT EXISTS idx_agent_tools_active ON agent_tools FIELDS is_active;",
+        // BM25 FTS fallback（無 embedding 時按 name+description 排序）
+        "DEFINE INDEX IF NOT EXISTS ft_agent_tools ON agent_tools FIELDS name, description SEARCH ANALYZER note_analyzer BM25;",
 
         // ── skill_usage_log：每次技能觸發記錄一筆，供趨勢圖使用 ──────────────
         "DEFINE TABLE IF NOT EXISTS skill_usage_log SCHEMAFULL;",

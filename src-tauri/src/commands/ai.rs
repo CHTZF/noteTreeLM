@@ -605,18 +605,28 @@ pub async fn invoke_agent(
     };
     let skill_emb_url = reg_emb_url.clone(); // 保留一份給 skill pre-pass 使用
     let search_method_tx = Arc::clone(&state.search_method_tx);
+
+    // 延遲繫結 handle（供 spawn_sub_agent 工具使用）
+    let llm_fn_late = crate::tools::make_late_llm_fn();
+    let registry_late: Arc<tokio::sync::Mutex<Option<Arc<ToolRegistry>>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
     let registry = if !vault_path.is_empty() && vault_id_opt.is_some() {
         crate::tools::build_vault_registry(
             vault_path.clone(),
             vault_db.clone(),
             vault_id_opt.clone().unwrap_or_default(),
             app.clone(),
-            reg_emb_url,
+            reg_emb_url.clone(),
             search_method_tx,
+            Arc::clone(&llm_fn_late),
+            Arc::clone(&registry_late),
         )
     } else {
         Arc::new(ToolRegistry::new())
     };
+    // 設定延遲繫結的 registry（spawn_sub_agent 使用）
+    *registry_late.lock().await = Some(Arc::clone(&registry));
 
     // 5. llm_fn：執行一輪 LLM 串流，返回 LlmRound
     //    tools_opt: None = 不傳工具；Some(json) = 傳指定工具列表（由 Agent 決定）
@@ -652,6 +662,8 @@ pub async fn invoke_agent(
             Ok(LlmRound { full_text: result.full_text, tool_calls })
         })
     });
+    // 設定延遲繫結的 llm_fn（spawn_sub_agent 使用）
+    *llm_fn_late.lock().await = Some(llm_fn.clone());
 
     // 6. confirm_write_fn：設定 oneshot channel，等待 confirm_write_tool 命令
     let write_tx = Arc::clone(&state.write_confirm_tx);
@@ -687,8 +699,16 @@ pub async fn invoke_agent(
     // 8. 建立 Agent，執行
     //    vault_tools: Agent 在 ToolUse/Chat 路徑使用（None = 無 vault 工具）
     //    Intent::Memory 路徑由 Agent 自行注入 MemoryAgent::tools_definition()
+    //    動態工具選取：依查詢 embedding 找最相關的 top-8 工具，避免 context 爆炸。
+    //    若無 embedding server 則 fallback 回傳全部工具。
     let vault_tools_opt = if !vault_path.is_empty() && vault_id_opt.is_some() {
-        Some(vault_tools())
+        let tools = find_relevant_tools_for_query(
+            &vault_db,
+            &input,
+            reg_emb_url.as_deref(),
+            8,
+        ).await;
+        Some(tools)
     } else {
         None
     };
@@ -1664,7 +1684,7 @@ pub async fn tool_create_agent_skill(
 }
 
 /// 工具定義（OpenAI function calling 格式）
-fn vault_tools() -> serde_json::Value {
+pub fn vault_tools() -> serde_json::Value {
     serde_json::json!([
         {
             "type": "function",
@@ -1889,8 +1909,182 @@ fn vault_tools() -> serde_json::Value {
                     "required": ["title", "trigger", "behavior"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "spawn_sub_agent",
+                "description": "委派子任務給專門的 sub-agent 執行，避免 Main Agent context 爆炸。\
+當任務屬於特定領域（搜尋、寫入、研究、記憶分析）時使用。\
+sub-agent 在獨立有界 context 中執行，完成後回傳結果摘要。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["search", "write", "research", "memory"],
+                            "description": "sub-agent 種類：search=搜尋筆記、write=建立/修改筆記、research=網路研究、memory=記憶分析"
+                        },
+                        "task": {
+                            "type": "string",
+                            "description": "完整的子任務描述，包含所有必要資訊"
+                        },
+                        "context": {
+                            "type": "string",
+                            "description": "（可選）提供給 sub-agent 的背景資訊或約束條件"
+                        }
+                    },
+                    "required": ["kind", "task"]
+                }
+            }
         }
     ])
+}
+
+// ── Tool Registry 工具 ─────────────────────────────────────────────────────
+
+/// 余弦相似度（兩向量長度不同或為空時回傳 0.0）
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 { return 0.0; }
+    dot / (norm_a * norm_b)
+}
+
+/// 將 vault_tools() 清單種入 agent_tools 表（冪等）。
+/// 有 emb_url 時同步計算 embedding；無則留 NULL，之後可補填。
+pub async fn seed_agent_tools(db: &SurrealDb, emb_url: Option<&str>) {
+    let tools_json = vault_tools();
+    let client = reqwest::Client::new();
+
+    let tools = match tools_json.as_array() {
+        Some(v) => v.clone(),
+        None => return,
+    };
+
+    for tool in &tools {
+        let func = &tool["function"];
+        let name = func["name"].as_str().unwrap_or("").to_string();
+        if name.is_empty() { continue; }
+        let description = func["description"].as_str().unwrap_or("").to_string();
+        let schema = serde_json::to_string(tool).unwrap_or_default();
+
+        // embedding（有伺服器時計算，失敗或無伺服器留 None）
+        let embedding: Option<Vec<f32>> = if let Some(url) = emb_url {
+            let emb = get_embedding(&client, url, &description).await;
+            if emb.is_empty() { None } else { Some(emb) }
+        } else {
+            None
+        };
+
+        // 用 name 作為固定 record ID（確保唯一且可以 UPSERT）
+        let _ = db.query(
+            "INSERT INTO agent_tools (tool_id, name, description, schema_json, is_active, is_builtin)
+             VALUES ($name, $name, $description, $schema_json, true, true)
+             ON DUPLICATE KEY UPDATE description = $description, schema_json = $schema_json;"
+        )
+        .bind(("name", name.clone()))
+        .bind(("description", description.clone()))
+        .bind(("schema_json", schema))
+        .await;
+
+        // 若有 embedding 且尚未設定，補填
+        if let Some(ref emb) = embedding {
+            let _ = db.query(
+                "UPDATE agent_tools SET embedding = $emb WHERE name = $name AND embedding = NONE;"
+            )
+            .bind(("emb", emb.clone()))
+            .bind(("name", name))
+            .await;
+        }
+    }
+}
+
+/// 依查詢向量從 agent_tools 表找出最相關的 top_k 個工具。
+/// - 有 embedding 時：余弦相似度排序
+/// - 無 embedding 時：回傳全部 (fallback = vault_tools())
+/// 永遠包含 plan_announce 工具（寫入確認機制必需）。
+pub async fn find_relevant_tools_for_query(
+    db: &SurrealDb,
+    query: &str,
+    emb_url: Option<&str>,
+    top_k: usize,
+) -> serde_json::Value {
+    // 必須永遠包含的工具（功能關鍵，不能被過濾掉）
+    const ALWAYS_INCLUDE: &[&str] = &["plan_announce"];
+
+    // ── 嘗試 embedding 相似度搜尋 ─────────────────────────────────
+    if let Some(url) = emb_url {
+        let client = reqwest::Client::new();
+        let query_emb = get_embedding(&client, url, query).await;
+        if !query_emb.is_empty() {
+            #[derive(serde::Deserialize)]
+            struct ToolRow {
+                name: String,
+                schema_json: String,
+                embedding: Option<Vec<f32>>,
+            }
+
+            let rows: Vec<ToolRow> = db
+                .query("SELECT name, schema_json, embedding FROM agent_tools WHERE is_active = true")
+                .await
+                .and_then(|mut r| r.take(0))
+                .unwrap_or_default();
+
+            // 只對有 embedding 的 row 計算分數
+            let mut scored: Vec<(f32, &ToolRow)> = rows
+                .iter()
+                .filter_map(|row| {
+                    row.embedding.as_ref().map(|emb| {
+                        (cosine_similarity(&query_emb, emb), row)
+                    })
+                })
+                .collect();
+
+            if !scored.is_empty() {
+                scored.sort_by(|a, b| {
+                    b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                let mut result: Vec<serde_json::Value> = Vec::new();
+                let mut included: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+
+                // 先加入必須工具
+                for row in &rows {
+                    if ALWAYS_INCLUDE.contains(&row.name.as_str()) {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&row.schema_json) {
+                            result.push(v);
+                            included.insert(row.name.clone());
+                        }
+                    }
+                }
+
+                // 再加入 top-K（略過已包含）
+                let mut count = 0;
+                for (_, row) in &scored {
+                    if count >= top_k { break; }
+                    if included.contains(&row.name) { continue; }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&row.schema_json) {
+                        result.push(v);
+                        included.insert(row.name.clone());
+                        count += 1;
+                    }
+                }
+
+                if !result.is_empty() {
+                    return serde_json::Value::Array(result);
+                }
+            }
+        }
+    }
+
+    // ── Fallback：回傳全部工具 ─────────────────────────────────────
+    vault_tools()
 }
 
 /// 驗證相對路徑安全性（防止路徑穿越），返回絕對路徑

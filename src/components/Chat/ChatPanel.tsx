@@ -301,6 +301,49 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     }
   }, []) // addLog 是 Zustand stable reference，不需要作為 dep
 
+  // 持續監聽 sub_agent:* 事件 → 寫入 debug
+  useEffect(() => {
+    let cancelled = false
+    const unlistens: (() => void)[] = []
+
+    const setup = async () => {
+      const { addLog: dbgLog } = useDebugStore.getState()
+
+      const fn1 = await listen<{ sub_session_id: string; kind: string; task: string }>(
+        'sub_agent:start', (e) => {
+          if (cancelled) return
+          dbgLog('sub-agent', 'info', `🤖 [${e.payload.kind}] 開始：${e.payload.task.slice(0, 80)}`)
+        }
+      )
+      const fn2 = await listen<{ sub_session_id: string; kind: string; display: string }>(
+        'sub_agent:tool_call', (e) => {
+          if (cancelled) return
+          dbgLog('sub-agent', 'info', e.payload.display)
+        }
+      )
+      const fn3 = await listen<{ sub_session_id: string; kind: string; result_preview: string }>(
+        'sub_agent:done', (e) => {
+          if (cancelled) return
+          dbgLog('sub-agent', 'info', `✅ [${e.payload.kind}] 完成`)
+        }
+      )
+      const fn4 = await listen<{ sub_session_id: string; error: string }>(
+        'sub_agent:error', (e) => {
+          if (cancelled) return
+          dbgLog('sub-agent', 'error', `❌ sub-agent 錯誤：${e.payload.error}`)
+        }
+      )
+      if (cancelled) { fn1(); fn2(); fn3(); fn4(); return }
+      unlistens.push(fn1, fn2, fn3, fn4)
+    }
+
+    setup()
+    return () => {
+      cancelled = true
+      unlistens.forEach(fn => fn())
+    }
+  }, [])
+
   // 自動捲動到底部
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })

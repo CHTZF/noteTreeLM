@@ -14,21 +14,26 @@ use tokio::sync::Mutex;
 use crate::commands::ai::{
     resolve_vault_path, tool_create_folder, tool_create_note, tool_list_structure,
     tool_read_note, tool_search_vault, tool_update_note, call_external_ai_via_db,
-    tool_list_recent_conversations, tool_create_agent_skill,
+    tool_list_recent_conversations, tool_create_agent_skill, vault_tools,
 };
 use crate::commands::knowledge_import::tool_web_search;
 use crate::db::surreal::SurrealDb;
 use crate::runtime::memory_agent::{add_memory_rule_to_db, tool_query_memory};
+use crate::runtime::sub_agent::run_sub_agent;
 use crate::runtime::tool_registry::ToolRegistry;
-use crate::runtime::types::Tool;
+use crate::runtime::types::{LlmFn, Tool};
 
 /// 建立包含所有 vault 工具的 ToolRegistry。
 ///
 /// # 參數
-/// - `vault_path`: Vault 根目錄絕對路徑
-/// - `vault_id`:   Vault ID（= vault_path，SurrealDB 過濾條件）
-/// - `vault_db`:   SurrealDB 連線（search / memory 工具使用）
-/// - `app`:        Tauri AppHandle（search 工具 emit debug 事件使用）
+/// - `vault_path`:    Vault 根目錄絕對路徑
+/// - `vault_id`:      Vault ID
+/// - `vault_db`:      SurrealDB 連線
+/// - `app`:           Tauri AppHandle
+/// - `emb_url`:       Embedding server URL（可選）
+/// - `search_method_tx`: 搜尋方式選擇 channel
+/// - `llm_fn_late`:   延遲繫結的 LlmFn（invoke_agent 在建完後設定）
+/// - `registry_late`: 延遲繫結的 Arc<ToolRegistry>（Arc::new(registry) 後設定）
 pub fn build_vault_registry(
     vault_path: String,
     vault_db: SurrealDb,
@@ -36,6 +41,8 @@ pub fn build_vault_registry(
     app: AppHandle,
     emb_url: Option<String>,
     search_method_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+    llm_fn_late: Arc<Mutex<Option<LlmFn>>>,
+    registry_late: Arc<Mutex<Option<Arc<ToolRegistry>>>>,
 ) -> Arc<ToolRegistry> {
     let mut registry = ToolRegistry::new();
 
@@ -427,5 +434,69 @@ pub fn build_vault_registry(
         );
     }
 
+    // spawn_sub_agent — 委派子任務給專門的 Sub-Agent 執行
+    // 使用延遲繫結 LlmFn + Registry（invoke_agent 在 Arc::new(registry) 後設定）
+    {
+        let app_sa   = app.clone();
+        let llm_late = Arc::clone(&llm_fn_late);
+        let reg_late = Arc::clone(&registry_late);
+
+        registry.register(
+            "spawn_sub_agent".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let kind    = args["kind"].as_str().unwrap_or("custom").to_string();
+                    let task    = args["task"].as_str().unwrap_or("").to_string();
+                    let context = args["context"].as_str().unwrap_or("").to_string();
+                    let llm_late = Arc::clone(&llm_late);
+                    let reg_late = Arc::clone(&reg_late);
+                    let app = app_sa.clone();
+                    Box::pin(async move {
+                        let llm_fn = {
+                            let guard = llm_late.lock().await;
+                            match guard.clone() {
+                                Some(f) => f,
+                                None => return Err("spawn_sub_agent: llm_fn 尚未初始化".to_string()),
+                            }
+                        };
+                        let sub_registry = {
+                            let guard = reg_late.lock().await;
+                            match guard.clone() {
+                                Some(r) => r,
+                                None => return Err("spawn_sub_agent: registry 尚未初始化".to_string()),
+                            }
+                        };
+                        let sub_session_id = uuid::Uuid::new_v4().to_string();
+                        let tools_json = vault_tools();
+                        let emit: crate::runtime::types::EmitEventFn = {
+                            let app = app.clone();
+                            Arc::new(move |event: String, payload: Value| {
+                                let _ = tauri::Emitter::emit(&app, &event, payload);
+                            })
+                        };
+                        let result = run_sub_agent(
+                            sub_session_id,
+                            String::new(),
+                            &kind,
+                            &task,
+                            &context,
+                            tools_json,
+                            sub_registry,
+                            llm_fn,
+                            emit,
+                        ).await;
+                        Ok(Value::String(result))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
     Arc::new(registry)
+}
+
+/// 建立延遲繫結 LlmFn 的 Arc（供 build_vault_registry + invoke_agent 共用）
+pub fn make_late_llm_fn() -> Arc<Mutex<Option<LlmFn>>> {
+    Arc::new(Mutex::new(None))
 }

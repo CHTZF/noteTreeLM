@@ -15,8 +15,8 @@ use commands::{
          save_memory_session, query_memory, add_memory_rule,
          get_memory_rules, delete_memory_rule, confirm_write_tool,
          test_vault_tool, run_tool_pipeline, cancel_tool_test, cancel_agent, invoke_agent,
-         set_note_status,
-         confirm_search_method},
+         set_note_status, confirm_search_method,
+         seed_agent_tools},
     conversation::{create_conversation, list_conversations, get_conversation,
                    delete_conversation, update_conversation_title, save_conversation_messages},
     download::*, graph::*, import::*, search::*,
@@ -148,6 +148,17 @@ pub fn run() {
                     warmup_llama_server(&state, &app_handle),
                     warmup_embedding_server(&state, &app_handle),
                 );
+
+                // Tool Registry 種子（確保 agent_tools 表有預設工具）
+                // 先用無 embedding 版本（快速），有 embedding server 時再補 embedding
+                {
+                    let db_seed = state.db.clone();
+                    let emb_url: Option<String> = {
+                        let port = *state.embedding_actual_port.lock().await;
+                        port.map(|p| format!("http://127.0.0.1:{}", p))
+                    };
+                    seed_agent_tools(&db_seed, emb_url.as_deref()).await;
+                }
 
                 // 自動更新：掃描開啟 auto_update 的 import sessions
                 auto_check_all_sessions(&app_handle, &state).await;

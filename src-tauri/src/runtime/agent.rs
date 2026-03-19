@@ -231,6 +231,10 @@ impl Agent {
         // plan_announce 是否已被呼叫（防止 note-open pending plan 覆蓋寫入 pending plan）
         let mut plan_announced = false;
 
+        // Context overflow 閾值：約 6000 tokens（粗估 CJK 約 2 char/token，英文 4 char/token）
+        // 超過時保留 system + 最近 4 條訊息，其餘壓縮為摘要注入
+        const OVERFLOW_CHARS: usize = 20_000;
+
         'outer: for _round in 0..5 {
             // 每輪前檢查取消旗標
             if cancel.load(Ordering::Relaxed) {
@@ -238,6 +242,51 @@ impl Agent {
                 self.emit_tx(&session_id, "cancel", &tx).await;
                 self.clear_session().await;
                 return Ok(String::new());
+            }
+
+            // ── Context overflow 偵測 ─────────────────────────────────
+            {
+                let total_chars: usize = messages.iter()
+                    .map(|m| m["content"].as_str().unwrap_or("").len())
+                    .sum();
+                if total_chars > OVERFLOW_CHARS && messages.len() > 6 {
+                    // 壓縮中間歷史：保留 system + 最後 4 條，其餘替換為摘要
+                    let system_msg = messages.first().cloned();
+                    let tail: Vec<Value> = messages.iter().rev().take(4).cloned().collect::<Vec<_>>()
+                        .into_iter().rev().collect();
+                    let middle: Vec<Value> = messages
+                        .iter()
+                        .skip(1)
+                        .take(messages.len().saturating_sub(5))
+                        .cloned()
+                        .collect();
+                    let summary_text = middle.iter()
+                        .filter_map(|m| {
+                            let role = m["role"].as_str().unwrap_or("");
+                            let content = m["content"].as_str().unwrap_or("");
+                            if content.is_empty() { None }
+                            else { Some(format!("[{}]: {}…", role, &content.chars().take(100).collect::<String>())) }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    let mut new_messages = Vec::new();
+                    if let Some(sys) = system_msg { new_messages.push(sys); }
+                    if !summary_text.is_empty() {
+                        new_messages.push(serde_json::json!({
+                            "role": "system",
+                            "content": format!("[對話歷史摘要（{} 條訊息已壓縮）]\n{}", middle.len(), summary_text)
+                        }));
+                    }
+                    new_messages.extend(tail);
+                    messages = new_messages;
+
+                    (self.emit)("sub_agent:context_overflow".into(), serde_json::json!({
+                        "session_id": session_id,
+                        "compressed_messages": middle.len(),
+                        "remaining_chars": messages.iter().map(|m| m["content"].as_str().unwrap_or("").len()).sum::<usize>(),
+                    }));
+                }
             }
 
             // LLM 串流（token 由 llm_fn 內部 emit llm:token）
@@ -599,6 +648,7 @@ impl Agent {
             "add_memory_rule" => format!("🧠 新增記憶規則: {}", args["pattern"].as_str().unwrap_or("")),
             "list_recent_conversations" => format!("🔎 觀察最近 {} 段對話", args["limit"].as_u64().unwrap_or(10)),
             "create_agent_skill" => format!("⚡ 建立技能：{}", args["title"].as_str().unwrap_or("")),
+            "spawn_sub_agent" => format!("🤖 委派 {} 任務：{}", args["kind"].as_str().unwrap_or(""), args["task"].as_str().unwrap_or("")),
             _ => format!("[{}]", name),
         }
     }
