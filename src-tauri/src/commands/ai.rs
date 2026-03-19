@@ -735,13 +735,16 @@ pub async fn invoke_agent(
         if !vault_path.is_empty() {
             let emb_base = base_url.as_str();
 
-            // Lazy repair：補算 trigger != '' 但 trigger_embedding = NONE 的 agents
+            // 生命週期管理（sleep / delete）
+            crate::commands::agent_def::check_agent_lifecycle(&vault_db, vid).await;
+
+            // Lazy repair：補算 trigger != '' 但 trigger_embedding = NONE 的 active agents
             {
                 #[derive(serde::Deserialize)]
                 struct NullEmbRow { def_id: String, trigger: String }
                 if let Ok(mut resp) = vault_db.query(
                     "SELECT def_id, trigger FROM agent_definitions \
-                     WHERE vault_id = $vid AND is_active = true \
+                     WHERE vault_id = $vid AND is_active = true AND status != 'sleep' \
                        AND trigger != '' AND trigger_embedding = NONE"
                 ).bind(("vid", vid.clone())).await {
                     let rows: Vec<NullEmbRow> = resp.take(0).unwrap_or_default();
@@ -785,11 +788,11 @@ pub async fn invoke_agent(
                         vid,
                         &user_emb,
                         0.75,
+                        true, // pre-routing: active only
                     ).await;
                     if matched.is_none() {
-                        // 找出有 trigger_embedding 的 agents 的 best score
                         let best = crate::commands::agent_def::find_matching_agent_definition(
-                            &vault_db, vid, &user_emb, 0.0).await;
+                            &vault_db, vid, &user_emb, 0.0, true).await;
                         let _ = app.emit("agent:pre_route_debug", serde_json::json!({
                             "step": "miss",
                             "best_match": best.as_ref().map(|b| &b.name),

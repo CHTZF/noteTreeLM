@@ -116,7 +116,7 @@ impl SystemAgentService {
                     &client, url, &request.target).await;
                 if !target_emb.is_empty() {
                     crate::commands::agent_def::find_matching_agent_definition(
-                        &self.db, &vault_id, &target_emb, 0.55,
+                        &self.db, &vault_id, &target_emb, 0.55, false, // include sleep for auto-wake
                     ).await
                 } else { None }
             } else { None }
@@ -285,6 +285,12 @@ impl SystemAgentService {
             }
         }
 
+        // 記錄使用（use_count+1, last_used_at=now, 若 sleep 自動 wake）
+        // 只對有 DB definition 的 agent 記錄（ephemeral fallback 的 def_id 以 "ephemeral-" 開頭）
+        if !def_id.starts_with("ephemeral-") {
+            crate::commands::agent_def::record_agent_usage(&self.db, &vault_id, &def_id).await;
+        }
+
         // Emit updated ephemeral list to frontend
         emit(
             "system_agent:ephemeral_updated".into(),
@@ -426,6 +432,10 @@ impl SystemAgentService {
             is_builtin: false,
             trigger,
             created_at: chrono::Utc::now().timestamp_millis(),
+            status: "active".to_string(),
+            slept_at: None,
+            use_count: 0,
+            last_used_at: None,
         })
     }
 

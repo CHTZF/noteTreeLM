@@ -19,6 +19,10 @@ pub struct AgentDefinition {
     pub is_builtin: bool,
     pub trigger: String,
     pub created_at: i64,        // ms timestamp
+    pub status: String,         // 'active' | 'sleep'
+    pub slept_at: Option<i64>,  // ms timestamp, set when entering sleep
+    pub use_count: i64,
+    pub last_used_at: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -37,6 +41,12 @@ struct DefRow {
     #[serde(default)]
     trigger: String,
     created_at: surrealdb::sql::Datetime,
+    #[serde(default)]
+    status: String,
+    slept_at: Option<surrealdb::sql::Datetime>,
+    #[serde(default)]
+    use_count: i64,
+    last_used_at: Option<surrealdb::sql::Datetime>,
 }
 
 impl From<DefRow> for AgentDefinition {
@@ -55,6 +65,10 @@ impl From<DefRow> for AgentDefinition {
             is_builtin: r.is_builtin,
             trigger: r.trigger,
             created_at: r.created_at.timestamp_millis(),
+            status: if r.status.is_empty() { "active".to_string() } else { r.status },
+            slept_at: r.slept_at.map(|d| d.timestamp_millis()),
+            use_count: r.use_count,
+            last_used_at: r.last_used_at.map(|d| d.timestamp_millis()),
         }
     }
 }
@@ -92,7 +106,8 @@ pub async fn list_agent_definitions(
 
     let mut resp = db.query(
         "SELECT def_id, vault_id, name, description, kind, skill_ids, tool_names, \
-                system_prompt, max_rounds, is_active, is_builtin, trigger OR '' AS trigger, created_at \
+                system_prompt, max_rounds, is_active, is_builtin, trigger OR '' AS trigger, created_at, \
+                status OR 'active' AS status, slept_at, use_count OR 0 AS use_count, last_used_at \
          FROM agent_definitions \
          WHERE vault_id = $vid \
          ORDER BY is_builtin DESC, created_at ASC"
@@ -134,9 +149,11 @@ pub async fn save_agent_definition(
     db.query(
         "INSERT INTO agent_definitions \
          (def_id, vault_id, name, description, kind, skill_ids, tool_names, \
-          system_prompt, max_rounds, is_active, is_builtin, trigger, trigger_embedding, created_at) \
+          system_prompt, max_rounds, is_active, is_builtin, trigger, trigger_embedding, created_at, \
+          status, use_count, last_used_at, slept_at) \
          VALUES ($did, $vid, $name, $desc, $kind, $skills, $tools, \
-                 $prompt, $rounds, true, false, $trigger, $temb, time::now())"
+                 $prompt, $rounds, true, false, $trigger, $temb, time::now(), \
+                 'active', 0, NONE, NONE)"
     )
     .bind(("did",    def_id.clone()))
     .bind(("vid",    vault_id.clone()))
@@ -165,6 +182,10 @@ pub async fn save_agent_definition(
         is_builtin: false,
         trigger: trigger_str,
         created_at: chrono::Utc::now().timestamp_millis(),
+        status: "active".to_string(),
+        slept_at: None,
+        use_count: 0,
+        last_used_at: None,
     })
 }
 
@@ -275,7 +296,8 @@ pub async fn get_agent_definition_by_id(
 ) -> Option<AgentDefinition> {
     let mut resp = db.query(
         "SELECT def_id, vault_id, name, description, kind, skill_ids, tool_names, \
-                system_prompt, max_rounds, is_active, is_builtin, trigger OR '' AS trigger, created_at \
+                system_prompt, max_rounds, is_active, is_builtin, trigger OR '' AS trigger, created_at, \
+                status OR 'active' AS status, slept_at, use_count OR 0 AS use_count, last_used_at \
          FROM agent_definitions \
          WHERE vault_id = $vid AND def_id = $did AND is_active = true \
          LIMIT 1"
@@ -300,9 +322,11 @@ pub async fn find_agent_definition(
     }
 
     // fallback：雙向 contains（name↔target）或 description CONTAINS target
+    // 包含 sleep 狀態的 agent（route() 命中後會自動 wake）
     let mut resp = db.query(
         "SELECT def_id, vault_id, name, description, kind, skill_ids, tool_names, \
-                system_prompt, max_rounds, is_active, is_builtin, trigger OR '' AS trigger, created_at \
+                system_prompt, max_rounds, is_active, is_builtin, trigger OR '' AS trigger, created_at, \
+                status OR 'active' AS status, slept_at, use_count OR 0 AS use_count, last_used_at \
          FROM agent_definitions \
          WHERE vault_id = $vid AND is_active = true \
            AND (string::lowercase(name) CONTAINS string::lowercase($target) \
@@ -319,13 +343,15 @@ pub async fn find_agent_definition(
     rows.into_iter().next().map(AgentDefinition::from)
 }
 
-/// 找到與 user_embedding cosine similarity 最高的 agent definition（閾值 > 0.75）
-/// 用於 invoke_agent pre-routing：匹配成功時可直接 route，跳過 Chat LLM
+/// 找到與 user_embedding cosine similarity 最高的 agent definition
+/// active_only=true：只匹配 status='active'（pre-routing 用）
+/// active_only=false：也匹配 sleep agent（route() fallback 用，命中後由呼叫方 wake）
 pub async fn find_matching_agent_definition(
     db: &SurrealDb,
     vault_id: &str,
     user_embedding: &[f32],
     threshold: f32,
+    active_only: bool,
 ) -> Option<AgentDefinition> {
     #[derive(Deserialize)]
     struct EmbRow {
@@ -344,25 +370,39 @@ pub async fn find_matching_agent_definition(
         trigger: String,
         created_at: surrealdb::sql::Datetime,
         trigger_embedding: Vec<f32>,
+        #[serde(default)]
+        status: String,
+        slept_at: Option<surrealdb::sql::Datetime>,
+        #[serde(default)]
+        use_count: i64,
+        last_used_at: Option<surrealdb::sql::Datetime>,
     }
 
-    // 查詢所有有 trigger_embedding 的 active defs
-    let mut resp = db.query(
+    let status_filter = if active_only {
+        "AND (status = 'active' OR status = NONE)"
+    } else {
+        ""
+    };
+
+    let query = format!(
         "SELECT def_id, vault_id, name, description, kind, skill_ids, tool_names, \
                 system_prompt, max_rounds, is_active, is_builtin, trigger OR '' AS trigger, \
-                created_at, trigger_embedding \
+                created_at, trigger_embedding, \
+                status OR 'active' AS status, slept_at, use_count OR 0 AS use_count, last_used_at \
          FROM agent_definitions \
-         WHERE vault_id = $vid AND is_active = true AND trigger_embedding != NONE"
-    )
-    .bind(("vid", vault_id.to_string()))
-    .await.ok()?;
+         WHERE vault_id = $vid AND is_active = true AND trigger_embedding != NONE {}",
+        status_filter
+    );
+
+    let mut resp = db.query(query)
+        .bind(("vid", vault_id.to_string()))
+        .await.ok()?;
 
     let rows: Vec<EmbRow> = resp.take(0).ok()?;
     if rows.is_empty() {
         return None;
     }
 
-    // Compute cosine similarity in Rust (avoid extra DB round-trip)
     let mut best_score = threshold;
     let mut best: Option<EmbRow> = None;
 
@@ -388,7 +428,74 @@ pub async fn find_matching_agent_definition(
         is_builtin: r.is_builtin,
         trigger: r.trigger,
         created_at: r.created_at.timestamp_millis(),
+        status: if r.status.is_empty() { "active".to_string() } else { r.status },
+        slept_at: r.slept_at.map(|d| d.timestamp_millis()),
+        use_count: r.use_count,
+        last_used_at: r.last_used_at.map(|d| d.timestamp_millis()),
     })
+}
+
+/// 記錄 agent 被呼叫（use_count+1, last_used_at=now, 若在 sleep 則自動 wake）
+pub async fn record_agent_usage(db: &SurrealDb, vault_id: &str, def_id: &str) {
+    let _ = db.query(
+        "UPDATE agent_definitions SET \
+           use_count = (use_count OR 0) + 1, \
+           last_used_at = time::now(), \
+           status = 'active', \
+           slept_at = NONE \
+         WHERE vault_id = $vid AND def_id = $did"
+    )
+    .bind(("vid", vault_id.to_string()))
+    .bind(("did", def_id.to_string()))
+    .await;
+}
+
+/// 生命週期管理：進 sleep（7天）、刪除（sleep 23天）
+/// 在 app 啟動及每次 invoke_agent 時呼叫
+pub async fn check_agent_lifecycle(db: &SurrealDb, vault_id: &str) {
+    let now = chrono::Utc::now();
+    let sleep_cutoff = now - chrono::TimeDelta::days(7);
+    let delete_cutoff = now - chrono::TimeDelta::days(23);
+
+    // 1. 刪除 sleep 超過 23 天的 agent
+    let _ = db.query(
+        "DELETE agent_definitions \
+         WHERE vault_id = $vid AND is_builtin = false \
+           AND status = 'sleep' AND slept_at != NONE AND slept_at < $dcutoff"
+    )
+    .bind(("vid", vault_id.to_string()))
+    .bind(("dcutoff", surrealdb::sql::Datetime::from(delete_cutoff)))
+    .await;
+
+    // 2. 將 7 天未使用的 active agent 設為 sleep
+    let _ = db.query(
+        "UPDATE agent_definitions SET status = 'sleep', slept_at = time::now() \
+         WHERE vault_id = $vid AND is_builtin = false AND status != 'sleep' \
+           AND ( (last_used_at != NONE AND last_used_at < $scutoff) \
+              OR (last_used_at = NONE  AND created_at  < $scutoff) )"
+    )
+    .bind(("vid", vault_id.to_string()))
+    .bind(("scutoff", surrealdb::sql::Datetime::from(sleep_cutoff)))
+    .await;
+}
+
+/// 手動 wake 一個 sleep 中的 agent（前端 UI 呼叫）
+#[tauri::command]
+pub async fn wake_agent_definition(
+    state: State<'_, AppState>,
+    def_id: String,
+) -> Result<(), AppError> {
+    let vault_id = state.get_vault_id().await?;
+
+    state.db.query(
+        "UPDATE agent_definitions SET status = 'active', slept_at = NONE \
+         WHERE vault_id = $vid AND def_id = $did AND is_builtin = false"
+    )
+    .bind(("vid", vault_id))
+    .bind(("did", def_id))
+    .await.map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(())
 }
 
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {

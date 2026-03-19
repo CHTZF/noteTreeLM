@@ -499,7 +499,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       )
 
       // Pre-routing debug trace
-      unlistenPreRouteDebug = await listen<{ step: string; reason?: string; best_match?: string; dim?: number }>(
+      unlistenPreRouteDebug = await listen<{ step: string; reason?: string; best_match?: string; dim?: number; found?: number; repaired?: number }>(
         'agent:pre_route_debug',
         (e) => {
           const p = e.payload
@@ -507,6 +507,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
             ? `⚠ pre-routing skip: ${p.reason}`
             : p.step === 'miss'
             ? `⚠ pre-routing miss: ${p.reason}${p.best_match ? ` (best: ${p.best_match})` : ''}`
+            : p.step === 'repair_done'
+            ? `✓ pre-routing repair_done found=${p.found} repaired=${p.repaired}`
             : `✓ pre-routing ${p.step}${p.dim ? ` dim=${p.dim}` : ''}`
           addLog('llm', 'info', msg)
         }

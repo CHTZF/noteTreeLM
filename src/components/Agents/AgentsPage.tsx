@@ -19,6 +19,10 @@ interface AgentDefinition {
   is_builtin: boolean
   trigger: string
   created_at: number
+  status: 'active' | 'sleep'
+  slept_at: number | null
+  use_count: number
+  last_used_at: number | null
 }
 
 interface EphemeralAgent {
@@ -92,6 +96,11 @@ export default function AgentsPage() {
     setDefs(prev => prev.filter(d => d.def_id !== def_id))
   }
 
+  const handleWake = async (def_id: string) => {
+    await invoke('wake_agent_definition', { defId: def_id })
+    setDefs(prev => prev.map(d => d.def_id === def_id ? { ...d, status: 'active' as const, slept_at: null } : d))
+  }
+
   const handleClearEphemeral = async () => {
     await invoke('clear_ephemeral_agents')
     setEphemeral([])
@@ -130,7 +139,7 @@ export default function AgentsPage() {
           )}
 
           {loading && <div style={{ color: 'var(--color-text-muted)', fontSize: 12 }}>載入中…</div>}
-          {!loading && defs.map(def => (
+          {!loading && defs.filter(d => d.status !== 'sleep').map(def => (
             <DefCard
               key={def.def_id}
               def={def}
@@ -141,6 +150,39 @@ export default function AgentsPage() {
             />
           ))}
         </div>
+
+        {/* ── 休眠中的 Agents ── */}
+        {!loading && defs.some(d => d.status === 'sleep') && (
+          <div style={{ marginBottom: 20 }}>
+            <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+              休眠中
+            </span>
+            {defs.filter(d => d.status === 'sleep').map(def => (
+              <div key={def.def_id} style={{
+                border: '1px solid var(--color-border)',
+                borderRadius: 6, marginTop: 8, padding: '8px 12px',
+                opacity: 0.55, background: 'var(--color-bg-surface, var(--color-bg-overlay))',
+                display: 'flex', alignItems: 'center', gap: 8,
+              }}>
+                <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-primary)', flex: 1 }}>{def.name}</span>
+                {def.slept_at && (
+                  <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>
+                    休眠於 {new Date(def.slept_at).toLocaleDateString()}
+                  </span>
+                )}
+                <button
+                  onClick={() => handleWake(def.def_id)}
+                  style={{ fontSize: 11, padding: '2px 8px', borderRadius: 4, background: 'rgba(99,102,241,0.15)', border: '1px solid var(--color-accent)', color: 'var(--color-accent)', cursor: 'pointer' }}
+                >
+                  喚醒
+                </button>
+                {!def.is_builtin && (
+                  <button onClick={() => handleDelete(def.def_id)} style={{ fontSize: 11, padding: '2px 6px', borderRadius: 4, background: 'var(--color-bg-overlay)', border: '1px solid var(--color-border)', color: 'var(--color-error, #ef4444)', cursor: 'pointer' }}>刪除</button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
 
         {/* ── 本次 Session 臨時 Agents ── */}
         <div>
