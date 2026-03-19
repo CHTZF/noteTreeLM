@@ -38,8 +38,23 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const [pendingSearchMethod, setPendingSearchMethod] = useState<{ query: string } | null>(null)
   const [error, setError] = useState('')
   const [isCompressing, setIsCompressing] = useState(false)
-  const [lastMemoryPath, setLastMemoryPath] = useState<string | null>(null)
+  const [lastMemoryPath] = useState<string | null>(null)  // 保留供 send dep array
+  const [showClearPrompt, setShowClearPrompt] = useState(false)
   const [savingWebMsgIdx, setSavingWebMsgIdx] = useState<number | null>(null)
+
+  // ─── In-conversation skill creation ───────────────────────────────────────
+  type SkillPreview = {
+    userMsg: string
+    assistantMsg: string
+    loading: boolean
+    title: string
+    trigger: string
+    behavior: string
+    autoToolCalls: string[]
+    injectionMode: 'passive' | 'active'
+  }
+  const [skillPreview, setSkillPreview] = useState<SkillPreview | null>(null)
+  const [savingSkill, setSavingSkill] = useState(false)
 
   // ─── Voice overlay ────────────────────────────────────────────────────────────
   const [voiceTranscript, setVoiceTranscript]   = useState('')
@@ -52,8 +67,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const streamingRef = useRef('')
   const tokenCountRef = useRef(0)
-  const justCompressedRef = useRef(false)
   const sessionWriteApprovedRef = useRef(false)
+  const userMsgCountRef = useRef(0)
 
   // Per-conversation draft state (input + chips), keyed by conversationId
   type DraftState = { input: string; noteSuggestions: { absPath: string; label: string }[] }
@@ -157,8 +172,6 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
 
   const isConfigured = !!settings.llama_cli_path && !!settings.llm_model_path
   const whisperConfigured = !!settings.whisper_cli_path && !!settings.whisper_model_path
-  const vaultConfigured = !!settings.system_current_vault_path
-
   // 語音轉文字：逐字累積到 overlay buffer（不直接寫入輸入框）
   const handleTranscript = useCallback((text: string) => {
     if (!text) return
@@ -293,20 +306,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages.length, streamingText])
 
-  // system_current_vault_path 變化時（包含首次設定、切換 vault）重置 lastMemoryPath 並重新查詢
-  // 確保切換 vault 後不會帶入舊 vault 的記憶路徑
-  useEffect(() => {
-    if (!vaultConfigured) {
-      setLastMemoryPath(null)
-      return
-    }
-    setLastMemoryPath(null) // 先清除，避免短暫帶入舊路徑
-    invoke<Array<{ path: string }>>('query_memory', { keywords: [], limit: 1 })
-      .then((results) => {
-        if (results.length > 0) setLastMemoryPath(results[0].path)
-      })
-      .catch(() => {})
-  }, [settings.system_current_vault_path])
+  // (lastMemoryPath 保留供 send dep array，但不再主動設定——記憶改走 compress_conversation_to_knowledge)
 
   const handleWriteConfirm = useCallback(async (approved: boolean) => {
     if (approved && writeConfirmMode === 'once') {
@@ -350,6 +350,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     let unlistenOpenNote: (() => void) | undefined
     let unlistenSearchMethod: (() => void) | undefined
     let unlistenWebRefs: (() => void) | undefined
+    let unlistenSkillsActivated: (() => void) = () => {}
+    let unlistenSkillSuggestion: (() => void) = () => {}
 
     // Clear previous suggestions at the start of each send
     setNoteSuggestions([])
@@ -427,8 +429,21 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         pendingWebRefsRef.current = [...pendingWebRefsRef.current, ...e.payload]
       })
 
+      // 透明度：skill pre-pass 觸發時，顯示哪些技能正在作用
+      unlistenSkillsActivated = await listen<{ titles: string[] }>(
+        'agent:skills_activated',
+        (e) => {
+          const names = e.payload.titles.join('、')
+          setMessages(prev => [...prev, {
+            role: 'tool' as const,
+            content: `⚡ 套用技能：${names}`,
+          }])
+          unlistenSkillsActivated()
+        }
+      )
+
       // Bottom-up skill 歸納：agent 偵測到結構化回答框架時，提示使用者存為技能規範
-      const unlistenSkillSuggestion = await listen<{ query: string; response_preview: string }>(
+      unlistenSkillSuggestion = await listen<{ query: string; response_preview: string }>(
         'agent:skill_suggestion',
         (_e) => {
           setMessages(prev => [...prev, {
@@ -453,6 +468,17 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         ? pendingWebRefsRef.current
         : undefined
       setMessages((prev) => [...prev, { role: 'assistant', content: finalContent, webRefs }])
+
+      // 自動偵測：使用者訊息含技能意圖關鍵字 → 自動觸發技能萃取
+      if (hasSkillIntent(text) && finalContent.length > 0) {
+        doExtractSkill(text, finalContent)
+      }
+
+      // Reflection：每 N 則對話後背景觀察模式（不阻塞 UI）
+      userMsgCountRef.current += 1
+      if (userMsgCountRef.current % REFLECTION_INTERVAL === 0) {
+        triggerReflection()
+      }
     } catch (e: unknown) {
       const msg =
         typeof e === 'string'
@@ -471,6 +497,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       unlistenOpenNote?.()
       unlistenSearchMethod?.()
       unlistenWebRefs?.()
+      unlistenSkillsActivated()
+      unlistenSkillSuggestion()
       setPendingWriteDisplay(null)
       setPendingSearchMethod(null)
       setIsStreaming(false)
@@ -491,8 +519,55 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     setError('')
     setStreamingText('')
     streamingRef.current = ''
-    setLastMemoryPath(null)
+    setShowClearPrompt(false)
   }
+
+  // ─── Reflection：每 6 則訊息後背景觀察對話模式，結果顯示在 Debug tab ──────
+  const REFLECTION_INTERVAL = 6
+  const REFLECTION_SYSTEM = `你是一個自我改進系統，負責觀察使用者與 AI 的對話模式並自動固化知識。
+執行步驟：
+1. 呼叫 list_recent_conversations 讀取最近對話
+2. 分析重複需求、知識缺口、常用查詢模式
+3. 若發現可固化的行為模式，呼叫 create_agent_skill 建立技能規範
+4. 若有值得保存的知識，呼叫 create_note 建立筆記
+限制：技能規範預設未啟用，使用者可在「我的技能規範」頁面審核。不要產生冗餘或過度通泛的技能。`
+
+  const triggerReflection = useCallback(async () => {
+    const { addLog: dbgLog } = useDebugStore.getState()
+    dbgLog('reflection', 'info', '🔄 開始觀察對話模式…')
+
+    let unlistenTool: (() => void) | null = null
+    let unlistenDone: (() => void) | null = null
+
+    try {
+      const sessionId = await invoke<string>('stream_chat', {
+        messages: [{ role: 'user', content: '開始觀察' }],
+        system: REFLECTION_SYSTEM,
+      })
+
+      unlistenTool = await listen<{ session_id: string; display: string }>('agent:tool_call', e => {
+        if (e.payload.session_id !== sessionId) return
+        dbgLog('reflection', 'info', e.payload.display)
+      })
+
+      unlistenDone = await listen<{ session_id: string; text: string; error?: string }>('llm:done', e => {
+        if (e.payload.session_id !== sessionId) return
+        if (e.payload.error) {
+          dbgLog('reflection', 'error', `❌ ${e.payload.error}`)
+        } else {
+          if (e.payload.text) dbgLog('reflection', 'info', e.payload.text)
+          dbgLog('reflection', 'info', '✅ 觀察完成')
+          window.dispatchEvent(new CustomEvent('skills-changed'))
+        }
+        unlistenTool?.()
+        unlistenDone?.()
+      })
+    } catch (e) {
+      dbgLog('reflection', 'error', `觸發失敗：${e}`)
+      unlistenTool?.()
+      unlistenDone?.()
+    }
+  }, [])
 
   const handleSaveWeb = useCallback(async (msgIndex: number, msg: Message) => {
     if (!msg.webRefs?.length) return
@@ -584,42 +659,77 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     }
   }, [voiceState, voiceTranscript, toggleVoice, doSaveToNewNote])
 
-  // 壓縮記憶：把目前對話原文存成 memories/ai_memory_[timestamp].md
-  const compressToMemory = useCallback(async () => {
-    const toCompress = messages.filter(m => m.role !== 'tool')
+  // ── Skill intent keywords ─────────────────────────────────────────────────
+  const SKILL_INTENT_KEYWORDS = ['記住', '以後', '從現在起', '幫我記', '每次都', '記得', '永遠', '不要再', '以後都', '下次', '請記得', '請幫我記']
+  const hasSkillIntent = (text: string) => SKILL_INTENT_KEYWORDS.some(k => text.includes(k))
+
+  // 呼叫 LLM 萃取技能（可由關鍵字自動觸發或使用者點擊📌按鈕觸發）
+  const doExtractSkill = useCallback(async (userMsg: string, assistantMsg: string) => {
+    setSkillPreview({ userMsg, assistantMsg, loading: true, title: '', trigger: '', behavior: '', autoToolCalls: [], injectionMode: 'passive' })
+    try {
+      const skill = await invoke<{ title: string; trigger: string; behavior: string; auto_tool_calls: string[] }>(
+        'extract_skill_from_exchange', { userMsg, assistantMsg }
+      )
+      setSkillPreview({ userMsg, assistantMsg, loading: false, title: skill.title, trigger: skill.trigger, behavior: skill.behavior, autoToolCalls: skill.auto_tool_calls, injectionMode: 'passive' })
+    } catch (e) {
+      toast.error('技能萃取失敗：' + String(e))
+      setSkillPreview(null)
+    }
+  }, [])
+
+  // 確認建立技能規範
+  const confirmSkill = useCallback(async () => {
+    if (!skillPreview || skillPreview.loading) return
+    setSavingSkill(true)
+    try {
+      await invoke('save_agent_skill', {
+        knowledgeItemId: 'conversation',
+        title: skillPreview.title,
+        trigger: skillPreview.trigger,
+        behavior: skillPreview.behavior,
+        autoToolCalls: skillPreview.autoToolCalls,
+        injectionMode: skillPreview.injectionMode,
+      })
+      toast.success(`技能「${skillPreview.title}」已建立`)
+      setSkillPreview(null)
+    } catch (e) {
+      toast.error('建立失敗：' + String(e))
+    } finally {
+      setSavingSkill(false)
+    }
+  }, [skillPreview])
+
+  // 壓縮記憶：用 LLM skill-first 萃取，建立 knowledge item + skill 規範
+  const compressToKnowledge = useCallback(async (thenClear = false) => {
+    const toCompress = messages.filter(m => m.role === 'user' || m.role === 'assistant')
     if (toCompress.length === 0 || isCompressing) return
     setIsCompressing(true)
+    setShowClearPrompt(false)
     try {
-      const path = await invoke<string>('save_memory_session', { messages: toCompress })
-      setLastMemoryPath(path)
-      const filename = path.split('/').pop() ?? path
-      setMessages([{
+      const result = await invoke<{ item_id: string; title: string; skill_count: number }>(
+        'compress_conversation_to_knowledge',
+        { messagesJson: JSON.stringify(toCompress) }
+      )
+      const skillMsg = result.skill_count > 0 ? `，萃取了 ${result.skill_count} 條技能規範` : ''
+      const notice: Message = {
         role: 'notice',
-        content: `已儲存記憶：${filename}`,
-      }])
-      toast.success(`記憶已儲存：${filename}`)
-      log(`記憶已儲存：${path}`)
+        content: `已壓縮為知識「${result.title}」${skillMsg}。前往「知識中心」可查看技能建議。`,
+      }
+      if (thenClear) {
+        setMessages([notice])
+      } else {
+        setMessages(prev => [...prev, notice])
+      }
+      toast.success(`知識已建立：${result.title}`)
+      log(`compress_conversation_to_knowledge 完成：item_id=${result.item_id}`)
     } catch (e: unknown) {
       const msg = typeof e === 'string' ? e : e instanceof Error ? e.message : String(e)
-      toast.error('記憶儲存失敗')
-      err('save_memory_session 失敗：' + msg)
+      toast.error('壓縮失敗：' + msg)
+      err('compress_conversation_to_knowledge 失敗：' + msg)
     } finally {
       setIsCompressing(false)
     }
   }, [messages, isCompressing, log, err])
-
-  // 自動觸發：當訊息數量達到閾值時壓縮記憶
-  useEffect(() => {
-    const threshold = settings.memory_threshold ?? 20
-    if (!settings.enable_auto_memory) return
-    if (isStreaming || isCompressing) return
-    if (justCompressedRef.current) { justCompressedRef.current = false; return }
-    const meaningful = messages.filter(m => m.role === 'user' || m.role === 'assistant').length
-    if (meaningful >= threshold) {
-      justCompressedRef.current = true
-      compressToMemory()
-    }
-  }, [messages.length, settings.enable_auto_memory, settings.memory_threshold, isStreaming, isCompressing, compressToMemory])
 
   return (
     <div style={{ position: 'relative', display: 'flex', flexDirection: 'row', width: '100%', height: '100%', background: 'var(--color-bg-base)', overflow: 'hidden' }}>
@@ -667,9 +777,9 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
             {conversationId && messages.length > 0 && (
               <>
                 <button
-                  onClick={compressToMemory}
+                  onClick={() => compressToKnowledge(false)}
                   disabled={isCompressing || isStreaming}
-                  title="將目前對話儲存為記憶筆記並清空對話"
+                  title="用 AI 萃取對話精華，建立知識項目與技能規範"
                   style={{
                     fontSize: '11px', padding: '2px 8px', borderRadius: '4px',
                     background: 'var(--color-bg-overlay)', border: '1px solid var(--color-border)',
@@ -677,15 +787,30 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
                     cursor: isCompressing || isStreaming ? 'not-allowed' : 'pointer',
                     opacity: isCompressing || isStreaming ? 0.5 : 1,
                   }}
-                >{isCompressing ? '儲存中…' : '壓縮記憶'}</button>
+                >{isCompressing ? '壓縮中…' : '壓縮記憶'}</button>
+                {showClearPrompt ? (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                    <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>要先壓縮？</span>
+                    <button
+                      onClick={() => compressToKnowledge(true)}
+                      disabled={isCompressing}
+                      style={{ fontSize: '11px', padding: '2px 8px', borderRadius: '4px', background: 'var(--color-accent)', color: '#fff', border: 'none', cursor: 'pointer' }}
+                    >壓縮後清除</button>
+                    <button
+                      onClick={clearChat}
+                      style={{ fontSize: '11px', padding: '2px 8px', borderRadius: '4px', background: 'var(--color-bg-overlay)', border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)', cursor: 'pointer' }}
+                    >直接清除</button>
+                  </div>
+                ) : (
                 <button
-                  onClick={clearChat}
+                  onClick={() => messages.filter(m => m.role === 'user' || m.role === 'assistant').length > 0 ? setShowClearPrompt(true) : clearChat()}
                   style={{
                     fontSize: '11px', padding: '2px 8px', borderRadius: '4px',
                     background: 'var(--color-bg-overlay)', border: '1px solid var(--color-border)',
                     color: 'var(--color-text-secondary)', cursor: 'pointer',
                   }}
                 >清除</button>
+                )}
               </>
             )}
           </div>
@@ -744,7 +869,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
             }}>
               <span>對話已達 {meaningful} 則，接近閾值 {threshold}，建議壓縮記憶。</span>
               <button
-                onClick={compressToMemory}
+                onClick={() => compressToKnowledge(false)}
                 disabled={isCompressing}
                 style={{
                   marginLeft: '8px', fontSize: '11px', padding: '2px 8px', borderRadius: '4px',
@@ -770,14 +895,24 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
             </div>
           )}
 
-          {messages.map((msg, i) => (
-            <MessageBubble
-              key={i}
-              message={msg}
-              onSaveWeb={msg.webRefs?.length ? () => handleSaveWeb(i, msg) : undefined}
-              savingWeb={savingWebMsgIdx === i}
-            />
-          ))}
+          {(() => {
+            let lastUserContent = ''
+            return messages.map((msg, i) => {
+              if (msg.role === 'user') lastUserContent = msg.content
+              const capturedUser = lastUserContent
+              return (
+                <MessageBubble
+                  key={i}
+                  message={msg}
+                  onSaveWeb={msg.webRefs?.length ? () => handleSaveWeb(i, msg) : undefined}
+                  savingWeb={savingWebMsgIdx === i}
+                  onExtractSkill={msg.role === 'assistant' && !isStreaming && capturedUser
+                    ? () => doExtractSkill(capturedUser, msg.content)
+                    : undefined}
+                />
+              )
+            })
+          })()}
 
           {/* 串流中 / agent 思考中的 assistant 泡泡 */}
           {isStreaming && (
@@ -870,6 +1005,73 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
                 style={{ padding: '4px 12px', borderRadius: '4px', background: 'transparent', color: 'var(--color-text-secondary)', border: '1px solid var(--color-border)', cursor: 'pointer', fontSize: '12px' }}
               >拒絕</button>
             </div>
+          </div>
+        )}
+
+        {/* 技能預覽卡片 */}
+        {skillPreview && (
+          <div style={{
+            margin: '0 8px 8px', padding: '12px 14px', borderRadius: '8px',
+            background: 'var(--color-bg-elevated)', border: '1px solid var(--color-accent)',
+            fontSize: '12px', flexShrink: 0,
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+              <span style={{ fontWeight: 600, color: 'var(--color-accent)', fontSize: '12px' }}>📌 建議技能規範</span>
+              <button onClick={() => setSkillPreview(null)} style={{ background: 'none', border: 'none', color: 'var(--color-text-muted)', cursor: 'pointer', fontSize: '14px', lineHeight: 1 }}>✕</button>
+            </div>
+            {skillPreview.loading ? (
+              <div style={{ color: 'var(--color-text-muted)', fontSize: '12px', padding: '4px 0' }}>萃取中…</div>
+            ) : (
+              <>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                  <label style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>標題</label>
+                  <input
+                    value={skillPreview.title}
+                    onChange={e => setSkillPreview(prev => prev ? { ...prev, title: e.target.value } : null)}
+                    style={{ padding: '4px 8px', borderRadius: '4px', border: '1px solid var(--color-border)', background: 'var(--color-bg-overlay)', color: 'var(--color-text-primary)', fontSize: '12px' }}
+                  />
+                  <label style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>觸發條件</label>
+                  <textarea
+                    value={skillPreview.trigger}
+                    onChange={e => setSkillPreview(prev => prev ? { ...prev, trigger: e.target.value } : null)}
+                    rows={2}
+                    style={{ padding: '4px 8px', borderRadius: '4px', border: '1px solid var(--color-border)', background: 'var(--color-bg-overlay)', color: 'var(--color-text-primary)', fontSize: '12px', resize: 'vertical', fontFamily: 'var(--font-sans)' }}
+                  />
+                  <label style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>行為指令</label>
+                  <textarea
+                    value={skillPreview.behavior}
+                    onChange={e => setSkillPreview(prev => prev ? { ...prev, behavior: e.target.value } : null)}
+                    rows={3}
+                    style={{ padding: '4px 8px', borderRadius: '4px', border: '1px solid var(--color-border)', background: 'var(--color-bg-overlay)', color: 'var(--color-text-primary)', fontSize: '12px', resize: 'vertical', fontFamily: 'var(--font-sans)' }}
+                  />
+                  <label style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>觸發時機</label>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                    {(['passive', 'active'] as const).map(mode => (
+                      <label key={mode} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', cursor: 'pointer' }}>
+                        <input
+                          type="radio"
+                          name="chat-injection-mode"
+                          checked={skillPreview.injectionMode === mode}
+                          onChange={() => setSkillPreview(prev => prev ? { ...prev, injectionMode: mode } : null)}
+                        />
+                        {mode === 'passive' ? '被動取用（相似度比對）' : '主動注入（每次對話）'}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: '6px', marginTop: '10px' }}>
+                  <button
+                    onClick={confirmSkill}
+                    disabled={savingSkill}
+                    style={{ padding: '4px 14px', borderRadius: '4px', background: 'var(--color-accent)', color: '#fff', border: 'none', cursor: 'pointer', fontSize: '12px', opacity: savingSkill ? 0.6 : 1 }}
+                  >{savingSkill ? '建立中…' : '確認建立'}</button>
+                  <button
+                    onClick={() => setSkillPreview(null)}
+                    style={{ padding: '4px 12px', borderRadius: '4px', background: 'transparent', color: 'var(--color-text-secondary)', border: '1px solid var(--color-border)', cursor: 'pointer', fontSize: '12px' }}
+                  >取消</button>
+                </div>
+              </>
+            )}
           </div>
         )}
 
@@ -986,11 +1188,13 @@ function MessageBubble({
   streaming,
   onSaveWeb,
   savingWeb,
+  onExtractSkill,
 }: {
   message: Message
   streaming?: boolean
   onSaveWeb?: () => void
   savingWeb?: boolean
+  onExtractSkill?: () => void
 }) {
   const isUser = message.role === 'user'
   const isTool = message.role === 'tool'
@@ -1049,14 +1253,29 @@ function MessageBubble({
             <style>{`@keyframes blink { 0%, 100% { opacity: 1 } 50% { opacity: 0 } }`}</style>
           )}
         </div>
-        {!isUser && !isTool && !isNotice && onSaveWeb && (
-          <button
-            className={message.savedWeb ? 'import-panel-v2__saved-btn' : 'import-panel-v2__save-btn'}
-            onClick={message.savedWeb ? undefined : onSaveWeb}
-            disabled={savingWeb || message.savedWeb}
-          >
-            {message.savedWeb ? '✓ 已儲存' : savingWeb ? '儲存中…' : '儲存為知識'}
-          </button>
+        {!isUser && !isTool && !isNotice && (onSaveWeb || onExtractSkill) && (
+          <div style={{ display: 'flex', gap: '4px', marginTop: '2px' }}>
+            {onSaveWeb && (
+              <button
+                className={message.savedWeb ? 'import-panel-v2__saved-btn' : 'import-panel-v2__save-btn'}
+                onClick={message.savedWeb ? undefined : onSaveWeb}
+                disabled={savingWeb || message.savedWeb}
+              >
+                {message.savedWeb ? '✓ 已儲存' : savingWeb ? '儲存中…' : '儲存為知識'}
+              </button>
+            )}
+            {onExtractSkill && (
+              <button
+                onClick={onExtractSkill}
+                title="從此回覆萃取技能規範"
+                style={{
+                  fontSize: '11px', padding: '2px 8px', borderRadius: '10px',
+                  background: 'transparent', border: '1px solid var(--color-border)',
+                  color: 'var(--color-text-muted)', cursor: 'pointer',
+                }}
+              >📌 轉為技能規範</button>
+            )}
+          </div>
         )}
       </div>
     </div>

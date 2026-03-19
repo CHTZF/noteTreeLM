@@ -102,6 +102,7 @@ export interface AgentSkillSuggestion {
   trigger: string
   behavior: string
   auto_tool_calls: string[]
+  injection_mode?: 'passive' | 'active'
 }
 
 /** 持久化後的技能規範（從 DB 讀取） */
@@ -114,6 +115,7 @@ export interface AgentSkill {
   behavior: string
   auto_tool_calls: string[]
   is_active: boolean
+  injection_mode: 'passive' | 'active'  // 被動取用 | 主動注入
   trigger_count: number
   last_triggered_at: number | null  // ms timestamp，null = 從未觸發
   created_at: number

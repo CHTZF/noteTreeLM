@@ -391,18 +391,6 @@ pub async fn delete_pending_plan(db: &SurrealDb, conv_id: &str) -> Result<(), Ap
     Ok(())
 }
 
-/// 清理超過 TTL（預設 24h）的過期 pending plans
-pub async fn cleanup_expired_pending_plans(db: &SurrealDb, ttl_secs: i64) -> Result<(), AppError> {
-    let cutoff_ts = chrono::Utc::now().timestamp() - ttl_secs;
-    // SurrealDB: compare datetime, cutoff as Unix epoch
-    db.query(
-        "DELETE FROM pending_plans WHERE time::unix(created_at) < $cutoff"
-    )
-    .bind(("cutoff", cutoff_ts))
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-    Ok(())
-}
 
 pub struct LoadedPendingPlan {
     pub deferred_tools: Vec<DeferredTool>,

@@ -29,7 +29,9 @@ use commands::{
                        save_knowledge_item, list_knowledge_items, get_knowledge_item,
                        delete_knowledge_item, rename_knowledge_item, suggest_kb_cards_for_item,
                        get_cached_page,
-                       save_agent_skill, list_agent_skills, toggle_agent_skill, delete_agent_skill},
+                       save_agent_skill, list_agent_skills, toggle_agent_skill, delete_agent_skill,
+                       update_agent_skill, compress_conversation_to_knowledge,
+                       get_skill_usage_stats, extract_skill_from_exchange},
     knowledge_import::auto_check_all_sessions,
     settings::{get_settings, save_personal_settings, get_system_settings, save_system_settings, get_api_key, set_api_key,
                get_vault_last_note, set_vault_last_note, check_vcredist,
@@ -93,6 +95,26 @@ pub fn run() {
             #[cfg(target_os = "windows")]
             if let Some(window) = app_handle.get_webview_window("main") {
                 let _ = window.set_decorations(false);
+            }
+
+            // 攔截 Ctrl+C / SIGINT：kill servers + 走 Tauri graceful exit，確保 SurrealDB WAL flush
+            {
+                let ah = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                    if let Some(state) = ah.try_state::<AppState>() {
+                        if let Some(mut child) = state.llama_server.lock().await.take() {
+                            let _ = child.kill().await;
+                        }
+                        if let Some(mut child) = state.whisper_server.lock().await.take() {
+                            let _ = child.kill().await;
+                        }
+                        if let Some(mut child) = state.embedding_server.lock().await.take() {
+                            let _ = child.kill().await;
+                        }
+                    }
+                    ah.exit(0);
+                });
             }
 
             // 背景完成 vault 初始化、FileWatcher、server warmup
@@ -229,6 +251,10 @@ pub fn run() {
             list_agent_skills,
             toggle_agent_skill,
             delete_agent_skill,
+            update_agent_skill,
+            compress_conversation_to_knowledge,
+            get_skill_usage_stats,
+            extract_skill_from_exchange,
             // Voice
             transcribe_audio,
             stop_whisper_server,

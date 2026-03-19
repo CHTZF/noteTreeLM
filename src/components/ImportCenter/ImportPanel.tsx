@@ -8,6 +8,7 @@ import {
   faPen, faCheck, faBolt,
 } from '@fortawesome/free-solid-svg-icons'
 import type { AgentSkill } from '../../types/models'
+import SkillStatsPanel from './SkillStats'
 import { toast } from '../common/Toast'
 import { useKnowledgeChatStore, type KBMessage, type KnowledgeRef } from '../../stores/knowledgeChatStore'
 import { useAuthStore } from '../../stores/authStore'
@@ -89,6 +90,7 @@ export default function ImportPanel() {
   const [detailNoteCards, setDetailNoteCards] = useState<KBCardSuggestion[]>([])
   const [detailSkills, setDetailSkills] = useState<AgentSkill[]>([])
   const [loadingSuggestions, setLoadingSuggestions] = useState(false)
+  const [suggestionError, setSuggestionError] = useState<string | null>(null)
 
   // ── Load knowledge items ────────────────────────────────────────────────────
   const loadItems = useCallback(async () => {
@@ -295,18 +297,9 @@ export default function ImportPanel() {
   }, [view, loadItems])
 
   // ── Load detail view ────────────────────────────────────────────────────────
-  const handleOpenDetail = useCallback(async (item: KnowledgeItem) => {
-    setDetailItem(item)
-    setDetailNoteCards([])
-    setDetailSkills([])
-    setView({ type: 'detail', itemId: item.item_id })
+  const runSuggestions = useCallback(async (item: KnowledgeItem) => {
     setLoadingSuggestions(true)
-
-    // 同步載入該知識項目已存在的 skills（前次產生的）
-    invoke<AgentSkill[]>('list_agent_skills', { knowledgeItemId: item.item_id, activeOnly: false })
-      .then(skills => setDetailSkills(skills))
-      .catch(() => {})
-
+    setSuggestionError(null)
     const unlisten = await listen<{
       item_id: string
       note_cards: KBCardSuggestion[]
@@ -317,13 +310,28 @@ export default function ImportPanel() {
       setDetailSkills(e.payload.skill_cards)
       setLoadingSuggestions(false)
       unlisten()
+      window.dispatchEvent(new CustomEvent('skills-changed'))
     })
     try {
       await invoke('suggest_kb_cards_for_item', { itemId: item.item_id })
-    } catch {
+    } catch (e) {
       setLoadingSuggestions(false)
+      setSuggestionError(fmtError(e))
       unlisten()
     }
+  }, [])
+
+  const handleOpenDetail = useCallback(async (item: KnowledgeItem) => {
+    setDetailItem(item)
+    setDetailNoteCards([])
+    setDetailSkills([])
+    setSuggestionError(null)
+    setView({ type: 'detail', itemId: item.item_id })
+
+    // 同步載入該知識項目已存在的 skills（前次產生的）
+    invoke<AgentSkill[]>('list_agent_skills', { knowledgeItemId: item.item_id, activeOnly: false })
+      .then(skills => setDetailSkills(skills))
+      .catch(() => {})
   }, [])
 
   // ── End active session ──────────────────────────────────────────────────────
@@ -449,13 +457,6 @@ export default function ImportPanel() {
             </div>
           ))}
         </div>
-        {/* 底部入口：我的技能規範 */}
-        <button
-          className={`import-panel-v2__skills-hub-btn ${view.type === 'skills_hub' ? 'active' : ''}`}
-          onClick={() => setView({ type: 'skills_hub' })}
-        >
-          <FontAwesomeIcon icon={faBolt} /> 我的技能規範
-        </button>
       </div>
 
       {/* Right: Content Area */}
@@ -627,11 +628,44 @@ export default function ImportPanel() {
               </div>
             </div>
 
+            {/* AI 建議：錯誤提示 + 重試 */}
+            {suggestionError && !loadingSuggestions && (
+              <div className="import-panel-v2__suggestion-error">
+                <span>⚠ 建議生成失敗：{suggestionError}</span>
+                <button
+                  className="import-panel-v2__retry-btn"
+                  onClick={() => detailItem && runSuggestions(detailItem)}
+                >
+                  重新生成
+                </button>
+              </div>
+            )}
+            {!suggestionError && !loadingSuggestions && detailNoteCards.length === 0 && detailSkills.length === 0 && (
+              <div className="import-panel-v2__suggestion-error">
+                <span>AI 建議為空（LLM 可能回傳格式有誤）</span>
+                <button
+                  className="import-panel-v2__retry-btn"
+                  onClick={() => detailItem && runSuggestions(detailItem)}
+                >
+                  重新生成
+                </button>
+              </div>
+            )}
+
             {/* AI 建議筆記卡片 */}
             <div className="import-panel-v2__detail-cards">
-              <span className="import-panel-v2__detail-label">
+              <span className="import-panel-v2__detail-label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                 <FontAwesomeIcon icon={faLightbulb} /> AI 建議筆記卡片
                 {loadingSuggestions && <FontAwesomeIcon icon={faSpinner} spin style={{ marginLeft: 6 }} />}
+                {!loadingSuggestions && (
+                  <button
+                    className="import-panel-v2__retry-btn"
+                    style={{ marginLeft: 4 }}
+                    onClick={() => detailItem && runSuggestions(detailItem)}
+                  >
+                    建立
+                  </button>
+                )}
               </span>
               {detailNoteCards.length > 0 ? (
                 <div className="import-panel-v2__detail-cards-body">
@@ -650,9 +684,18 @@ export default function ImportPanel() {
 
             {/* AI 建議技能規範 */}
             <div className="import-panel-v2__detail-skills">
-              <span className="import-panel-v2__detail-label">
+              <span className="import-panel-v2__detail-label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                 <FontAwesomeIcon icon={faBolt} /> AI 建議技能規範
                 {loadingSuggestions && <FontAwesomeIcon icon={faSpinner} spin style={{ marginLeft: 6 }} />}
+                {!loadingSuggestions && (
+                  <button
+                    className="import-panel-v2__retry-btn"
+                    style={{ marginLeft: 4 }}
+                    onClick={() => detailItem && runSuggestions(detailItem)}
+                  >
+                    建立
+                  </button>
+                )}
               </span>
               {detailSkills.length === 0 && !loadingSuggestions && (
                 <div className="import-panel-v2__empty-hint">暫無技能規範</div>
@@ -666,10 +709,19 @@ export default function ImportPanel() {
                     setDetailSkills(prev => prev.map(s =>
                       s.skill_id === id ? { ...s, is_active: active } : s
                     ))
+                    window.dispatchEvent(new CustomEvent('skills-changed'))
                   }}
                   onDelete={async (id) => {
                     await invoke('delete_agent_skill', { skillId: id })
                     setDetailSkills(prev => prev.filter(s => s.skill_id !== id))
+                    window.dispatchEvent(new CustomEvent('skills-changed'))
+                  }}
+                  onUpdate={async (id, title, trigger, behavior, autoToolCalls, injectionMode) => {
+                    await invoke('update_agent_skill', { skillId: id, title, trigger, behavior, autoToolCalls, injectionMode })
+                    setDetailSkills(prev => prev.map(s =>
+                      s.skill_id === id ? { ...s, title, trigger, behavior, auto_tool_calls: autoToolCalls, injection_mode: injectionMode as 'passive' | 'active' } : s
+                    ))
+                    window.dispatchEvent(new CustomEvent('skills-changed'))
                   }}
                 />
               ))}
@@ -688,19 +740,61 @@ export default function ImportPanel() {
 
 // ── Skills Hub 全局管理頁面 ────────────────────────────────────────────────────
 
-function SkillsHub() {
+export function SkillsHub() {
   const [skills, setSkills] = useState<AgentSkill[]>([])
   const [loading, setLoading] = useState(true)
+  const [showCreate, setShowCreate] = useState(false)
+  const [creating, setCreating] = useState(false)
+  const [newTitle, setNewTitle] = useState('')
+  const [newTrigger, setNewTrigger] = useState('')
+  const [newBehavior, setNewBehavior] = useState('')
+  const [newTools, setNewTools] = useState<string[]>([])
+  const [newInjectionMode, setNewInjectionMode] = useState<'passive' | 'active'>('passive')
 
-  useEffect(() => {
+  const loadSkills = useCallback(() => {
     invoke<AgentSkill[]>('list_agent_skills', { activeOnly: false })
       .then(s => setSkills(s))
       .catch(() => {})
       .finally(() => setLoading(false))
   }, [])
 
+  useEffect(() => {
+    loadSkills()
+    window.addEventListener('skills-changed', loadSkills)
+    return () => window.removeEventListener('skills-changed', loadSkills)
+  }, [loadSkills])
+
   const activeCount = skills.filter(s => s.is_active).length
   const totalTriggers = skills.reduce((n, s) => n + s.trigger_count, 0)
+
+  const handleCreate = async () => {
+    if (!newTitle.trim() || !newTrigger.trim() || !newBehavior.trim()) return
+    setCreating(true)
+    try {
+      const skill = await invoke<AgentSkill>('save_agent_skill', {
+        knowledgeItemId: 'manual',
+        title: newTitle.trim(),
+        trigger: newTrigger.trim(),
+        behavior: newBehavior.trim(),
+        autoToolCalls: newTools,
+        injectionMode: newInjectionMode,
+      })
+      setSkills(prev => [skill, ...prev])
+      setShowCreate(false)
+      setNewTitle(''); setNewTrigger(''); setNewBehavior(''); setNewTools([]); setNewInjectionMode('passive')
+    } catch (e) {
+      toast.error('建立失敗：' + fmtError(e))
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  const handleUpdate = async (id: string, title: string, trigger: string, behavior: string, autoToolCalls: string[], injectionMode: string) => {
+    await invoke('update_agent_skill', { skillId: id, title, trigger, behavior, autoToolCalls, injectionMode })
+    setSkills(prev => prev.map(s =>
+      s.skill_id === id ? { ...s, title, trigger, behavior, auto_tool_calls: autoToolCalls, injection_mode: injectionMode as 'passive' | 'active' } : s
+    ))
+  }
 
   return (
     <div className="import-panel-v2__skills-hub">
@@ -710,11 +804,81 @@ function SkillsHub() {
           <span>{activeCount} 項啟用中</span>
           {totalTriggers > 0 && <span>共驅動 {totalTriggers} 次對話</span>}
         </div>
+        <button className="import-panel-v2__skill-new-btn" onClick={() => setShowCreate(v => !v)}>
+          <FontAwesomeIcon icon={faPlus} /> 新增技能
+        </button>
       </div>
+
+      {/* 新增技能表單 */}
+      {showCreate && (
+        <div className="import-panel-v2__skill-create-form">
+          <input
+            className="import-panel-v2__skill-edit-input"
+            placeholder="技能標題"
+            value={newTitle}
+            onChange={e => setNewTitle(e.target.value)}
+          />
+          <label className="import-panel-v2__skill-edit-label">觸發條件</label>
+          <textarea
+            className="import-panel-v2__skill-edit-textarea"
+            placeholder="當使用者問到...時"
+            value={newTrigger}
+            onChange={e => setNewTrigger(e.target.value)}
+            rows={2}
+          />
+          <label className="import-panel-v2__skill-edit-label">行為規範</label>
+          <textarea
+            className="import-panel-v2__skill-edit-textarea"
+            placeholder="應先...，再...，最後..."
+            value={newBehavior}
+            onChange={e => setNewBehavior(e.target.value)}
+            rows={3}
+          />
+          <div className="import-panel-v2__skill-edit-tools">
+            <span className="import-panel-v2__skill-edit-label">自動工具</span>
+            {ALLOWED_TOOLS.map(tool => (
+              <label key={tool} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11 }}>
+                <input
+                  type="checkbox"
+                  checked={newTools.includes(tool)}
+                  onChange={e => setNewTools(prev =>
+                    e.target.checked ? [...prev, tool] : prev.filter(t => t !== tool)
+                  )}
+                />
+                {tool}
+              </label>
+            ))}
+          </div>
+          <div className="import-panel-v2__skill-edit-tools" style={{ marginTop: 6 }}>
+            <span className="import-panel-v2__skill-edit-label">觸發時機</span>
+            {(['passive', 'active'] as const).map(mode => (
+              <label key={mode} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11 }}>
+                <input
+                  type="radio"
+                  name="new-injection-mode"
+                  checked={newInjectionMode === mode}
+                  onChange={() => setNewInjectionMode(mode)}
+                />
+                {mode === 'passive' ? '被動取用（相似度比對）' : '主動注入（每次對話）'}
+              </label>
+            ))}
+          </div>
+          <div className="import-panel-v2__skill-edit-footer">
+            <button className="import-panel-v2__skill-save-btn" onClick={handleCreate} disabled={creating || !newTitle.trim() || !newTrigger.trim() || !newBehavior.trim()}>
+              {creating ? <FontAwesomeIcon icon={faSpinner} spin /> : <><FontAwesomeIcon icon={faCheck} /> 建立</>}
+            </button>
+            <button className="import-panel-v2__skill-cancel-btn" onClick={() => setShowCreate(false)}>取消</button>
+          </div>
+        </div>
+      )}
+
+      {/* 統計面板 */}
+      {!loading && skills.length > 0 && <SkillStatsPanel />}
+
       {loading && <FontAwesomeIcon icon={faSpinner} spin />}
-      {!loading && skills.length === 0 && (
+      {!loading && skills.length === 0 && !showCreate && (
         <div className="import-panel-v2__empty-hint">
-          尚無技能規範 — 開啟知識項目後，AI 會自動建議技能
+          尚無技能規範 — 點「新增技能」手動建立，或開啟知識項目讓 AI 自動建議
         </div>
       )}
       <div className="import-panel-v2__skills-hub-list">
@@ -724,14 +888,13 @@ function SkillsHub() {
             skill={skill}
             onToggle={async (id, active) => {
               await invoke('toggle_agent_skill', { skillId: id, isActive: active })
-              setSkills(prev => prev.map(s =>
-                s.skill_id === id ? { ...s, is_active: active } : s
-              ))
+              setSkills(prev => prev.map(s => s.skill_id === id ? { ...s, is_active: active } : s))
             }}
             onDelete={async (id) => {
               await invoke('delete_agent_skill', { skillId: id })
               setSkills(prev => prev.filter(s => s.skill_id !== id))
             }}
+            onUpdate={handleUpdate}
           />
         ))}
       </div>
@@ -806,16 +969,27 @@ function fmtLastTriggered(ts: number | null): string | null {
   return `${days} 天前觸發`
 }
 
+const ALLOWED_TOOLS = ['search_vault', 'read_note', 'list_structure'] as const
+
 function SkillCard({
   skill,
   onToggle,
   onDelete,
+  onUpdate,
 }: {
   skill: AgentSkill
   onToggle: (id: string, active: boolean) => Promise<void>
   onDelete: (id: string) => Promise<void>
+  onUpdate?: (id: string, title: string, trigger: string, behavior: string, autoToolCalls: string[], injectionMode: string) => Promise<void>
 }) {
   const [toggling, setToggling] = useState(false)
+  const [editing, setEditing] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [editTitle, setEditTitle] = useState(skill.title)
+  const [editTrigger, setEditTrigger] = useState(skill.trigger)
+  const [editBehavior, setEditBehavior] = useState(skill.behavior)
+  const [editTools, setEditTools] = useState<string[]>(skill.auto_tool_calls)
+  const [editInjectionMode, setEditInjectionMode] = useState<'passive' | 'active'>(skill.injection_mode ?? 'passive')
 
   const daysSinceTrigger = skill.last_triggered_at
     ? Math.floor((Date.now() - skill.last_triggered_at) / 86400000)
@@ -823,64 +997,156 @@ function SkillCard({
   const isStale = skill.is_active && skill.trigger_count > 0 && daysSinceTrigger !== null && daysSinceTrigger > 90
   const neverTriggered = skill.trigger_count === 0
 
+  const handleSaveEdit = async () => {
+    if (!onUpdate) return
+    setSaving(true)
+    try {
+      await onUpdate(skill.skill_id, editTitle, editTrigger, editBehavior, editTools, editInjectionMode)
+      setEditing(false)
+    } finally {
+      setSaving(false)
+    }
+  }
+
   return (
     <div className={`import-panel-v2__skill-card ${skill.is_active ? 'active' : 'inactive'}${isStale ? ' stale' : ''}`}>
       <div className="import-panel-v2__skill-header">
-        <span className="import-panel-v2__skill-title">{skill.title}</span>
+        {editing
+          ? <input
+              className="import-panel-v2__skill-edit-input"
+              value={editTitle}
+              onChange={e => setEditTitle(e.target.value)}
+              placeholder="技能標題"
+            />
+          : <span className="import-panel-v2__skill-title">{skill.title}</span>
+        }
         <div className="import-panel-v2__skill-actions">
-          {skill.trigger_count > 0 && (
+          {skill.trigger_count > 0 && !editing && (
             <span className="import-panel-v2__skill-usage-badge" title={fmtLastTriggered(skill.last_triggered_at) ?? ''}>
               觸發 {skill.trigger_count} 次
             </span>
           )}
-          <button
-            className={`import-panel-v2__skill-toggle ${skill.is_active ? 'on' : 'off'}`}
-            disabled={toggling}
-            onClick={async () => {
-              setToggling(true)
-              await onToggle(skill.skill_id, !skill.is_active)
-              setToggling(false)
-            }}
-          >
-            {toggling
-              ? <FontAwesomeIcon icon={faSpinner} spin />
-              : skill.is_active ? '啟用中' : '已停用'}
-          </button>
-          <button
-            className="import-panel-v2__skill-delete"
-            onClick={() => onDelete(skill.skill_id)}
-            title="刪除技能"
-          >
-            <FontAwesomeIcon icon={faTrash} />
-          </button>
+          {!editing && onUpdate && (
+            <button
+              className="import-panel-v2__skill-edit-btn"
+              onClick={() => setEditing(true)}
+              title="編輯技能"
+            >
+              <FontAwesomeIcon icon={faPen} />
+            </button>
+          )}
+          {!editing && (
+            <button
+              className={`import-panel-v2__skill-toggle ${skill.is_active ? 'on' : 'off'}`}
+              disabled={toggling}
+              onClick={async () => {
+                setToggling(true)
+                await onToggle(skill.skill_id, !skill.is_active)
+                setToggling(false)
+              }}
+            >
+              {toggling ? <FontAwesomeIcon icon={faSpinner} spin /> : skill.is_active ? '啟用中' : '已停用'}
+            </button>
+          )}
+          {!editing && (
+            <button className="import-panel-v2__skill-delete" onClick={() => onDelete(skill.skill_id)} title="刪除技能">
+              <FontAwesomeIcon icon={faTrash} />
+            </button>
+          )}
         </div>
       </div>
-      <div className="import-panel-v2__skill-trigger">
-        <strong>觸發：</strong>{skill.trigger}
-      </div>
-      <div className="import-panel-v2__skill-behavior">
-        <strong>行為：</strong>{skill.behavior}
-      </div>
-      {skill.auto_tool_calls.length > 0 && (
-        <div className="import-panel-v2__skill-tools">
-          自動工具：{skill.auto_tool_calls.join('、')}
+
+      {editing ? (
+        <div className="import-panel-v2__skill-edit-body">
+          <label className="import-panel-v2__skill-edit-label">觸發條件</label>
+          <textarea
+            className="import-panel-v2__skill-edit-textarea"
+            value={editTrigger}
+            onChange={e => setEditTrigger(e.target.value)}
+            rows={2}
+            placeholder="當使用者問到...時"
+          />
+          <label className="import-panel-v2__skill-edit-label">行為規範</label>
+          <textarea
+            className="import-panel-v2__skill-edit-textarea"
+            value={editBehavior}
+            onChange={e => setEditBehavior(e.target.value)}
+            rows={3}
+            placeholder="應先...，再...，最後..."
+          />
+          <div className="import-panel-v2__skill-edit-tools">
+            <span className="import-panel-v2__skill-edit-label">自動工具</span>
+            {ALLOWED_TOOLS.map(tool => (
+              <label key={tool} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11 }}>
+                <input
+                  type="checkbox"
+                  checked={editTools.includes(tool)}
+                  onChange={e => setEditTools(prev =>
+                    e.target.checked ? [...prev, tool] : prev.filter(t => t !== tool)
+                  )}
+                />
+                {tool}
+              </label>
+            ))}
+          </div>
+          <div className="import-panel-v2__skill-edit-tools" style={{ marginTop: 6 }}>
+            <span className="import-panel-v2__skill-edit-label">觸發時機</span>
+            {(['passive', 'active'] as const).map(mode => (
+              <label key={mode} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11 }}>
+                <input
+                  type="radio"
+                  name={`injection-${skill.skill_id}`}
+                  checked={editInjectionMode === mode}
+                  onChange={() => setEditInjectionMode(mode)}
+                />
+                {mode === 'passive' ? '被動取用（相似度比對）' : '主動注入（每次對話）'}
+              </label>
+            ))}
+          </div>
+          <div className="import-panel-v2__skill-edit-footer">
+            <button className="import-panel-v2__skill-save-btn" onClick={handleSaveEdit} disabled={saving}>
+              {saving ? <FontAwesomeIcon icon={faSpinner} spin /> : <><FontAwesomeIcon icon={faCheck} /> 儲存</>}
+            </button>
+            <button className="import-panel-v2__skill-cancel-btn" onClick={() => {
+              setEditing(false)
+              setEditTitle(skill.title)
+              setEditTrigger(skill.trigger)
+              setEditBehavior(skill.behavior)
+              setEditTools(skill.auto_tool_calls)
+              setEditInjectionMode(skill.injection_mode ?? 'passive')
+            }}>取消</button>
+          </div>
         </div>
-      )}
-      {/* 健康度提示 */}
-      {isStale && (
-        <div className="import-panel-v2__skill-health-warn">
-          此技能已 {daysSinceTrigger} 天未觸發，是否
-          <button onClick={() => onToggle(skill.skill_id, false)}>停用</button>？
-        </div>
-      )}
-      {neverTriggered && skill.is_active && (
-        <div className="import-panel-v2__skill-never-used">尚未觸發 — 等待相關對話</div>
-      )}
-      {/* last triggered */}
-      {skill.last_triggered_at && (
-        <div className="import-panel-v2__skill-last-used">
-          {fmtLastTriggered(skill.last_triggered_at)}
-        </div>
+      ) : (
+        <>
+          <div className="import-panel-v2__skill-trigger"><strong>觸發：</strong>{skill.trigger}</div>
+          <div className="import-panel-v2__skill-behavior"><strong>行為：</strong>{skill.behavior}</div>
+          {skill.auto_tool_calls.length > 0 && (
+            <div className="import-panel-v2__skill-tools">自動工具：{skill.auto_tool_calls.join('、')}</div>
+          )}
+          <div style={{ marginTop: 4 }}>
+            <span style={{
+              fontSize: 10, padding: '1px 6px', borderRadius: 8,
+              background: skill.injection_mode === 'active' ? 'rgba(99,102,241,0.15)' : 'var(--color-bg-overlay)',
+              color: skill.injection_mode === 'active' ? 'var(--color-accent)' : 'var(--color-text-muted)',
+              border: `1px solid ${skill.injection_mode === 'active' ? 'var(--color-accent)' : 'var(--color-border)'}`,
+            }}>
+              {skill.injection_mode === 'active' ? '⚡ 主動注入' : '🔍 被動取用'}
+            </span>
+          </div>
+          {isStale && (
+            <div className="import-panel-v2__skill-health-warn">
+              此技能已 {daysSinceTrigger} 天未觸發，是否
+              <button onClick={() => onToggle(skill.skill_id, false)}>停用</button>？
+            </div>
+          )}
+          {neverTriggered && skill.is_active && (
+            <div className="import-panel-v2__skill-never-used">尚未觸發 — 等待相關對話</div>
+          )}
+          {skill.last_triggered_at && (
+            <div className="import-panel-v2__skill-last-used">{fmtLastTriggered(skill.last_triggered_at)}</div>
+          )}
+        </>
       )}
     </div>
   )

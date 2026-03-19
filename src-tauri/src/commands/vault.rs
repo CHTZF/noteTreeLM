@@ -115,6 +115,7 @@ pub async fn create_note(
 
     // 檢查是否已有同名筆記
     #[derive(Deserialize)]
+    #[allow(dead_code)]
     struct PathRow { path: String }
     let mut resp = db
         .query("SELECT path FROM notes WHERE title = $title AND vault_id = $vid LIMIT 1")
@@ -606,6 +607,7 @@ pub async fn scan_vault(state: State<'_, AppState>) -> Result<usize, AppError> {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
         #[derive(Deserialize)]
+        #[allow(dead_code)]
         struct CheckRow { path: String }
         let check_rows: Vec<CheckRow> = check.take(0).map_err(|e| AppError::Database(e.to_string()))?;
         if check_rows.is_empty() {

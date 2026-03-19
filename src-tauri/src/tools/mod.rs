@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 use crate::commands::ai::{
     resolve_vault_path, tool_create_folder, tool_create_note, tool_list_structure,
     tool_read_note, tool_search_vault, tool_update_note, call_external_ai_via_db,
+    tool_list_recent_conversations, tool_create_agent_skill,
 };
 use crate::commands::knowledge_import::tool_web_search;
 use crate::db::surreal::SurrealDb;
@@ -74,7 +75,7 @@ pub fn build_vault_registry(
 
     // search_vault
     {
-        let vp = vault_path.clone();
+        let _vp = vault_path.clone();
         let db = vault_db.clone();
         let vid = vault_id.clone();
         let app = app.clone();
@@ -371,6 +372,53 @@ pub fn build_vault_registry(
                     Box::pin(async move {
                         Ok(Value::String(
                             tool_web_search(&db, &vid, &query, &app, emb.as_deref()).await,
+                        ))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // list_recent_conversations — 讀取最近對話記錄，供 reflection agent 分析
+    {
+        let db = vault_db.clone();
+        let vid = vault_id.clone();
+        registry.register(
+            "list_recent_conversations".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let limit = args["limit"].as_u64().unwrap_or(10) as usize;
+                    let db = db.clone();
+                    let vid = vid.clone();
+                    Box::pin(async move {
+                        Ok(Value::String(tool_list_recent_conversations(&db, &vid, limit).await))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // create_agent_skill — reflection agent 建立新技能規範（預設未啟用）
+    {
+        let db = vault_db.clone();
+        let vid = vault_id.clone();
+        let emb = emb_url.clone();
+        registry.register(
+            "create_agent_skill".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let title          = args["title"].as_str().unwrap_or("").to_string();
+                    let trigger        = args["trigger"].as_str().unwrap_or("").to_string();
+                    let behavior       = args["behavior"].as_str().unwrap_or("").to_string();
+                    let injection_mode = args["injection_mode"].as_str().unwrap_or("passive").to_string();
+                    let db  = db.clone();
+                    let vid = vid.clone();
+                    let emb = emb.clone();
+                    Box::pin(async move {
+                        Ok(Value::String(
+                            tool_create_agent_skill(&db, &vid, &title, &trigger, &behavior, &injection_mode, emb.as_deref()).await
                         ))
                     })
                 }),

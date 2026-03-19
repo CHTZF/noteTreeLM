@@ -59,13 +59,17 @@ async fn resolve_server_config(state: &AppState) -> Result<(PathBuf, String), Ap
         ));
     }
 
-    let mut bin = PathBuf::from(&server_path);
+    #[cfg(not(windows))]
+    let bin = PathBuf::from(&server_path);
     // On Windows, auto-append .exe if the path has no extension and the bare path doesn't exist.
     #[cfg(windows)]
-    if !bin.exists() && bin.extension().is_none() {
-        let candidate = bin.with_extension("exe");
-        if candidate.exists() { bin = candidate; }
-    }
+    let bin = {
+        let b = PathBuf::from(&server_path);
+        if !b.exists() && b.extension().is_none() {
+            let candidate = b.with_extension("exe");
+            if candidate.exists() { candidate } else { b }
+        } else { b }
+    };
     if !bin.exists() {
         return Err(AppError::AI(format!(
             "找不到 llama-server：{}",
@@ -492,28 +496,6 @@ async fn send_streaming_request(
     })
 }
 
-/// 回傳只包含 call_external_ai 的工具定義陣列（用於 stream_chat）
-fn external_ai_tool_definition() -> serde_json::Value {
-    serde_json::json!([{
-        "type": "function",
-        "function": {
-            "name": "call_external_ai",
-            "description": "呼叫外部 AI 服務獲取即時資訊或當前事件。\
-僅在需要本地模型不具備的最新外部資料時使用（如今日新聞、即時排行、最新活動）。\
-不用於查詢 Vault 筆記或歷史對話記憶。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "發送給外部 AI 的完整問題或指令"
-                    }
-                },
-                "required": ["query"]
-            }
-        }
-    }])
-}
 
 /// 從 DB 讀取外部 AI 設定並執行查詢（供 ToolRegistry 的 call_external_ai 工具使用）
 pub(crate) async fn call_external_ai_via_db(
@@ -788,18 +770,19 @@ pub async fn invoke_agent(
 
     // 10. Skill pre-pass：向量搜尋符合當前查詢的 active skills → 注入 system prompt
     if let Some(ref vid) = vault_id_opt {
-        let skill_section = run_skill_pre_pass(
+        if let Some((section, titles)) = run_skill_pre_pass(
             &state.db, vid, &input,
             skill_emb_url.as_deref(),
             &client,
-        ).await;
-        if let Some(section) = skill_section {
+        ).await {
             if messages_json.first().and_then(|m| m["role"].as_str()) == Some("system") {
                 let old = messages_json[0]["content"].as_str().unwrap_or("").to_string();
                 messages_json[0]["content"] = serde_json::json!(format!("{}\n\n{}", old, section));
             } else {
                 messages_json.insert(0, serde_json::json!({"role": "system", "content": section}));
             }
+            // 透明度：通知前端哪些技能被觸發
+            let _ = app.emit("agent:skills_activated", serde_json::json!({ "titles": titles }));
         }
     }
 
@@ -1224,12 +1207,16 @@ async fn resolve_embedding_config(state: &AppState) -> Result<(PathBuf, String),
     if model_path.is_empty() {
         return Err(AppError::AI("尚未設定 Embedding 模型路徑".to_string()));
     }
-    let mut bin = PathBuf::from(&server_path);
+    #[cfg(not(windows))]
+    let bin = PathBuf::from(&server_path);
     #[cfg(windows)]
-    if !bin.exists() && bin.extension().is_none() {
-        let candidate = bin.with_extension("exe");
-        if candidate.exists() { bin = candidate; }
-    }
+    let bin = {
+        let b = PathBuf::from(&server_path);
+        if !b.exists() && b.extension().is_none() {
+            let candidate = b.with_extension("exe");
+            if candidate.exists() { candidate } else { b }
+        } else { b }
+    };
     if !bin.exists() {
         return Err(AppError::AI(format!("找不到 llama-server：{}", bin.display())));
     }
@@ -1589,6 +1576,93 @@ async fn call_external_ai_tool(query: &str, config: &ExtAiConfig, app: &AppHandl
     response_text
 }
 
+/// 讀取最近對話，回傳摘要供 reflection agent 分析模式
+pub async fn tool_list_recent_conversations(db: &crate::db::surreal::SurrealDb, vault_id: &str, limit: usize) -> String {
+    #[derive(serde::Deserialize)]
+    struct ConvRow {
+        title: Option<String>,
+        mode: Option<String>,
+        messages_json: Option<String>,
+    }
+    let limit = limit.min(20) as i64;
+    let mut resp = match db.query(
+        "SELECT title, mode, messages_json FROM conversations \
+         WHERE (vault_id = $vid OR vault_id = NONE) AND messages_json != '[]' \
+         ORDER BY updated_at DESC LIMIT $lim"
+    ).bind(("vid", vault_id.to_string())).bind(("lim", limit)).await {
+        Ok(r) => r,
+        Err(e) => return format!("查詢失敗：{e}"),
+    };
+    let rows: Vec<ConvRow> = resp.take(0).unwrap_or_default();
+    if rows.is_empty() { return "沒有找到任何對話記錄".to_string(); }
+
+    let mut out = format!("最近 {} 段對話：\n\n", rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        let title = row.title.as_deref().unwrap_or("未命名");
+        let mode  = row.mode.as_deref().unwrap_or("chat");
+        out.push_str(&format!("## 對話 {} — {} ({})\n", i + 1, title, mode));
+
+        // 取最後 6 則 user/assistant 訊息
+        if let Some(ref json) = row.messages_json {
+            if let Ok(msgs) = serde_json::from_str::<Vec<serde_json::Value>>(json) {
+                let tail: Vec<_> = msgs.iter()
+                    .filter(|m| {
+                        let role = m["role"].as_str().unwrap_or("");
+                        role == "user" || role == "assistant"
+                    })
+                    .rev().take(6).collect::<Vec<_>>().into_iter().rev().collect();
+                for m in tail {
+                    let role    = m["role"].as_str().unwrap_or("?");
+                    let content = m["content"].as_str().unwrap_or("").chars().take(200).collect::<String>();
+                    out.push_str(&format!("**{}**: {}\n", role, content));
+                }
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// 建立新技能規範（供 reflection agent 呼叫，預設未啟用）
+pub async fn tool_create_agent_skill(
+    db: &crate::db::surreal::SurrealDb,
+    vault_id: &str,
+    title: &str,
+    trigger: &str,
+    behavior: &str,
+    injection_mode: &str,
+    emb_url: Option<&str>,
+) -> String {
+    let skill_id = uuid::Uuid::new_v4().to_string();
+    let mode = if injection_mode == "active" { "active" } else { "passive" };
+    let client = reqwest::Client::new();
+    let trigger_embedding: Option<Vec<f32>> = if let Some(url) = emb_url {
+        let v = get_embedding(&client, url, trigger).await;
+        if v.is_empty() { None } else { Some(v) }
+    } else { None };
+
+    let result = db.query(
+        "INSERT INTO agent_skills \
+         (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
+          auto_tool_calls, is_active, injection_mode, trigger_count, trigger_embedding, created_at) \
+         VALUES ($sid, $vid, 'reflection', $title, $trigger, $behavior, \
+                 [], false, $mode, 0, $emb, time::now())"
+    )
+    .bind(("sid", skill_id.clone()))
+    .bind(("vid", vault_id.to_string()))
+    .bind(("title", title.to_string()))
+    .bind(("trigger", trigger.to_string()))
+    .bind(("behavior", behavior.to_string()))
+    .bind(("mode", mode.to_string()))
+    .bind(("emb", trigger_embedding))
+    .await;
+
+    match result {
+        Ok(_)  => format!("✅ 技能「{}」已建立（未啟用，請至技能規範頁面審核）", title),
+        Err(e) => format!("❌ 建立失敗：{e}"),
+    }
+}
+
 /// 工具定義（OpenAI function calling 格式）
 fn vault_tools() -> serde_json::Value {
     serde_json::json!([
@@ -1682,39 +1756,10 @@ fn vault_tools() -> serde_json::Value {
         {
             "type": "function",
             "function": {
-                "name": "query_memory",
-                "description": "查詢過去整理的對話記憶筆記。當使用者提到之前討論的話題、或需要回顧歷史對話時使用。\
-【時間參數轉換規則】若使用者提到時間範圍，請將自然語言轉成 since 的 ISO 日期：\
-今天→今日日期、昨天→前一天、本週→本週一、本月→本月1號、上個月→上月1號、N天前→對應日期；\
-若無時間限制則省略 since。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "keywords": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "語意搜尋關鍵字列表，例如 [\"Rust\", \"async\", \"Tauri\"]；若無特定主題可傳空陣列"
-                        },
-                        "since": {
-                            "type": "string",
-                            "description": "可選，只查詢此日期之後的記憶，格式 YYYY-MM-DD。例：昨天→前一天日期，本月→本月01日"
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "回傳最多幾筆，預設 3"
-                        }
-                    },
-                    "required": ["keywords"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
                 "name": "call_external_ai",
                 "description": "呼叫外部 AI 服務（如 OpenAI / Anthropic）獲取即時資訊或當前事件。\
 僅在問題需要本地模型不具備的最新外部資料時使用（例如今日新聞、即時排行、最新活動等）。\
-不用於查詢 Vault 筆記或歷史對話記憶（那些請用 search_vault / query_memory）。",
+不用於查詢 Vault 筆記或歷史對話（那些請用 search_vault）。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1804,6 +1849,44 @@ fn vault_tools() -> serde_json::Value {
                         }
                     },
                     "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_recent_conversations",
+                "description": "讀取最近的對話記錄，分析使用者的重複需求、知識缺口和行為模式。僅供自我改進分析使用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "number",
+                            "description": "要讀取的對話數量（預設 10，最多 20）"
+                        }
+                    },
+                    "required": []
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "create_agent_skill",
+                "description": "根據觀察到的使用者模式，建立新的技能規範。建立後預設未啟用，使用者可在「我的技能規範」頁面審核並啟用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string", "description": "技能名稱" },
+                        "trigger": { "type": "string", "description": "觸發條件，以「當...時」開頭" },
+                        "behavior": { "type": "string", "description": "具體操作規範：先做A，再做B" },
+                        "injection_mode": {
+                            "type": "string",
+                            "enum": ["passive", "active"],
+                            "description": "passive=語意相似時注入；active=永遠注入"
+                        }
+                    },
+                    "required": ["title", "trigger", "behavior"]
                 }
             }
         }
@@ -3250,24 +3333,48 @@ struct ActiveSkillRow {
     trigger: String,
     behavior: String,
     auto_tool_calls: Vec<String>,
+    #[allow(dead_code)]
+    #[serde(default = "passive_str")]
+    injection_mode: String,
 }
 
-/// 向量搜尋相似度 > SKILL_THRESHOLD 的 active skills；
+fn passive_str() -> String { "passive".to_string() }
+
+/// 取得所有 injection_mode = 'active' 的啟用技能（永遠注入，不做 embedding 比對）。
+async fn fetch_always_on_skills(
+    db: &surrealdb::Surreal<surrealdb::engine::local::Db>,
+    vault_id: &str,
+) -> Vec<ActiveSkillRow> {
+    let mut resp = db.query(
+        "SELECT skill_id, title, trigger, behavior, auto_tool_calls, injection_mode \
+         FROM agent_skills \
+         WHERE vault_id = $vid AND is_active = true AND injection_mode = 'active' \
+         ORDER BY created_at ASC"
+    )
+    .bind(("vid", vault_id.to_string()))
+    .await.ok();
+    resp.as_mut()
+        .and_then(|r| r.take::<Vec<ActiveSkillRow>>(0).ok())
+        .unwrap_or_default()
+}
+
+/// 向量搜尋相似度 > SKILL_THRESHOLD 的 passive skills；
 /// 若 trigger_embedding 為 None，fallback 到文字 contains 匹配。
-async fn search_active_skills(
+async fn search_passive_skills(
     db: &surrealdb::Surreal<surrealdb::engine::local::Db>,
     vault_id: &str,
     query_embedding: &[f32],
 ) -> Vec<ActiveSkillRow> {
     const SKILL_THRESHOLD: f64 = 0.65;
 
-    // 向量搜尋（有 embedding 的 skills）
+    // 向量搜尋（有 embedding 的 passive skills）
     let mut vector_results: Vec<ActiveSkillRow> = {
         let emb_val: Vec<f64> = query_embedding.iter().map(|&x| x as f64).collect();
         let mut resp = db.query(
-            "SELECT skill_id, title, trigger, behavior, auto_tool_calls \
+            "SELECT skill_id, title, trigger, behavior, auto_tool_calls, injection_mode \
              FROM agent_skills \
-             WHERE vault_id = $vid AND is_active = true AND trigger_embedding != NONE \
+             WHERE vault_id = $vid AND is_active = true AND injection_mode != 'active' \
+               AND trigger_embedding != NONE \
                AND vector::similarity::cosine(trigger_embedding, $qvec) > $thresh \
              ORDER BY vector::similarity::cosine(trigger_embedding, $qvec) DESC \
              LIMIT 4"
@@ -3281,14 +3388,13 @@ async fn search_active_skills(
             .unwrap_or_default()
     };
 
-    // Fallback：text contains 匹配（trigger_embedding 為 None 的 skills）
+    // Fallback：text contains 匹配（trigger_embedding 為 None 的 passive skills）
     let mut text_results: Vec<ActiveSkillRow> = {
-        let query_lower = query_embedding.is_empty().then_some("").unwrap_or("");
-        let _ = query_lower; // suppress warning, real query below uses $query
         let mut resp = db.query(
-            "SELECT skill_id, title, trigger, behavior, auto_tool_calls \
+            "SELECT skill_id, title, trigger, behavior, auto_tool_calls, injection_mode \
              FROM agent_skills \
-             WHERE vault_id = $vid AND is_active = true AND trigger_embedding = NONE \
+             WHERE vault_id = $vid AND is_active = true AND injection_mode != 'active' \
+               AND trigger_embedding = NONE \
              LIMIT 10"
         )
         .bind(("vid", vault_id.to_string()))
@@ -3299,7 +3405,7 @@ async fn search_active_skills(
     };
 
     vector_results.append(&mut text_results);
-    vector_results.truncate(5);
+    vector_results.truncate(4);
     vector_results
 }
 
@@ -3318,7 +3424,7 @@ fn build_skill_injection_section(skills: &[ActiveSkillRow]) -> String {
     section
 }
 
-/// 更新 trigger_count 和 last_triggered_at。
+/// 更新 trigger_count + last_triggered_at，並寫入 skill_usage_log（供趨勢圖）。
 async fn bump_skill_trigger_count(
     db: &surrealdb::Surreal<surrealdb::engine::local::Db>,
     vault_id: &str,
@@ -3332,32 +3438,64 @@ async fn bump_skill_trigger_count(
     .bind(("vid", vault_id.to_string()))
     .bind(("ids", skill_ids.to_vec()))
     .await;
+
+    // 寫入使用記錄
+    for sid in skill_ids {
+        let log_id = uuid::Uuid::new_v4().to_string();
+        let _ = db.query(
+            "INSERT INTO skill_usage_log (log_id, vault_id, skill_id, triggered_at) \
+             VALUES ($lid, $vid, $sid, time::now())"
+        )
+        .bind(("lid", log_id))
+        .bind(("vid", vault_id.to_string()))
+        .bind(("sid", sid.clone()))
+        .await;
+    }
 }
 
-/// Pre-pass 入口：embed query → search → build injection section → bump counts。
-/// 回傳 Some(injection_text) 若有符合的 skills，否則 None。
+/// Pre-pass 入口：
+/// 1. 主動注入（injection_mode = 'active'）：永遠注入，不做 embedding 比對。
+/// 2. 被動取用（injection_mode = 'passive'）：embed query → cosine 相似度 > 閾值才注入。
+/// 回傳 Some((injection_text, titles)) 若有任何符合的 skills，否則 None。
 async fn run_skill_pre_pass(
     db: &surrealdb::Surreal<surrealdb::engine::local::Db>,
     vault_id: &str,
     query: &str,
     emb_url: Option<&str>,
     client: &reqwest::Client,
-) -> Option<String> {
-    // 若 embedding server 不可用，直接略過（不影響主流程）
-    let emb_url = emb_url?;
+) -> Option<(String, Vec<String>)> {
+    // 1. 主動注入 skills（不需要 embedding server）
+    let always_on = fetch_always_on_skills(db, vault_id).await;
 
-    let query_vec = get_embedding(client, emb_url, query).await;
-    if query_vec.is_empty() { return None; }
+    // 2. 被動取用 skills（需要 embedding server）
+    let passive = if let Some(url) = emb_url {
+        let query_vec = get_embedding(client, url, query).await;
+        if query_vec.is_empty() {
+            vec![]
+        } else {
+            search_passive_skills(db, vault_id, &query_vec).await
+        }
+    } else {
+        vec![]
+    };
 
-    let matched = search_active_skills(db, vault_id, &query_vec).await;
+    // 合併，去重（active 優先）
+    let mut seen = std::collections::HashSet::new();
+    let mut matched: Vec<ActiveSkillRow> = Vec::new();
+    for s in always_on.into_iter().chain(passive.into_iter()) {
+        if seen.insert(s.skill_id.clone()) {
+            matched.push(s);
+        }
+    }
+
     if matched.is_empty() { return None; }
 
     // 更新觸發統計
     let ids: Vec<String> = matched.iter().map(|s| s.skill_id.clone()).collect();
     bump_skill_trigger_count(db, vault_id, &ids).await;
 
-    // 收集 auto_tool_calls（後續可擴充為真正的工具預執行）
-    // 目前先記錄在 section 中提示 agent 自動執行
+    let titles: Vec<String> = matched.iter().map(|s| s.title.clone()).collect();
+
     let auto_tools: Vec<String> = matched.iter()
         .flat_map(|s| s.auto_tool_calls.iter().cloned())
         .collect::<std::collections::HashSet<_>>()
@@ -3373,7 +3511,7 @@ async fn run_skill_pre_pass(
         ));
     }
 
-    Some(section)
+    Some((section, titles))
 }
 
 #[cfg(test)]

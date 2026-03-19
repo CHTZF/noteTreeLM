@@ -13,10 +13,6 @@ pub fn to_relative_path(vault_root: &str, abs_path: &Path) -> Option<String> {
         .map(|p| p.to_string_lossy().replace('\\', "/"))
 }
 
-/// 將相對路徑轉換為絕對路徑
-pub fn to_absolute_path(vault_root: &str, rel_path: &str) -> PathBuf {
-    PathBuf::from(vault_root).join(rel_path)
-}
 
 /// 從路徑提取筆記標題（優先 H1，否則用檔名）
 pub fn extract_title(path: &str, content: &str) -> String {

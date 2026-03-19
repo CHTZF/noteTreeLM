@@ -8,6 +8,10 @@ use surrealdb::{
 
 pub type SurrealDb = Arc<Surreal<Db>>;
 
+/// Schema 版本：每次修改 apply_schema 或 insert_default_settings 時遞增，
+/// 確保已安裝的客戶端會重新執行一次 DDL，之後快取跳過。
+const SCHEMA_VERSION: u32 = 1;
+
 /// 初始化 SurrealDB（embedded SurrealKV）
 /// 所有資料存於 app_data_dir/surrealdb/
 pub async fn init_db(app_data_dir: &Path) -> crate::error::Result<SurrealDb> {
@@ -23,37 +27,21 @@ pub async fn init_db(app_data_dir: &Path) -> crate::error::Result<SurrealDb> {
         .await
         .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
 
-    apply_schema(&db).await?;
+    // 版本快取：若版本檔匹配則跳過 ~100 條 DDL，大幅縮短啟動時間
+    let version_file = app_data_dir.join("schema_version");
+    let cached = tokio::fs::read_to_string(&version_file).await
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
 
-    let db_arc = Arc::new(db);
-
-    // One-time migration: rebuild FTS indexes to repair corruption caused by
-    // the old ON DUPLICATE KEY UPDATE pattern. Runs only once; after that the
-    // migration flag "migration:fts_rebuild_v1" is set in the KV store.
-    {
-        let db2 = Arc::clone(&db_arc);
-        tokio::spawn(async move {
-            #[derive(serde::Deserialize)]
-            struct KvRow { value: String }
-            let already_done: bool = db2
-                .query("SELECT value FROM kv WHERE key = 'migration:fts_rebuild_v1' LIMIT 1")
-                .await
-                .ok()
-                .and_then(|mut r| r.take::<Vec<KvRow>>(0).ok())
-                .map(|rows| !rows.is_empty())
-                .unwrap_or(false);
-
-            if !already_done {
-                let _ = db2.query("REBUILD INDEX ft_chunks ON chunks;").await;
-                let _ = db2.query("REBUILD INDEX ft_import_pages ON import_pages;").await;
-                let _ = db2
-                    .query("INSERT INTO kv (key, value) VALUES ('migration:fts_rebuild_v1', 'done') ON DUPLICATE KEY UPDATE value = 'done'")
-                    .await;
-            }
-        });
+    if cached != Some(SCHEMA_VERSION) {
+        apply_schema(&db).await?;
+        let _ = tokio::fs::write(&version_file, SCHEMA_VERSION.to_string()).await;
+    } else {
+        // DDL 已快取，仍需插入可能新增的預設設定
+        insert_default_settings(&db).await?;
     }
 
-    Ok(db_arc)
+    Ok(Arc::new(db))
 }
 
 /// 定義所有 table / index
@@ -96,12 +84,6 @@ async fn apply_schema(db: &Surreal<Db>) -> crate::error::Result<()> {
         "DEFINE FIELD IF NOT EXISTS last_open_note ON vault_states TYPE string DEFAULT '';",
         "DEFINE FIELD IF NOT EXISTS updated_at     ON vault_states TYPE datetime DEFAULT time::now();",
         "DEFINE INDEX IF NOT EXISTS idx_vault_states_path ON vault_states FIELDS vault_path UNIQUE;",
-
-        // Intent keywords for voice classifier
-        "DEFINE TABLE IF NOT EXISTS intent_keywords SCHEMAFULL;",
-        "DEFINE FIELD IF NOT EXISTS intent   ON intent_keywords TYPE string;",
-        "DEFINE FIELD IF NOT EXISTS keywords ON intent_keywords TYPE array<string>;",
-        "DEFINE INDEX IF NOT EXISTS idx_intent_keywords_intent ON intent_keywords FIELDS intent UNIQUE;",
 
         // ── 對話層 ───────────────────────────────────────────────────
         "DEFINE TABLE IF NOT EXISTS conversations SCHEMAFULL;",
@@ -345,10 +327,21 @@ async fn apply_schema(db: &Surreal<Db>) -> crate::error::Result<()> {
         "DEFINE FIELD IF NOT EXISTS trigger_count        ON agent_skills TYPE int DEFAULT 0;",
         "DEFINE FIELD IF NOT EXISTS last_triggered_at    ON agent_skills TYPE option<datetime>;",
         "DEFINE FIELD IF NOT EXISTS trigger_embedding    ON agent_skills TYPE option<array<float>>;",
+        "DEFINE FIELD IF NOT EXISTS injection_mode       ON agent_skills TYPE string DEFAULT 'passive';",
         "DEFINE FIELD IF NOT EXISTS created_at           ON agent_skills TYPE datetime DEFAULT time::now();",
         "DEFINE INDEX IF NOT EXISTS idx_agent_skills_vault  ON agent_skills FIELDS vault_id, skill_id UNIQUE;",
         "DEFINE INDEX IF NOT EXISTS idx_agent_skills_ki     ON agent_skills FIELDS vault_id, knowledge_item_id;",
         "DEFINE INDEX IF NOT EXISTS idx_agent_skills_active ON agent_skills FIELDS vault_id, is_active;",
+
+        // ── skill_usage_log：每次技能觸發記錄一筆，供趨勢圖使用 ──────────────
+        "DEFINE TABLE IF NOT EXISTS skill_usage_log SCHEMAFULL;",
+        "DEFINE FIELD IF NOT EXISTS log_id       ON skill_usage_log TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS vault_id     ON skill_usage_log TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS skill_id     ON skill_usage_log TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS triggered_at ON skill_usage_log TYPE datetime DEFAULT time::now();",
+        "DEFINE INDEX IF NOT EXISTS idx_sul_vault   ON skill_usage_log FIELDS vault_id;",
+        "DEFINE INDEX IF NOT EXISTS idx_sul_skill   ON skill_usage_log FIELDS vault_id, skill_id;",
+        "DEFINE INDEX IF NOT EXISTS idx_sul_date    ON skill_usage_log FIELDS vault_id, triggered_at;",
     ];
 
     // Batch all DDL into one query to avoid N sequential round-trips.
@@ -359,13 +352,13 @@ async fn apply_schema(db: &Surreal<Db>) -> crate::error::Result<()> {
 
     // 插入預設設定（只在 key 不存在時插入）
     insert_default_settings(db).await?;
-    insert_default_intent_keywords(db).await?;
 
     Ok(())
 }
 
 async fn insert_default_settings(db: &Surreal<Db>) -> crate::error::Result<()> {
-    let defaults = [
+    // 所有值均為程式內建常數，直接內嵌成 batch 避免 N 次 round-trip
+    let defaults: &[(&str, &str)] = &[
         ("vault_path",          ""),
         ("theme",               "dark"),
         ("auto_save_mode",      "afterDelay"),
@@ -405,29 +398,16 @@ async fn insert_default_settings(db: &Surreal<Db>) -> crate::error::Result<()> {
         ("enable_auto_memory",  "false"),
         ("memory_threshold",    "20"),
     ];
-    for (key, value) in defaults {
-        db.query("INSERT INTO settings (key, value) VALUES ($key, $value) ON DUPLICATE KEY UPDATE key = key")
-            .bind(("key", key))
-            .bind(("value", value))
-            .await
-            .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
-    }
+    let batch = defaults.iter()
+        .map(|(k, v)| format!(
+            "INSERT INTO settings (key, value) VALUES ('{}', '{}') ON DUPLICATE KEY UPDATE key = key;",
+            k, v
+        ))
+        .collect::<Vec<_>>()
+        .join("\n");
+    db.query(batch)
+        .await
+        .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
     Ok(())
 }
 
-async fn insert_default_intent_keywords(db: &Surreal<Db>) -> crate::error::Result<()> {
-    let intents = [
-        ("CANCEL",    r#"["算了","取消","不要","停止","不用了","停","不用","別","不行"]"#),
-        ("INTERRUPT", r#"["等等","先停","暫停","先等","hold on","wait"]"#),
-        ("CONFIRM",   r#"["確認","好的","是","對","OK","ok","確定","沒錯","對對","行","好"]"#),
-        ("REPEAT",    r#"["再說一次","再講一次","重複","請再說","再說","重說"]"#),
-    ];
-    for (intent, keywords) in intents {
-        db.query("INSERT INTO intent_keywords (intent, keywords) VALUES ($intent, $keywords) ON DUPLICATE KEY UPDATE intent = intent")
-            .bind(("intent", intent))
-            .bind(("keywords", keywords))
-            .await
-            .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
-    }
-    Ok(())
-}

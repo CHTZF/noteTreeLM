@@ -662,6 +662,7 @@ pub async fn auto_check_all_sessions(app: &AppHandle, state: &AppState) {
 
         tokio::spawn(async move {
             #[derive(serde::Deserialize)]
+            #[allow(dead_code)]
             struct PageRow { url: String, content_hash: Option<String>, http_etag: Option<String> }
 
             let mut resp = match db2.query(
@@ -1315,13 +1316,6 @@ async fn find_relevant_imported_pages(
     results
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() { return 0.0; }
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { dot / (norm_a * norm_b) }
-}
 
 /// Find pending pages whose sitemap title is most relevant to `question`.
 /// Uses pre-embedded sitemap_titles (populated during fetch_site_outline).
@@ -1392,8 +1386,9 @@ async fn find_matching_pending_pages(
 
     // ── Fallback: FTS on sitemap_titles ───────────────────────────────────────
     #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
     struct SitemapFts { url: String }
-    let fts_hits: Vec<SitemapFts> = if let Some(sid) = session_id {
+    let _fts_hits: Vec<SitemapFts> = if let Some(sid) = session_id {
         db.query(
             "SELECT url FROM sitemap_titles \
              WHERE vault_id = $vid AND session_id = $sid AND title @1@ $q \
@@ -1717,8 +1712,12 @@ pub struct AgentSkillSuggestion {
     pub title: String,
     pub trigger: String,          // "當問題涉及 X、Y、Z 時"
     pub behavior: String,         // agent 應執行的操作指令
-    pub auto_tool_calls: Vec<String>, // 自動呼叫的工具，限 search_vault/read_note/list_structure/query_memory
+    pub auto_tool_calls: Vec<String>, // 自動呼叫的工具，限 search_vault/read_note/list_structure
+    #[serde(default = "default_passive")]
+    pub injection_mode: String,   // "passive"（embedding 比對）或 "active"（永遠注入）
 }
+
+fn default_passive() -> String { "passive".to_string() }
 
 /// 持久化後的技能規範（從 DB 讀取）
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1731,6 +1730,7 @@ pub struct AgentSkillRecord {
     pub behavior: String,
     pub auto_tool_calls: Vec<String>,
     pub is_active: bool,
+    pub injection_mode: String,   // "passive" | "active"
     pub trigger_count: i64,
     pub last_triggered_at: Option<i64>, // ms timestamp，None = 從未觸發
     pub created_at: i64,
@@ -2473,10 +2473,14 @@ pub async fn save_agent_skill(
     trigger: String,
     behavior: String,
     auto_tool_calls: Vec<String>,
+    #[allow(unused_variables)]
+    injection_mode: Option<String>,
 ) -> Result<AgentSkillRecord, AppError> {
     let vault_id = state.get_vault_id().await?;
     let db = &state.db;
     let skill_id = uuid::Uuid::new_v4().to_string();
+    let mode = injection_mode.unwrap_or_else(|| "passive".to_string());
+    let mode = if mode == "active" { "active" } else { "passive" };
 
     // 計算 trigger 向量（若 embedding server 未就緒則存 None）
     let emb_url: Option<String> = {
@@ -2493,7 +2497,7 @@ pub async fn save_agent_skill(
     } else { None };
 
     // 篩選合法工具（防止任意工具被注入）
-    let allowed = ["search_vault", "read_note", "list_structure", "query_memory"];
+    let allowed = ["search_vault", "read_note", "list_structure"];
     let safe_tools: Vec<String> = auto_tool_calls.into_iter()
         .filter(|t| allowed.contains(&t.as_str()))
         .collect();
@@ -2501,9 +2505,9 @@ pub async fn save_agent_skill(
     db.query(
         "INSERT INTO agent_skills \
          (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
-          auto_tool_calls, is_active, trigger_count, trigger_embedding, created_at) \
+          auto_tool_calls, is_active, injection_mode, trigger_count, trigger_embedding, created_at) \
          VALUES ($sid, $vid, $kid, $title, $trigger, $behavior, \
-                 $tools, true, 0, $emb, time::now())"
+                 $tools, true, $mode, 0, $emb, time::now())"
     )
     .bind(("sid", skill_id.clone()))
     .bind(("vid", vault_id.clone()))
@@ -2512,6 +2516,7 @@ pub async fn save_agent_skill(
     .bind(("trigger", trigger.clone()))
     .bind(("behavior", behavior.clone()))
     .bind(("tools", safe_tools.clone()))
+    .bind(("mode", mode.to_string()))
     .bind(("emb", trigger_embedding))
     .await.map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -2525,10 +2530,179 @@ pub async fn save_agent_skill(
         behavior,
         auto_tool_calls: safe_tools,
         is_active: true,
+        injection_mode: mode.to_string(),
         trigger_count: 0,
         last_triggered_at: None,
         created_at,
     })
+}
+
+// ── Skill Usage Stats ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DailyCount {
+    pub date: String,  // "YYYY-MM-DD"
+    pub count: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SkillTrendStat {
+    pub skill_id: String,
+    pub title: String,
+    pub trigger_count: i64,
+    pub daily: Vec<DailyCount>,  // 30 天每日觸發數
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SkillUsageStats {
+    pub global_daily: Vec<DailyCount>,       // 30 天全局每日觸發數
+    pub top_skills: Vec<SkillTrendStat>,     // trigger_count 前 10 的 skill（含各自 30 天）
+    pub active_count: i64,
+    pub total_triggers_30d: i64,
+}
+
+/// 取得過去 30 天技能使用統計：全局趨勢 + top 10 技能各自趨勢。
+#[tauri::command]
+pub async fn get_skill_usage_stats(
+    state: State<'_, AppState>,
+) -> Result<SkillUsageStats, AppError> {
+    let vault_id = state.get_vault_id().await?;
+    let db = &state.db;
+
+    let since_ts = chrono::Utc::now() - chrono::Duration::days(30);
+    let since_str = since_ts.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+    // ── 全局 30 天觸發記錄 ────────────────────────────────────────────────────
+    #[derive(Deserialize)]
+    struct LogRow { skill_id: String, triggered_at: surrealdb::sql::Datetime }
+
+    let mut r = db.query(
+        "SELECT skill_id, triggered_at FROM skill_usage_log \
+         WHERE vault_id = $vid AND triggered_at > $since \
+         ORDER BY triggered_at ASC"
+    )
+    .bind(("vid", vault_id.clone()))
+    .bind(("since", since_str.clone()))
+    .await.map_err(|e| AppError::Database(e.to_string()))?;
+
+    let logs: Vec<LogRow> = r.take(0).unwrap_or_default();
+
+    // 建立 30 天日期表（確保每天都有，即使為 0）
+    let today = chrono::Utc::now().date_naive();
+    let dates: Vec<String> = (0..30).rev()
+        .map(|d| (today - chrono::Duration::days(d)).format("%Y-%m-%d").to_string())
+        .collect();
+
+    // 全局每日聚合
+    let mut global_map: std::collections::HashMap<String, i64> =
+        dates.iter().map(|d| (d.clone(), 0)).collect();
+    // per-skill 每日聚合
+    let mut skill_map: std::collections::HashMap<String, std::collections::HashMap<String, i64>> =
+        std::collections::HashMap::new();
+
+    for log in &logs {
+        let dt: chrono::DateTime<chrono::Utc> = log.triggered_at.clone().into();
+        let date_str = dt.format("%Y-%m-%d").to_string();
+        *global_map.entry(date_str.clone()).or_insert(0) += 1;
+        skill_map.entry(log.skill_id.clone()).or_default()
+            .entry(date_str).or_insert(0);
+        *skill_map.entry(log.skill_id.clone()).or_default()
+            .entry(dt.format("%Y-%m-%d").to_string()).or_insert(0) += 1;
+    }
+
+    let global_daily: Vec<DailyCount> = dates.iter()
+        .map(|d| DailyCount { date: d.clone(), count: *global_map.get(d).unwrap_or(&0) })
+        .collect();
+    let total_triggers_30d: i64 = global_daily.iter().map(|d| d.count).sum();
+
+    // ── 取 top 10 skills（by trigger_count）及 active_count ──────────────────
+    #[derive(Deserialize)]
+    struct SkillRow {
+        skill_id: String,
+        title: String,
+        trigger_count: i64,
+        is_active: bool,
+    }
+    let mut r2 = db.query(
+        "SELECT skill_id, title, trigger_count, is_active FROM agent_skills \
+         WHERE vault_id = $vid ORDER BY trigger_count DESC LIMIT 10"
+    )
+    .bind(("vid", vault_id.clone()))
+    .await.map_err(|e| AppError::Database(e.to_string()))?;
+    let skill_rows: Vec<SkillRow> = r2.take(0).unwrap_or_default();
+
+    let active_count = skill_rows.iter().filter(|s| s.is_active).count() as i64;
+
+    let top_skills: Vec<SkillTrendStat> = skill_rows.into_iter().map(|s| {
+        let per_day = skill_map.get(&s.skill_id);
+        let daily = dates.iter().map(|d| DailyCount {
+            date: d.clone(),
+            count: per_day.and_then(|m| m.get(d)).copied().unwrap_or(0),
+        }).collect();
+        SkillTrendStat {
+            skill_id: s.skill_id,
+            title: s.title,
+            trigger_count: s.trigger_count,
+            daily,
+        }
+    }).collect();
+
+    Ok(SkillUsageStats { global_daily, top_skills, active_count, total_triggers_30d })
+}
+
+/// 更新技能規範內容並重算 trigger embedding。
+#[tauri::command]
+pub async fn update_agent_skill(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    skill_id: String,
+    title: String,
+    trigger: String,
+    behavior: String,
+    auto_tool_calls: Vec<String>,
+    injection_mode: Option<String>,
+) -> Result<(), AppError> {
+    let vault_id = state.get_vault_id().await?;
+    let db = &state.db;
+
+    let mode = injection_mode.unwrap_or_else(|| "passive".to_string());
+    let mode = if mode == "active" { "active" } else { "passive" };
+
+    let allowed = ["search_vault", "read_note", "list_structure"];
+    let safe_tools: Vec<String> = auto_tool_calls.into_iter()
+        .filter(|t| allowed.contains(&t.as_str()))
+        .collect();
+
+    // 重算 trigger embedding
+    let emb_url: Option<String> = {
+        let port = *state.embedding_actual_port.lock().await;
+        port.map(|p| format!("http://127.0.0.1:{}", p))
+    };
+    let trigger_embedding: Option<Vec<f32>> = if let Some(ref url) = emb_url {
+        let base_url = crate::commands::ai::ensure_server_running(state.inner(), &app).await.ok();
+        if base_url.is_some() {
+            let client = reqwest::Client::new();
+            let vec = crate::commands::ai::get_embedding(&client, url, &trigger).await;
+            if vec.is_empty() { None } else { Some(vec) }
+        } else { None }
+    } else { None };
+
+    db.query(
+        "UPDATE agent_skills SET title = $title, trigger = $trigger, behavior = $behavior, \
+         auto_tool_calls = $tools, injection_mode = $mode, trigger_embedding = $emb \
+         WHERE vault_id = $vid AND skill_id = $sid"
+    )
+    .bind(("title", title))
+    .bind(("trigger", trigger))
+    .bind(("behavior", behavior))
+    .bind(("tools", safe_tools))
+    .bind(("mode", mode.to_string()))
+    .bind(("emb", trigger_embedding))
+    .bind(("vid", vault_id))
+    .bind(("sid", skill_id))
+    .await.map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(())
 }
 
 /// 列出 vault 中所有技能規範，可選擇只回傳特定知識項目或只回傳啟用中的技能。
@@ -2551,13 +2725,16 @@ pub async fn list_agent_skills(
         behavior: String,
         auto_tool_calls: Vec<String>,
         is_active: bool,
+        #[serde(default = "default_passive")]
+        injection_mode: String,
         trigger_count: i64,
         last_triggered_at: Option<surrealdb::sql::Datetime>,
         created_at: surrealdb::sql::Datetime,
     }
 
     let mut query = "SELECT skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
-                     auto_tool_calls, is_active, trigger_count, last_triggered_at, created_at \
+                     auto_tool_calls, is_active, injection_mode OR 'passive' AS injection_mode, \
+                     trigger_count, last_triggered_at, created_at \
                      FROM agent_skills WHERE vault_id = $vid".to_string();
     if active_only { query.push_str(" AND is_active = true"); }
     if knowledge_item_id.is_some() { query.push_str(" AND knowledge_item_id = $kid"); }
@@ -2568,7 +2745,10 @@ pub async fn list_agent_skills(
         req = req.bind(("kid", kid.clone()));
     }
     let mut resp = req.await.map_err(|e| AppError::Database(e.to_string()))?;
-    let rows: Vec<SkillRow> = resp.take(0).unwrap_or_default();
+    let rows: Vec<SkillRow> = resp.take(0).unwrap_or_else(|e| {
+        eprintln!("[list_agent_skills] deserialize error: {e}");
+        vec![]
+    });
 
     Ok(rows.into_iter().map(|r| AgentSkillRecord {
         skill_id: r.skill_id,
@@ -2579,6 +2759,7 @@ pub async fn list_agent_skills(
         behavior: r.behavior,
         auto_tool_calls: r.auto_tool_calls,
         is_active: r.is_active,
+        injection_mode: r.injection_mode,
         trigger_count: r.trigger_count,
         last_triggered_at: r.last_triggered_at.map(|dt| {
             dt.timestamp_millis()
@@ -2636,18 +2817,20 @@ pub async fn suggest_kb_cards_for_item(
 
     // 載入知識項目
     #[derive(Deserialize)]
-    struct KIRow { title: String, ai_summary: String, source_refs: Option<String> }
+    struct KIRow { title: String, ai_summary: String, source_refs: Option<serde_json::Value> }
     let mut resp = db.query(
         "SELECT title, ai_summary, source_refs FROM knowledge_items \
          WHERE vault_id = $vid AND item_id = $iid LIMIT 1"
     )
     .bind(("vid", vault_id.clone())).bind(("iid", item_id.clone()))
     .await.map_err(|e| AppError::Database(e.to_string()))?;
-    let row = resp.take::<Vec<KIRow>>(0).unwrap_or_default().into_iter().next()
+    let row = resp.take::<Vec<KIRow>>(0)
+        .map_err(|e| AppError::Database(format!("KIRow deserialize error: {e}")))?
+        .into_iter().next()
         .ok_or_else(|| AppError::Import(format!("knowledge item not found: {}", item_id)))?;
 
     let source_refs: Vec<KnowledgeRef> = row.source_refs
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
     let refs_text = source_refs.iter()
         .map(|r| format!("- [{}]({})", r.title, r.path))
@@ -2680,7 +2863,7 @@ pub async fn suggest_kb_cards_for_item(
 - skill_cards：1-2 張
   - trigger 必須明確描述觸發情境，以「當…時」開頭
   - behavior 必須是可執行的操作指令，不能是模糊描述
-  - auto_tool_calls 只能包含：search_vault、read_note、list_structure、query_memory（或空陣列）
+  - auto_tool_calls 只能包含：search_vault、read_note、list_structure（或空陣列）
   - 若知識內容不適合產生 skill_cards，可回傳空陣列
 
 note_cards content 格式範例（concept）：
@@ -2732,12 +2915,18 @@ tags: [concept]
         .as_str().unwrap_or("").trim().to_string();
 
     // 找 JSON 物件邊界（LLM 可能夾雜說明文字）
+    let preview: String = raw.chars().take(500).collect();
+    eprintln!("[suggest_kb_cards] raw LLM response ({} chars): {}", raw.len(), preview);
     let obj_start = raw.find('{').unwrap_or(0);
     let obj_end = raw.rfind('}').map(|i| i + 1).unwrap_or(raw.len());
     let json_str = &raw[obj_start..obj_end];
 
     let suggestions: KBAndSkillSuggestions = serde_json::from_str(json_str)
-        .unwrap_or_else(|_| KBAndSkillSuggestions { note_cards: vec![], skill_cards: vec![] });
+        .unwrap_or_else(|e| {
+            let js_preview: String = json_str.chars().take(300).collect();
+            eprintln!("[suggest_kb_cards] JSON parse error: {e}\njson_str: {}", js_preview);
+            KBAndSkillSuggestions { note_cards: vec![], skill_cards: vec![] }
+        });
 
     // 持久化 note_cards 到 kb_suggestions（清除同 item 的舊建議）
     let _ = db.query(
@@ -2774,7 +2963,7 @@ tags: [concept]
         port.map(|p| format!("http://127.0.0.1:{}", p))
     };
 
-    let allowed = ["search_vault", "read_note", "list_structure", "query_memory"];
+    let allowed = ["search_vault", "read_note", "list_structure"];
     let mut saved_skills: Vec<AgentSkillRecord> = Vec::new();
 
     for skill in &suggestions.skill_cards {
@@ -2789,12 +2978,13 @@ tags: [concept]
             if vec.is_empty() { None } else { Some(vec) }
         } else { None };
 
-        let _ = db.query(
+        let mode = if skill.injection_mode == "active" { "active" } else { "passive" };
+        let insert_result = db.query(
             "INSERT INTO agent_skills \
              (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
-              auto_tool_calls, is_active, trigger_count, trigger_embedding, created_at) \
+              auto_tool_calls, is_active, injection_mode, trigger_count, trigger_embedding, created_at) \
              VALUES ($sid, $vid, $kid, $title, $trigger, $behavior, \
-                     $tools, true, 0, $emb, time::now())"
+                     $tools, false, $mode, 0, $emb, time::now())"
         )
         .bind(("sid", skill_id.clone()))
         .bind(("vid", vault_id.clone()))
@@ -2803,8 +2993,12 @@ tags: [concept]
         .bind(("trigger", skill.trigger.clone()))
         .bind(("behavior", skill.behavior.clone()))
         .bind(("tools", safe_tools.clone()))
+        .bind(("mode", mode.to_string()))
         .bind(("emb", trigger_embedding))
         .await;
+        if let Err(e) = insert_result {
+            eprintln!("[suggest_kb_cards] INSERT agent_skills FAILED: {e}");
+        }
 
         saved_skills.push(AgentSkillRecord {
             skill_id,
@@ -2814,7 +3008,8 @@ tags: [concept]
             trigger: skill.trigger.clone(),
             behavior: skill.behavior.clone(),
             auto_tool_calls: safe_tools,
-            is_active: true,
+            is_active: false,
+            injection_mode: skill.injection_mode.clone(),
             trigger_count: 0,
             last_triggered_at: None,
             created_at: now_ms,
@@ -2829,6 +3024,287 @@ tags: [concept]
     }));
 
     Ok(())
+}
+
+// ── compress_conversation_to_knowledge ───────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompressedConvResult {
+    pub item_id: String,
+    pub title: String,
+    pub skill_count: usize,
+}
+
+/// LLM 壓縮對話輸出格式
+#[derive(Debug, Serialize, Deserialize)]
+struct ConvCompression {
+    title: String,
+    knowledge_summary: String,
+    skill_candidates: Vec<AgentSkillSuggestion>,
+}
+
+/// 將一段 Chat 對話以 skill-first 方式壓縮為知識項目 + 技能規範。
+/// 一次 LLM call 萃取：標題、知識摘要（供向量搜尋）、技能候選（直接可用的行為規則）。
+/// 完成後 emit kb:suggestions_ready，前端可跳轉 Import Center 查看。
+#[tauri::command]
+pub async fn compress_conversation_to_knowledge(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    messages_json: String,
+) -> Result<CompressedConvResult, AppError> {
+    let vault_id = state.get_vault_id().await?;
+    let db = &state.db;
+
+    // 解析訊息，只保留 user/assistant
+    #[derive(Deserialize)]
+    struct RawMsg { role: String, content: String }
+    let raw_msgs: Vec<RawMsg> = serde_json::from_str(&messages_json)
+        .map_err(|e| AppError::Import(format!("messages_json 解析失敗：{}", e)))?;
+    let filtered: Vec<&RawMsg> = raw_msgs.iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .collect();
+    if filtered.is_empty() {
+        return Err(AppError::Import("對話內容為空，無法壓縮".into()));
+    }
+
+    // 組成對話文字供 LLM 閱讀
+    let conv_text = filtered.iter().map(|m| {
+        let role_label = if m.role == "user" { "使用者" } else { "助理" };
+        format!("**{}**：{}", role_label, m.content)
+    }).collect::<Vec<_>>().join("\n\n");
+
+    let system_prompt = r#"你是個人知識萃取 AI，專門從對話中萃取「使用者可程式化 AI 助理」所需的行為規則。
+分析這段對話，回傳嚴格 JSON（不含其他文字）：
+
+{
+  "title": "這段對話的簡短標題（10字以內）",
+  "knowledge_summary": "敘述性摘要，描述討論了什麼、決定了什麼、使用者的背景脈絡（供未來語意搜尋）",
+  "skill_candidates": [
+    {
+      "title": "技能標題",
+      "trigger": "當使用者問到...時（具體描述觸發情境）",
+      "behavior": "應先...，再...，最後...（可執行的操作指令）",
+      "auto_tool_calls": []
+    }
+  ]
+}
+
+萃取優先順序：
+1. 使用者明確表達的偏好（回答格式、深度、風格）
+2. 已做出的決策（技術選型、方向）→ 轉成「不需重複評估 X，直接用 Y」的行為規則
+3. 隱性工作習慣（從對話行為推斷）→ 轉成可執行規則
+4. 高密度 Q&A（問題有意義 + 答案有知識價值）
+
+skill_candidates：只萃取能直接改變未來 AI 行為的規則。若對話純屬閒聊或無可萃取規則，回傳空陣列。
+auto_tool_calls 只能包含：search_vault、read_note、list_structure（或空陣列）。"#;
+
+    let base_url = ensure_server_running(state.inner(), &app).await
+        .map_err(|e| AppError::AI(e.to_string()))?;
+    let client = reqwest::Client::new();
+
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": conv_text},
+        ],
+        "stream": false,
+        "temperature": 0.2,
+        "max_tokens": 1200,
+    });
+    let response = client
+        .post(format!("{}/v1/chat/completions", base_url))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(90))
+        .send().await.map_err(|e| AppError::AI(e.to_string()))?;
+
+    let json: serde_json::Value = response.json().await
+        .map_err(|e| AppError::AI(format!("回應解析失敗：{}", e)))?;
+    let raw = json["choices"][0]["message"]["content"]
+        .as_str().unwrap_or("").trim().to_string();
+
+    let obj_start = raw.find('{').unwrap_or(0);
+    let obj_end = raw.rfind('}').map(|i| i + 1).unwrap_or(raw.len());
+    let json_str = &raw[obj_start..obj_end];
+
+    let compression: ConvCompression = serde_json::from_str(json_str)
+        .unwrap_or_else(|e| {
+            eprintln!("[compress_conv] JSON parse error: {e}");
+            ConvCompression {
+                title: "對話壓縮".into(),
+                knowledge_summary: conv_text.chars().take(500).collect(),
+                skill_candidates: vec![],
+            }
+        });
+
+    // ── 建立 knowledge item ────────────────────────────────────────────────────
+    let item_id = Uuid::new_v4().to_string();
+    let now_ms = chrono::Local::now().timestamp_millis();
+    let source_refs: Vec<KnowledgeRef> = vec![];  // 對話來源，無外部 URL
+
+    db.query(
+        "INSERT INTO knowledge_items \
+         (vault_id, item_id, session_id, title, source_refs, ai_summary, created_at) \
+         VALUES ($vid, $iid, $sid, $title, $refs, $summary, time::now())"
+    )
+    .bind(("vid", vault_id.clone())).bind(("iid", item_id.clone()))
+    .bind(("sid", "conversation".to_string()))
+    .bind(("title", compression.title.clone()))
+    .bind(("refs", source_refs))
+    .bind(("summary", compression.knowledge_summary.clone()))
+    .await.map_err(|e| AppError::Database(e.to_string()))?;
+
+    // 背景：chunk + embed 知識摘要
+    let emb_url: Option<String> = {
+        let port = *state.embedding_actual_port.lock().await;
+        port.map(|p| format!("http://127.0.0.1:{}", p))
+    };
+    {
+        let db2 = db.clone();
+        let vid2 = vault_id.clone();
+        let iid2 = item_id.clone();
+        let summary2 = compression.knowledge_summary.clone();
+        let emb_url2 = emb_url.clone();
+        tokio::spawn(async move {
+            let file_path = format!("knowledge_items/{}.md", iid2);
+            let chunks = crate::vault::chunker::chunk_note(&file_path, &summary2, now_ms);
+            for chunk in &chunks {
+                let _ = db2.query(
+                    "INSERT INTO chunks \
+                     (vault_id, chunk_id, file_path, section, content, links, chunk_type, word_count, updated_at, item_id) \
+                     VALUES ($vid, $cid, $fp, $section, $content, $links, $chunk_type, $wc, time::now(), $iid) \
+                     ON DUPLICATE KEY UPDATE content = $content, item_id = $iid, updated_at = time::now()"
+                )
+                .bind(("vid", vid2.clone())).bind(("cid", chunk.id.clone()))
+                .bind(("fp", chunk.file_path.clone())).bind(("section", chunk.section.clone()))
+                .bind(("content", chunk.content.clone())).bind(("links", chunk.links.clone()))
+                .bind(("chunk_type", chunk.chunk_type.clone())).bind(("wc", chunk.word_count))
+                .bind(("iid", iid2.clone()))
+                .await.ok();
+            }
+            if let Some(ref url) = emb_url2 {
+                let _ = crate::vault::chunker::upsert_chunks(&db2, &vid2, &chunks, Some(url)).await;
+            }
+        });
+    }
+
+    // ── 持久化 skill_candidates ────────────────────────────────────────────────
+    let allowed = ["search_vault", "read_note", "list_structure"];
+    let mut saved_skills: Vec<AgentSkillRecord> = Vec::new();
+
+    for skill in &compression.skill_candidates {
+        let skill_id = Uuid::new_v4().to_string();
+        let safe_tools: Vec<String> = skill.auto_tool_calls.iter()
+            .filter(|t| allowed.contains(&t.as_str()))
+            .cloned().collect();
+
+        let trigger_embedding: Option<Vec<f32>> = if let Some(ref url) = emb_url {
+            let vec = get_embedding(&client, url, &skill.trigger).await;
+            if vec.is_empty() { None } else { Some(vec) }
+        } else { None };
+
+        let mode = if skill.injection_mode == "active" { "active" } else { "passive" };
+        let _ = db.query(
+            "INSERT INTO agent_skills \
+             (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
+              auto_tool_calls, is_active, injection_mode, trigger_count, trigger_embedding, created_at) \
+             VALUES ($sid, $vid, $kid, $title, $trigger, $behavior, \
+                     $tools, false, $mode, 0, $emb, time::now())"
+        )
+        .bind(("sid", skill_id.clone())).bind(("vid", vault_id.clone()))
+        .bind(("kid", item_id.clone())).bind(("title", skill.title.clone()))
+        .bind(("trigger", skill.trigger.clone())).bind(("behavior", skill.behavior.clone()))
+        .bind(("tools", safe_tools.clone())).bind(("mode", mode.to_string())).bind(("emb", trigger_embedding))
+        .await;
+
+        saved_skills.push(AgentSkillRecord {
+            skill_id,
+            vault_id: vault_id.clone(),
+            knowledge_item_id: item_id.clone(),
+            title: skill.title.clone(),
+            trigger: skill.trigger.clone(),
+            behavior: skill.behavior.clone(),
+            auto_tool_calls: safe_tools,
+            is_active: false,
+            injection_mode: skill.injection_mode.clone(),
+            trigger_count: 0,
+            last_triggered_at: None,
+            created_at: now_ms,
+        });
+    }
+
+    // emit kb:suggestions_ready（note_cards 為空，因為壓縮不產生筆記卡片）
+    let _ = app.emit("kb:suggestions_ready", serde_json::json!({
+        "item_id": &item_id,
+        "note_cards": serde_json::json!([]),
+        "skill_cards": &saved_skills,
+    }));
+
+    Ok(CompressedConvResult {
+        item_id,
+        title: compression.title,
+        skill_count: saved_skills.len(),
+    })
+}
+
+// ── extract_skill_from_exchange ───────────────────────────────────────────────
+
+/// 從單次對話交換（使用者訊息 + 助理回覆）萃取一條技能規範建議。
+/// 前端可在偵測到「記住」等關鍵字或使用者點擊📌按鈕時呼叫。
+#[tauri::command]
+pub async fn extract_skill_from_exchange(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    user_msg: String,
+    assistant_msg: String,
+) -> Result<AgentSkillSuggestion, AppError> {
+    let base_url = ensure_server_running(state.inner(), &app).await
+        .map_err(|e| AppError::AI(e.to_string()))?;
+    let client = reqwest::Client::new();
+
+    let system_prompt = r#"你是個人 AI 行為規則萃取器。根據以下對話交換，萃取一條可重用的技能規範。
+回傳嚴格 JSON（不含其他文字、不含 markdown code fence）：
+
+{
+  "title": "技能標題（10字以內）",
+  "trigger": "當使用者...時（具體觸發條件，15-30字）",
+  "behavior": "應先...，再...（具體、可執行的操作指令）",
+  "auto_tool_calls": []
+}
+
+auto_tool_calls 只能包含：search_vault、read_note、list_structure（或空陣列）。
+若對話內容無可萃取的行為規則，trigger 欄填入「無法萃取」。"#;
+
+    let conv = format!("使用者：{}\n\n助理：{}", user_msg, assistant_msg);
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": conv},
+        ],
+        "stream": false,
+        "temperature": 0.2,
+        "max_tokens": 400,
+    });
+
+    let response = client
+        .post(format!("{}/v1/chat/completions", base_url))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(60))
+        .send().await.map_err(|e| AppError::AI(e.to_string()))?;
+
+    let json: serde_json::Value = response.json().await
+        .map_err(|e| AppError::AI(format!("回應解析失敗：{}", e)))?;
+    let raw = json["choices"][0]["message"]["content"]
+        .as_str().unwrap_or("").trim().to_string();
+
+    // 尋找 JSON 物件邊界（容錯 markdown code fence）
+    let obj_start = raw.find('{').unwrap_or(0);
+    let obj_end = raw.rfind('}').map(|i| i + 1).unwrap_or(raw.len());
+    let json_str = &raw[obj_start..obj_end];
+
+    let skill: AgentSkillSuggestion = serde_json::from_str(json_str)
+        .map_err(|e| AppError::AI(format!("JSON 解析失敗：{}\n原始：{}", e, json_str.chars().take(200).collect::<String>())))?;
+
+    Ok(skill)
 }
 
 /// 診斷：列出目前 vault 的 import sessions + pages 狀態 + chunks 分佈
@@ -2898,6 +3374,7 @@ pub async fn debug_kb_chunks(state: State<'_, AppState>) -> Result<String, AppEr
     out += "\n";
 
     #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
     struct SampleChunk { file_path: String, section: String, status: String, updated_at: Option<serde_json::Value> }
     let mut r2 = db.query(
         "SELECT file_path, section, status, updated_at FROM chunks WHERE vault_id = $vid ORDER BY updated_at DESC LIMIT 5"

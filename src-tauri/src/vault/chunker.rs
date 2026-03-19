@@ -19,7 +19,9 @@ pub struct Chunk {
     pub links:      Vec<String>, // wikilink target titles found in content
     pub chunk_type: String,
     pub word_count: i64,
+    #[allow(dead_code)]
     pub updated_at: i64,      // milliseconds
+    #[allow(dead_code)]
     pub embedding:  Option<Vec<f32>>,
     pub status:     String,   // from frontmatter: "draft" | "verified" | "deprecated" | ""
 }
@@ -228,21 +230,6 @@ pub async fn upsert_chunks(
     Ok(())
 }
 
-/// Update status for all chunks of a file (called after set_note_status).
-pub async fn update_chunks_status(
-    db: &SurrealDb,
-    vault_id: &str,
-    file_path: &str,
-    status: &str,
-) -> Result<(), AppError> {
-    db.query("UPDATE chunks SET status = $status WHERE vault_id = $vid AND file_path = $fp")
-        .bind(("status", status.to_owned()))
-        .bind(("vid", vault_id.to_owned()))
-        .bind(("fp", file_path.to_owned()))
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-    Ok(())
-}
 
 /// Remove all chunks for a given file path (called on note delete).
 pub async fn delete_chunks(db: &SurrealDb, vault_id: &str, file_path: &str) -> Result<(), AppError> {

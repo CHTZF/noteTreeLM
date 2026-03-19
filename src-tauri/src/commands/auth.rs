@@ -44,6 +44,7 @@ fn session_path(app: &tauri::AppHandle) -> std::path::PathBuf {
 
 #[derive(Deserialize)]
 struct UserRow {
+    #[allow(dead_code)]
     username: String,
 }
 

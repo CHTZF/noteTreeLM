@@ -57,13 +57,17 @@ async fn resolve_whisper_server_config(
         ));
     }
 
-    let mut bin = PathBuf::from(&server_path);
+    #[cfg(not(windows))]
+    let bin = PathBuf::from(&server_path);
     // On Windows, auto-append .exe if the path has no extension and the bare path doesn't exist.
     #[cfg(windows)]
-    if !bin.exists() && bin.extension().is_none() {
-        let candidate = bin.with_extension("exe");
-        if candidate.exists() { bin = candidate; }
-    }
+    let bin = {
+        let b = PathBuf::from(&server_path);
+        if !b.exists() && b.extension().is_none() {
+            let candidate = b.with_extension("exe");
+            if candidate.exists() { candidate } else { b }
+        } else { b }
+    };
     if !bin.exists() {
         return Err(AppError::Voice(format!(
             "找不到 whisper-server：{}，請到 Settings > Voice 更新路徑。",

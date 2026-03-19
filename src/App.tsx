@@ -3,7 +3,7 @@ import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
 import { open as openPath } from '@tauri-apps/plugin-shell'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
-import { faGear, faBolt, faChevronLeft, faChevronRight, faSitemap, faFolderTree, faMagnifyingGlass, faBug, faComments, faMicrophone, faArrowRightArrowLeft, faTrash, faArrowRightFromBracket, faCircleQuestion, faUser, faFileImport, faShieldHalved } from '@fortawesome/free-solid-svg-icons'
+import { faGear, faBolt, faChevronLeft, faChevronRight, faSitemap, faFolderTree, faMagnifyingGlass, faBug, faComments, faMicrophone, faArrowRightArrowLeft, faTrash, faArrowRightFromBracket, faCircleQuestion, faUser, faFileImport, faShieldHalved, faSliders } from '@fortawesome/free-solid-svg-icons'
 import { useSettingsStore } from './stores/settingsStore'
 import { useVaultStore } from './stores/vaultStore'
 import { useGraphStore } from './stores/graphStore'
@@ -28,6 +28,7 @@ import SettingsModal from './components/Settings/SettingsModal'
 import { AgentToolContent } from './components/AgentTools/AgentToolPanel'
 import TrashPanel from './components/Trash/TrashPanel'
 import ImportPanel from './components/ImportCenter/ImportPanel'
+import SkillsPage from './components/Skills/SkillsPage'
 import KnowledgeAssistant from './components/KnowledgeAssistant/KnowledgeAssistant'
 import HelpPanel from './components/Help/HelpPanel'
 import Editor from './components/Editor/Editor'
@@ -50,6 +51,7 @@ const HELP_TAB = '__help__'
 const TRASH_TAB = '__trash__'
 const IMPORT_TAB = '__import__'
 const KB_ASSIST_TAB = '__kb_assist__'
+const SKILLS_TAB = '__skills__'
 
 // ─── Pane tree types ───────────────────────────────────────────────────────
 interface PaneLeaf {
@@ -462,7 +464,7 @@ function AppMain() {
 
   // ─── Open a note in the focused pane ──────────────────────────────────
   // Chat/LiveChat tabs should never be replaced by content navigation
-  const isChatTab = (p: string) => p === CHAT_TAB || p === LIVE_CHAT_TAB || p === IMPORT_TAB || p === KB_ASSIST_TAB
+  const isChatTab = (p: string) => p === CHAT_TAB || p === LIVE_CHAT_TAB || p === IMPORT_TAB || p === KB_ASSIST_TAB || p === SKILLS_TAB
 
   // Find a pane that is NOT showing a Chat/LiveChat tab as its active tab,
   // excluding the given leafId. Returns undefined if none exists.
@@ -1007,8 +1009,8 @@ function AppMain() {
             }
           }}
         >
-          {/* Always-mounted Chat / LiveChat / Import / KB Assistant panels — hidden with display:none when not active */}
-          {leaf.tabs.filter(t => t.path === CHAT_TAB || t.path === LIVE_CHAT_TAB || t.path === IMPORT_TAB || t.path === KB_ASSIST_TAB).map(t => (
+          {/* Always-mounted Chat / LiveChat / Import / KB Assistant / Skills panels — hidden with display:none when not active */}
+          {leaf.tabs.filter(t => t.path === CHAT_TAB || t.path === LIVE_CHAT_TAB || t.path === IMPORT_TAB || t.path === KB_ASSIST_TAB || t.path === SKILLS_TAB).map(t => (
             <div key={t.id} style={{
               display: t.id === leaf.activeTabId ? 'flex' : 'none',
               flex: 1, flexDirection: 'column', height: '100%', overflow: 'hidden',
@@ -1029,13 +1031,16 @@ function AppMain() {
               {t.path === IMPORT_TAB && (
                 <ImportPanel />
               )}
+              {t.path === SKILLS_TAB && (
+                <SkillsPage />
+              )}
               {t.path === KB_ASSIST_TAB && (
                 <KnowledgeAssistant onOpenNote={openNoteFromChat} />
               )}
             </div>
           ))}
           {/* Regular content — only when active tab is not Chat/LiveChat/Import */}
-          {(!activeTab || (activeTab.path !== CHAT_TAB && activeTab.path !== LIVE_CHAT_TAB && activeTab.path !== IMPORT_TAB && activeTab.path !== KB_ASSIST_TAB)) && (
+          {(!activeTab || (activeTab.path !== CHAT_TAB && activeTab.path !== LIVE_CHAT_TAB && activeTab.path !== IMPORT_TAB && activeTab.path !== KB_ASSIST_TAB && activeTab.path !== SKILLS_TAB)) && (
             renderPaneContent(leaf, isFocused, activePath)
           )}
           {isDraggingTab && dropZoneInfo?.paneId === leaf.id && (
@@ -1148,6 +1153,12 @@ function AppMain() {
             title="知識庫助手"
             onClick={() => openNote(KB_ASSIST_TAB)}
           ><FontAwesomeIcon icon={faShieldHalved} /></button>
+
+          <button
+            className={`icon-menubar-btn${currentPath === SKILLS_TAB ? ' active' : ''}`}
+            title="技能規範"
+            onClick={() => openNote(SKILLS_TAB)}
+          ><FontAwesomeIcon icon={faSliders} /></button>
 
           {settings.enable_chat && <>
             <button
