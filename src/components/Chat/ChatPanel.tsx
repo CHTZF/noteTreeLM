@@ -611,6 +611,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       const chatMessages = meaningfulMsgs.map(m => ({ role: m.role, content: m.content }))
       invoke('save_memory_session', { messages: chatMessages })
         .then(() => invoke('distill_preferences').catch(() => {}))
+        .then(() => invoke('analyze_tool_patterns').catch(() => {}))
         .catch(() => {})
     }
     setMessages([])

@@ -1946,7 +1946,8 @@ pub fn vault_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "search_vault",
-                "description": "全文搜索 Vault 中的筆記，返回相關筆記列表及摘要",
+                "description": "全文搜索 Vault 中的筆記，返回相關筆記列表及摘要。\
+【前置工具】：open_note / read_note / update_note / append_to_note / delete_note / move_note 都需要精確路徑，若路徑不確定，必須先呼叫 search_vault 取得。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1974,8 +1975,9 @@ pub fn vault_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "read_note",
-                "description": "讀取指定筆記的完整 Markdown 內容，用於需要分析或摘要筆記內容時。\
-注意：若使用者只是要「打開」或「查看」筆記，請改用 open_note 工具；read_note 僅用於需要理解筆記內容才能回答問題的情況。",
+                "description": "讀取指定筆記的完整 Markdown 內容，用於需要分析、摘要或修改筆記內容時。\
+【前置要求】必須知道精確路徑；不確定時先用 search_vault。\
+注意：若使用者只是要「打開」或「查看」筆記，請改用 open_note 工具；read_note 僅用於需要理解或修改內容的情況。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2004,7 +2006,8 @@ pub fn vault_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "update_note",
-                "description": "覆寫更新現有筆記的完整內容",
+                "description": "覆寫更新現有筆記的完整內容。\
+【操作序列】：(1) 若路徑不確定 → 先 search_vault；(2) 若需保留現有內容做部分修改 → 先 read_note 取得原始內容，再修改後呼叫 update_note。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2291,7 +2294,8 @@ pub fn vault_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "list_notes_in_folder",
-                "description": "列出指定資料夾內的所有筆記",
+                "description": "列出指定資料夾下的所有筆記。\
+【操作序列】：若資料夾路徑不確定 → 先 list_structure 確認資料夾名稱，再呼叫本工具。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2305,7 +2309,8 @@ pub fn vault_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "append_to_note",
-                "description": "在現有筆記末尾追加內容（比 update_note 更安全，不覆蓋原有內容）",
+                "description": "在現有筆記末尾追加內容（不覆蓋原有內容）。\
+【操作序列】：若路徑不確定 → 先 search_vault 取得路徑，再呼叫 append_to_note。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2320,7 +2325,8 @@ pub fn vault_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "delete_note",
-                "description": "刪除指定筆記（需使用者確認）",
+                "description": "刪除指定筆記（永久，不可復原）。\
+【操作序列】：操作不可逆，若路徑不確定，必須先 search_vault 確認路徑後再呼叫。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2348,7 +2354,8 @@ pub fn vault_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "move_note",
-                "description": "移動或重新命名筆記",
+                "description": "移動或重新命名筆記。\
+【操作序列】：若 from 路徑不確定 → 先 search_vault 找到來源路徑，再呼叫 move_note。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -3854,6 +3861,196 @@ pub async fn distill_preferences(state: State<'_, AppState>) -> Result<(), AppEr
     .await;
 
     Ok(())
+}
+
+/// 分析最近對話中的工具呼叫序列，自動生成/更新技能規範（auto_tool_calls）
+#[tauri::command]
+pub async fn analyze_tool_patterns(state: State<'_, AppState>) -> Result<u32, AppError> {
+    let vault_id = match state.get_vault_id().await {
+        Ok(vid) => vid,
+        Err(_) => return Ok(0),
+    };
+    let vault_db = state.db.clone();
+
+    // 取得 llama-server URL（若未啟動則靜默跳過）
+    let base_url = {
+        let port = *state.llama_actual_port.lock().await;
+        match port {
+            Some(p) => format!("http://127.0.0.1:{}", p),
+            None => return Ok(0),
+        }
+    };
+
+    // 讀取最近 30 筆對話（包含完整 tool call 歷史）
+    #[derive(Deserialize)]
+    struct ConvRow { messages_json: String }
+    let mut resp = match vault_db.query(
+        "SELECT messages_json FROM conversations ORDER BY updated_at DESC LIMIT 30"
+    ).await {
+        Ok(r) => r,
+        Err(_) => return Ok(0),
+    };
+    let rows: Vec<ConvRow> = resp.take(0).unwrap_or_default();
+    if rows.is_empty() { return Ok(0); }
+
+    // 提取每筆對話的 tool call 序列
+    let mut sequence_counts: std::collections::HashMap<Vec<String>, u32> =
+        std::collections::HashMap::new();
+
+    for row in &rows {
+        let Ok(msgs) = serde_json::from_str::<serde_json::Value>(&row.messages_json) else { continue };
+        let Some(arr) = msgs.as_array() else { continue };
+
+        let mut seq: Vec<String> = Vec::new();
+        let mut last_user_idx: Option<usize> = None;
+
+        for (i, msg) in arr.iter().enumerate() {
+            match msg["role"].as_str() {
+                Some("user") => {
+                    // 保存上一段 user→tool 序列
+                    if seq.len() >= 2 {
+                        *sequence_counts.entry(seq.clone()).or_insert(0) += 1;
+                    }
+                    seq.clear();
+                    last_user_idx = Some(i);
+                }
+                Some("assistant") => {
+                    if let Some(tool_calls) = msg["tool_calls"].as_array() {
+                        for tc in tool_calls {
+                            if let Some(name) = tc["function"]["name"].as_str() {
+                                if !name.starts_with("__") {
+                                    seq.push(name.to_string());
+                                }
+                            }
+                        }
+                    }
+                    let _ = last_user_idx;
+                }
+                _ => {}
+            }
+        }
+        // 最後一段
+        if seq.len() >= 2 {
+            *sequence_counts.entry(seq).or_insert(0) += 1;
+        }
+    }
+
+    // 過濾：只保留出現 >= 2 次、長度 2-5 的序列
+    let frequent: Vec<(Vec<String>, u32)> = sequence_counts
+        .into_iter()
+        .filter(|(seq, count)| *count >= 2 && seq.len() >= 2 && seq.len() <= 5)
+        .collect();
+
+    if frequent.is_empty() { return Ok(0); }
+
+    // 組裝給 LLM 的摘要文字
+    let mut summary = String::new();
+    for (seq, count) in &frequent {
+        summary.push_str(&format!("- {} 次：{}\n", count, seq.join(" → ")));
+    }
+
+    // 呼叫 LLM 標籤每個序列的使用者意圖，並建議 trigger 與 behavior
+    let client = reqwest::Client::new();
+    let prompt = format!(
+        "以下是從對話記錄中統計出的工具呼叫序列（格式：次數：tool1 → tool2 → ...）：\n\n{}\n\n\
+請為每個序列輸出 JSON 陣列，每個元素包含：\n\
+- trigger: 觸發此序列的使用者意圖（以「當使用者...時」開頭，15字以內）\n\
+- first_tool: 序列中第一個工具名稱（與輸入完全一致）\n\
+- behavior: 操作說明（20字以內，描述先做什麼再做什麼）\n\n\
+只輸出 JSON 陣列，不要任何說明。範例：\n\
+[{{\"trigger\":\"當使用者要打開筆記時\",\"first_tool\":\"search_vault\",\"behavior\":\"先 search_vault 找路徑，再 open_note\"}}]",
+        summary
+    );
+
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 600,
+        "temperature": 0.2,
+        "stream": false,
+    });
+
+    let http_resp = match client
+        .post(format!("{}/v1/chat/completions", base_url))
+        .json(&body)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Ok(0),
+    };
+
+    let json: serde_json::Value = match http_resp.json().await {
+        Ok(v) => v,
+        Err(_) => return Ok(0),
+    };
+
+    let text = json["choices"][0]["message"]["content"].as_str().unwrap_or("");
+    let start = match text.find('[') { Some(i) => i, None => return Ok(0) };
+    let end   = match text.rfind(']') { Some(i) => i + 1, None => return Ok(0) };
+    let patterns: serde_json::Value = match serde_json::from_str(&text[start..end]) {
+        Ok(v) => v,
+        Err(_) => return Ok(0),
+    };
+
+    let arr = match patterns.as_array() {
+        Some(a) => a,
+        None => return Ok(0),
+    };
+
+    let mut created = 0u32;
+    let now_dt = surrealdb::sql::Datetime::from(chrono::Utc::now());
+
+    for item in arr {
+        let trigger = item["trigger"].as_str().unwrap_or("").to_string();
+        let first_tool = item["first_tool"].as_str().unwrap_or("").to_string();
+        let behavior = item["behavior"].as_str().unwrap_or("").to_string();
+
+        if trigger.is_empty() || first_tool.is_empty() || behavior.is_empty() { continue; }
+
+        // skill_id 用 trigger 的 hash，避免重複建立相同意圖的 skill
+        let skill_id = format!("__pattern__{:x}",
+            trigger.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64)));
+
+        // 若已存在則跳過（不覆蓋使用者可能已手動調整的 skill）
+        #[derive(Deserialize)]
+        struct ExistRow { skill_id: String }
+        let mut check = vault_db.query(
+            "SELECT skill_id FROM agent_skills WHERE vault_id = $vid AND skill_id = $sid LIMIT 1"
+        )
+        .bind(("vid", vault_id.clone()))
+        .bind(("sid", skill_id.clone()))
+        .await.ok();
+        let exists: Vec<ExistRow> = check.as_mut()
+            .and_then(|r| r.take::<Vec<ExistRow>>(0).ok())
+            .unwrap_or_default();
+        if !exists.is_empty() { continue; }
+
+        let title = format!("【自動】{}", trigger.trim_start_matches("當使用者").trim_start_matches("當"));
+        let auto_tools = vec![first_tool];
+
+        let _ = vault_db.query(
+            "INSERT INTO agent_skills \
+             (skill_id, vault_id, title, trigger, behavior, auto_tool_calls, \
+              is_active, injection_mode, trigger_count, created_at) \
+             VALUES ($sid, $vid, $title, $trigger, $behavior, $tools, \
+                     false, 'passive', 0, $now)"
+        )
+        .bind(("sid", skill_id))
+        .bind(("vid", vault_id.clone()))
+        .bind(("title", title))
+        .bind(("trigger", trigger))
+        .bind(("behavior", behavior))
+        .bind(("tools", auto_tools))
+        .bind(("now", now_dt.clone()))
+        .await;
+
+        created += 1;
+    }
+
+    Ok(created)
 }
 
 // ── Pipeline 型別（用於 run_tool_pipeline） ───────────────────────────────
