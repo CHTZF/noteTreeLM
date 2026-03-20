@@ -605,6 +605,14 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   }
 
   const clearChat = () => {
+    // 有意義的對話（至少 1 則 user + 1 則 assistant）才儲存記憶
+    const meaningfulMsgs = messages.filter(m => m.role === 'user' || m.role === 'assistant')
+    if (meaningfulMsgs.length >= 2) {
+      const chatMessages = meaningfulMsgs.map(m => ({ role: m.role, content: m.content }))
+      invoke('save_memory_session', { messages: chatMessages })
+        .then(() => invoke('distill_preferences').catch(() => {}))
+        .catch(() => {})
+    }
     setMessages([])
     setError('')
     setStreamingText('')

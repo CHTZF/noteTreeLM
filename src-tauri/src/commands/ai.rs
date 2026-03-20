@@ -960,6 +960,22 @@ pub async fn invoke_agent(
         let _ = tx.prepare().await;
         let mut final_text = String::new();
 
+        // Skill pre-pass：active skills（永遠注入）+ passive skills（embedding 相似度匹配）
+        if let Some(ref vid) = vault_id_opt {
+            if let Some((skill_text, _skill_titles)) = run_skill_pre_pass(
+                &vault_db, vid, &input, skill_emb_url.as_deref(), &client, "main"
+            ).await {
+                // 將 skill 注入到 system message 末尾
+                if let Some(sys) = msgs.first_mut() {
+                    if sys["role"].as_str() == Some("system") {
+                        let existing = sys["content"].as_str().unwrap_or("").to_string();
+                        let new_content = format!("{}\n\n{}", existing, skill_text);
+                        *sys = serde_json::json!({"role": "system", "content": new_content});
+                    }
+                }
+            }
+        }
+
         'tool_loop: for _round in 0..8usize {
             if state.agent_cancel.load(std::sync::atomic::Ordering::Relaxed) { break; }
 
@@ -3696,6 +3712,148 @@ pub async fn query_memory(
         .collect();
 
     Ok(results)
+}
+
+/// 從最近對話記憶中蒸餾使用者偏好，寫入 preferences/user_prefs.md 並注入為 active skill
+#[tauri::command]
+pub async fn distill_preferences(state: State<'_, AppState>) -> Result<(), AppError> {
+    let vault_id = match state.get_vault_id().await {
+        Ok(vid) => vid,
+        Err(_) => return Ok(()),
+    };
+    let vault_path = state.get_vault_path().await;
+    let vault_db = state.db.clone();
+
+    // 取得 llama-server URL（若未啟動則靜默跳過）
+    let base_url = {
+        let port = *state.llama_actual_port.lock().await;
+        match port {
+            Some(p) => format!("http://127.0.0.1:{}", p),
+            None => return Ok(()),
+        }
+    };
+
+    // 取最近 5 筆記憶筆記
+    #[derive(Deserialize)]
+    struct MemRow { content: String }
+    let mut resp = match vault_db.query(
+        "SELECT content FROM notes \
+         WHERE vault_id = $vid AND string::starts_with(path, 'memories/') \
+         ORDER BY modified_at DESC LIMIT 5"
+    )
+    .bind(("vid", vault_id.clone()))
+    .await {
+        Ok(r) => r,
+        Err(_) => return Ok(()),
+    };
+
+    let rows: Vec<MemRow> = resp.take(0).unwrap_or_default();
+    if rows.is_empty() { return Ok(()); }
+
+    // 組合內容（每筆最多 2000 字元）
+    let combined: String = rows.iter()
+        .map(|r| r.content.chars().take(2000).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+
+    // 呼叫 LLM 蒸餾偏好（非串流）
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是一個使用者偏好分析系統。從以下對話記憶中，提取使用者的：\n1. 工作習慣與偏好（如回答風格、語言偏好）\n2. 常見需求模式\n3. 個人背景資訊（如果有）\n4. 重要規則（使用者明確表達的規定）\n\n輸出格式：條列式，每條以「- 」開頭，簡潔描述。不超過 15 條。只輸出偏好列表，不要說明或解釋。"
+            },
+            {
+                "role": "user",
+                "content": format!("以下是最近的對話記憶，請提取使用者偏好：\n\n{}", combined)
+            }
+        ],
+        "max_tokens": 512,
+        "temperature": 0.3,
+        "stream": false,
+    });
+
+    let http_resp = match client
+        .post(format!("{}/v1/chat/completions", base_url))
+        .json(&body)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Ok(()),
+    };
+
+    let json: serde_json::Value = match http_resp.json().await {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+
+    let prefs = match json["choices"][0]["message"]["content"].as_str() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return Ok(()),
+    };
+
+    // 寫入 preferences/user_prefs.md
+    let now = Local::now();
+    let content = format!(
+        "---\ncreated: {}\n---\n\n# 使用者偏好（自動蒸餾）\n\n更新時間：{}\n\n{}\n",
+        now.to_rfc3339(),
+        now.format("%Y-%m-%d %H:%M"),
+        prefs
+    );
+    let rel_path = "preferences/user_prefs.md".to_string();
+
+    if !vault_path.is_empty() {
+        let prefs_dir = std::path::PathBuf::from(&vault_path).join("preferences");
+        tokio::fs::create_dir_all(&prefs_dir).await.ok();
+        let abs_path = prefs_dir.join("user_prefs.md");
+        tokio::fs::write(&abs_path, &content).await.ok();
+    }
+
+    // 更新 notes 表
+    let now_dt = surrealdb::sql::Datetime::from(chrono::Utc::now());
+    let word_count = content.split_whitespace().count() as i64;
+    let title = "使用者偏好（自動蒸餾）".to_string();
+
+    let _ = vault_db.query(
+        "INSERT INTO notes (vault_id, path, title, content, word_count, created_at, modified_at, checksum)
+         VALUES ($vid, $path, $title, $content, $wc, $now, $now, '')
+         ON DUPLICATE KEY UPDATE title = $title, content = $content, word_count = $wc, modified_at = $now"
+    )
+    .bind(("vid", vault_id.clone()))
+    .bind(("path", rel_path))
+    .bind(("title", title.clone()))
+    .bind(("content", content.clone()))
+    .bind(("wc", word_count))
+    .bind(("now", now_dt.clone()))
+    .await;
+
+    // 刪除舊的 __user_prefs__ skill，再重新插入（避免 ON DUPLICATE KEY 問題）
+    let skill_id = "__user_prefs__".to_string();
+    let _ = vault_db.query(
+        "DELETE FROM agent_skills WHERE vault_id = $vid AND skill_id = $sid"
+    )
+    .bind(("vid", vault_id.clone()))
+    .bind(("sid", skill_id.clone()))
+    .await;
+
+    let _ = vault_db.query(
+        "INSERT INTO agent_skills \
+         (skill_id, vault_id, title, trigger, behavior, auto_tool_calls, \
+          is_active, injection_mode, trigger_count, created_at) \
+         VALUES ($sid, $vid, $title, $trigger, $behavior, [], true, 'active', 0, $now)"
+    )
+    .bind(("sid", skill_id))
+    .bind(("vid", vault_id))
+    .bind(("title", title))
+    .bind(("trigger", "每次對話".to_string()))
+    .bind(("behavior", prefs))
+    .bind(("now", now_dt))
+    .await;
+
+    Ok(())
 }
 
 // ── Pipeline 型別（用於 run_tool_pipeline） ───────────────────────────────
