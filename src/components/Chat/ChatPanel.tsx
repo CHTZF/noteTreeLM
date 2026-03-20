@@ -108,11 +108,25 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
 
   const loadConversationMessages = useCallback(async (id: string) => {
     try {
-      const snap: { messages_json: string } = await invoke('get_conversation', { id })
+      const [snap, ratingEntries] = await Promise.all([
+        invoke<{ messages_json: string }>('get_conversation', { id }),
+        invoke<Array<{ content_hash: string; rating: string }>>('get_conversation_ratings', { conversationId: id }).catch(() => [] as Array<{ content_hash: string; rating: string }>),
+      ])
       const msgs: Array<{ role: string; content: string }> = JSON.parse(snap.messages_json)
       const filtered = msgs.filter(m => m.role === 'user' || m.role === 'assistant')
-      setMessages(filtered.map(m => ({ role: m.role as 'user' | 'assistant', content: m.content })))
-      setRatings({})
+      const loadedMsgs = filtered.map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }))
+      setMessages(loadedMsgs)
+
+      // 從 DB 恢復每則 assistant 回覆的評分狀態（依 content_hash 對位訊息 index）
+      const ratingMap: Record<number, 'good' | 'bad'> = {}
+      ratingEntries.forEach(({ content_hash, rating }) => {
+        if (rating !== 'good' && rating !== 'bad') return
+        const idx = loadedMsgs.findIndex(
+          m => m.role === 'assistant' && m.content.slice(0, 150) === content_hash
+        )
+        if (idx >= 0) ratingMap[idx] = rating
+      })
+      setRatings(ratingMap)
     } catch (e) {
       console.error('[ChatPanel] loadConversationMessages error:', e)
       // Stale conversation ID — clear it and show empty screen

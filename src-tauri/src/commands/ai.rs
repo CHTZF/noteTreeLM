@@ -988,15 +988,17 @@ pub async fn invoke_agent(
         let mut final_text = String::new();
 
         // Skill pre-pass：active skills（永遠注入）+ passive skills（embedding 相似度匹配）
+        // 上限 1500 chars，保護 system message budget
         if let Some(ref vid) = vault_id_opt {
             if let Some((skill_text, _skill_titles)) = run_skill_pre_pass(
                 &vault_db, vid, &input, skill_emb_url.as_deref(), &client, "main"
             ).await {
-                // 將 skill 注入到 system message 末尾
                 if let Some(sys) = msgs.first_mut() {
                     if sys["role"].as_str() == Some("system") {
                         let existing = sys["content"].as_str().unwrap_or("").to_string();
-                        let new_content = format!("{}\n\n{}", existing, skill_text);
+                        // 技能文字上限 1500 chars（防止過多 active skills 撐爆 context）
+                        let skill_snippet: String = skill_text.chars().take(1500).collect();
+                        let new_content = format!("{}\n\n{}", existing, skill_snippet);
                         *sys = serde_json::json!({"role": "system", "content": new_content});
                     }
                 }
@@ -1025,6 +1027,38 @@ pub async fn invoke_agent(
                     *sys = serde_json::json!({"role": "system", "content": format!("{}{}", existing, mem_block)});
                 }
             }
+        }
+
+        // Context sliding window：保留 system，歷史訊息總 chars 上限 12000
+        // （本地 LLM context ≈ 4096-8192 tokens；system+tools 佔 ~1500 tokens，
+        //   剩餘 ~1000-2000 tokens 留給歷史，12000 chars ≈ 3000 tokens 足夠）
+        {
+            const MAX_HISTORY_CHARS: usize = 12000;
+            let system_part: Vec<serde_json::Value> = msgs.iter()
+                .filter(|m| m["role"].as_str() == Some("system"))
+                .cloned().collect();
+            let hist: Vec<serde_json::Value> = msgs.into_iter()
+                .filter(|m| m["role"].as_str() != Some("system"))
+                .collect();
+            let total: usize = hist.iter()
+                .map(|m| m["content"].as_str().unwrap_or("").len())
+                .sum();
+            let trimmed = if total > MAX_HISTORY_CHARS {
+                // 從最舊訊息逐條捨棄，但至少保留最後 4 則
+                let mut chars = total;
+                let mut drop_n = 0usize;
+                while chars > MAX_HISTORY_CHARS && drop_n + 4 < hist.len() {
+                    chars = chars.saturating_sub(hist[drop_n]["content"].as_str().unwrap_or("").len());
+                    drop_n += 1;
+                }
+                if drop_n > 0 {
+                    eprintln!("[chat] context sliding window: dropped {} oldest messages (was {} chars)", drop_n, total);
+                }
+                hist[drop_n..].to_vec()
+            } else {
+                hist
+            };
+            msgs = system_part.into_iter().chain(trimmed.into_iter()).collect();
         }
 
         'tool_loop: for _round in 0..8usize {
@@ -3945,6 +3979,37 @@ pub async fn rate_response(
     .await;
 
     Ok(())
+}
+
+/// 取得某對話所有回覆的評分記錄，供前端 UI 還原 👍/👎 狀態
+#[tauri::command]
+pub async fn get_conversation_ratings(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<Vec<serde_json::Value>, AppError> {
+    let vault_id = match state.get_vault_id().await {
+        Ok(vid) => vid,
+        Err(_) => return Ok(vec![]),
+    };
+
+    #[derive(Deserialize)]
+    struct FeedbackRow { content_hash: String, rating: String }
+
+    let mut resp = state.db.query(
+        "SELECT content_hash, rating FROM response_feedback \
+         WHERE vault_id = $vid AND conversation_id = $conv \
+         ORDER BY created_at ASC"
+    )
+    .bind(("vid", vault_id))
+    .bind(("conv", conversation_id))
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let rows: Vec<FeedbackRow> = resp.take(0).unwrap_or_default();
+    Ok(rows.into_iter().map(|r| serde_json::json!({
+        "content_hash": r.content_hash,
+        "rating": r.rating,
+    })).collect())
 }
 
 /// 分析最近對話中的工具呼叫序列，自動生成/更新技能規範（auto_tool_calls）
