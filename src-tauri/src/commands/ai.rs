@@ -955,9 +955,21 @@ pub async fn invoke_agent(
             }
         }
 
-        // 相關記憶注入（上限 1500 字元，避免撐爆 context window）
+        // 相關記憶注入（上限 1500 字元，切在筆記邊界避免截斷語義）
         if !memory_context.is_empty() {
-            let snippet: String = memory_context.chars().take(1500).collect();
+            let snippet: String = if memory_context.chars().count() <= 1500 {
+                memory_context.clone()
+            } else {
+                // 取前 1500 字元後，退回到最近的 \n\n 邊界（記憶條目分隔符）
+                let truncated: String = memory_context.chars().take(1500).collect();
+                match truncated.rfind("\n\n") {
+                    Some(i) => format!(
+                        "{}（…尚有更多記憶，可用 query_memory 工具取得完整內容）",
+                        &truncated[..i]
+                    ),
+                    None => format!("{}…", truncated),
+                }
+            };
             let mem_block = format!("\n\n[相關歷史記憶]\n{}", snippet);
             if let Some(sys) = msgs.first_mut() {
                 if sys["role"].as_str() == Some("system") {
