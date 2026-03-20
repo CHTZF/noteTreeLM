@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+use reqwest;
 
 use crate::db::surreal::SurrealDb;
 use crate::error::AppError;
@@ -55,6 +56,8 @@ pub struct AppState {
     pub system_agent: Arc<SystemAgentService>,
     /// API key 記憶體快取：provider → key，避免重複呼叫 keychain
     pub api_key_cache: Arc<Mutex<HashMap<String, String>>>,
+    /// 共用 HTTP client（所有 LLM / embedding 呼叫共用，避免重複建立 connection pool）
+    pub http_client: reqwest::Client,
 }
 
 impl AppState {
@@ -84,6 +87,7 @@ impl AppState {
             tool_test_cancel: Arc::new(AtomicBool::new(false)),
             search_method_tx: Arc::new(Mutex::new(None)),
             api_key_cache: Arc::new(Mutex::new(HashMap::new())),
+            http_client: reqwest::Client::new(),
         }
     }
 

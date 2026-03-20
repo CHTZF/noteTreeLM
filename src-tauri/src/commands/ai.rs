@@ -646,10 +646,11 @@ pub async fn cancel_agent(state: State<'_, AppState>) -> Result<(), AppError> {
 }
 
 /// 從 memory_facts 表語意搜尋與當前 query 最相關的事實
-/// 有 embedding server → 向量搜尋；無 → 回傳最新事實
+/// 有 embedding server → 向量搜尋；無 → CJK bigram keyword 搜尋；完全無結果 → 最新事實
 async fn retrieve_relevant_facts(
     db: &crate::db::surreal::SurrealDb,
     vault_id: &str,
+    query_text: &str,
     query_embedding: &[f32],
     limit: usize,
 ) -> String {
@@ -681,12 +682,14 @@ async fn retrieve_relevant_facts(
             .unwrap_or_default();
 
         if !rows.is_empty() {
-            // 更新 access_count 與 last_accessed_at（fire-and-forget）
+            // 只更新實際被返回的事實（而非所有 facts）
+            let returned_contents: Vec<String> = rows.iter().map(|r| r.content.clone()).collect();
             let _ = db.query(
                 "UPDATE memory_facts SET access_count += 1, last_accessed_at = time::now() \
-                 WHERE vault_id = $vid AND embedding IS NOT NONE"
+                 WHERE vault_id = $vid AND content IN $contents"
             )
             .bind(("vid", vault_id.to_string()))
+            .bind(("contents", returned_contents))
             .await;
 
             let lines: Vec<String> = rows.iter()
@@ -700,7 +703,38 @@ async fn retrieve_relevant_facts(
         }
     }
 
-    // Fallback：無 embedding 時回傳最新事實
+    // Fallback 1：CJK bigram keyword 搜尋（無 embedding server 時仍保有相關性）
+    let keywords = extract_cjk_keywords(query_text, 3);
+    if !keywords.is_empty() {
+        // 用第一個 keyword 搜尋（SurrealDB string::contains）
+        let kw = &keywords[0];
+        let mut resp = db.query(
+            "SELECT content, category FROM memory_facts \
+             WHERE vault_id = $vid AND string::contains(content, $kw) \
+             ORDER BY access_count DESC LIMIT $lim"
+        )
+        .bind(("vid", vault_id.to_string()))
+        .bind(("kw", kw.clone()))
+        .bind(("lim", limit_i))
+        .await.ok();
+
+        let rows: Vec<FactRow> = resp.as_mut()
+            .and_then(|r| r.take::<Vec<FactRow>>(0).ok())
+            .unwrap_or_default();
+
+        if !rows.is_empty() {
+            let lines: Vec<String> = rows.iter()
+                .map(|r| format!("• [{}] {}", r.category, r.content))
+                .collect();
+            return format!(
+                "[記憶] （共 {} 條，依關鍵字相關性篩選）\n{}",
+                lines.len(),
+                lines.join("\n")
+            );
+        }
+    }
+
+    // Fallback 2：純最新事實（無任何 embedding 也無關鍵字命中時）
     let mut resp = db.query(
         "SELECT content, category FROM memory_facts \
          WHERE vault_id = $vid \
@@ -728,6 +762,29 @@ async fn retrieve_relevant_facts(
     )
 }
 
+/// 從查詢文字取出最多 N 個有意義的 CJK bigram，供 keyword 搜尋
+fn extract_cjk_keywords(text: &str, max: usize) -> Vec<String> {
+    const STOPS: &[char] = &[
+        '你','我','他','她','它','的','了','嗎','是','有','在','說','道','記',
+        '什','麼','這','那','就','都','也','還','不','沒','要','會','可','以',
+        '和','與','或','但','如','果','因','為','所','而','且','呢','嗎','啊',
+    ];
+    let cjk: Vec<char> = text.chars()
+        .filter(|c| *c as u32 >= 0x4E00 && *c as u32 <= 0x9FFF)
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for pair in cjk.windows(2) {
+        if STOPS.contains(&pair[0]) && STOPS.contains(&pair[1]) { continue; }
+        let bigram: String = pair.iter().collect();
+        if seen.insert(bigram.clone()) {
+            out.push(bigram);
+            if out.len() >= max { break; }
+        }
+    }
+    out
+}
+
 /// 帶意圖分類的 Agent 串流
 /// 透過 runtime::Agent 執行：意圖分類 → 取消/確認/多輪 LLM+工具 loop
 /// 每輪工具呼叫透過 ToolRegistry + Transaction 執行（支援 rollback）
@@ -751,7 +808,7 @@ pub async fn invoke_agent(
 
     // 1. 確保 llama-server 運行，取得 base_url
     let base_url = ensure_server_running(state.inner(), &app).await?;
-    let client = reqwest::Client::new();
+    let client = state.http_client.clone();
 
     // 2. Vault 資訊
     let vault_path = state.get_vault_path().await;
@@ -940,7 +997,7 @@ pub async fn invoke_agent(
     // 10. 記憶事實語意搜尋（embedding 相似度優先，fallback 最新事實）
     let memory_context = if let Some(ref vid) = vault_id_opt {
         let query_vec = get_embedding(&client, &base_url, &input).await;
-        retrieve_relevant_facts(&vault_db, vid, &query_vec, 10).await
+        retrieve_relevant_facts(&vault_db, vid, &input, &query_vec, 10).await
     } else { String::new() };
 
     // 12. 統一 LLM + tool loop（所有輪次相同路徑，tool call 歷史完整保存至 DB）
@@ -1116,7 +1173,15 @@ pub async fn invoke_agent(
             msgs.push(serde_json::json!({"role": "assistant", "content": null, "tool_calls": tc_json}));
 
             for ((tool_id, name, _), res) in result.tool_calls.iter().zip(results.iter()) {
-                let res_str = res.as_str().map(String::from).unwrap_or_else(|| res.to_string());
+                let raw = res.as_str().map(String::from).unwrap_or_else(|| res.to_string());
+                // Tool result 上限 3000 chars，防止大型 read_note 繞過 sliding window
+                const MAX_TOOL_RESULT: usize = 3000;
+                let res_str = if raw.chars().count() > MAX_TOOL_RESULT {
+                    let truncated: String = raw.chars().take(MAX_TOOL_RESULT).collect();
+                    format!("{}…（內容已截斷，如需完整請分段呼叫）", truncated)
+                } else {
+                    raw
+                };
                 msgs.push(serde_json::json!({"role": "tool", "tool_call_id": tool_id, "name": name, "content": res_str}));
             }
 
@@ -3849,7 +3914,7 @@ pub async fn distill_preferences(state: State<'_, AppState>) -> Result<(), AppEr
         .join("\n\n---\n\n");
 
     // 呼叫 LLM 蒸餾偏好（非串流）
-    let client = reqwest::Client::new();
+    let client = state.http_client.clone();
     let body = serde_json::json!({
         "messages": [
             {
@@ -4116,7 +4181,7 @@ pub async fn analyze_tool_patterns(state: State<'_, AppState>) -> Result<u32, Ap
     }
 
     // 呼叫 LLM 標籤每個序列的使用者意圖，並建議 trigger 與 behavior
-    let client = reqwest::Client::new();
+    let client = state.http_client.clone();
     let prompt = format!(
         "以下是從對話記錄中統計出的工具呼叫序列（格式：次數：tool1 → tool2 → ...）：\n\n{}\n\n\
 請為每個序列輸出 JSON 陣列，每個元素包含：\n\
@@ -4253,7 +4318,7 @@ pub async fn extract_memory_facts(
     if dialog.is_empty() { return Ok(0); }
 
     // 呼叫 LLM 萃取離散事實（非串流）
-    let client = reqwest::Client::new();
+    let client = state.http_client.clone();
     let prompt = format!(
         "你是記憶萃取系統。從以下對話中提取 3-10 條值得長期記憶的離散事實。\n\
 規則：\n\
