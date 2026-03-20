@@ -150,11 +150,16 @@ pub async fn get_conversation(
         .ok_or_else(|| AppError::Database(format!("conversation {} not found", id)))?;
 
     let has_plan = has_pending_plan(db, &row.id).await?;
+
+    // 過濾 tool call 訊息（只回傳 user/assistant text 給前端顯示）
+    // DB 仍儲存完整歷史（含 role:tool、role:assistant + tool_calls）供 LLM context 使用
+    let display_messages_json = filter_display_messages(&row.messages_json);
+
     Ok(ConversationSnapshot {
         id: row.id,
         mode: row.mode,
         title: row.title,
-        messages_json: row.messages_json,
+        messages_json: display_messages_json,
         has_pending_plan: has_plan,
         created_at: row.created_at.timestamp(),
         updated_at: row.updated_at.timestamp(),
@@ -198,6 +203,29 @@ pub async fn update_conversation_title(
 }
 
 // ── Internal helpers（供 invoke_agent 呼叫，不走 Tauri command）────────────
+
+/// 過濾 messages_json，移除 tool call 相關訊息，只保留前端顯示需要的訊息：
+/// - role: "user" → 保留
+/// - role: "assistant" with string content → 保留
+/// - role: "assistant" with content: null (tool_calls) → 移除
+/// - role: "tool" → 移除
+/// - role: "system" → 移除
+fn filter_display_messages(messages_json: &str) -> String {
+    let Ok(msgs) = serde_json::from_str::<serde_json::Value>(messages_json) else {
+        return messages_json.to_string();
+    };
+    let Some(arr) = msgs.as_array() else {
+        return messages_json.to_string();
+    };
+    let filtered: Vec<&serde_json::Value> = arr.iter().filter(|m| {
+        match m["role"].as_str() {
+            Some("user") => true,
+            Some("assistant") => m["content"].is_string(),
+            _ => false,
+        }
+    }).collect();
+    serde_json::to_string(&filtered).unwrap_or_else(|_| messages_json.to_string())
+}
 
 async fn has_pending_plan(db: &SurrealDb, conv_id: &str) -> Result<bool, AppError> {
     #[derive(Deserialize)]
@@ -307,37 +335,24 @@ pub struct DeferredTool {
     pub args: serde_json::Value,
 }
 
-/// 儲存 pending plan（embedding centroids 以 JSON array<float> 儲存）
+/// 儲存 pending plan
 pub async fn save_pending_plan(
     db: &SurrealDb,
     conv_id: &str,
     deferred_tools: &[DeferredTool],
-    confirm_centroid: &[f32],
-    cancel_centroid: &[f32],
-    interrupt_centroid: &[f32],
 ) -> Result<(), AppError> {
     let tools_json = serde_json::to_string(deferred_tools)
         .map_err(|e| AppError::AI(e.to_string()))?;
 
-    let confirm_vec: Vec<f64> = confirm_centroid.iter().map(|&f| f as f64).collect();
-    let cancel_vec: Vec<f64> = cancel_centroid.iter().map(|&f| f as f64).collect();
-    let interrupt_vec: Vec<f64> = interrupt_centroid.iter().map(|&f| f as f64).collect();
-
     db.query(
         "INSERT INTO pending_plans
-         (conversation_id, deferred_tools_json, confirm_centroid, cancel_centroid, interrupt_centroid)
-         VALUES ($conversation_id, $tools_json, $confirm, $cancel, $interrupt)
+         (conversation_id, deferred_tools_json)
+         VALUES ($conversation_id, $tools_json)
          ON DUPLICATE KEY UPDATE
-           deferred_tools_json = $tools_json,
-           confirm_centroid = $confirm,
-           cancel_centroid = $cancel,
-           interrupt_centroid = $interrupt",
+           deferred_tools_json = $tools_json",
     )
     .bind(("conversation_id", conv_id.to_owned()))
     .bind(("tools_json", tools_json.clone()))
-    .bind(("confirm", confirm_vec))
-    .bind(("cancel", cancel_vec))
-    .bind(("interrupt", interrupt_vec))
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
     Ok(())
@@ -351,14 +366,11 @@ pub async fn load_pending_plan(
     #[derive(Deserialize)]
     struct PlanRow {
         deferred_tools_json: String,
-        confirm_centroid: Vec<f64>,
-        cancel_centroid: Vec<f64>,
-        interrupt_centroid: Vec<f64>,
         created_at: surrealdb::sql::Datetime,
     }
     let mut resp = db
         .query(
-            "SELECT deferred_tools_json, confirm_centroid, cancel_centroid, interrupt_centroid, created_at
+            "SELECT deferred_tools_json, created_at
              FROM pending_plans WHERE conversation_id = $id LIMIT 1",
         )
         .bind(("id", conv_id.to_owned()))
@@ -375,9 +387,6 @@ pub async fn load_pending_plan(
 
     Ok(Some(LoadedPendingPlan {
         deferred_tools,
-        confirm_centroid: row.confirm_centroid.iter().map(|&f| f as f32).collect(),
-        cancel_centroid: row.cancel_centroid.iter().map(|&f| f as f32).collect(),
-        interrupt_centroid: row.interrupt_centroid.iter().map(|&f| f as f32).collect(),
         created_at: row.created_at.timestamp(),
     }))
 }
@@ -394,8 +403,5 @@ pub async fn delete_pending_plan(db: &SurrealDb, conv_id: &str) -> Result<(), Ap
 
 pub struct LoadedPendingPlan {
     pub deferred_tools: Vec<DeferredTool>,
-    pub confirm_centroid: Vec<f32>,
-    pub cancel_centroid: Vec<f32>,
-    pub interrupt_centroid: Vec<f32>,
     pub created_at: i64,
 }

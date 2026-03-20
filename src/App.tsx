@@ -400,6 +400,23 @@ function AppMain() {
         console.log('[ui:open_note] received:', e.payload)
         if (e.payload) openNoteFromChat(e.payload)
       })
+      const uiToastUnlisten = await listen<{ message: string; kind: string; duration_ms: number }>('ui:toast', e => {
+        const { message, kind } = e.payload
+        if (kind === 'error') toast.error(message)
+        else if (kind === 'success') toast.success(message)
+        else toast.info(message)
+      })
+      const uiActionUnlisten = await listen<{ action: string; payload?: unknown }>('ui:action', e => {
+        const { action, payload } = e.payload
+        if (action === 'open_chat') openNote(CHAT_TAB)
+        else if (action === 'open_live_chat') openNote(LIVE_CHAT_TAB)
+        else if (action === 'open_settings') openNote(SETTINGS_TAB)
+        else if (action === 'open_note' && typeof payload === 'string') openNoteFromChat(payload)
+        else console.warn('[ui:action] unknown action:', action, payload)
+      })
+      const scheduleTriggeredUnlisten = await listen<{ task_id: string; description: string }>('schedule:triggered', e => {
+        toast.info(`排程提醒：${e.payload.description}`)
+      })
       const noteDeletedUnlisten = await listen<string[]>('vault:note-deleted', e => {
         const vaultPath = useSettingsStore.getState().settings.system_current_vault_path
         const deletedRelPaths = e.payload
@@ -435,6 +452,9 @@ function AppMain() {
         graphListeners.forEach(u => u())
         vaultChangedUnlisten()
         openNoteUnlisten()
+        uiToastUnlisten()
+        uiActionUnlisten()
+        scheduleTriggeredUnlisten()
         noteDeletedUnlisten()
         window.removeEventListener('note:renamed', handleNoteRenamed)
       }

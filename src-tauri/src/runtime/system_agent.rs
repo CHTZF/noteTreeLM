@@ -19,7 +19,7 @@ use tokio::sync::RwLock;
 use crate::commands::agent_def::find_agent_definition;
 use crate::db::surreal::SurrealDb;
 use crate::runtime::tool_registry::ToolRegistry;
-use crate::runtime::types::{EmitEventFn, LlmFn};
+use crate::runtime::types::{ConfirmWriteFn, EmitEventFn, LlmFn};
 
 // ── NewSkillSpec（create_agent 工具傳入的 skill 規格）────────────────────────
 
@@ -55,7 +55,12 @@ pub struct AgentRequest {
     pub caller_session_id: String,
     pub target: String,   // def_id 或 name（模糊匹配）
     pub task: String,
-    pub context: String,
+    pub context: String,  // 序列化的對話歷史 + 記憶摘要（注入 sub-agent system prompt）
+    /// 呼叫端的 ORCHESTRATOR_SYSTEM：sub-agent 若無自訂 system_prompt，繼承此 prompt
+    /// 讓 sub-agent 擁有與主 LLM 相同的意圖理解框架
+    pub parent_system: String,
+    pub conversation_id: Option<String>,  // 用於 note-open pending_plan 儲存
+    pub vault_path: String,               // 用於 note_refs 路徑解析
 }
 
 // ── SystemAgentService ────────────────────────────────────────────────────────
@@ -101,6 +106,8 @@ impl SystemAgentService {
         emit: EmitEventFn,
         cancel: Option<Arc<AtomicBool>>,
         emb_url: Option<&str>,
+        confirm_write: ConfirmWriteFn,
+        embed_fn: Option<crate::runtime::types::EmbedFn>,
     ) -> String {
         let vault_id = self.vault_id.read().await.clone();
 
@@ -209,13 +216,31 @@ impl SystemAgentService {
             String::new()
         };
 
-        let base_system = if system_prompt_override.is_empty() {
-            format!(
-                "你是一個專業的 {def_name} 助理，負責完成指定子任務。\
-                 請簡潔地完成任務，回傳結果摘要，不要加入多餘的說明。"
-            )
+        let anti_hallucination = "\n\n## 規則（必須遵守）\n\
+            1. 必須實際呼叫工具執行任務；禁止假裝已完成或虛構結果。\n\
+            2. 若搜尋無結果，直接回報找不到，不可捏造內容或筆記名稱。\n\
+            3. 完成後簡潔回傳結果，不加多餘說明。";
+
+        let base_system = if !system_prompt_override.is_empty() {
+            // Agent definition 有自訂 system prompt → 優先使用
+            format!("{}{}", system_prompt_override, anti_hallucination)
+        } else if !request.parent_system.is_empty() {
+            // 繼承主 LLM 的 ORCHESTRATOR_SYSTEM，讓 sub-agent 有相同的意圖理解框架
+            format!("{}{}", request.parent_system, anti_hallucination)
         } else {
-            system_prompt_override
+            // Fallback：無任何 system → 使用內建 vault 意圖指南
+            format!(
+                "你是 NoteTreeLM 的 {def_name} sub-agent，在使用者的 Markdown 筆記庫（Vault）中工作。\n\
+                 \n\
+                 ## 常見使用者意圖解讀\n\
+                 - 「打開 X」「看 X」→ 先用 search_vault 搜尋關鍵字，再用 open_note 打開\n\
+                 - 「讀取 X」「X 裡面有什麼」→ 先用 search_vault，再用 read_note 取得內容\n\
+                 - 「找 X」「搜尋 X」→ 用 search_vault\n\
+                 - 「建立 X」「新增 X」→ 用 create_note\n\
+                 - 「更新 X」「修改 X」→ 先搜尋確認路徑，再用 update_note\n\
+                 - 使用者提到的名詞通常是筆記名稱關鍵字，不一定完全吻合，需用 search_vault 模糊搜尋{}",
+                anti_hallucination
+            )
         };
 
         let full_system = if skill_section.is_empty() {
@@ -260,6 +285,7 @@ impl SystemAgentService {
             request.caller_session_id,
             &def_name,
             &request.task,
+            &request.context,
             &full_system,
             filtered_tools,
             registry,
@@ -267,6 +293,11 @@ impl SystemAgentService {
             emit.clone(),
             max_rounds,
             cancel,
+            confirm_write,
+            request.vault_path,
+            request.conversation_id,
+            self.db.clone(),
+            embed_fn,
         )
         .await;
 
@@ -312,6 +343,7 @@ impl SystemAgentService {
         description: String,
         trigger: String,
         tool_names: Vec<String>,
+        system_prompt: String,
         skills: Vec<NewSkillSpec>,
         max_rounds: i64,
         emb_url: Option<&str>,
@@ -337,7 +369,7 @@ impl SystemAgentService {
         }
 
         // 2. 找不到相似 agent → 建立新的
-        self.create_agent(name, description, trigger, tool_names, skills, max_rounds, emb_url, emit).await
+        self.create_agent(name, description, trigger, tool_names, system_prompt, skills, max_rounds, emb_url, emit).await
     }
 
     /// 由 `create_agent` 工具呼叫，Chat LLM 透過此方法有機地建立專用 agent。
@@ -347,6 +379,7 @@ impl SystemAgentService {
         description: String,
         trigger: String,
         tool_names: Vec<String>,
+        system_prompt: String,
         skills: Vec<NewSkillSpec>,
         max_rounds: i64,
         emb_url: Option<&str>,
@@ -439,7 +472,7 @@ impl SystemAgentService {
              (def_id, vault_id, name, description, kind, skill_ids, tool_names, \
               system_prompt, max_rounds, is_active, is_builtin, trigger, trigger_embedding, created_at) \
              VALUES ($did, $vid, $name, $desc, 'sub', $skills, $tools, \
-                     '', $rounds, true, false, $trigger, $temb, time::now())"
+                     $sys, $rounds, true, false, $trigger, $temb, time::now())"
         )
         .bind(("did",     def_id.clone()))
         .bind(("vid",     vault_id.clone()))
@@ -447,6 +480,7 @@ impl SystemAgentService {
         .bind(("desc",    description.clone()))
         .bind(("tools",   tool_names.clone()))
         .bind(("skills",  skill_ids.clone()))
+        .bind(("sys",     system_prompt.clone()))
         .bind(("rounds",  rounds))
         .bind(("trigger", trigger.clone()))
         .bind(("temb",    trigger_embedding))
@@ -466,7 +500,7 @@ impl SystemAgentService {
             kind: "sub".to_string(),
             skill_ids,
             tool_names,
-            system_prompt: String::new(),
+            system_prompt,
             max_rounds: rounds,
             is_active: true,
             is_builtin: false,
@@ -582,11 +616,62 @@ impl SystemAgentService {
 
 // ── run_sub_agent_with_system（帶自訂 system prompt + max_rounds）────────────
 
+/// search_vault / read_note 執行結果中提取筆記路徑（與 agent.rs 邏輯一致）
+fn extract_note_refs(tool_name: &str, args: &Value, result: &str, vault_path: &str) -> Vec<String> {
+    if vault_path.is_empty() { return vec![]; }
+    match tool_name {
+        "read_note" => {
+            if let Some(p) = args["path"].as_str() {
+                let abs = std::path::PathBuf::from(vault_path).join(p);
+                vec![abs.to_string_lossy().to_string()]
+            } else { vec![] }
+        }
+        "search_vault" => result.lines().filter_map(|line| {
+            let line = line.trim();
+            if line.starts_with("- **") {
+                if let Some(lp) = line.rfind('(') {
+                    if let Some(rp) = line[lp..].find(')') {
+                        let rel = &line[lp + 1..lp + rp];
+                        if rel.ends_with(".md") {
+                            let abs = std::path::PathBuf::from(vault_path).join(rel);
+                            let abs_path = abs.to_string_lossy().to_string();
+                            let section = line.find("** (").and_then(|bold_end| {
+                                let content = &line[4..bold_end];
+                                content.find(" § ").map(|sep| content[sep + 3..].to_string())
+                            });
+                            return Some(match section {
+                                Some(s) if !s.is_empty() => format!("{}#{}", abs_path, s),
+                                _ => abs_path,
+                            });
+                        }
+                    }
+                }
+            }
+            None
+        }).collect(),
+        _ => vec![],
+    }
+}
+
+fn is_write_tool(name: &str) -> bool {
+    matches!(name, "create_note" | "update_note" | "create_folder")
+}
+
+fn tool_display_sub(name: &str, args: &Value) -> String {
+    match name {
+        "create_note"   => format!("✏️  建立筆記: {}", args["path"].as_str().unwrap_or("")),
+        "update_note"   => format!("✏️  更新筆記: {}", args["path"].as_str().unwrap_or("")),
+        "create_folder" => format!("📁 建立資料夾: {}", args["path"].as_str().unwrap_or("")),
+        _ => format!("[{}]", name),
+    }
+}
+
 async fn run_sub_agent_with_system(
     sub_session_id: String,
     parent_session_id: String,
     def_name: &str,
     task: &str,
+    context: &str,
     system_content: &str,
     filtered_tools: Value,
     registry: Arc<ToolRegistry>,
@@ -594,6 +679,11 @@ async fn run_sub_agent_with_system(
     emit: EmitEventFn,
     max_rounds: usize,
     cancel: Option<Arc<AtomicBool>>,
+    confirm_write: ConfirmWriteFn,
+    vault_path: String,
+    conversation_id: Option<String>,
+    db: crate::db::surreal::SurrealDb,
+    embed_fn: Option<crate::runtime::types::EmbedFn>,
 ) -> String {
     use crate::runtime::dispatcher::Dispatcher;
     use crate::runtime::planner::Planner;
@@ -601,8 +691,15 @@ async fn run_sub_agent_with_system(
 
     let mut messages: Vec<Value> = vec![
         serde_json::json!({"role": "system", "content": system_content}),
-        serde_json::json!({"role": "user", "content": task}),
     ];
+    // context 注入：序列化的對話歷史 + 記憶摘要
+    if !context.is_empty() {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": format!("[對話背景]\n{}", context)
+        }));
+    }
+    messages.push(serde_json::json!({"role": "user", "content": task}));
 
     emit(
         "sub_agent:start".into(),
@@ -619,11 +716,13 @@ async fn run_sub_agent_with_system(
     let _ = tx.prepare().await;
 
     let mut final_text = String::new();
+    let mut all_note_refs: Vec<String> = Vec::new();
 
     for round in 0..max_rounds {
         // 取消檢查
         if let Some(ref flag) = cancel {
             if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = tx.cancel().await;
                 emit(
                     "sub_agent:cancelled".into(),
                     serde_json::json!({ "sub_session_id": sub_session_id }),
@@ -668,6 +767,59 @@ async fn run_sub_agent_with_system(
             );
         }
 
+        // ── 寫入工具確認 ──────────────────────────────────────────────────────
+        // 有 conversation_id + embed_fn → 儲存 pending_plan，讓使用者在 chat 用自然語言確認
+        // 無 conversation_id（直接工具呼叫）→ 用 confirm_write fn（UI dialog）
+        let has_write = llm_result.tool_calls.iter().any(|(_, n, _)| is_write_tool(n));
+        if has_write {
+            let batch_display = llm_result.tool_calls.iter()
+                .filter(|(_, n, _)| is_write_tool(n))
+                .map(|(_, n, a)| format!("- {}", tool_display_sub(n, a)))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            if let (Some(ref conv_id), Some(ref ef)) = (&conversation_id, &embed_fn) {
+                // pending_plan 路徑：儲存 deferred 工具，sub-agent 先回傳確認訊息
+                use crate::commands::conversation::{save_pending_plan, DeferredTool};
+                let deferred: Vec<DeferredTool> = llm_result.tool_calls.iter()
+                    .filter(|(_, n, _)| is_write_tool(n))
+                    .map(|(_, name, args)| DeferredTool {
+                        name: name.clone(),
+                        args: args.clone(),
+                    })
+                    .collect();
+                let _ = save_pending_plan(&db, conv_id, &deferred).await;
+
+                // 讓 LLM 知道寫入被暫緩，並傳達確認訊息給使用者
+                let confirm_prompt = format!(
+                    "以下操作已暫緩，等待你的確認（請回覆「確認」或「取消」）：\n{}",
+                    batch_display
+                );
+                let _ = tx.cancel().await; // 本輪 transaction 暫緩
+                final_text = confirm_prompt.clone();
+                emit("llm:token".into(), Value::String(confirm_prompt.clone()));
+                break; // 停止本輪 sub-agent，等待使用者確認
+            } else {
+                // UI dialog 路徑（無對話脈絡）
+                emit("agent:write_request".into(), Value::String(batch_display.clone()));
+                let approved = confirm_write(batch_display).await;
+                if !approved {
+                    let tc_json: Vec<Value> = llm_result.tool_calls.iter().map(|(id, name, args)| {
+                        serde_json::json!({"id": id, "type": "function",
+                            "function": {"name": name, "arguments": args.to_string()}})
+                    }).collect();
+                    messages.push(serde_json::json!({"role": "assistant", "content": null, "tool_calls": tc_json}));
+                    for (tool_id, name, _) in &llm_result.tool_calls {
+                        messages.push(serde_json::json!({
+                            "role": "tool", "tool_call_id": tool_id,
+                            "name": name, "content": "用戶拒絕了此寫入操作。"
+                        }));
+                    }
+                    continue;
+                }
+            }
+        }
+
         let tool_graph = Planner::plan(&llm_result.tool_calls);
         let results = match dispatcher.run(Arc::clone(&tx), tool_graph).await {
             Ok(r) => r,
@@ -694,13 +846,32 @@ async fn run_sub_agent_with_system(
             "tool_calls": tc_json,
         }));
 
-        for ((tool_id, name, _), result) in llm_result.tool_calls.iter().zip(results.iter()) {
+        for ((tool_id, name, args), result) in llm_result.tool_calls.iter().zip(results.iter()) {
+            let result_owned = result.as_str().map(String::from).unwrap_or_else(|| result.to_string());
+            let result_str = result_owned.as_str();
             messages.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": tool_id,
                 "name": name,
-                "content": result.as_str().unwrap_or(&result.to_string()),
+                "content": result_str,
             }));
+            // 收集 note_refs（search_vault / read_note）
+            let refs = extract_note_refs(name, args, result_str, &vault_path);
+            if !refs.is_empty() {
+                emit("agent:note_refs".into(),
+                    serde_json::to_value(refs.clone()).unwrap_or(Value::Null));
+                all_note_refs.extend(refs);
+            }
+        }
+
+        // open_note 是 terminal tool：執行完直接結束，不需再呼叫 LLM
+        if llm_result.tool_calls.iter().any(|(_, n, _)| n == "open_note") {
+            let opened: Vec<&str> = llm_result.tool_calls.iter()
+                .filter(|(_, n, _)| n == "open_note")
+                .map(|(_, _, a)| a["path"].as_str().unwrap_or("筆記"))
+                .collect();
+            final_text = format!("已為你打開：{}", opened.join("、"));
+            break;
         }
 
         if round == max_rounds - 1 {
@@ -709,6 +880,19 @@ async fn run_sub_agent_with_system(
     }
 
     let _ = tx.commit().await;
+
+    // ── note-open pending_plan：找到筆記 → 儲存計畫，讓主對話下一輪確認 ────
+    if !all_note_refs.is_empty() {
+        if let Some(conv_id) = &conversation_id {
+            all_note_refs.dedup();
+            use crate::commands::conversation::{save_pending_plan, DeferredTool};
+            let deferred = vec![DeferredTool {
+                name: "__open_note__".into(),
+                args: serde_json::json!({ "paths": all_note_refs }),
+            }];
+            let _ = save_pending_plan(&db, conv_id, &deferred).await;
+        }
+    }
 
     emit(
         "sub_agent:done".into(),

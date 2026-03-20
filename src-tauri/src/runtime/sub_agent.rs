@@ -42,7 +42,7 @@ impl SubAgentKind {
     /// 回傳該種類需要的工具名稱清單（None = 不過濾，使用全部）
     pub fn tool_filter(&self) -> Option<&'static [&'static str]> {
         match self {
-            Self::Search   => Some(&["search_vault", "read_note", "list_structure", "query_memory"]),
+            Self::Search   => Some(&["search_vault", "read_note", "open_note", "list_structure", "query_memory"]),
             Self::Write    => Some(&["create_note", "update_note", "create_folder"]),
             Self::Research => Some(&["web_search", "call_external_ai", "search_vault", "read_note"]),
             Self::Memory   => Some(&["query_memory", "list_recent_conversations"]),
@@ -93,14 +93,20 @@ pub async fn run_sub_agent(
 
     let system_content = if context.is_empty() {
         format!(
-            "你是一個專業的 {kind_str} 助理，負責完成指定子任務。\
-             請簡潔地完成任務，回傳結果摘要，不要加入多餘的說明。"
+            "你是一個專業的 {kind_str} 助理，負責完成指定子任務。\n\
+             規則：\n\
+             1. 必須實際呼叫工具執行任務；禁止假裝已完成或虛構結果。\n\
+             2. 若搜尋無結果，直接回報找不到，不可捏造內容或筆記名稱。\n\
+             3. 完成後簡潔回傳結果，不加多餘說明。"
         )
     } else {
         format!(
-            "你是一個專業的 {kind_str} 助理，負責完成指定子任務。\
+            "你是一個專業的 {kind_str} 助理，負責完成指定子任務。\n\
              背景資訊：{context}\n\
-             請簡潔地完成任務，回傳結果摘要，不要加入多餘的說明。"
+             規則：\n\
+             1. 必須實際呼叫工具執行任務；禁止假裝已完成或虛構結果。\n\
+             2. 若搜尋無結果，直接回報找不到，不可捏造內容或筆記名稱。\n\
+             3. 完成後簡潔回傳結果，不加多餘說明。"
         )
     };
 

@@ -49,6 +49,7 @@ use state::AppState;
 use std::time::Duration;
 use tauri::{
     generate_handler,
+    Emitter,
     Manager,
 };
 
@@ -121,6 +122,7 @@ pub fn run() {
             }
 
             // 背景完成 vault 初始化、FileWatcher、server warmup
+            let app_handle_sched = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 let state = app_handle.state::<AppState>();
 
@@ -179,6 +181,68 @@ pub fn run() {
                 // 自動更新：掃描開啟 auto_update 的 import sessions
                 auto_check_all_sessions(&app_handle, &state).await;
             });
+
+            // 排程器：每分鐘檢查到期的 scheduled_tasks
+            {
+                let ah_sched = app_handle_sched;
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                        let state = ah_sched.state::<AppState>();
+                        let now_ts = chrono::Utc::now().timestamp();
+
+                        #[derive(serde::Deserialize)]
+                        struct TaskRow {
+                            task_id: String,
+                            description: String,
+                            repeat_interval_secs: i64,
+                        }
+
+                        let vid = state.get_vault_path().await;
+                        if vid.is_empty() { continue; }
+
+                        let mut resp = match state.db.query(
+                            "SELECT task_id, description, repeat_interval_secs \
+                             FROM scheduled_tasks \
+                             WHERE vault_id = $vid AND status = 'pending' AND run_at_ts <= $now"
+                        )
+                        .bind(("vid", vid.clone()))
+                        .bind(("now", now_ts))
+                        .await {
+                            Ok(r) => r,
+                            Err(_) => continue,
+                        };
+
+                        let due: Vec<TaskRow> = resp.take(0).unwrap_or_default();
+                        for task in due {
+                            // 通知使用者
+                            let _ = ah_sched.emit("schedule:triggered", serde_json::json!({
+                                "task_id": task.task_id,
+                                "description": task.description,
+                            }));
+
+                            if task.repeat_interval_secs > 0 {
+                                // 重新排程
+                                let next_ts = now_ts + task.repeat_interval_secs;
+                                let _ = state.db.query(
+                                    "UPDATE scheduled_tasks SET run_at_ts = $next \
+                                     WHERE task_id = $tid"
+                                )
+                                .bind(("next", next_ts))
+                                .bind(("tid", task.task_id.clone()))
+                                .await;
+                            } else {
+                                // 標記完成
+                                let _ = state.db.query(
+                                    "UPDATE scheduled_tasks SET status = 'done' WHERE task_id = $tid"
+                                )
+                                .bind(("tid", task.task_id.clone()))
+                                .await;
+                            }
+                        }
+                    }
+                });
+            }
 
             Ok(())
         })

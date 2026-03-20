@@ -108,9 +108,6 @@ impl Agent {
                     // 用 embedding 分類 intent
                     let intent = self.intent_classifier.classify_with_embedding(
                         &user_input,
-                        &pending.confirm_centroid,
-                        &pending.cancel_centroid,
-                        &pending.interrupt_centroid,
                         &self.embed_fn,
                     ).await;
 
@@ -213,7 +210,6 @@ impl Agent {
         session_id: String,
     ) -> Result<String, String> {
         use crate::commands::conversation::{save_pending_plan, DeferredTool};
-        use crate::commands::ai::compute_centroid;
 
         // 建立 Transaction → prepare → emit
         let tx = Arc::new(Transaction::new());
@@ -334,24 +330,8 @@ impl Agent {
                             .map(|(_, name, args)| DeferredTool { name: name.clone(), args: args.clone() })
                             .collect();
                         if !deferred.is_empty() {
-                            let confirm_phrases = ["好", "確認", "沒問題", "執行", "對", "行", "繼續"];
-                            let cancel_phrases  = ["不要", "算了", "取消", "停", "不用"];
-                            let interrupt_phrases = ["等等", "先停", "稍等"];
-                            let confirm_vecs: Vec<Vec<f32>> = futures::future::join_all(
-                                confirm_phrases.iter().map(|p| (self.embed_fn)(p.to_string()))
-                            ).await;
-                            let cancel_vecs: Vec<Vec<f32>> = futures::future::join_all(
-                                cancel_phrases.iter().map(|p| (self.embed_fn)(p.to_string()))
-                            ).await;
-                            let interrupt_vecs: Vec<Vec<f32>> = futures::future::join_all(
-                                interrupt_phrases.iter().map(|p| (self.embed_fn)(p.to_string()))
-                            ).await;
-                            let c_confirm = compute_centroid(&confirm_vecs.iter().filter(|v| !v.is_empty()).cloned().collect::<Vec<_>>());
-                            let c_cancel  = compute_centroid(&cancel_vecs.iter().filter(|v| !v.is_empty()).cloned().collect::<Vec<_>>());
-                            let c_inter   = compute_centroid(&interrupt_vecs.iter().filter(|v| !v.is_empty()).cloned().collect::<Vec<_>>());
                             let _ = save_pending_plan(
                                 &self.db, conv_id, &deferred,
-                                &c_confirm, &c_cancel, &c_inter,
                             ).await;
                             // 通知 LLM 計畫已記錄
                             messages.push(serde_json::json!({
@@ -369,16 +349,6 @@ impl Agent {
                     // 找出 plan_announce tool call
                     let pa = round.tool_calls.iter().find(|(_, n, _)| n == "plan_announce");
                     if let Some((_, _, pa_args)) = pa {
-                        let confirm_phrases: Vec<String> = pa_args["confirm_phrases"]
-                            .as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                            .unwrap_or_default();
-                        let cancel_phrases: Vec<String> = pa_args["cancel_phrases"]
-                            .as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                            .unwrap_or_default();
-                        let interrupt_phrases: Vec<String> = pa_args["interrupt_phrases"]
-                            .as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                            .unwrap_or_default();
-
                         // deferred_tools：從 plan_announce args 或同輪寫入工具中取得
                         let deferred: Vec<DeferredTool> = if let Some(arr) = pa_args["deferred_tools"].as_array() {
                             arr.iter().filter_map(|t| {
@@ -394,29 +364,8 @@ impl Agent {
                         };
 
                         if !deferred.is_empty() {
-                            // 生成 embedding centroids
-                            let embed_strs = |phrases: Vec<String>| {
-                                let ef = Arc::clone(&self.embed_fn);
-                                async move {
-                                    futures::future::join_all(
-                                        phrases.into_iter().map(|p| (ef)(p))
-                                    ).await
-                                }
-                            };
-                            let confirm_vecs   = embed_strs(confirm_phrases).await;
-                            let cancel_vecs    = embed_strs(cancel_phrases).await;
-                            let interrupt_vecs = embed_strs(interrupt_phrases).await;
-
-                            let non_empty = |vecs: Vec<Vec<f32>>| -> Vec<Vec<f32>> {
-                                vecs.into_iter().filter(|v| !v.is_empty()).collect()
-                            };
-                            let c_confirm = compute_centroid(&non_empty(confirm_vecs));
-                            let c_cancel  = compute_centroid(&non_empty(cancel_vecs));
-                            let c_inter   = compute_centroid(&non_empty(interrupt_vecs));
-
                             let _ = save_pending_plan(
                                 &self.db, conv_id, &deferred,
-                                &c_confirm, &c_cancel, &c_inter,
                             ).await;
                         }
 
@@ -545,30 +494,7 @@ impl Agent {
                     name: "__open_note__".into(),
                     args: serde_json::json!({ "paths": all_note_refs }),
                 }];
-                // 使用較少短語減少嵌入延遲
-                let confirm_ph  = ["好", "要", "打開", "開啟", "確認", "可以"];
-                let cancel_ph   = ["不", "算了", "取消"];
-                let interrupt_ph = ["等等", "先停"];
-                let embed_batch = |phrases: &[&str]| {
-                    let ef = Arc::clone(&self.embed_fn);
-                    let ps: Vec<String> = phrases.iter().map(|p| p.to_string()).collect();
-                    async move {
-                        futures::future::join_all(ps.into_iter().map(|p| (ef)(p))).await
-                    }
-                };
-                let confirm_vecs   = embed_batch(&confirm_ph).await;
-                let cancel_vecs    = embed_batch(&cancel_ph).await;
-                let interrupt_vecs = embed_batch(&interrupt_ph).await;
-                let non_empty = |vecs: Vec<Vec<f32>>| -> Vec<Vec<f32>> {
-                    vecs.into_iter().filter(|v| !v.is_empty()).collect()
-                };
-                let c_confirm = compute_centroid(&non_empty(confirm_vecs));
-                let c_cancel  = compute_centroid(&non_empty(cancel_vecs));
-                let c_inter   = compute_centroid(&non_empty(interrupt_vecs));
-                let _ = save_pending_plan(
-                    &self.db, conv_id, &deferred,
-                    &c_confirm, &c_cancel, &c_inter,
-                ).await;
+                let _ = save_pending_plan(&self.db, conv_id, &deferred).await;
             }
         }
 

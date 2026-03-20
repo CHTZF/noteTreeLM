@@ -363,6 +363,110 @@ pub async fn get_embedding(client: &reqwest::Client, base_url: &str, text: &str)
     vec![]
 }
 
+/// 呼叫 LLM（非串流）根據 user_ask 生成 agent 規格 JSON。
+/// 回傳 (name, description, trigger, tool_names)；任何錯誤 fallback 至 raw input。
+async fn generate_agent_spec(
+    client: &reqwest::Client,
+    base_url: &str,
+    input: &str,
+) -> (String, String, String, Vec<String>, String, Vec<crate::runtime::system_agent::NewSkillSpec>) {
+    let fallback = || (
+        input.chars().take(24).collect::<String>(),
+        input.to_string(),
+        input.to_string(),
+        vec![],
+        String::new(),
+        vec![],
+    );
+
+    let system = "\
+你是一個 agent 規劃助理。根據使用者需求，輸出 JSON agent 規格（只輸出 JSON，不加任何說明）。\n\
+格式：\n\
+{\n\
+  \"name\": \"<10字以內的中文名稱>\",\n\
+  \"description\": \"<此agent專門做什麼>\",\n\
+  \"trigger\": \"<何時觸發此agent的語意描述>\",\n\
+  \"tool_names\": [<工具列表>],\n\
+  \"system_prompt\": \"<此agent的繁體中文任務指令，說明如何解讀使用者語意、工具使用順序，2-4句話>\",\n\
+  \"skills\": [\n\
+    {\n\
+      \"title\": \"<技能名稱>\",\n\
+      \"trigger\": \"<何時套用此技能的語意描述>\",\n\
+      \"behavior\": \"<具體行為規範，說明遇到此情境應如何處理>\",\n\
+      \"injection_mode\": \"passive\"\n\
+    }\n\
+  ]\n\
+}\n\
+\n\
+可用 tool_names：search_vault, read_note, open_note, list_structure, create_note, update_note, create_folder, query_memory, call_external_ai, list_recent_conversations\n\
+選擇原則：\n\
+- 筆記查詢/搜尋 → [\"search_vault\"]\n\
+- 筆記打開（讓使用者在編輯器中查看）→ [\"search_vault\",\"open_note\"]\n\
+- 筆記閱讀/分析內容 → [\"search_vault\",\"read_note\"]\n\
+- 筆記寫入/更新 → [\"create_note\",\"update_note\",\"create_folder\"]\n\
+- 外部資訊/網路查詢 → [\"call_external_ai\"]\n\
+- 記憶查詢 → [\"query_memory\"]\n\
+- 複合任務 → 組合上述\n\
+\n\
+skills 撰寫原則：\n\
+- 每個 skill 對應一種使用者可能的語意變體或邊緣情境（例如：使用者說「找不到」時的 fallback 行為）\n\
+- 0-3 個 skills，只有確實需要時才加（簡單任務可以 skills: []）\n\
+- behavior 要具體可執行，不要空泛\n\
+\n\
+system_prompt 撰寫重點：說明使用者的用詞習慣、意圖語意、工具使用順序（例如：先 search_vault 再 open_note），禁止虛構結果。";
+
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": input},
+        ],
+        "max_tokens": 256,
+        "temperature": 0.3,
+        "stream": false,
+    });
+
+    let resp = match client
+        .post(format!("{}/v1/chat/completions", base_url))
+        .json(&body)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return fallback(),
+    };
+
+    let json: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return fallback(),
+    };
+
+    let text = json["choices"][0]["message"]["content"].as_str().unwrap_or("");
+    let start = match text.find('{') { Some(i) => i, None => return fallback() };
+    let end   = match text.rfind('}') { Some(i) => i + 1, None => return fallback() };
+
+    let spec: serde_json::Value = match serde_json::from_str(&text[start..end]) {
+        Ok(v) => v,
+        Err(_) => return fallback(),
+    };
+
+    let name = spec["name"].as_str().unwrap_or("").chars().take(24).collect::<String>();
+    let desc = spec["description"].as_str().unwrap_or(input).to_string();
+    let trigger = spec["trigger"].as_str().unwrap_or(input).to_string();
+    let tools: Vec<String> = spec["tool_names"].as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let system_prompt = spec["system_prompt"].as_str().unwrap_or("").to_string();
+    let skills: Vec<crate::runtime::system_agent::NewSkillSpec> = spec["skills"].as_array()
+        .map(|arr| arr.iter()
+            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+            .collect())
+        .unwrap_or_default();
+
+    let name = if name.is_empty() { input.chars().take(24).collect() } else { name };
+    (name, desc, trigger, tools, system_prompt, skills)
+}
+
 /// 計算多個 embedding 向量的 centroid（平均向量），並做 L2 正規化
 pub fn compute_centroid(vecs: &[Vec<f32>]) -> Vec<f32> {
     if vecs.is_empty() {
@@ -559,11 +663,9 @@ pub async fn invoke_agent(
     conversation_id: Option<String>,
 ) -> Result<String, AppError> {
     use crate::commands::conversation::{load_messages, save_messages, maybe_set_title};
-    use crate::runtime::agent::Agent;
-    use crate::runtime::dispatcher::Dispatcher;
-    use crate::runtime::intent_classifier::IntentClassifier;
+    use crate::runtime::intent_classifier::{Intent, IntentClassifier};
     use crate::runtime::tool_registry::ToolRegistry;
-    use crate::runtime::types::{ConfirmWriteFn, EmitEventFn, LlmFn, LlmRound, PrefetchFn};
+    use crate::runtime::types::{ConfirmWriteFn, EmitEventFn, LlmFn, LlmRound};
 
     // 1. 確保 llama-server 運行，取得 base_url
     let base_url = ensure_server_running(state.inner(), &app).await?;
@@ -701,300 +803,256 @@ pub async fn invoke_agent(
         })
     });
 
-    // 8. 建立 Agent，執行
-    //    Chat 主 agent 只擁有 meta 工具（call_agent / list_available_agents / query_memory / create_agent_skill）。
-    //    直接 vault 操作透過 call_agent 委派給 sub-agents，確保 SystemAgentService 作為唯一中介。
-    //    Intent::Memory 路徑由 Agent 自行注入 MemoryAgent::tools_definition()。
-    let vault_tools_opt = if !vault_path.is_empty() && vault_id_opt.is_some() {
-        Some(chat_meta_tools())
-    } else {
-        None
-    };
-
-
-    // Pre-routing：若 user input 與某個 agent definition 的 trigger_embedding 相似度 > 0.75
-    // 則跳過 Chat LLM，直接透過 SystemAgentService.route() 執行，節省一次 LLM 呼叫。
-    //
-    // 只在「全新對話」觸發：只要 messages_json 裡已存在任何 assistant 訊息，
-    // 就代表對話上下文已建立，後續訊息一律由 Chat LLM 繼續處理，
-    // 避免 embedding 攔截破壞多輪對話的連貫性。
-    let has_prior_assistant = messages_json.iter()
-        .any(|m| m["role"].as_str() == Some("assistant"));
-
-    if has_prior_assistant {
-        let _ = app.emit("agent:pre_route_debug", serde_json::json!({
-            "step": "skip", "reason": "has_prior_assistant = true，非首輪對話"
-        }));
-    }
-    if !has_prior_assistant {
-    if vault_id_opt.is_none() || vault_path.is_empty() {
-        let _ = app.emit("agent:pre_route_debug", serde_json::json!({
-            "step": "skip", "reason": "vault 未設定"
-        }));
-    }
-    if let Some(ref vid) = vault_id_opt {
-        if !vault_path.is_empty() {
-            let emb_base = base_url.as_str();
-
-            // 生命週期管理（sleep / delete）
-            crate::commands::agent_def::check_agent_lifecycle(&vault_db, vid).await;
-
-            // Agent DB 狀態 dump（debug）
-            {
-                #[derive(serde::Deserialize)]
-                struct AgentRow { name: String, trigger: String, has_emb: bool, status: String, vault_id: String, is_builtin: bool }
-                // 查全部 agent（不過濾 vault_id / is_builtin）以偵測 vault_id 不符或只有 builtin 的情況
-                if let Ok(mut resp) = vault_db.query(
-                    "SELECT name, trigger OR '' AS trigger, trigger_embedding != NONE AS has_emb, \
-                            status OR 'active' AS status, vault_id, is_builtin \
-                     FROM agent_definitions"
-                ).await {
-                    let rows: Vec<AgentRow> = resp.take(0).unwrap_or_default();
-                    let _ = app.emit("agent:pre_route_debug", serde_json::json!({
-                        "step": "db_dump",
-                        "query_vid": vid,
-                        "agents": rows.iter().map(|r| serde_json::json!({
-                            "name": r.name,
-                            "trigger": if r.trigger.is_empty() { "(empty)" } else { r.trigger.as_str() },
-                            "has_emb": r.has_emb,
-                            "status": r.status,
-                            "vid_match": r.vault_id == *vid,
-                            "builtin": r.is_builtin,
-                        })).collect::<Vec<_>>(),
-                    }));
-                }
-            }
-
-            // Lazy repair：補算 trigger != '' 但 trigger_embedding = NONE 的 active agents
-            {
-                #[derive(serde::Deserialize)]
-                struct NullEmbRow { def_id: String, trigger: String }
-                if let Ok(mut resp) = vault_db.query(
-                    "SELECT def_id, trigger FROM agent_definitions \
-                     WHERE vault_id = $vid AND is_active = true AND status != 'sleep' \
-                       AND trigger != '' AND trigger_embedding = NONE"
-                ).bind(("vid", vid.clone())).await {
-                    let rows: Vec<NullEmbRow> = resp.take(0).unwrap_or_default();
-                    let found = rows.len();
-                    let mut repaired = 0usize;
-                    for row in rows {
-                        let emb = get_embedding(&client, emb_base, &row.trigger).await;
-                        if !emb.is_empty() {
-                            let ok = vault_db.query(
-                                "UPDATE agent_definitions SET trigger_embedding = $emb \
-                                 WHERE vault_id = $vid AND def_id = $did"
-                            )
-                            .bind(("emb", emb))
-                            .bind(("vid", vid.clone()))
-                            .bind(("did", row.def_id))
-                            .await.is_ok();
-                            if ok { repaired += 1; }
-                        }
-                    }
-                    let _ = app.emit("agent:pre_route_debug", serde_json::json!({
-                        "step": "repair_done",
-                        "found": found,
-                        "repaired": repaired,
-                    }));
-                }
-            }
-
-            let user_emb = get_embedding(&client, emb_base, &input).await;
-            if user_emb.is_empty() {
-                let _ = app.emit("agent:pre_route_debug", serde_json::json!({
-                    "step": "skip", "reason": "get_embedding 回傳空向量（llama-server 異常？）"
-                }));
-            } else {
-                let _ = app.emit("agent:pre_route_debug", serde_json::json!({
-                    "step": "embedding_ok", "dim": user_emb.len()
-                }));
-            }
-            if !user_emb.is_empty() {
-                    let matched = crate::commands::agent_def::find_matching_agent_definition(
-                        &vault_db,
-                        vid,
-                        &user_emb,
-                        0.75,
-                        true, // pre-routing: active only
-                    ).await;
-                    if matched.is_none() {
-                        let best = crate::commands::agent_def::find_matching_agent_definition(
-                            &vault_db, vid, &user_emb, 0.0, true).await;
-                        let _ = app.emit("agent:pre_route_debug", serde_json::json!({
-                            "step": "miss",
-                            "best_match": best.as_ref().map(|b| &b.name),
-                            "reason": if best.is_some() {
-                                "最佳匹配 similarity < 0.75"
-                            } else {
-                                "DB 中沒有任何 agent 有 trigger_embedding"
-                            }
-                        }));
-                    }
-                    if let Some(def) = matched {
-                        // 設定 session + cancel flag（與 Agent::run_streaming_loop 一致）
-                        state.agent_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
-                        let session_id = uuid::Uuid::new_v4().to_string();
-                        *state.agent_session.lock().await = Some(session_id.clone());
-
-                        let _ = app.emit("agent:pre_route", serde_json::json!({
-                            "def_id": def.def_id,
-                            "def_name": def.name,
-                            "session_id": session_id.clone(),
-                        }));
-
-                        let result = state.system_agent.route(
-                            crate::runtime::system_agent::AgentRequest {
-                                caller_session_id: session_id.clone(),
-                                target: def.def_id.clone(),
-                                task: input.clone(),
-                                context: String::new(),
-                            },
-                            vault_tools(),
-                            Arc::clone(&registry),
-                            llm_fn.clone(),
-                            Arc::clone(&emit_fn),
-                            Some(Arc::clone(&state.agent_cancel)),
-                            reg_emb_url.as_deref(),
-                        ).await;
-
-                        *state.agent_session.lock().await = None;
-                        (emit_fn)("llm:done".into(), serde_json::Value::String(result.clone()));
-
-                        // 若有 conversation_id，存回 DB
-                        if let Some(ref conv_id) = conversation_id {
-                            use crate::commands::conversation::{save_messages, maybe_set_title};
-                            let mut to_save: Vec<serde_json::Value> = messages_json.into_iter()
-                                .filter(|m| m["role"].as_str() != Some("system"))
+    // 8. Pending plan check（原 Agent::run 邏輯）
+    // 9. Pending plan check（原 Agent::run 邏輯，移至此處統一處理）
+    if let Some(ref conv_id) = conversation_id {
+        use crate::commands::conversation::{load_pending_plan, delete_pending_plan};
+        if let Ok(Some(pending)) = load_pending_plan(&state.db, conv_id).await {
+            let age = chrono::Utc::now().timestamp() - pending.created_at;
+            let _ = delete_pending_plan(&state.db, conv_id).await;
+            if age <= 86400 {
+                let intent = IntentClassifier::new().classify_with_embedding(
+                    &input,
+                    &embed_fn,
+                ).await;
+                match intent {
+                    Intent::Confirm => {
+                        let is_note_open = pending.deferred_tools.first()
+                            .map(|t| t.name == "__open_note__").unwrap_or(false);
+                        if is_note_open {
+                            let paths: Vec<serde_json::Value> = pending.deferred_tools.iter()
+                                .flat_map(|t| t.args["paths"].as_array().cloned().unwrap_or_default())
                                 .collect();
-                            if !result.is_empty() {
-                                to_save.push(serde_json::json!({"role": "assistant", "content": result}));
-                            }
-                            let arr = serde_json::Value::Array(to_save);
-                            let _ = save_messages(&state.db, conv_id, &arr).await;
-                            let _ = maybe_set_title(&state.db, conv_id, &arr).await;
+                            let note_name = paths.first()
+                                .and_then(|p| p.as_str())
+                                .and_then(|p| p.split('/').last())
+                                .map(|n| n.trim_end_matches(".md").to_string())
+                                .unwrap_or_else(|| "筆記".to_string());
+                            let confirm_text = format!("好的，已為你打開《{}》。", note_name);
+                            (emit_fn)("agent:open_note".into(), serde_json::Value::Array(paths));
+                            (emit_fn)("llm:token".into(), serde_json::Value::String(confirm_text.clone()));
+                            (emit_fn)("llm:done".into(), serde_json::Value::String(confirm_text.clone()));
+                            return Ok(confirm_text);
                         }
-
-                        return Ok(result);
+                        // 寫入 deferred plan：將工具清單注入 context，繼續路由讓 sub-agent 執行
+                        let deferred_desc = pending.deferred_tools.iter()
+                            .map(|t| format!("[系統] 已確認，請立即執行：{} {:?}", t.name, t.args))
+                            .collect::<Vec<_>>().join("\n");
+                        messages_json.push(serde_json::json!({
+                            "role": "user",
+                            "content": deferred_desc
+                        }));
+                        // 繼續往下路由（full_context 會帶入訊息）
                     }
+                    Intent::Cancel | Intent::Interrupt => {
+                        (emit_fn)("agent:cancelled".into(), serde_json::Value::Null);
+                        (emit_fn)("llm:done".into(), serde_json::Value::String(String::new()));
+                        return Ok(String::new());
+                    }
+                    _ => {} // 無法辨識 → 繼續正常路由
                 }
             }
-        }
-    } // end if !has_prior_assistant
-
-    // 9. prefetch_memory：Intent::Memory 路徑的純 Rust 預取（<100ms，無 LLM）
-    //    有結果 → 注入 system prompt 作為初始種子；無結果 → 空字串，LLM 自行用 query_memory 搜尋
-    let prefetch_memory: Option<PrefetchFn> = if vault_id_opt.is_some() {
-        let db_pf = vault_db.clone();
-        let vid_pf = vault_id_opt.clone().unwrap_or_default();
-        Some(Arc::new(move |query: String| {
-            let db = db_pf.clone();
-            let vault_id = vid_pf.clone();
-            Box::pin(async move {
-                let now = Local::now();
-                let rules = load_memory_rules(&db, &vault_id).await;
-                let extra_stops: Vec<char> = rules.iter()
-                    .filter(|(pt, _, _)| pt == "stopword")
-                    .filter_map(|(_, pattern, _)| pattern.chars().next())
-                    .collect();
-                let since_ts = parse_query_since_with_rules(&query, &now, &rules);
-                let terms = extract_cjk_bigrams_with_extra_stops(&query, &extra_stops);
-                let limit = 3i64;
-
-                #[derive(Deserialize)]
-                struct PrefetchRow { path: String, title: String, created_at: surrealdb::sql::Datetime }
-
-                let rows: Vec<(String, String, i64)> = if terms.is_empty() {
-                    let mut resp = db.query(
-                        "SELECT path, title, created_at FROM notes
-                         WHERE vault_id = $vid AND string::starts_with(path, 'memories/')
-                         ORDER BY created_at DESC LIMIT $limit"
-                    )
-                    .bind(("vid", vault_id.clone()))
-                    .bind(("limit", limit))
-                    .await.ok();
-                    resp.as_mut()
-                        .and_then(|r| r.take::<Vec<PrefetchRow>>(0).ok())
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|r| (r.path, r.title, r.created_at.timestamp() * 1000))
-                        .filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min))
-                        .collect()
-                } else {
-                    // Build a LIKE-based filter for terms
-                    let conditions: String = terms.iter()
-                        .enumerate()
-                        .map(|(i, _)| format!("string::contains(content, $term{})", i))
-                        .collect::<Vec<_>>().join(" OR ");
-                    let sql = format!(
-                        "SELECT path, title, created_at FROM notes
-                         WHERE vault_id = $vid AND string::starts_with(path, 'memories/') AND ({})
-                         ORDER BY created_at DESC LIMIT $limit",
-                        conditions
-                    );
-                    let mut q = db.query(&sql).bind(("vid", vault_id.clone())).bind(("limit", limit));
-                    for (i, term) in terms.iter().enumerate() {
-                        q = q.bind((format!("term{}", i), term.clone()));
-                    }
-                    let mut resp = q.await.ok();
-                    resp.as_mut()
-                        .and_then(|r| r.take::<Vec<PrefetchRow>>(0).ok())
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|r| (r.path, r.title, r.created_at.timestamp() * 1000))
-                        .filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min))
-                        .collect()
-                };
-
-                if rows.is_empty() {
-                    String::new()
-                } else {
-                    format_memory_rows(&rows, "", &db, &vault_id).await
-                }
-            })
-        }))
-    } else {
-        None
-    };
-
-    // 10. Skill pre-pass：向量搜尋符合當前查詢的 active skills → 注入 system prompt
-    if let Some(ref vid) = vault_id_opt {
-        if let Some((section, titles)) = run_skill_pre_pass(
-            &state.db, vid, &input,
-            skill_emb_url.as_deref(),
-            &client,
-            "main",
-        ).await {
-            if messages_json.first().and_then(|m| m["role"].as_str()) == Some("system") {
-                let old = messages_json[0]["content"].as_str().unwrap_or("").to_string();
-                messages_json[0]["content"] = serde_json::json!(format!("{}\n\n{}", old, section));
-            } else {
-                messages_json.insert(0, serde_json::json!({"role": "system", "content": section}));
-            }
-            // 透明度：通知前端哪些技能被觸發
-            let _ = app.emit("agent:skills_activated", serde_json::json!({ "titles": titles }));
         }
     }
 
-    let agent = Agent::new(
-        Dispatcher::new(registry),
-        IntentClassifier::new(),
-        llm_fn,
-        confirm_write,
-        emit_fn,
-        vault_path,
-        Arc::clone(&state.agent_cancel),
-        Arc::clone(&state.agent_session),
-        vault_tools_opt,
-        prefetch_memory,
-        embed_fn,
-        state.db.clone(),
-        conversation_id.clone(),
-    );
+    // 10. 記憶預取（作為 sub-agent context 的一部分）
+    let memory_context = if let Some(ref vid) = vault_id_opt {
+        let now = Local::now();
+        let rules = load_memory_rules(&vault_db, vid).await;
+        let extra_stops: Vec<char> = rules.iter()
+            .filter(|(pt, _, _)| pt == "stopword")
+            .filter_map(|(_, pattern, _)| pattern.chars().next())
+            .collect();
+        let since_ts = parse_query_since_with_rules(&input, &now, &rules);
+        let terms = extract_cjk_bigrams_with_extra_stops(&input, &extra_stops);
+        #[derive(Deserialize)]
+        struct PrefetchRow { path: String, title: String, created_at: surrealdb::sql::Datetime }
+        let rows: Vec<(String, String, i64)> = if terms.is_empty() {
+            let mut resp = vault_db.query(
+                "SELECT path, title, created_at FROM notes
+                 WHERE vault_id = $vid AND string::starts_with(path, 'memories/')
+                 ORDER BY created_at DESC LIMIT 3"
+            ).bind(("vid", vid.clone())).await.ok();
+            resp.as_mut().and_then(|r| r.take::<Vec<PrefetchRow>>(0).ok()).unwrap_or_default()
+                .into_iter().map(|r| (r.path, r.title, r.created_at.timestamp() * 1000))
+                .filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min)).collect()
+        } else {
+            let conds: String = terms.iter().enumerate()
+                .map(|(i, _)| format!("string::contains(content, $term{})", i))
+                .collect::<Vec<_>>().join(" OR ");
+            let sql = format!(
+                "SELECT path, title, created_at FROM notes
+                 WHERE vault_id = $vid AND string::starts_with(path, 'memories/') AND ({})
+                 ORDER BY created_at DESC LIMIT 3", conds);
+            let mut q = vault_db.query(&sql).bind(("vid", vid.clone()));
+            for (i, term) in terms.iter().enumerate() { q = q.bind((format!("term{}", i), term.clone())); }
+            let mut resp = q.await.ok();
+            resp.as_mut().and_then(|r| r.take::<Vec<PrefetchRow>>(0).ok()).unwrap_or_default()
+                .into_iter().map(|r| (r.path, r.title, r.created_at.timestamp() * 1000))
+                .filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min)).collect()
+        };
+        if rows.is_empty() { String::new() }
+        else { format_memory_rows(&rows, "", &vault_db, vid).await }
+    } else { String::new() };
 
-    let response_text = agent
-        .run(input.clone(), messages_json.clone(), use_tools.unwrap_or(true))
-        .await
-        .map_err(AppError::AI)?;
+    // 11. 序列化近期對話歷史（最多 10 條，作為 sub-agent context）
+    let messages_context: String = {
+        let recent: Vec<&serde_json::Value> = messages_json.iter()
+            .filter(|m| m["role"].as_str().map_or(false, |r| r == "user" || r == "assistant"))
+            .rev().take(10).collect::<Vec<_>>().into_iter().rev().collect();
+        recent.iter().filter_map(|m| {
+            let role = m["role"].as_str()?;
+            let content = m["content"].as_str().unwrap_or("");
+            if content.is_empty() { return None; }
+            let prefix = if role == "user" { "使用者" } else { "助理" };
+            Some(format!("{}: {}", prefix, &content.chars().take(300).collect::<String>()))
+        }).collect::<Vec<_>>().join("\n")
+    };
+
+    let full_context = match (messages_context.is_empty(), memory_context.is_empty()) {
+        (false, false) => format!("{}\n\n[相關記憶]\n{}", messages_context, memory_context),
+        (false, true)  => messages_context,
+        (true,  false) => format!("[相關記憶]\n{}", memory_context),
+        (true,  true)  => String::new(),
+    };
+
+    // 12. 統一 LLM + tool loop（所有輪次相同路徑，tool call 歷史完整保存至 DB）
+    //     背景異步：touch_agent 做 agent learning（不阻塞主流程）
+    let session_id = uuid::Uuid::new_v4().to_string();
+    *state.agent_session.lock().await = Some(session_id.clone());
+    state.agent_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+
+
+    let response_text = if vault_id_opt.is_some() && use_tools.unwrap_or(true) {
+        // messages_json 已包含當前 user input（line 654 append 過）
+        use crate::runtime::dispatcher::Dispatcher;
+        use crate::runtime::planner::Planner;
+        use crate::runtime::transaction::Transaction;
+
+        // 保留前端傳來的 system（ORCHESTRATOR_SYSTEM，含明確工具使用規則）；
+        // 若無 system，補上最低限度的 anti-hallucination 提示
+        let anti_hallucination = "\n\n必須實際呼叫工具完成任務；禁止假裝或虛構結果。\
+                                   若搜尋無結果，直接說明找不到。\
+                                   回覆中引用筆記時，請包含完整的 vault 相對路徑。";
+        let mut msgs: Vec<serde_json::Value> = if let Some(sys_msg) = messages_json.iter()
+            .find(|m| m["role"].as_str() == Some("system"))
+        {
+            // 前端已有 system → 在末尾追加 anti-hallucination 補丁
+            let patched_content = format!(
+                "{}{}",
+                sys_msg["content"].as_str().unwrap_or(""),
+                anti_hallucination
+            );
+            std::iter::once(serde_json::json!({"role": "system", "content": patched_content}))
+                .chain(messages_json.iter().filter(|m| m["role"].as_str() != Some("system")).cloned())
+                .collect()
+        } else {
+            // 無 system → 使用 fallback
+            let fallback = format!("你是一個筆記助理，可以使用工具搜尋、讀取和管理筆記。{}", anti_hallucination);
+            std::iter::once(serde_json::json!({"role": "system", "content": fallback}))
+                .chain(messages_json.iter().cloned())
+                .collect()
+        };
+
+        let tools = vault_tools();
+        let dispatcher = Dispatcher::new(Arc::clone(&registry));
+        let tx = Arc::new(Transaction::new());
+        let _ = tx.prepare().await;
+        let mut final_text = String::new();
+
+        'tool_loop: for _round in 0..8usize {
+            if state.agent_cancel.load(std::sync::atomic::Ordering::Relaxed) { break; }
+
+            let result = match llm_fn(
+                msgs.clone(),
+                Some(tools.clone()),
+                Some(Arc::clone(&state.agent_cancel)),
+            ).await {
+                Ok(r) => r,
+                Err(e) => { eprintln!("[chat] llm error: {e}"); break; }
+            };
+            final_text = result.full_text.clone();
+            if result.tool_calls.is_empty() { break; }
+
+            for (_, name, _) in &result.tool_calls {
+                (emit_fn)("agent:tool_call".into(), serde_json::json!({
+                    "session_id": session_id,
+                    "display": format!("🔧 {name}"),
+                }));
+            }
+
+            // 寫入工具確認
+            let has_write = result.tool_calls.iter().any(|(_, n, _)|
+                matches!(n.as_str(), "create_note" | "update_note" | "create_folder" | "delete_note" | "delete_folder" | "move_note" | "append_to_note"));
+            if has_write {
+                let display = result.tool_calls.iter()
+                    .filter(|(_, n, _)| matches!(n.as_str(), "create_note"|"update_note"|"create_folder"|"delete_note"|"delete_folder"|"move_note"|"append_to_note"))
+                    .map(|(_, n, a)| format!("- {} {}", n, a["path"].as_str().or_else(|| a["from"].as_str()).unwrap_or("")))
+                    .collect::<Vec<_>>().join("\n");
+                (emit_fn)("agent:write_request".into(), serde_json::Value::String(display.clone()));
+                let approved = confirm_write.clone()(display).await;
+                if !approved {
+                    let tc_json: Vec<serde_json::Value> = result.tool_calls.iter().map(|(id, n, a)| {
+                        serde_json::json!({"id": id, "type": "function", "function": {"name": n, "arguments": a.to_string()}})
+                    }).collect();
+                    msgs.push(serde_json::json!({"role": "assistant", "content": null, "tool_calls": tc_json}));
+                    for (tool_id, name, _) in &result.tool_calls {
+                        msgs.push(serde_json::json!({"role": "tool", "tool_call_id": tool_id, "name": name, "content": "用戶拒絕了此寫入操作。"}));
+                    }
+                    continue 'tool_loop;
+                }
+            }
+
+            let tool_graph = Planner::plan(&result.tool_calls);
+            let results = match dispatcher.run(Arc::clone(&tx), tool_graph).await {
+                Ok(r) => r,
+                Err(e) => { eprintln!("[chat] tool error: {e}"); break; }
+            };
+
+            let tc_json: Vec<serde_json::Value> = result.tool_calls.iter().map(|(id, n, a)| {
+                serde_json::json!({"id": id, "type": "function", "function": {"name": n, "arguments": a.to_string()}})
+            }).collect();
+            msgs.push(serde_json::json!({"role": "assistant", "content": null, "tool_calls": tc_json}));
+
+            for ((tool_id, name, _), res) in result.tool_calls.iter().zip(results.iter()) {
+                let res_str = res.as_str().map(String::from).unwrap_or_else(|| res.to_string());
+                msgs.push(serde_json::json!({"role": "tool", "tool_call_id": tool_id, "name": name, "content": res_str}));
+            }
+
+            // open_note 是 terminal tool：執行完直接結束，不需再呼叫 LLM
+            if result.tool_calls.iter().any(|(_, n, _)| n == "open_note") {
+                let opened: Vec<&str> = result.tool_calls.iter()
+                    .filter(|(_, n, _)| n == "open_note")
+                    .map(|(_, _, a)| a["path"].as_str().unwrap_or("筆記"))
+                    .collect();
+                final_text = format!("已為你打開：{}", opened.join("、"));
+                break;
+            }
+        }
+
+        let _ = tx.commit().await;
+        (emit_fn)("llm:done".into(), serde_json::Value::String(final_text.clone()));
+
+        // 更新 messages_json 供 save 段落使用：保留完整 tool call history（含 tool role）
+        // 前端顯示時透過 get_conversation 的 display_messages_json 過濾，不在此處截斷
+        messages_json = msgs.into_iter()
+            .filter(|m| m["role"].as_str() != Some("system"))
+            .collect();
+
+        final_text
+    } else {
+        // 無 vault 或 use_tools=false → 直接 LLM（純對話）
+        let session_id2 = session_id.clone();
+        let result = llm_fn(messages_json.clone(), None, Some(Arc::clone(&state.agent_cancel))).await
+            .map_err(AppError::AI)?;
+        let text = result.full_text;
+        (emit_fn)("llm:token".into(), serde_json::Value::String(text.clone()));
+        (emit_fn)("llm:done".into(), serde_json::Value::String(text.clone()));
+        let _ = session_id2;
+        text
+    };
+
+    *state.agent_session.lock().await = None;
 
     // 5-5: Bottom-up skill 歸納：若回覆包含明顯的步驟框架，發出 agent:skill_suggestion 事件
     // 讓前端決定是否引導使用者儲存為技能規範
@@ -2096,9 +2154,11 @@ pub fn vault_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "touch_agent",
-                "description": "委派任務給最合適的 agent 並執行。\
-系統會自動以 task 的語意搜尋現有 agent；找到相似 agent 則直接複用，找不到則依提示自動建立後執行。\
-無需預先知道 agent 名稱，也無需分開呼叫 create_agent 和 call_agent。",
+                "description": "當使用者需要以下任何一種任務時，必須呼叫此工具：\
+網路搜尋、即時資訊（天氣/新聞/股價）、外部 API、複雜計算、程式碼生成、\
+資料分析、建立或修改筆記、整理或摘要多篇筆記。\
+系統會自動以 task 語意搜尋現有 agent；找到則複用，找不到則自動建立後執行。\
+只有「純粹閒聊」或「解釋概念」才可不呼叫此工具直接回答。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2202,24 +2262,161 @@ pub fn vault_tools() -> serde_json::Value {
                     "required": ["keywords"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_current_datetime",
+                "description": "取得目前本地時間（年月日時分秒時區）",
+                "parameters": {"type": "object", "properties": {}, "required": []}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_notes_in_folder",
+                "description": "列出指定資料夾內的所有筆記",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "folder": {"type": "string", "description": "資料夾相對路徑（如 'projects' 或 'projects/web'）"}
+                    },
+                    "required": ["folder"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "append_to_note",
+                "description": "在現有筆記末尾追加內容（比 update_note 更安全，不覆蓋原有內容）",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "筆記相對路徑"},
+                        "content": {"type": "string", "description": "要追加的內容"}
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "delete_note",
+                "description": "刪除指定筆記（需使用者確認）",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "筆記相對路徑或名稱"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "delete_folder",
+                "description": "刪除指定資料夾及其所有內容（需使用者確認）",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "資料夾相對路徑"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "move_note",
+                "description": "移動或重新命名筆記",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "from": {"type": "string", "description": "原始相對路徑"},
+                        "to": {"type": "string", "description": "目標相對路徑（含新檔名）"}
+                    },
+                    "required": ["from", "to"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "show_toast",
+                "description": "顯示通知訊息給使用者（適合背景任務完成後通知）",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string"},
+                        "kind": {"type": "string", "description": "info|success|warning|error", "enum": ["info","success","warning","error"]},
+                        "duration_ms": {"type": "integer", "description": "顯示時間（毫秒），預設 3000"}
+                    },
+                    "required": ["message"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "ui_action",
+                "description": "模擬使用者操作 UI（切換 tab、開啟搜尋等）",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "操作類型",
+                            "enum": ["open_tab","focus_editor","open_search","new_note","open_settings","scroll_to_top"]
+                        },
+                        "payload": {"type": "object", "description": "額外參數（如 open_tab 需要 tab 名稱）"}
+                    },
+                    "required": ["action"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "reflect_on_skills",
+                "description": "查看所有技能規範的觸發命中率，供 agent 自我調優",
+                "parameters": {"type": "object", "properties": {}, "required": []}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_web",
+                "description": "搜尋網路（使用 Brave Search），取得即時資訊",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "搜尋關鍵字"}
+                    },
+                    "required": ["query"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "schedule_task",
+                "description": "排程一個任務，在指定時間執行（可設定重複間隔）",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "description": {"type": "string", "description": "任務描述（到時會顯示通知）"},
+                        "run_at": {"type": "string", "description": "執行時間，ISO 8601 格式（如 2026-03-21T09:00:00+08:00）"},
+                        "repeat_interval_seconds": {"type": "integer", "description": "重複間隔秒數，0 或省略表示只執行一次"}
+                    },
+                    "required": ["description", "run_at"]
+                }
+            }
         }
     ])
-}
-
-/// Chat 主 agent 只擁有的 meta 工具（不含直接 vault 操作）
-/// 直接 vault 操作全部透過 call_agent 委派給 sub-agent
-pub fn chat_meta_tools() -> serde_json::Value {
-    let all = vault_tools();
-    let meta_names = ["touch_agent", "list_available_agents", "query_memory", "create_agent_skill"];
-    let arr = all.as_array().cloned().unwrap_or_default();
-    serde_json::Value::Array(
-        arr.into_iter()
-            .filter(|t| {
-                let name = t["function"]["name"].as_str().unwrap_or("");
-                meta_names.contains(&name)
-            })
-            .collect(),
-    )
 }
 
 // ── Tool Registry 工具 ─────────────────────────────────────────────────────

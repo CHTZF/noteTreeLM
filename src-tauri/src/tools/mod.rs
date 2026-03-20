@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::Value;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex;
 
 use crate::commands::ai::{
@@ -22,7 +22,7 @@ use crate::runtime::memory_agent::{add_memory_rule_to_db, tool_query_memory};
 use std::sync::atomic::AtomicBool;
 use crate::runtime::system_agent::{AgentRequest, NewSkillSpec, SystemAgentService};
 use crate::runtime::tool_registry::ToolRegistry;
-use crate::runtime::types::{LlmFn, Tool};
+use crate::runtime::types::{ConfirmWriteFn, LlmFn, Tool};
 
 /// 建立包含所有 vault 工具的 ToolRegistry。
 ///
@@ -288,23 +288,76 @@ pub fn build_vault_registry(
     }
 
     // open_note — 發送 ui:open_note 事件讓前端開啟筆記（唯讀，無 rollback）
+    // 驗證路徑：先試 vault_path/path，找不到時掃描同名檔，前端接收 absolute path
     {
         let app = app.clone();
+        let vp = vault_path.clone();
         registry.register(
             "open_note".into(),
             Tool {
                 execute: Arc::new(move |args: Value| {
                     let app = app.clone();
-                    let mut path = args["path"].as_str().unwrap_or("").to_string();
-                    if !path.is_empty() && !path.ends_with(".md") {
-                        path.push_str(".md");
+                    let vp = vp.clone();
+                    let mut rel = args["path"].as_str().unwrap_or("").to_string();
+                    if !rel.is_empty() && !rel.ends_with(".md") {
+                        rel.push_str(".md");
                     }
                     Box::pin(async move {
-                        if path.is_empty() {
+                        if rel.is_empty() {
                             return Err("請提供筆記路徑".to_string());
                         }
-                        let _ = app.emit("ui:open_note", &path);
-                        Ok(Value::String(format!("✅ 已打開筆記：{}", path)))
+                        // 1. 先試完整 vault_path/rel
+                        let abs = std::path::PathBuf::from(&vp).join(&rel);
+                        if abs.exists() {
+                            let abs_str = abs.to_string_lossy().to_string();
+                            let _ = app.emit("ui:open_note", &abs_str);
+                            return Ok(Value::String(format!("✅ 已打開筆記：{}", rel)));
+                        }
+                        // 2. 嘗試只比對檔名（rel 可能缺少資料夾前綴）
+                        let filename = std::path::Path::new(&rel)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| rel.clone());
+                        let mut found: Option<String> = None;
+                        if let Ok(walker) = std::fs::read_dir(&vp) {
+                            // 只搜一層 vault root（常見情形）
+                            for entry in walker.flatten() {
+                                if entry.file_name().to_string_lossy() == filename {
+                                    found = Some(entry.path().to_string_lossy().to_string());
+                                    break;
+                                }
+                            }
+                        }
+                        // 3. 若還找不到，遞迴 walk 整個 vault（深層搜尋）
+                        if found.is_none() {
+                            fn find_in_dir(dir: &std::path::Path, name: &str, depth: u32) -> Option<String> {
+                                if depth > 6 { return None; }
+                                let Ok(entries) = std::fs::read_dir(dir) else { return None; };
+                                for entry in entries.flatten() {
+                                    let p = entry.path();
+                                    if p.file_name().map(|n| n.to_string_lossy().as_ref() == name).unwrap_or(false) {
+                                        return Some(p.to_string_lossy().to_string());
+                                    }
+                                    if p.is_dir() {
+                                        if let Some(r) = find_in_dir(&p, name, depth + 1) {
+                                            return Some(r);
+                                        }
+                                    }
+                                }
+                                None
+                            }
+                            found = find_in_dir(std::path::Path::new(&vp), &filename, 1);
+                        }
+                        match found {
+                            Some(abs_str) => {
+                                let _ = app.emit("ui:open_note", &abs_str);
+                                Ok(Value::String(format!("✅ 已打開筆記：{}", filename)))
+                            }
+                            None => Err(format!(
+                                "找不到筆記「{}」，請先用 search_vault 確認正確路徑後再呼叫 open_note",
+                                rel
+                            )),
+                        }
                     })
                 }),
                 rollback: None,
@@ -483,12 +536,29 @@ pub fn build_vault_registry(
                                 let _ = tauri::Emitter::emit(&app, &event, payload);
                             })
                         };
+                        let app_state = app.state::<crate::state::AppState>();
+                        let parent_system = String::new();
+                        let confirm_write: ConfirmWriteFn = {
+                            let write_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<bool>>>> = Arc::clone(&app_state.write_confirm_tx);
+                            Arc::new(move |_display: String| {
+                                let tx = Arc::clone(&write_tx);
+                                Box::pin(async move {
+                                    let (ch_tx, ch_rx) = tokio::sync::oneshot::channel::<bool>();
+                                    *tx.lock().await = Some(ch_tx);
+                                    tokio::time::timeout(std::time::Duration::from_secs(60), ch_rx)
+                                        .await.unwrap_or(Ok(false)).unwrap_or(false)
+                                })
+                            })
+                        };
                         let result = svc.route(
                             AgentRequest {
                                 caller_session_id: String::new(),
                                 target,
                                 task,
                                 context,
+                                parent_system,
+                                conversation_id: None,
+                                vault_path: String::new(),
                             },
                             vault_tools(),
                             sub_registry,
@@ -496,6 +566,8 @@ pub fn build_vault_registry(
                             emit,
                             cancel,
                             emb.as_deref(),
+                            confirm_write,
+                            None,
                         ).await;
                         Ok(Value::String(result))
                     })
@@ -564,7 +636,7 @@ pub fn build_vault_registry(
                         // Step 1：touch_agent METHOD — 用 task 語意找或建立 AgentDefinition
                         let def = svc.touch_agent(
                             name.clone(), description, trigger,
-                            tool_names, vec![], 5,
+                            tool_names, String::new(), vec![], 5,
                             emb.as_deref(), emit.clone(), &task,
                         ).await;
 
@@ -573,12 +645,29 @@ pub fn build_vault_registry(
                             Ok(ref d) => d.def_id.clone(),
                             Err(_) => name, // fallback to hint name
                         };
+                        let app_state2 = app.state::<crate::state::AppState>();
+                        let parent_system2 = String::new();
+                        let confirm_write: ConfirmWriteFn = {
+                            let write_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<bool>>>> = Arc::clone(&app_state2.write_confirm_tx);
+                            Arc::new(move |_display: String| {
+                                let tx = Arc::clone(&write_tx);
+                                Box::pin(async move {
+                                    let (ch_tx, ch_rx) = tokio::sync::oneshot::channel::<bool>();
+                                    *tx.lock().await = Some(ch_tx);
+                                    tokio::time::timeout(std::time::Duration::from_secs(60), ch_rx)
+                                        .await.unwrap_or(Ok(false)).unwrap_or(false)
+                                })
+                            })
+                        };
                         let result = svc.route(
                             crate::runtime::system_agent::AgentRequest {
                                 caller_session_id: String::new(),
                                 target,
                                 task,
                                 context,
+                                parent_system: parent_system2,
+                                conversation_id: None,
+                                vault_path: String::new(),
                             },
                             crate::commands::ai::vault_tools(),
                             sub_registry,
@@ -586,6 +675,8 @@ pub fn build_vault_registry(
                             emit,
                             cancel,
                             emb.as_deref(),
+                            confirm_write,
+                            None,
                         ).await;
                         Ok(Value::String(result))
                     })
@@ -630,6 +721,8 @@ pub fn build_vault_registry(
                             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                             .unwrap_or_default();
 
+                        let system_prompt = args["system_prompt"].as_str().unwrap_or("").to_string();
+
                         let skills: Vec<NewSkillSpec> = args["skills"]
                             .as_array()
                             .map(|a| {
@@ -647,7 +740,7 @@ pub fn build_vault_registry(
                         };
 
                         match svc.create_agent(
-                            name.clone(), description, trigger, tool_names,
+                            name.clone(), description, trigger, tool_names, system_prompt,
                             skills, max_rounds, emb.as_deref(), emit,
                         ).await {
                             Ok(def) => Ok(Value::String(format!(
@@ -713,6 +806,499 @@ pub fn build_vault_registry(
                         } else {
                             Ok(Value::String(format!("# 可用 Agents\n{}", lines.join("\n"))))
                         }
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // ── 新增工具 ──────────────────────────────────────────────────
+
+    // get_current_datetime — 唯讀，回傳本地時間字串
+    {
+        registry.register(
+            "get_current_datetime".into(),
+            Tool {
+                execute: Arc::new(move |_args: Value| {
+                    Box::pin(async move {
+                        let now = chrono::Local::now();
+                        Ok(Value::String(format!("{}", now.format("%Y-%m-%d %H:%M:%S %z"))))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // list_notes_in_folder — 唯讀，列出資料夾內的筆記
+    {
+        let db = vault_db.clone();
+        let vid = vault_id.clone();
+        registry.register(
+            "list_notes_in_folder".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let folder = args["folder"].as_str().unwrap_or("").to_string();
+                    let db = db.clone();
+                    let vid = vid.clone();
+                    Box::pin(async move {
+                        if folder.is_empty() {
+                            return Err("請提供資料夾路徑".to_string());
+                        }
+                        // 確保前綴以 / 結尾進行 starts_with 匹配
+                        let prefix = if folder.ends_with('/') {
+                            folder.clone()
+                        } else {
+                            format!("{}/", folder)
+                        };
+
+                        #[derive(serde::Deserialize)]
+                        struct NoteRow {
+                            title: Option<String>,
+                            path: String,
+                        }
+
+                        let mut resp = db.query(
+                            "SELECT title, path FROM notes \
+                             WHERE vault_id = $vid AND (path = $exact OR string::starts_with(path, $prefix)) \
+                             ORDER BY path ASC LIMIT 200"
+                        )
+                        .bind(("vid", vid.clone()))
+                        .bind(("exact", format!("{}.md", folder)))
+                        .bind(("prefix", prefix.clone()))
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                        let rows: Vec<NoteRow> = resp.take(0).unwrap_or_default();
+
+                        if rows.is_empty() {
+                            return Ok(Value::String(format!("資料夾「{}」中沒有筆記。", folder)));
+                        }
+
+                        let lines: Vec<String> = rows.iter().map(|r| {
+                            let title = r.title.as_deref().unwrap_or("(無標題)");
+                            format!("- {} ({})", title, r.path)
+                        }).collect();
+
+                        Ok(Value::String(format!(
+                            "資料夾「{}」共 {} 篇筆記：\n{}",
+                            folder, lines.len(), lines.join("\n")
+                        )))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // append_to_note — 寫入工具，在既有筆記末尾追加內容
+    {
+        let vp = vault_path.clone();
+        let app_an = app.clone();
+        registry.register(
+            "append_to_note".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let path = args["path"].as_str().unwrap_or("").to_string();
+                    let content = args["content"].as_str().unwrap_or("").to_string();
+                    let vp = vp.clone();
+                    let app = app_an.clone();
+                    Box::pin(async move {
+                        if path.is_empty() {
+                            return Err("請提供筆記路徑".to_string());
+                        }
+                        let rel = if path.ends_with(".md") { path.clone() } else { format!("{}.md", path) };
+                        let abs = std::path::PathBuf::from(&vp).join(&rel);
+                        if !abs.exists() {
+                            return Err(format!("找不到筆記：{}", rel));
+                        }
+                        let existing = tokio::fs::read_to_string(&abs).await
+                            .map_err(|e| format!("讀取失敗：{}", e))?;
+                        let new_content = format!("{}\n{}", existing.trim_end(), content);
+                        tokio::fs::write(&abs, &new_content).await
+                            .map_err(|e| format!("寫入失敗：{}", e))?;
+                        let abs_str = abs.to_string_lossy().to_string();
+                        let _ = app.emit("ui:open_note", &abs_str);
+                        Ok(Value::String(format!("已追加內容至 {}", rel)))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // delete_note — 寫入工具（需確認）
+    {
+        let vp = vault_path.clone();
+        let db = vault_db.clone();
+        let vid = vault_id.clone();
+        registry.register(
+            "delete_note".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let path = args["path"].as_str().unwrap_or("").to_string();
+                    let vp = vp.clone();
+                    let db = db.clone();
+                    let vid = vid.clone();
+                    Box::pin(async move {
+                        if path.is_empty() {
+                            return Err("請提供筆記路徑".to_string());
+                        }
+                        let rel = if path.ends_with(".md") { path.clone() } else { format!("{}.md", path) };
+                        // 1. 先試完整路徑
+                        let direct = std::path::PathBuf::from(&vp).join(&rel);
+                        let abs_path = if direct.exists() {
+                            direct.to_string_lossy().to_string()
+                        } else {
+                            // 2. 只比對檔名（root scan）
+                            let filename = std::path::Path::new(&rel)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| rel.clone());
+                            let mut found: Option<String> = None;
+                            if let Ok(entries) = std::fs::read_dir(&vp) {
+                                for entry in entries.flatten() {
+                                    if entry.file_name().to_string_lossy() == filename {
+                                        found = Some(entry.path().to_string_lossy().to_string());
+                                        break;
+                                    }
+                                }
+                            }
+                            // 3. 遞迴搜尋
+                            if found.is_none() {
+                                fn find_in_dir(dir: &std::path::Path, name: &str, depth: u32) -> Option<String> {
+                                    if depth > 6 { return None; }
+                                    let Ok(entries) = std::fs::read_dir(dir) else { return None; };
+                                    for entry in entries.flatten() {
+                                        let p = entry.path();
+                                        if p.file_name().map(|n| n.to_string_lossy().as_ref() == name).unwrap_or(false) {
+                                            return Some(p.to_string_lossy().to_string());
+                                        }
+                                        if p.is_dir() {
+                                            if let Some(r) = find_in_dir(&p, name, depth + 1) {
+                                                return Some(r);
+                                            }
+                                        }
+                                    }
+                                    None
+                                }
+                                found = find_in_dir(std::path::Path::new(&vp), &filename, 1);
+                            }
+                            match found {
+                                Some(p) => p,
+                                None => return Err(format!("找不到筆記：{}", rel)),
+                            }
+                        };
+
+                        // 計算 rel 路徑（for DB）
+                        let vault_base = std::path::PathBuf::from(&vp);
+                        let abs_pb = std::path::PathBuf::from(&abs_path);
+                        let rel_for_db = abs_pb.strip_prefix(&vault_base)
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| rel.clone());
+
+                        std::fs::remove_file(&abs_path)
+                            .map_err(|e| format!("刪除檔案失敗：{}", e))?;
+
+                        let _ = db.query(
+                            "DELETE FROM notes WHERE vault_id = $vid AND path = $path"
+                        )
+                        .bind(("vid", vid.clone()))
+                        .bind(("path", rel_for_db.clone()))
+                        .await;
+
+                        Ok(Value::String(format!("已刪除筆記：{}", rel_for_db)))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // delete_folder — 寫入工具（需確認）
+    {
+        let vp = vault_path.clone();
+        let db = vault_db.clone();
+        let vid = vault_id.clone();
+        registry.register(
+            "delete_folder".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let path = args["path"].as_str().unwrap_or("").to_string();
+                    let vp = vp.clone();
+                    let db = db.clone();
+                    let vid = vid.clone();
+                    Box::pin(async move {
+                        if path.is_empty() {
+                            return Err("請提供資料夾路徑".to_string());
+                        }
+                        let abs = std::path::PathBuf::from(&vp).join(&path);
+                        if !abs.exists() {
+                            return Err(format!("找不到資料夾：{}", path));
+                        }
+                        std::fs::remove_dir_all(&abs)
+                            .map_err(|e| format!("刪除資料夾失敗：{}", e))?;
+
+                        let prefix = if path.ends_with('/') {
+                            path.clone()
+                        } else {
+                            format!("{}/", path)
+                        };
+
+                        let _ = db.query(
+                            "DELETE FROM notes WHERE vault_id = $vid AND string::starts_with(path, $prefix)"
+                        )
+                        .bind(("vid", vid.clone()))
+                        .bind(("prefix", prefix))
+                        .await;
+
+                        Ok(Value::String(format!("已刪除資料夾：{}", path)))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // move_note — 寫入工具
+    {
+        let vp = vault_path.clone();
+        let db = vault_db.clone();
+        let vid = vault_id.clone();
+        registry.register(
+            "move_note".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let from = args["from"].as_str().unwrap_or("").to_string();
+                    let to = args["to"].as_str().unwrap_or("").to_string();
+                    let vp = vp.clone();
+                    let db = db.clone();
+                    let vid = vid.clone();
+                    Box::pin(async move {
+                        if from.is_empty() || to.is_empty() {
+                            return Err("from 和 to 為必填".to_string());
+                        }
+                        let from_rel = if from.ends_with(".md") { from.clone() } else { format!("{}.md", from) };
+                        let to_rel   = if to.ends_with(".md")   { to.clone()   } else { format!("{}.md", to)   };
+
+                        let from_abs = std::path::PathBuf::from(&vp).join(&from_rel);
+                        let to_abs   = std::path::PathBuf::from(&vp).join(&to_rel);
+
+                        if !from_abs.exists() {
+                            return Err(format!("找不到來源筆記：{}", from_rel));
+                        }
+                        if let Some(parent) = to_abs.parent() {
+                            std::fs::create_dir_all(parent)
+                                .map_err(|e| format!("建立目標資料夾失敗：{}", e))?;
+                        }
+                        std::fs::rename(&from_abs, &to_abs)
+                            .map_err(|e| format!("移動失敗：{}", e))?;
+
+                        let _ = db.query(
+                            "UPDATE notes SET path = $to WHERE vault_id = $vid AND path = $from"
+                        )
+                        .bind(("vid", vid.clone()))
+                        .bind(("from", from_rel.clone()))
+                        .bind(("to", to_rel.clone()))
+                        .await;
+
+                        Ok(Value::String(format!("已移動 {} → {}", from_rel, to_rel)))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // show_toast — 側效工具，無 rollback
+    {
+        let app_st = app.clone();
+        registry.register(
+            "show_toast".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let message = args["message"].as_str().unwrap_or("").to_string();
+                    let kind = args["kind"].as_str().unwrap_or("info").to_string();
+                    let duration_ms = args["duration_ms"].as_i64().unwrap_or(3000);
+                    let app = app_st.clone();
+                    Box::pin(async move {
+                        let _ = app.emit("ui:toast", serde_json::json!({
+                            "message": message,
+                            "kind": kind,
+                            "duration_ms": duration_ms,
+                        }));
+                        Ok(Value::String("已顯示通知".to_string()))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // ui_action — 側效工具，無 rollback
+    {
+        let app_ua = app.clone();
+        registry.register(
+            "ui_action".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let action = args["action"].as_str().unwrap_or("").to_string();
+                    let payload = args["payload"].clone();
+                    let app = app_ua.clone();
+                    Box::pin(async move {
+                        if action.is_empty() {
+                            return Err("action 為必填".to_string());
+                        }
+                        let _ = app.emit("ui:action", serde_json::json!({
+                            "action": action,
+                            "payload": payload,
+                        }));
+                        Ok(Value::String(format!("已執行 UI 操作: {}", action)))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // reflect_on_skills — 唯讀，查詢技能規範統計
+    {
+        let db = vault_db.clone();
+        let vid = vault_id.clone();
+        registry.register(
+            "reflect_on_skills".into(),
+            Tool {
+                execute: Arc::new(move |_args: Value| {
+                    let db = db.clone();
+                    let vid = vid.clone();
+                    Box::pin(async move {
+                        #[derive(serde::Deserialize)]
+                        #[allow(dead_code)]
+                        struct SkillRow {
+                            skill_id: String,
+                            title: String,
+                            trigger: String,
+                            trigger_count: Option<i64>,
+                            last_triggered_at: Option<surrealdb::sql::Datetime>,
+                            is_active: bool,
+                            injection_mode: Option<String>,
+                        }
+
+                        let mut resp = db.query(
+                            "SELECT skill_id, title, trigger, trigger_count, last_triggered_at, is_active, injection_mode \
+                             FROM agent_skills \
+                             WHERE vault_id = $vid AND is_active = true \
+                             ORDER BY trigger_count DESC"
+                        )
+                        .bind(("vid", vid.clone()))
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                        let rows: Vec<SkillRow> = resp.take(0).unwrap_or_default();
+
+                        if rows.is_empty() {
+                            return Ok(Value::String("目前沒有已啟用的技能規範。".to_string()));
+                        }
+
+                        let lines: Vec<String> = rows.iter().map(|s| {
+                            let last = s.last_triggered_at.as_ref()
+                                .map(|dt| dt.to_string())
+                                .unwrap_or_else(|| "從未".to_string());
+                            let count = s.trigger_count.unwrap_or(0);
+                            let mode = s.injection_mode.as_deref().unwrap_or("passive");
+                            format!(
+                                "- **{}** (id: `{}`) | 觸發: {} | 最後: {} | 模式: {} | trigger: {}",
+                                s.title, s.skill_id, count, last, mode, s.trigger
+                            )
+                        }).collect();
+
+                        Ok(Value::String(format!(
+                            "# 已啟用技能規範（共 {}）\n{}",
+                            rows.len(), lines.join("\n")
+                        )))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // search_web — 唯讀，搜尋網路（Brave Search）
+    {
+        let db = vault_db.clone();
+        let vid = vault_id.clone();
+        let app_sw = app.clone();
+        let emb_sw = emb_url.clone();
+        registry.register(
+            "search_web".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let query = args["query"].as_str().unwrap_or("").to_string();
+                    let db = db.clone();
+                    let vid = vid.clone();
+                    let app = app_sw.clone();
+                    let emb = emb_sw.clone();
+                    Box::pin(async move {
+                        Ok(Value::String(
+                            tool_web_search(&db, &vid, &query, &app, emb.as_deref()).await,
+                        ))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // schedule_task — 寫入工具，插入 scheduled_tasks 表
+    {
+        let db = vault_db.clone();
+        let vid = vault_id.clone();
+        registry.register(
+            "schedule_task".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let description = args["description"].as_str().unwrap_or("").to_string();
+                    let run_at_str = args["run_at"].as_str().unwrap_or("").to_string();
+                    let repeat_interval_secs = args["repeat_interval_seconds"].as_i64().unwrap_or(0);
+                    let db = db.clone();
+                    let vid = vid.clone();
+                    Box::pin(async move {
+                        if description.is_empty() {
+                            return Err("description 為必填".to_string());
+                        }
+                        if run_at_str.is_empty() {
+                            return Err("run_at 為必填".to_string());
+                        }
+                        let run_at_dt = chrono::DateTime::parse_from_rfc3339(&run_at_str)
+                            .map_err(|e| format!("run_at 格式錯誤（需 ISO 8601）：{}", e))?;
+                        let run_at_ts = run_at_dt.timestamp();
+                        let task_id = uuid::Uuid::new_v4().to_string();
+                        let now_ts = chrono::Utc::now().timestamp();
+
+                        let _ = db.query(
+                            "INSERT INTO scheduled_tasks (task_id, vault_id, description, run_at_ts, repeat_interval_secs, status, created_at) \
+                             VALUES ($tid, $vid, $desc, $ts, $interval, 'pending', $now)"
+                        )
+                        .bind(("tid", task_id.clone()))
+                        .bind(("vid", vid.clone()))
+                        .bind(("desc", description.clone()))
+                        .bind(("ts", run_at_ts))
+                        .bind(("interval", repeat_interval_secs))
+                        .bind(("now", now_ts))
+                        .await
+                        .map_err(|e| format!("排程失敗：{}", e))?;
+
+                        let repeat_info = if repeat_interval_secs > 0 {
+                            format!("，每 {} 秒重複", repeat_interval_secs)
+                        } else {
+                            String::new()
+                        };
+
+                        Ok(Value::String(format!(
+                            "已排程「{}」於 {}{}（task_id: {}）",
+                            description, run_at_str, repeat_info, task_id
+                        )))
                     })
                 }),
                 rollback: None,
