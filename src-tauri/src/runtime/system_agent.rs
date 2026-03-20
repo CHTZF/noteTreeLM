@@ -19,7 +19,7 @@ use tokio::sync::RwLock;
 use crate::commands::agent_def::find_agent_definition;
 use crate::db::surreal::SurrealDb;
 use crate::runtime::tool_registry::ToolRegistry;
-use crate::runtime::types::{ConfirmWriteFn, EmitEventFn, LlmFn};
+use crate::runtime::types::{ConfirmWriteFn, EmitEventFn, LlmFn, SummarizeFn};
 
 // ── NewSkillSpec（create_agent 工具傳入的 skill 規格）────────────────────────
 
@@ -108,6 +108,7 @@ impl SystemAgentService {
         emb_url: Option<&str>,
         confirm_write: ConfirmWriteFn,
         embed_fn: Option<crate::runtime::types::EmbedFn>,
+        summarize_fn: Option<SummarizeFn>,
     ) -> String {
         let vault_id = self.vault_id.read().await.clone();
 
@@ -298,6 +299,7 @@ impl SystemAgentService {
             request.conversation_id,
             self.db.clone(),
             embed_fn,
+            summarize_fn,
         )
         .await;
 
@@ -684,6 +686,7 @@ async fn run_sub_agent_with_system(
     conversation_id: Option<String>,
     db: crate::db::surreal::SurrealDb,
     embed_fn: Option<crate::runtime::types::EmbedFn>,
+    summarize_fn: Option<SummarizeFn>,
 ) -> String {
     use crate::runtime::dispatcher::Dispatcher;
     use crate::runtime::planner::Planner;
@@ -848,15 +851,37 @@ async fn run_sub_agent_with_system(
 
         for ((tool_id, name, args), result) in llm_result.tool_calls.iter().zip(results.iter()) {
             let result_owned = result.as_str().map(String::from).unwrap_or_else(|| result.to_string());
-            let result_str = result_owned.as_str();
+            // read_note 大型結果：嘗試並行分段摘要；其他工具截斷至 3000 chars
+            const MAX_TOOL_RESULT: usize = 3000;
+            let content = if result_owned.chars().count() > MAX_TOOL_RESULT {
+                if name == "read_note" {
+                    if let (Some(ref sfn), Some(fp)) = (&summarize_fn, args["path"].as_str()) {
+                        match sfn(fp.to_string(), task.to_string()).await {
+                            Some(s) => s,
+                            None => {
+                                let t: String = result_owned.chars().take(MAX_TOOL_RESULT).collect();
+                                format!("{}…（已截斷）", t)
+                            }
+                        }
+                    } else {
+                        let t: String = result_owned.chars().take(MAX_TOOL_RESULT).collect();
+                        format!("{}…（已截斷）", t)
+                    }
+                } else {
+                    let t: String = result_owned.chars().take(MAX_TOOL_RESULT).collect();
+                    format!("{}…（已截斷，如需完整請分段呼叫）", t)
+                }
+            } else {
+                result_owned.clone()
+            };
             messages.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": tool_id,
                 "name": name,
-                "content": result_str,
+                "content": content,
             }));
             // 收集 note_refs（search_vault / read_note）
-            let refs = extract_note_refs(name, args, result_str, &vault_path);
+            let refs = extract_note_refs(name, args, &content, &vault_path);
             if !refs.is_empty() {
                 emit("agent:note_refs".into(),
                     serde_json::to_value(refs.clone()).unwrap_or(Value::Null));

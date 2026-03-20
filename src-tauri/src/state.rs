@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -56,8 +56,15 @@ pub struct AppState {
     pub system_agent: Arc<SystemAgentService>,
     /// API key 記憶體快取：provider → key，避免重複呼叫 keychain
     pub api_key_cache: Arc<Mutex<HashMap<String, String>>>,
+    /// 外部 AI 設定快取：key → value（ai_provider / ai_base_url / ai_model），使用者儲存後失效
+    pub settings_cache: Arc<Mutex<HashMap<String, String>>>,
     /// 共用 HTTP client（所有 LLM / embedding 呼叫共用，避免重複建立 connection pool）
     pub http_client: reqwest::Client,
+    /// Intent centroid 快取（confirm / cancel / interrupt 三組固定詞組的 embedding 平均值）
+    /// 首次計算後永久快取；詞組不變，無需失效機制
+    pub intent_centroids: Arc<Mutex<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>>>,
+    /// 已設置標題的對話 ID 集合（in-memory）：防止 maybe_set_title 每輪重複 DB query
+    pub titled_convs: Arc<Mutex<HashSet<String>>>,
 }
 
 impl AppState {
@@ -87,7 +94,10 @@ impl AppState {
             tool_test_cancel: Arc::new(AtomicBool::new(false)),
             search_method_tx: Arc::new(Mutex::new(None)),
             api_key_cache: Arc::new(Mutex::new(HashMap::new())),
+            settings_cache: Arc::new(Mutex::new(HashMap::new())),
             http_client: reqwest::Client::new(),
+            intent_centroids: Arc::new(Mutex::new(None)),
+            titled_convs: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 

@@ -555,7 +555,10 @@ impl Agent {
 
     /// 判斷是否為寫入工具（需要使用者確認）
     fn is_write(&self, name: &str) -> bool {
-        matches!(name, "create_note" | "update_note" | "create_folder")
+        matches!(name,
+            "create_note" | "update_note" | "append_to_note" | "create_folder" |
+            "delete_note" | "delete_folder" | "move_note"
+        )
     }
 
     /// 工具呼叫的可讀摘要（emit 給前端顯示）

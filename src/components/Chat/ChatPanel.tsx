@@ -17,6 +17,26 @@ interface Message {
   savedWeb?: boolean
 }
 
+const ORCHESTRATOR_SYSTEM =
+  `你是一個筆記助理，可以直接使用工具完成使用者的請求。\n` +
+  `可用工具：\n` +
+  `- 讀取：search_vault、read_note、list_structure、list_notes_in_folder、query_memory、get_current_datetime\n` +
+  `- 開啟：open_note\n` +
+  `- 寫入：create_note、update_note、append_to_note、create_folder\n` +
+  `- 刪除/移動：delete_note、delete_folder、move_note\n` +
+  `- 搜尋：search_web\n` +
+  `- 外部 AI：call_external_ai\n` +
+  `- 排程：schedule_task\n` +
+  `- UI：show_toast、ui_action\n` +
+  `- 反思：reflect_on_skills\n` +
+  `- 對話記錄：list_recent_conversations\n` +
+  `規則：\n` +
+  `1. 使用者要「打開」某筆記 → 先 search_vault 找到路徑，再 open_note 打開。\n` +
+  `2. 使用者要「搜尋」或「查看內容」→ search_vault 再 read_note。\n` +
+  `3. 需要即時網路資訊 → search_web；需要 AI 分析 → call_external_ai。\n` +
+  `4. 禁止虛構筆記名稱或路徑；搜尋無結果時直接告知找不到。\n` +
+  `5. 純閒聊或解釋概念可不使用工具。`
+
 export default function ChatPanel({ liveChatActive = false, onActiveChange, onOpenNote }: { liveChatActive?: boolean; onActiveChange?: (active: boolean) => void; onOpenNote?: (path: string) => void }) {
   const { settings } = useSettingsStore()
   const { session } = useAuthStore()
@@ -38,7 +58,6 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const [pendingSearchMethod, setPendingSearchMethod] = useState<{ query: string } | null>(null)
   const [error, setError] = useState('')
   const [isCompressing, setIsCompressing] = useState(false)
-  const [lastMemoryPath] = useState<string | null>(null)  // 保留供 send dep array
   const [showClearPrompt, setShowClearPrompt] = useState(false)
   const [savingWebMsgIdx, setSavingWebMsgIdx] = useState<number | null>(null)
   const [ratings, setRatings] = useState<Record<number, 'good' | 'bad'>>({})
@@ -72,6 +91,12 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const userMsgCountRef = useRef(0)
   // 追蹤上次 extract_memory_facts 時的訊息數量，避免 auto-save 與 clearChat 重複萃取
   const lastExtractedMsgCountRef = useRef(0)
+  // Reflection 執行中旗標：防止多輪反思並發
+  const isReflectingRef = useRef(false)
+  // isStreaming 的同步版本：防止 React state 非同步導致快速雙擊穿透
+  const isStreamingRef = useRef(false)
+  // notePart cache：currentPath + content 前綴未變時跳過重建
+  const lastNotePartRef = useRef<{ path: string; prefix: string; result: string | null } | null>(null)
 
   // Per-conversation draft state (input + chips), keyed by conversationId
   type DraftState = { input: string; noteSuggestions: { absPath: string; label: string }[] }
@@ -383,7 +408,14 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
 
   const send = useCallback(async () => {
     const text = input.trim()
-    if (!text || isStreaming) return
+    // isStreamingRef 做同步 guard，防止 React state 非同步導致快速雙擊穿透
+    if (!text || isStreamingRef.current) return
+    isStreamingRef.current = true
+
+    // 若反思 agent 正在執行中，先取消它再繼續
+    if (isReflectingRef.current) {
+      invoke('cancel_agent').catch(() => {})
+    }
 
     const userMsg: Message = { role: 'user', content: text }
     const allMessages = [...messages, userMsg]
@@ -402,17 +434,17 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
 
     log(`▶ 傳送訊息（${text.length} 字）`)
 
-    let unlistenToken: (() => void) | undefined
-    let unlistenDone: (() => void) | undefined
-    let unlistenToolCall: (() => void) | undefined
-    let unlistenWriteReq: (() => void) | undefined
-    let unlistenNoteRefs: (() => void) | undefined
-    let unlistenOpenNote: (() => void) | undefined
-    let unlistenSearchMethod: (() => void) | undefined
-    let unlistenWebRefs: (() => void) | undefined
+    let unlistenToken: (() => void) = () => {}
+    let unlistenDone: (() => void) = () => {}
+    let unlistenToolCall: (() => void) = () => {}
+    let unlistenWriteReq: (() => void) = () => {}
+    let unlistenNoteRefs: (() => void) = () => {}
+    let unlistenOpenNote: (() => void) = () => {}
+    let unlistenSearchMethod: (() => void) = () => {}
+    let unlistenWebRefs: (() => void) = () => {}
     let unlistenSkillsActivated: (() => void) = () => {}
     let unlistenSkillSuggestion: (() => void) = () => {}
-    let unlistenPreRouteDebug: (() => void) | undefined
+    let unlistenPreRouteDebug: (() => void) = () => {}
 
     // Clear previous suggestions at the start of each send
     setNoteSuggestions([])
@@ -420,30 +452,21 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     pendingWebRefsRef.current = []
 
     try {
-      const ORCHESTRATOR_SYSTEM =
-        `你是一個筆記助理，可以直接使用工具完成使用者的請求。\n` +
-        `可用工具：\n` +
-        `- 讀取：search_vault、read_note、list_structure、list_notes_in_folder、query_memory、get_current_datetime\n` +
-        `- 開啟：open_note\n` +
-        `- 寫入：create_note、update_note、append_to_note、create_folder\n` +
-        `- 刪除/移動：delete_note、delete_folder、move_note\n` +
-        `- 搜尋：search_web\n` +
-        `- 外部 AI：call_external_ai\n` +
-        `- 排程：schedule_task\n` +
-        `- UI：show_toast、ui_action\n` +
-        `- 反思：reflect_on_skills\n` +
-        `- 對話記錄：list_recent_conversations\n` +
-        `規則：\n` +
-        `1. 使用者要「打開」某筆記 → 先 search_vault 找到路徑，再 open_note 打開。\n` +
-        `2. 使用者要「搜尋」或「查看內容」→ search_vault 再 read_note。\n` +
-        `3. 需要即時網路資訊 → search_web；需要 AI 分析 → call_external_ai。\n` +
-        `4. 禁止虛構筆記名稱或路徑；搜尋無結果時直接告知找不到。\n` +
-        `5. 純閒聊或解釋概念可不使用工具。`
-
-      const notePart =
-        useNoteContext && currentPath && noteContent
+      // 快取 notePart：同一筆記的前 200 字未變時跳過重建
+      const contentPrefix = noteContent?.slice(0, 200) ?? ''
+      let notePart: string | null
+      if (
+        useNoteContext && currentPath && noteContent &&
+        lastNotePartRef.current?.path === currentPath &&
+        lastNotePartRef.current?.prefix === contentPrefix
+      ) {
+        notePart = lastNotePartRef.current.result
+      } else {
+        notePart = useNoteContext && currentPath && noteContent
           ? `你是一個筆記助手。以下是使用者目前開啟的筆記內容，請根據此內容協助回答問題：\n\n${noteContent.slice(0, 4000)}`
           : null
+        lastNotePartRef.current = { path: currentPath ?? '', prefix: contentPrefix, result: notePart }
+      }
 
       // 記憶上下文由 agent 內部自動預取注入（prefetch_memory），前端不需再呼叫 resolve_memory_context
       const system = notePart
@@ -451,119 +474,117 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         : ORCHESTRATOR_SYSTEM
       if (system) log(`  帶入 system 上下文（${system.length} 字元）`)
 
-      // 監聽工具調用顯示
-      unlistenToolCall = await listen<{ session_id?: string; display?: string } | string>('agent:tool_call', (event) => {
-        const display = typeof event.payload === 'string'
-          ? event.payload
-          : (event.payload as any)?.display ?? JSON.stringify(event.payload)
-        setMessages((prev) => [...prev, { role: 'tool', content: display }])
-      })
-
-      // 追蹤筆記建議（供 chip 按鈕顯示）
-      unlistenNoteRefs = await listen<string[]>('agent:note_refs', (e) => {
-        const suggestions = e.payload.map(absPath => {
-          const hashIdx = absPath.indexOf('#')
-          const filePart = hashIdx >= 0 ? absPath.slice(0, hashIdx) : absPath
-          const section = hashIdx >= 0 ? absPath.slice(hashIdx + 1) : ''
-          const filename = filePart.split('/').pop()?.replace(/\.md$/, '') ?? filePart
-          const label = section ? `${filename} § ${section}` : filename
-          return { absPath, label }
-        })
-        setNoteSuggestions(suggestions)
-        noteSuggestionsRef.current = suggestions
-      })
-
-      // 後端 pending_plan 確認後開啟筆記（embedding-based intent classify）
-      unlistenOpenNote = await listen<string[]>('agent:open_note', (e) => {
-        if (onOpenNote && e.payload.length > 0) {
-          onOpenNote(e.payload[0])
-        }
-      })
-
-      // 監聽寫入確認請求
-      unlistenWriteReq = await listen<string>('agent:write_request', async (event) => {
-        const display = event.payload
-        if (writeConfirmMode === 'never') {
-          await invoke('confirm_write_tool', { approved: true })
-          return
-        }
-        if (writeConfirmMode === 'once' && sessionWriteApprovedRef.current) {
-          await invoke('confirm_write_tool', { approved: true })
-          return
-        }
-        // 'always' 或 'once' 首次：顯示確認 UI
-        setPendingWriteDisplay(display)
-      })
-
-      // 監聽搜尋方式選擇請求
-      unlistenSearchMethod = await listen<{ query: string }>('agent:search_method_request', (event) => {
-        setPendingSearchMethod(event.payload)
-      })
-
-      unlistenToken = await listen<string>('llm:token', (event) => {
-        streamingRef.current += event.payload
-        tokenCountRef.current += event.payload.length
-        setStreamingText(streamingRef.current)
-        if (tokenCountRef.current === event.payload.length) {
-          log('✓ 開始收到 llm:token 串流')
-        }
-      })
-      unlistenDone = await listen('llm:done', () => {
-        log(`⏹ llm:done 事件收到，共 ${tokenCountRef.current} 字元`)
-      })
-      unlistenWebRefs = await listen<Array<{ path: string; title: string; excerpt: string }>>('agent:web_refs', (e) => {
-        pendingWebRefsRef.current = [...pendingWebRefsRef.current, ...e.payload]
-      })
-
-      // 透明度：skill pre-pass 觸發時，顯示哪些技能正在作用
-      unlistenSkillsActivated = await listen<{ titles: string[] }>(
-        'agent:skills_activated',
-        (e) => {
+      // 所有監聽器並行建立，再呼叫 invoke_agent
+      ;[
+        unlistenToolCall,
+        unlistenNoteRefs,
+        unlistenOpenNote,
+        unlistenWriteReq,
+        unlistenSearchMethod,
+        unlistenToken,
+        unlistenDone,
+        unlistenWebRefs,
+        unlistenSkillsActivated,
+        unlistenSkillSuggestion,
+        unlistenPreRouteDebug,
+      ] = await Promise.all([
+        listen<{ session_id?: string; display?: string } | string>('agent:tool_call', (event) => {
+          const display = typeof event.payload === 'string'
+            ? event.payload
+            : (event.payload as any)?.display ?? JSON.stringify(event.payload)
+          setMessages((prev) => [...prev, { role: 'tool', content: display }])
+        }),
+        listen<string[]>('agent:note_refs', (e) => {
+          const suggestions = e.payload.map(absPath => {
+            const hashIdx = absPath.indexOf('#')
+            const filePart = hashIdx >= 0 ? absPath.slice(0, hashIdx) : absPath
+            const section = hashIdx >= 0 ? absPath.slice(hashIdx + 1) : ''
+            const filename = filePart.split('/').pop()?.replace(/\.md$/, '') ?? filePart
+            const label = section ? `${filename} § ${section}` : filename
+            return { absPath, label }
+          })
+          setNoteSuggestions(suggestions)
+          noteSuggestionsRef.current = suggestions
+        }),
+        // 後端 pending_plan 確認後開啟筆記（embedding-based intent classify）
+        listen<string[]>('agent:open_note', (e) => {
+          if (onOpenNote && e.payload.length > 0) {
+            onOpenNote(e.payload[0])
+          }
+        }),
+        // 監聽寫入確認請求
+        listen<string>('agent:write_request', async (event) => {
+          const display = event.payload
+          if (writeConfirmMode === 'never') {
+            await invoke('confirm_write_tool', { approved: true })
+            return
+          }
+          if (writeConfirmMode === 'once' && sessionWriteApprovedRef.current) {
+            await invoke('confirm_write_tool', { approved: true })
+            return
+          }
+          setPendingWriteDisplay(display)
+        }),
+        listen<{ query: string }>('agent:search_method_request', (event) => {
+          setPendingSearchMethod(event.payload)
+        }),
+        listen<string>('llm:token', (event) => {
+          streamingRef.current += event.payload
+          tokenCountRef.current += event.payload.length
+          setStreamingText(streamingRef.current)
+          if (tokenCountRef.current === event.payload.length) {
+            log('✓ 開始收到 llm:token 串流')
+          }
+        }),
+        listen('llm:done', () => {
+          log(`⏹ llm:done 事件收到，共 ${tokenCountRef.current} 字元`)
+        }),
+        listen<Array<{ path: string; title: string; excerpt: string }>>('agent:web_refs', (e) => {
+          pendingWebRefsRef.current = [...pendingWebRefsRef.current, ...e.payload]
+        }),
+        // 透明度：skill pre-pass 觸發時，顯示哪些技能正在作用
+        listen<{ titles: string[] }>('agent:skills_activated', (e) => {
           const names = e.payload.titles.join('、')
           setMessages(prev => [...prev, {
             role: 'tool' as const,
             content: `⚡ 套用技能：${names}`,
           }])
           unlistenSkillsActivated()
-        }
-      )
-
-      // Bottom-up skill 歸納：agent 偵測到結構化回答框架時，提示使用者存為技能規範
-      unlistenSkillSuggestion = await listen<{ query: string; response_preview: string }>(
-        'agent:skill_suggestion',
-        (_e) => {
+        }),
+        // Bottom-up skill 歸納：agent 偵測到結構化回答框架時，提示使用者存為技能規範
+        listen<{ query: string; response_preview: string }>('agent:skill_suggestion', (_e) => {
           setMessages(prev => [...prev, {
             role: 'notice' as const,
             content: `💡 這個回答包含可重用的框架，是否前往「知識中心 → 我的技能規範」將此偏好設定為技能？`,
           }])
           unlistenSkillSuggestion()
-        }
-      )
-
-      // Pre-routing debug trace
-      unlistenPreRouteDebug = await listen<{ step: string; reason?: string; best_match?: string; dim?: number; found?: number; repaired?: number }>(
-        'agent:pre_route_debug',
-        (e) => {
-          const p = e.payload
-          const msg = p.step === 'skip'
-            ? `⚠ pre-routing skip: ${p.reason}`
-            : p.step === 'miss'
-            ? `⚠ pre-routing miss: ${p.reason}${p.best_match ? ` (best: ${p.best_match})` : ''}`
-            : p.step === 'repair_done'
-            ? `✓ pre-routing repair_done found=${p.found} repaired=${p.repaired}`
-            : p.step === 'create_agent_called'
-            ? `🔨 create_agent called: name=${(p as any).name} trigger=${(p as any).trigger} emb=${(p as any).emb_url}`
-            : p.step === 'db_dump'
-            ? `🗄 db_dump vid=${(p as any).query_vid} | ${(p as any).agents?.map((a: any) => `${a.name}[t=${a.trigger},emb=${a.has_emb},st=${a.status},vid=${a.vid_match?'✓':'✗'},builtin=${a.builtin}]`).join(' | ') || '(no agents)'}`
-            : `✓ pre-routing ${p.step}${p.dim ? ` dim=${p.dim}` : ''}`
-          addLog('llm', 'info', msg)
-        }
-      )
+        }),
+        // Pre-routing debug trace
+        listen<{ step: string; reason?: string; best_match?: string; dim?: number; found?: number; repaired?: number }>(
+          'agent:pre_route_debug',
+          (e) => {
+            const p = e.payload
+            const msg = p.step === 'skip'
+              ? `⚠ pre-routing skip: ${p.reason}`
+              : p.step === 'miss'
+              ? `⚠ pre-routing miss: ${p.reason}${p.best_match ? ` (best: ${p.best_match})` : ''}`
+              : p.step === 'repair_done'
+              ? `✓ pre-routing repair_done found=${p.found} repaired=${p.repaired}`
+              : p.step === 'create_agent_called'
+              ? `🔨 create_agent called: name=${(p as any).name} trigger=${(p as any).trigger} emb=${(p as any).emb_url}`
+              : p.step === 'db_dump'
+              ? `🗄 db_dump vid=${(p as any).query_vid} | ${(p as any).agents?.map((a: any) => `${a.name}[t=${a.trigger},emb=${a.has_emb},st=${a.status},vid=${a.vid_match?'✓':'✗'},builtin=${a.builtin}]`).join(' | ') || '(no agents)'}`
+              : `✓ pre-routing ${p.step}${p.dim ? ` dim=${p.dim}` : ''}`
+            addLog('llm', 'info', msg)
+          }
+        ),
+      ])
 
       log('  呼叫 invoke("invoke_agent")')
       const responseText = await invoke<string>('invoke_agent', {
         input: text,
-        messages: llmMessages,
+        // conversationId 存在時 Rust 從 DB 讀取歷史，不需要 frontend 再傳 messages
+        messages: conversationId ? [] : llmMessages,
         system,
         conversationId: conversationId ?? undefined,
       })
@@ -609,24 +630,25 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       err(`invoke 失敗：\n${msg}`)
       setError(msg)
     } finally {
-      unlistenToken?.()
-      unlistenDone?.()
-      unlistenToolCall?.()
-      unlistenWriteReq?.()
-      unlistenNoteRefs?.()
-      unlistenOpenNote?.()
-      unlistenSearchMethod?.()
-      unlistenWebRefs?.()
+      unlistenToken()
+      unlistenDone()
+      unlistenToolCall()
+      unlistenWriteReq()
+      unlistenNoteRefs()
+      unlistenOpenNote()
+      unlistenSearchMethod()
+      unlistenWebRefs()
       unlistenSkillsActivated()
       unlistenSkillSuggestion()
-      unlistenPreRouteDebug?.()
+      unlistenPreRouteDebug()
       setPendingWriteDisplay(null)
       setPendingSearchMethod(null)
       setIsStreaming(false)
+      isStreamingRef.current = false
       setStreamingText('')
       streamingRef.current = ''
     }
-  }, [input, isStreaming, messages, useNoteContext, writeConfirmMode, currentPath, noteContent, lastMemoryPath, conversationId, onOpenNote, log, err])
+  }, [input, isStreaming, messages, useNoteContext, writeConfirmMode, currentPath, noteContent, conversationId, onOpenNote, log, err])
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -642,14 +664,15 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       const chatMessages = meaningfulMsgs.map(m => ({ role: m.role, content: m.content }))
       // 若 auto-save 距今不足 4 條新訊息則跳過 extract（避免重複萃取同份資料）
       const newSinceLastExtract = chatMessages.length - lastExtractedMsgCountRef.current
-      invoke('save_memory_session', { messages: chatMessages })
-        .then(() => newSinceLastExtract >= 4
-          ? invoke('extract_memory_facts', { messages: chatMessages }).catch(() => {})
-          : Promise.resolve()
-        )
-        .then(() => invoke('distill_preferences').catch(() => {}))
-        .then(() => invoke('analyze_tool_patterns').catch(() => {}))
-        .catch(() => {})
+      const extractOp = newSinceLastExtract >= 4
+        ? invoke('extract_memory_facts', { messages: chatMessages }).catch(() => {})
+        : Promise.resolve()
+      Promise.all([
+        invoke('save_memory_session', { messages: chatMessages }).catch(() => {}),
+        extractOp,
+        invoke('distill_preferences').catch(() => {}),
+        invoke('analyze_tool_patterns').catch(() => {}),
+      ]).catch(() => {})
       lastExtractedMsgCountRef.current = 0
     }
     setRatings({})
@@ -671,6 +694,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
 限制：技能規範預設未啟用，使用者可在「我的技能規範」頁面審核。不要產生冗餘或過度通泛的技能。`
 
   const triggerReflection = useCallback(async () => {
+    if (isReflectingRef.current) return
+    isReflectingRef.current = true
     const { addLog: dbgLog } = useDebugStore.getState()
     dbgLog('reflection', 'info', '🔄 開始觀察對話模式…')
 
@@ -695,6 +720,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     } catch (e) {
       dbgLog('reflection', 'error', `觸發失敗：${e}`)
     } finally {
+      isReflectingRef.current = false
       unlistenTool?.()
     }
   }, [])

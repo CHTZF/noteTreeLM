@@ -22,7 +22,7 @@ use crate::runtime::memory_agent::{add_memory_rule_to_db, tool_query_memory};
 use std::sync::atomic::AtomicBool;
 use crate::runtime::system_agent::{AgentRequest, NewSkillSpec, SystemAgentService};
 use crate::runtime::tool_registry::ToolRegistry;
-use crate::runtime::types::{ConfirmWriteFn, LlmFn, Tool};
+use crate::runtime::types::{ConfirmWriteFn, LlmFn, SummarizeFn, Tool};
 
 /// 建立包含所有 vault 工具的 ToolRegistry。
 ///
@@ -47,6 +47,7 @@ pub fn build_vault_registry(
     system_agent_svc: Arc<SystemAgentService>,
     cancel: Option<Arc<AtomicBool>>,
     api_key_cache: Arc<Mutex<HashMap<String, String>>>,
+    settings_cache: Arc<Mutex<HashMap<String, String>>>,
 ) -> Arc<ToolRegistry> {
     let mut registry = ToolRegistry::new();
 
@@ -373,6 +374,7 @@ pub fn build_vault_registry(
         let emb = emb_url.clone();
         let tx = search_method_tx.clone();
         let cache = Arc::clone(&api_key_cache);
+        let scache = Arc::clone(&settings_cache);
         registry.register(
             "call_external_ai".into(),
             Tool {
@@ -384,6 +386,7 @@ pub fn build_vault_registry(
                     let emb = emb.clone();
                     let tx = tx.clone();
                     let cache = Arc::clone(&cache);
+                    let scache = Arc::clone(&scache);
                     Box::pin(async move {
                         // 通知前端選擇搜尋方式
                         let _ = app.emit("agent:search_method_request", serde_json::json!({
@@ -410,7 +413,7 @@ pub fn build_vault_registry(
                             let _ = app.emit("agent:web_refs", serde_json::json!([
                                 {"path": "", "title": query, "excerpt": ""}
                             ]));
-                            call_external_ai_via_db(&query, &db, &app, &cache).await
+                            call_external_ai_via_db(&query, &db, &app, &cache, &scache).await
                         };
                         Ok(Value::String(result))
                     })
@@ -550,6 +553,19 @@ pub fn build_vault_registry(
                                 })
                             })
                         };
+                        let summarize_fn: Option<SummarizeFn> = if let Some(ref base_url) = emb {
+                            let db = app_state.db.clone();
+                            let client = app_state.http_client.clone();
+                            let vid = app_state.get_vault_id().await.unwrap_or_default();
+                            let base = base_url.clone();
+                            Some(Arc::new(move |fp: String, uq: String| {
+                                let db = db.clone(); let client = client.clone();
+                                let vid = vid.clone(); let base = base.clone();
+                                Box::pin(async move {
+                                    crate::commands::ai::parallel_chunk_summarize(&db, &vid, &fp, &uq, &client, &base).await
+                                }) as std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
+                            }) as SummarizeFn)
+                        } else { None };
                         let result = svc.route(
                             AgentRequest {
                                 caller_session_id: String::new(),
@@ -568,6 +584,7 @@ pub fn build_vault_registry(
                             emb.as_deref(),
                             confirm_write,
                             None,
+                            summarize_fn,
                         ).await;
                         Ok(Value::String(result))
                     })
@@ -659,6 +676,19 @@ pub fn build_vault_registry(
                                 })
                             })
                         };
+                        let summarize_fn2: Option<SummarizeFn> = if let Some(ref base_url) = emb {
+                            let db = app_state2.db.clone();
+                            let client = app_state2.http_client.clone();
+                            let vid = app_state2.get_vault_id().await.unwrap_or_default();
+                            let base = base_url.clone();
+                            Some(Arc::new(move |fp: String, uq: String| {
+                                let db = db.clone(); let client = client.clone();
+                                let vid = vid.clone(); let base = base.clone();
+                                Box::pin(async move {
+                                    crate::commands::ai::parallel_chunk_summarize(&db, &vid, &fp, &uq, &client, &base).await
+                                }) as std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
+                            }) as SummarizeFn)
+                        } else { None };
                         let result = svc.route(
                             crate::runtime::system_agent::AgentRequest {
                                 caller_session_id: String::new(),
@@ -677,6 +707,7 @@ pub fn build_vault_registry(
                             emb.as_deref(),
                             confirm_write,
                             None,
+                            summarize_fn2,
                         ).await;
                         Ok(Value::String(result))
                     })

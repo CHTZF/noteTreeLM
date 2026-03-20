@@ -491,6 +491,113 @@ pub fn compute_centroid(vecs: &[Vec<f32>]) -> Vec<f32> {
     centroid
 }
 
+/// 大型 read_note 結果的並行分段摘要。
+/// 從 chunks 表取出該筆記的 heading-level 切段，分批並行呼叫非串流 LLM，
+/// 依使用者查詢提取要點後合併回傳。
+/// chunks 不存在時回傳 None（呼叫方 fallback 至截斷）。
+pub(crate) async fn parallel_chunk_summarize(
+    db: &SurrealDb,
+    vault_id: &str,
+    file_path: &str,
+    user_query: &str,
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct ChunkRow { section: String, content: String }
+
+    let mut res = db
+        .query("SELECT section, content FROM chunks WHERE vault_id = $vid AND file_path = $fp ORDER BY id")
+        .bind(("vid", vault_id.to_string()))
+        .bind(("fp", file_path.to_string()))
+        .await.ok()?;
+    let rows: Vec<ChunkRow> = res.take(0).ok()?;
+    if rows.is_empty() {
+        return None;
+    }
+
+    // 批次分組：每批最多 2500 chars
+    const BATCH_CHARS: usize = 2500;
+    let mut batches: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for row in rows {
+        let chunk_text = if row.section.is_empty() {
+            row.content.clone()
+        } else {
+            format!("## {}\n{}", row.section, row.content)
+        };
+        if !current.is_empty() && current.chars().count() + chunk_text.chars().count() > BATCH_CHARS {
+            batches.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() { current.push('\n'); }
+        current.push_str(&chunk_text);
+    }
+    if !current.is_empty() { batches.push(current); }
+
+    let file_label = file_path.split('/').last().unwrap_or(file_path).trim_end_matches(".md").to_string();
+
+    // 並行呼叫非串流 LLM 摘要各批次
+    let futs: Vec<_> = batches.into_iter().enumerate().map(|(i, chunk)| {
+        let client = client.clone();
+        let base_url = base_url.to_string();
+        let query = user_query.to_string();
+        let label = file_label.clone();
+        async move {
+            #[derive(serde::Deserialize)]
+            struct Resp { choices: Vec<Choice> }
+            #[derive(serde::Deserialize)]
+            struct Choice { message: Msg }
+            #[derive(serde::Deserialize)]
+            struct Msg { content: String }
+
+            let body = serde_json::json!({
+                "model": "local",
+                "stream": false,
+                "max_tokens": 512,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": format!(
+                            "你是筆記摘要助手。以下是「{}」第 {} 段，請根據查詢提取相關要點，\
+                            輸出 3-6 個條目，每點不超過 40 字。與查詢無關時回覆「本段無相關內容」。",
+                            label, i + 1
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": format!("查詢：{}\n\n內容：\n{}", query, chunk)
+                    }
+                ]
+            });
+            let resp = client
+                .post(format!("{}/v1/chat/completions", base_url))
+                .json(&body)
+                .timeout(Duration::from_secs(60))
+                .send().await.ok()?;
+            let parsed: Resp = resp.json().await.ok()?;
+            parsed.choices.into_iter().next().map(|c| c.message.content)
+        }
+    }).collect();
+
+    let summaries: Vec<String> = futures::future::join_all(futs)
+        .await
+        .into_iter()
+        .flatten()
+        .filter(|s| s.trim() != "本段無相關內容")
+        .collect();
+
+    if summaries.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "[「{}」摘要，共 {} 段相關內容]\n{}",
+        file_label,
+        summaries.len(),
+        summaries.join("\n---\n")
+    ))
+}
+
 /// 封裝 OpenAI-compatible SSE 串流請求，返回 StreamResult
 /// 同時處理文字 token（emit llm:token）和 tool call fragments 的累積
 async fn send_streaming_request(
@@ -603,21 +710,37 @@ async fn send_streaming_request(
 }
 
 
-/// 從 DB 讀取外部 AI 設定並執行查詢（供 ToolRegistry 的 call_external_ai 工具使用）
+/// DB 設定讀取快取輔助：先查快取，miss 時讀 DB 並寫入快取
+async fn get_cached_setting(
+    cache: &tokio::sync::Mutex<std::collections::HashMap<String, String>>,
+    db: &SurrealDb,
+    key: &str,
+    default: &str,
+) -> String {
+    {
+        let guard = cache.lock().await;
+        if let Some(v) = guard.get(key) {
+            return v.clone();
+        }
+    }
+    let val = queries::get_setting(db, key)
+        .await.unwrap_or_default()
+        .unwrap_or_else(|| default.to_string());
+    cache.lock().await.insert(key.to_string(), val.clone());
+    val
+}
+
+/// 從快取（或 DB）讀取外部 AI 設定並執行查詢（供 ToolRegistry 的 call_external_ai 工具使用）
 pub(crate) async fn call_external_ai_via_db(
     query: &str,
     db: &SurrealDb,
     app: &AppHandle,
     api_key_cache: &tokio::sync::Mutex<std::collections::HashMap<String, String>>,
+    settings_cache: &tokio::sync::Mutex<std::collections::HashMap<String, String>>,
 ) -> String {
-    let provider = queries::get_setting(db, "ai_provider")
-        .await.unwrap_or_default().unwrap_or_default();
-    let base_url = queries::get_setting(db, "ai_base_url")
-        .await.unwrap_or_default()
-        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-    let model = queries::get_setting(db, "ai_model")
-        .await.unwrap_or_default()
-        .unwrap_or_else(|| "gpt-4o".to_string());
+    let provider = get_cached_setting(settings_cache, db, "ai_provider", "").await;
+    let base_url = get_cached_setting(settings_cache, db, "ai_base_url", "https://api.openai.com/v1").await;
+    let model = get_cached_setting(settings_cache, db, "ai_model", "gpt-4o").await;
     let api_key = read_api_key(api_key_cache, &provider).await;
     let config = ExtAiConfig { provider, base_url, model, api_key };
     call_external_ai_tool(query, &config, app).await
@@ -884,6 +1007,7 @@ pub async fn invoke_agent(
             Arc::clone(&state.system_agent),
             Some(Arc::clone(&state.agent_cancel)),
             Arc::clone(&state.api_key_cache),
+            Arc::clone(&state.settings_cache),
         )
     } else {
         Arc::new(ToolRegistry::new())
@@ -967,10 +1091,14 @@ pub async fn invoke_agent(
             let age = chrono::Utc::now().timestamp() - pending.created_at;
             let _ = delete_pending_plan(&state.db, conv_id).await;
             if age <= 86400 {
-                let intent = IntentClassifier::new().classify_with_embedding(
-                    &input,
-                    &embed_fn,
-                ).await;
+                let intent = match IntentClassifier::compute_centroids_cached(
+                    &state.intent_centroids, &embed_fn,
+                ).await {
+                    Some((cc, ccl, ci)) => IntentClassifier::new().classify_with_centroids(
+                        &input, &embed_fn, &cc, &ccl, &ci,
+                    ).await,
+                    None => IntentClassifier::new().classify_with_embedding(&input, &embed_fn).await,
+                };
                 match intent {
                     Intent::Confirm => {
                         let is_note_open = pending.deferred_tools.first()
@@ -1012,10 +1140,15 @@ pub async fn invoke_agent(
     }
 
     // 10. 記憶事實語意搜尋（embedding 相似度優先，fallback 最新事實）
-    let memory_context = if let Some(ref vid) = vault_id_opt {
+    // query_vec 提升到此 scope，供後續 skill pre-pass 共用，避免重複呼叫 /embedding
+    let (memory_context, query_vec_opt) = if let Some(ref vid) = vault_id_opt {
         let query_vec = get_embedding(&client, &base_url, &input).await;
-        retrieve_relevant_facts(&vault_db, vid, &input, &query_vec, 10).await
-    } else { String::new() };
+        let mem = retrieve_relevant_facts(&vault_db, vid, &input, &query_vec, 10).await;
+        let vec_opt = if query_vec.is_empty() { None } else { Some(query_vec) };
+        (mem, vec_opt)
+    } else {
+        (String::new(), None)
+    };
 
     // 12. 統一 LLM + tool loop（所有輪次相同路徑，tool call 歷史完整保存至 DB）
     //     背景異步：touch_agent 做 agent learning（不阻塞主流程）
@@ -1065,7 +1198,8 @@ pub async fn invoke_agent(
         // 上限 1500 chars，保護 system message budget
         if let Some(ref vid) = vault_id_opt {
             if let Some((skill_text, _skill_titles)) = run_skill_pre_pass(
-                &vault_db, vid, &input, skill_emb_url.as_deref(), &client, "main"
+                &vault_db, vid, &input, skill_emb_url.as_deref(), &client, "main",
+                query_vec_opt.clone(),  // 共用 memory 步驟已算好的向量
             ).await {
                 if let Some(sys) = msgs.first_mut() {
                     if sys["role"].as_str() == Some("system") {
@@ -1189,13 +1323,28 @@ pub async fn invoke_agent(
             }).collect();
             msgs.push(serde_json::json!({"role": "assistant", "content": null, "tool_calls": tc_json}));
 
-            for ((tool_id, name, _), res) in result.tool_calls.iter().zip(results.iter()) {
+            for ((tool_id, name, args), res) in result.tool_calls.iter().zip(results.iter()) {
                 let raw = res.as_str().map(String::from).unwrap_or_else(|| res.to_string());
                 // Tool result 上限 3000 chars，防止大型 read_note 繞過 sliding window
                 const MAX_TOOL_RESULT: usize = 3000;
                 let res_str = if raw.chars().count() > MAX_TOOL_RESULT {
-                    let truncated: String = raw.chars().take(MAX_TOOL_RESULT).collect();
-                    format!("{}…（內容已截斷，如需完整請分段呼叫）", truncated)
+                    // read_note：嘗試從 chunks 表並行摘要；其他工具截斷
+                    if name == "read_note" {
+                        if let (Some(vid), Some(fp)) = (vault_id_opt.as_deref(), args["path"].as_str()) {
+                            if let Some(summary) = parallel_chunk_summarize(&vault_db, vid, fp, &input, &client, &base_url).await {
+                                summary
+                            } else {
+                                let truncated: String = raw.chars().take(MAX_TOOL_RESULT).collect();
+                                format!("{}…（內容已截斷）", truncated)
+                            }
+                        } else {
+                            let truncated: String = raw.chars().take(MAX_TOOL_RESULT).collect();
+                            format!("{}…（內容已截斷）", truncated)
+                        }
+                    } else {
+                        let truncated: String = raw.chars().take(MAX_TOOL_RESULT).collect();
+                        format!("{}…（內容已截斷，如需完整請分段呼叫）", truncated)
+                    }
                 } else {
                     raw
                 };
@@ -1225,11 +1374,11 @@ pub async fn invoke_agent(
         final_text
     } else {
         // 無 vault 或 use_tools=false → 直接 LLM（純對話）
+        // llm_fn 內部 send_streaming_request 已逐 token emit llm:token；此處只需 emit done
         let session_id2 = session_id.clone();
         let result = llm_fn(messages_json.clone(), None, Some(Arc::clone(&state.agent_cancel))).await
             .map_err(AppError::AI)?;
         let text = result.full_text;
-        (emit_fn)("llm:token".into(), serde_json::Value::String(text.clone()));
         (emit_fn)("llm:done".into(), serde_json::Value::String(text.clone()));
         let _ = session_id2;
         text
@@ -1265,7 +1414,13 @@ pub async fn invoke_agent(
 
         let arr = serde_json::Value::Array(to_save);
         let _ = save_messages(&state.db, conv_id, &arr).await;
-        let _ = maybe_set_title(&state.db, conv_id, &arr).await;
+
+        // maybe_set_title：只有首次（標題尚未設定）才需呼叫；之後用 in-memory set 跳過
+        let already_titled = state.titled_convs.lock().await.contains(conv_id.as_str());
+        if !already_titled {
+            let _ = maybe_set_title(&state.db, conv_id, &arr).await;
+            state.titled_convs.lock().await.insert(conv_id.clone());
+        }
     }
 
     Ok(response_text)
@@ -4631,14 +4786,9 @@ pub async fn run_tool_pipeline(
     let needs_ext = steps.iter().any(|s| s.name == "call_external_ai");
     let ext_config = if needs_ext {
         let db = &state.db;
-        let ext_provider = queries::get_setting(db, "ai_provider")
-            .await.unwrap_or_default().unwrap_or_default();
-        let ext_base_url = queries::get_setting(db, "ai_base_url")
-            .await.unwrap_or_default()
-            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-        let ext_model = queries::get_setting(db, "ai_model")
-            .await.unwrap_or_default()
-            .unwrap_or_else(|| "gpt-4o".to_string());
+        let ext_provider = get_cached_setting(&state.settings_cache, db, "ai_provider", "").await;
+        let ext_base_url = get_cached_setting(&state.settings_cache, db, "ai_base_url", "https://api.openai.com/v1").await;
+        let ext_model = get_cached_setting(&state.settings_cache, db, "ai_model", "gpt-4o").await;
         let ext_api_key = read_api_key(&state.api_key_cache, &ext_provider).await;
         ExtAiConfig { provider: ext_provider, base_url: ext_base_url, model: ext_model, api_key: ext_api_key }
     } else {
@@ -4755,14 +4905,9 @@ pub async fn test_vault_tool(
 
     // Only build ext_config for call_external_ai — other tools ignore it entirely.
     let ext_config = if tool_name == "call_external_ai" {
-        let ext_provider = queries::get_setting(&db, "ai_provider")
-            .await.unwrap_or_default().unwrap_or_default();
-        let ext_base_url = queries::get_setting(&db, "ai_base_url")
-            .await.unwrap_or_default()
-            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-        let ext_model = queries::get_setting(&db, "ai_model")
-            .await.unwrap_or_default()
-            .unwrap_or_else(|| "gpt-4o".to_string());
+        let ext_provider = get_cached_setting(&state.settings_cache, &db, "ai_provider", "").await;
+        let ext_base_url = get_cached_setting(&state.settings_cache, &db, "ai_base_url", "https://api.openai.com/v1").await;
+        let ext_model = get_cached_setting(&state.settings_cache, &db, "ai_model", "gpt-4o").await;
         let ext_api_key = read_api_key(&state.api_key_cache, &ext_provider).await;
         ExtAiConfig { provider: ext_provider, base_url: ext_base_url, model: ext_model, api_key: ext_api_key }
     } else {
@@ -4971,13 +5116,17 @@ async fn run_skill_pre_pass(
     emb_url: Option<&str>,
     client: &reqwest::Client,
     caller_scope: &str,
+    precomputed_embedding: Option<Vec<f32>>,  // 傳入已算好的向量，避免重複呼叫 /embedding
 ) -> Option<(String, Vec<String>)> {
     // 1. 主動注入 skills（不需要 embedding server）
     let always_on = fetch_always_on_skills(db, vault_id, caller_scope).await;
 
-    // 2. 被動取用 skills（需要 embedding server）
+    // 2. 被動取用 skills（需要 embedding server；優先使用外部傳入的向量）
     let passive = if let Some(url) = emb_url {
-        let query_vec = get_embedding(client, url, query).await;
+        let query_vec = match precomputed_embedding {
+            Some(v) if !v.is_empty() => v,
+            _ => get_embedding(client, url, query).await,
+        };
         if query_vec.is_empty() {
             vec![]
         } else {

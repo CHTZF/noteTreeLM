@@ -75,3 +75,10 @@ pub type EmbedFn = Arc<
     + Send + Sync
 >;
 
+/// 大型筆記摘要回呼：(file_path, user_query) → 精簡摘要（None = chunks 不存在，呼叫方截斷）
+/// 使用非串流 LLM 並行處理 chunks，不向前端 emit llm:token 事件
+pub type SummarizeFn = Arc<
+    dyn Fn(String, String) -> Pin<Box<dyn Future<Output = Option<String>> + Send>>
+    + Send + Sync
+>;
+

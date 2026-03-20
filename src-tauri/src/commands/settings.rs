@@ -190,6 +190,13 @@ pub async fn save_system_settings(
     gsave!("ai_provider", settings.ai_provider);
     gsave!("ai_model", settings.ai_model);
     gsave!("ai_base_url", settings.ai_base_url);
+    // 使用者更新外部 AI 設定後失效快取，確保下次讀取到最新值
+    {
+        let mut sc = state.settings_cache.lock().await;
+        sc.remove("ai_provider");
+        sc.remove("ai_model");
+        sc.remove("ai_base_url");
+    }
     gsave!("ai_enable_topics", settings.ai_enable_topics);
     gsave!("ai_enable_summary", settings.ai_enable_summary);
     gsave!("ai_enable_vision", settings.ai_enable_vision);
