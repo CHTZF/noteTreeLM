@@ -579,6 +579,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
           .map(m => ({ role: m.role, content: m.content }))
         if (snapshotMsgs.length >= 2) {
           invoke('save_memory_session', { messages: snapshotMsgs }).catch(() => {})
+          invoke('extract_memory_facts', { messages: snapshotMsgs }).catch(() => {})
         }
       }
     } catch (e: unknown) {
@@ -623,6 +624,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     if (meaningfulMsgs.length >= 2) {
       const chatMessages = meaningfulMsgs.map(m => ({ role: m.role, content: m.content }))
       invoke('save_memory_session', { messages: chatMessages })
+        .then(() => invoke('extract_memory_facts', { messages: chatMessages }).catch(() => {}))
         .then(() => invoke('distill_preferences').catch(() => {}))
         .then(() => invoke('analyze_tool_patterns').catch(() => {}))
         .catch(() => {})

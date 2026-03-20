@@ -1,8 +1,7 @@
 use crate::{db::queries, error::AppError, state::AppState};
 use crate::db::surreal::SurrealDb;
 use crate::runtime::memory_agent::{
-    extract_cjk_bigrams_with_extra_stops, format_memory_rows, load_memory_rules,
-    parse_query_since_with_rules, parse_text_tool_calls, tool_query_memory,
+    parse_text_tool_calls, tool_query_memory,
 };
 use chrono::Local;
 use futures_util::StreamExt;
@@ -646,6 +645,89 @@ pub async fn cancel_agent(state: State<'_, AppState>) -> Result<(), AppError> {
     Ok(())
 }
 
+/// 從 memory_facts 表語意搜尋與當前 query 最相關的事實
+/// 有 embedding server → 向量搜尋；無 → 回傳最新事實
+async fn retrieve_relevant_facts(
+    db: &crate::db::surreal::SurrealDb,
+    vault_id: &str,
+    query_embedding: &[f32],
+    limit: usize,
+) -> String {
+    #[derive(serde::Deserialize)]
+    struct FactRow {
+        content: String,
+        category: String,
+    }
+
+    let limit_i = limit as i64;
+
+    // 向量搜尋路徑
+    if !query_embedding.is_empty() {
+        let qvec: Vec<f64> = query_embedding.iter().map(|&x| x as f64).collect();
+        let mut resp = db.query(
+            "SELECT content, category, \
+                    vector::similarity::cosine(embedding, $vec) AS score \
+             FROM memory_facts \
+             WHERE vault_id = $vid AND embedding IS NOT NONE \
+             ORDER BY score DESC LIMIT $lim"
+        )
+        .bind(("vid", vault_id.to_string()))
+        .bind(("vec", qvec))
+        .bind(("lim", limit_i))
+        .await.ok();
+
+        let rows: Vec<FactRow> = resp.as_mut()
+            .and_then(|r| r.take::<Vec<FactRow>>(0).ok())
+            .unwrap_or_default();
+
+        if !rows.is_empty() {
+            // 更新 access_count 與 last_accessed_at（fire-and-forget）
+            let _ = db.query(
+                "UPDATE memory_facts SET access_count += 1, last_accessed_at = time::now() \
+                 WHERE vault_id = $vid AND embedding IS NOT NONE"
+            )
+            .bind(("vid", vault_id.to_string()))
+            .await;
+
+            let lines: Vec<String> = rows.iter()
+                .map(|r| format!("• [{}] {}", r.category, r.content))
+                .collect();
+            return format!(
+                "[記憶] （共 {} 條，依語意相關性篩選）\n{}",
+                lines.len(),
+                lines.join("\n")
+            );
+        }
+    }
+
+    // Fallback：無 embedding 時回傳最新事實
+    let mut resp = db.query(
+        "SELECT content, category FROM memory_facts \
+         WHERE vault_id = $vid \
+         ORDER BY created_at DESC LIMIT $lim"
+    )
+    .bind(("vid", vault_id.to_string()))
+    .bind(("lim", limit_i))
+    .await.ok();
+
+    let rows: Vec<FactRow> = resp.as_mut()
+        .and_then(|r| r.take::<Vec<FactRow>>(0).ok())
+        .unwrap_or_default();
+
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    let lines: Vec<String> = rows.iter()
+        .map(|r| format!("• [{}] {}", r.category, r.content))
+        .collect();
+    format!(
+        "[記憶] （共 {} 條，最新優先）\n{}",
+        lines.len(),
+        lines.join("\n")
+    )
+}
+
 /// 帶意圖分類的 Agent 串流
 /// 透過 runtime::Agent 執行：意圖分類 → 取消/確認/多輪 LLM+工具 loop
 /// 每輪工具呼叫透過 ToolRegistry + Transaction 執行（支援 rollback）
@@ -855,44 +937,10 @@ pub async fn invoke_agent(
         }
     }
 
-    // 10. 記憶預取（作為 sub-agent context 的一部分）
+    // 10. 記憶事實語意搜尋（embedding 相似度優先，fallback 最新事實）
     let memory_context = if let Some(ref vid) = vault_id_opt {
-        let now = Local::now();
-        let rules = load_memory_rules(&vault_db, vid).await;
-        let extra_stops: Vec<char> = rules.iter()
-            .filter(|(pt, _, _)| pt == "stopword")
-            .filter_map(|(_, pattern, _)| pattern.chars().next())
-            .collect();
-        let since_ts = parse_query_since_with_rules(&input, &now, &rules);
-        let terms = extract_cjk_bigrams_with_extra_stops(&input, &extra_stops);
-        #[derive(Deserialize)]
-        struct PrefetchRow { path: String, title: String, created_at: surrealdb::sql::Datetime }
-        let rows: Vec<(String, String, i64)> = if terms.is_empty() {
-            let mut resp = vault_db.query(
-                "SELECT path, title, created_at FROM notes
-                 WHERE vault_id = $vid AND string::starts_with(path, 'memories/')
-                 ORDER BY created_at DESC LIMIT 3"
-            ).bind(("vid", vid.clone())).await.ok();
-            resp.as_mut().and_then(|r| r.take::<Vec<PrefetchRow>>(0).ok()).unwrap_or_default()
-                .into_iter().map(|r| (r.path, r.title, r.created_at.timestamp() * 1000))
-                .filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min)).collect()
-        } else {
-            let conds: String = terms.iter().enumerate()
-                .map(|(i, _)| format!("string::contains(content, $term{})", i))
-                .collect::<Vec<_>>().join(" OR ");
-            let sql = format!(
-                "SELECT path, title, created_at FROM notes
-                 WHERE vault_id = $vid AND string::starts_with(path, 'memories/') AND ({})
-                 ORDER BY created_at DESC LIMIT 3", conds);
-            let mut q = vault_db.query(&sql).bind(("vid", vid.clone()));
-            for (i, term) in terms.iter().enumerate() { q = q.bind((format!("term{}", i), term.clone())); }
-            let mut resp = q.await.ok();
-            resp.as_mut().and_then(|r| r.take::<Vec<PrefetchRow>>(0).ok()).unwrap_or_default()
-                .into_iter().map(|r| (r.path, r.title, r.created_at.timestamp() * 1000))
-                .filter(|(_, _, ts)| since_ts.map_or(true, |min| *ts >= min)).collect()
-        };
-        if rows.is_empty() { String::new() }
-        else { format_memory_rows(&rows, "", &vault_db, vid).await }
+        let query_vec = get_embedding(&client, &base_url, &input).await;
+        retrieve_relevant_facts(&vault_db, vid, &query_vec, 10).await
     } else { String::new() };
 
     // 12. 統一 LLM + tool loop（所有輪次相同路徑，tool call 歷史完整保存至 DB）
@@ -4104,6 +4152,186 @@ pub async fn analyze_tool_patterns(state: State<'_, AppState>) -> Result<u32, Ap
     }
 
     Ok(created)
+}
+
+/// 從對話中萃取離散記憶事實，embedding 去重後 upsert 至 memory_facts 表
+#[tauri::command]
+pub async fn extract_memory_facts(
+    state: State<'_, AppState>,
+    messages: Vec<ChatMessage>,
+) -> Result<u32, AppError> {
+    let vault_id = match state.get_vault_id().await {
+        Ok(vid) => vid,
+        Err(_) => return Ok(0),
+    };
+    let vault_db = state.db.clone();
+
+    // 取得 llama-server URL（若未啟動則靜默跳過）
+    let base_url = {
+        let port = *state.llama_actual_port.lock().await;
+        match port {
+            Some(p) => format!("http://127.0.0.1:{}", p),
+            None => return Ok(0),
+        }
+    };
+
+    // 過濾只保留 user/assistant 訊息，組成對話文字
+    let dialog: String = messages.iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .map(|m| {
+            let prefix = if m.role == "user" { "使用者" } else { "助理" };
+            format!("{}: {}", prefix, m.content.chars().take(500).collect::<String>())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if dialog.is_empty() { return Ok(0); }
+
+    // 呼叫 LLM 萃取離散事實（非串流）
+    let client = reqwest::Client::new();
+    let prompt = format!(
+        "你是記憶萃取系統。從以下對話中提取 3-10 條值得長期記憶的離散事實。\n\
+規則：\n\
+- 每條事實必須獨立可理解，不依賴對話上下文\n\
+- 只提取有長期價值的資訊：偏好、背景、規則、重要知識\n\
+- 忽略一次性問答、閒聊、具體指令執行結果\n\
+- 每條 10-30 字，簡潔精確\n\
+- category 只能選：preference（偏好）、context（背景）、knowledge（知識）、rule（規則）\n\n\
+輸出純 JSON 陣列，不要說明：\n\
+[{{\"category\":\"...\",\"content\":\"...\"}}]\n\n\
+對話：\n{}",
+        dialog
+    );
+
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 512,
+        "temperature": 0.2,
+        "stream": false,
+    });
+
+    let http_resp = match client
+        .post(format!("{}/v1/chat/completions", base_url))
+        .json(&body)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Ok(0),
+    };
+
+    let json: serde_json::Value = match http_resp.json().await {
+        Ok(v) => v,
+        Err(_) => return Ok(0),
+    };
+
+    let text = json["choices"][0]["message"]["content"].as_str().unwrap_or("");
+    let start = match text.find('[') { Some(i) => i, None => return Ok(0) };
+    let end   = match text.rfind(']') { Some(i) => i + 1, None => return Ok(0) };
+    let facts_val: serde_json::Value = match serde_json::from_str(&text[start..end]) {
+        Ok(v) => v,
+        Err(_) => return Ok(0),
+    };
+    let facts = match facts_val.as_array() {
+        Some(a) => a.clone(),
+        None => return Ok(0),
+    };
+
+    // 取得 embedding server URL（可選）
+    let emb_url: Option<String> = {
+        let port = *state.embedding_actual_port.lock().await;
+        port.map(|p| format!("http://127.0.0.1:{}", p))
+    };
+
+    let mut inserted = 0u32;
+    let now_dt = surrealdb::sql::Datetime::from(chrono::Utc::now());
+
+    for fact in &facts {
+        let content = match fact["content"].as_str() {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+        let category = fact["category"].as_str()
+            .filter(|c| matches!(*c, "preference"|"context"|"knowledge"|"rule"))
+            .unwrap_or("knowledge")
+            .to_string();
+
+        // 若有 embedding server，計算向量並做相似度去重
+        let fact_embedding: Vec<f32> = if let Some(ref eu) = emb_url {
+            get_embedding(&client, eu, &content).await
+        } else {
+            vec![]
+        };
+
+        // 向量去重：若已有相似度 > 0.88 的事實則更新，否則插入
+        let existing_id: Option<String> = if !fact_embedding.is_empty() {
+            #[derive(Deserialize)]
+            struct SimilarRow { fact_id: String }
+            let qvec: Vec<f64> = fact_embedding.iter().map(|&x| x as f64).collect();
+            let mut resp = vault_db.query(
+                "SELECT fact_id FROM memory_facts \
+                 WHERE vault_id = $vid AND embedding IS NOT NONE \
+                   AND vector::similarity::cosine(embedding, $vec) > 0.88 \
+                 LIMIT 1"
+            )
+            .bind(("vid", vault_id.clone()))
+            .bind(("vec", qvec))
+            .await.ok();
+            resp.as_mut()
+                .and_then(|r| r.take::<Vec<SimilarRow>>(0).ok())
+                .and_then(|rows| rows.into_iter().next())
+                .map(|r| r.fact_id)
+        } else {
+            None
+        };
+
+        if let Some(fid) = existing_id {
+            // 更新現有事實（newer content wins）
+            let emb_val: serde_json::Value = if !fact_embedding.is_empty() {
+                let v: Vec<f64> = fact_embedding.iter().map(|&x| x as f64).collect();
+                serde_json::json!(v)
+            } else {
+                serde_json::Value::Null
+            };
+            let _ = vault_db.query(
+                "UPDATE memory_facts SET content = $content, category = $cat, \
+                                        embedding = $emb, updated_at = $now \
+                 WHERE fact_id = $fid"
+            )
+            .bind(("fid", fid))
+            .bind(("content", content))
+            .bind(("cat", category))
+            .bind(("emb", emb_val))
+            .bind(("now", now_dt.clone()))
+            .await;
+        } else {
+            // 插入新事實
+            let fact_id = uuid::Uuid::new_v4().to_string();
+            let emb_val: serde_json::Value = if !fact_embedding.is_empty() {
+                let v: Vec<f64> = fact_embedding.iter().map(|&x| x as f64).collect();
+                serde_json::json!(v)
+            } else {
+                serde_json::Value::Null
+            };
+            let _ = vault_db.query(
+                "INSERT INTO memory_facts \
+                 (fact_id, vault_id, content, category, embedding, \
+                  access_count, created_at, updated_at) \
+                 VALUES ($fid, $vid, $content, $cat, $emb, 0, $now, $now)"
+            )
+            .bind(("fid", fact_id))
+            .bind(("vid", vault_id.clone()))
+            .bind(("content", content))
+            .bind(("cat", category))
+            .bind(("emb", emb_val))
+            .bind(("now", now_dt.clone()))
+            .await;
+            inserted += 1;
+        }
+    }
+
+    Ok(inserted)
 }
 
 // ── Pipeline 型別（用於 run_tool_pipeline） ───────────────────────────────
