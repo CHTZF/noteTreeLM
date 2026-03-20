@@ -895,27 +895,6 @@ pub async fn invoke_agent(
         else { format_memory_rows(&rows, "", &vault_db, vid).await }
     } else { String::new() };
 
-    // 11. 序列化近期對話歷史（最多 10 條，作為 sub-agent context）
-    let messages_context: String = {
-        let recent: Vec<&serde_json::Value> = messages_json.iter()
-            .filter(|m| m["role"].as_str().map_or(false, |r| r == "user" || r == "assistant"))
-            .rev().take(10).collect::<Vec<_>>().into_iter().rev().collect();
-        recent.iter().filter_map(|m| {
-            let role = m["role"].as_str()?;
-            let content = m["content"].as_str().unwrap_or("");
-            if content.is_empty() { return None; }
-            let prefix = if role == "user" { "使用者" } else { "助理" };
-            Some(format!("{}: {}", prefix, &content.chars().take(300).collect::<String>()))
-        }).collect::<Vec<_>>().join("\n")
-    };
-
-    let full_context = match (messages_context.is_empty(), memory_context.is_empty()) {
-        (false, false) => format!("{}\n\n[相關記憶]\n{}", messages_context, memory_context),
-        (false, true)  => messages_context,
-        (true,  false) => format!("[相關記憶]\n{}", memory_context),
-        (true,  true)  => String::new(),
-    };
-
     // 12. 統一 LLM + tool loop（所有輪次相同路徑，tool call 歷史完整保存至 DB）
     //     背景異步：touch_agent 做 agent learning（不阻塞主流程）
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -972,6 +951,18 @@ pub async fn invoke_agent(
                         let new_content = format!("{}\n\n{}", existing, skill_text);
                         *sys = serde_json::json!({"role": "system", "content": new_content});
                     }
+                }
+            }
+        }
+
+        // 相關記憶注入（上限 1500 字元，避免撐爆 context window）
+        if !memory_context.is_empty() {
+            let snippet: String = memory_context.chars().take(1500).collect();
+            let mem_block = format!("\n\n[相關歷史記憶]\n{}", snippet);
+            if let Some(sys) = msgs.first_mut() {
+                if sys["role"].as_str() == Some("system") {
+                    let existing = sys["content"].as_str().unwrap_or("").to_string();
+                    *sys = serde_json::json!({"role": "system", "content": format!("{}{}", existing, mem_block)});
                 }
             }
         }

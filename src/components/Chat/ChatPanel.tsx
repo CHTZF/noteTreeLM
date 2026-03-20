@@ -107,13 +107,10 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   }, [session?.username])
 
   const loadConversationMessages = useCallback(async (id: string) => {
-    console.log('[ChatPanel] loadConversationMessages id:', id)
     try {
       const snap: { messages_json: string } = await invoke('get_conversation', { id })
-      console.log('[ChatPanel] get_conversation raw messages_json:', snap.messages_json)
       const msgs: Array<{ role: string; content: string }> = JSON.parse(snap.messages_json)
       const filtered = msgs.filter(m => m.role === 'user' || m.role === 'assistant')
-      console.log('[ChatPanel] parsed', msgs.length, 'msgs, filtered to', filtered.length)
       setMessages(filtered.map(m => ({ role: m.role as 'user' | 'assistant', content: m.content })))
       setRatings({})
     } catch (e) {
@@ -148,7 +145,6 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   }, [])
 
   const handleSelectConversation = useCallback((id: string) => {
-    console.log('[ChatPanel] handleSelectConversation id:', id, 'isStreaming:', isStreaming)
     if (isStreaming) return
     switchConversation(conversationId, id)
     setConversationId(id)
@@ -572,6 +568,18 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       userMsgCountRef.current += 1
       if (userMsgCountRef.current % REFLECTION_INTERVAL === 0) {
         triggerReflection()
+      }
+
+      // 每 memory_threshold 則訊息自動快照記憶（app 關閉前也能保留）
+      const autoSaveThreshold = settings.memory_threshold ?? 20
+      if (userMsgCountRef.current > 0 && userMsgCountRef.current % autoSaveThreshold === 0) {
+        const snapshotMsgs = [...messages, { role: 'user' as const, content: text },
+          { role: 'assistant' as const, content: finalContent }]
+          .filter(m => m.role === 'user' || m.role === 'assistant')
+          .map(m => ({ role: m.role, content: m.content }))
+        if (snapshotMsgs.length >= 2) {
+          invoke('save_memory_session', { messages: snapshotMsgs }).catch(() => {})
+        }
       }
     } catch (e: unknown) {
       const msg =
