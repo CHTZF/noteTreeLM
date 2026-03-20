@@ -654,6 +654,23 @@ async fn retrieve_relevant_facts(
     query_embedding: &[f32],
     limit: usize,
 ) -> String {
+    // 空表快速返回（避免對新用戶發出無謂的 embedding 呼叫）
+    {
+        #[derive(serde::Deserialize)]
+        struct CntRow { cnt: i64 }
+        let mut cr = db.query(
+            "SELECT count() AS cnt FROM memory_facts WHERE vault_id = $vid GROUP ALL"
+        )
+        .bind(("vid", vault_id.to_string()))
+        .await.ok();
+        let n: i64 = cr.as_mut()
+            .and_then(|r| r.take::<Vec<CntRow>>(0).ok())
+            .and_then(|v| v.into_iter().next())
+            .map(|r| r.cnt)
+            .unwrap_or(0);
+        if n == 0 { return String::new(); }
+    }
+
     #[derive(serde::Deserialize)]
     struct FactRow {
         content: String,
@@ -4306,11 +4323,16 @@ pub async fn extract_memory_facts(
     };
 
     // 過濾只保留 user/assistant 訊息，組成對話文字
+    // assistant 截斷 1000 chars（回覆通常含最有價值的資訊），user 截斷 300 chars
     let dialog: String = messages.iter()
         .filter(|m| m.role == "user" || m.role == "assistant")
         .map(|m| {
-            let prefix = if m.role == "user" { "使用者" } else { "助理" };
-            format!("{}: {}", prefix, m.content.chars().take(500).collect::<String>())
+            let (prefix, limit) = if m.role == "user" {
+                ("使用者", 300usize)
+            } else {
+                ("助理", 1000usize)
+            };
+            format!("{}: {}", prefix, m.content.chars().take(limit).collect::<String>())
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -4374,26 +4396,30 @@ pub async fn extract_memory_facts(
         port.map(|p| format!("http://127.0.0.1:{}", p))
     };
 
-    let mut inserted = 0u32;
-    let now_dt = surrealdb::sql::Datetime::from(chrono::Utc::now());
-
-    for fact in &facts {
-        let content = match fact["content"].as_str() {
-            Some(s) if !s.is_empty() => s.to_string(),
-            _ => continue,
-        };
+    // 解析出有效的 (content, category) 清單
+    let parsed: Vec<(String, String)> = facts.iter().filter_map(|fact| {
+        let content = fact["content"].as_str().filter(|s| !s.is_empty())?.to_string();
         let category = fact["category"].as_str()
             .filter(|c| matches!(*c, "preference"|"context"|"knowledge"|"rule"))
             .unwrap_or("knowledge")
             .to_string();
+        Some((content, category))
+    }).collect();
 
-        // 若有 embedding server，計算向量並做相似度去重
-        let fact_embedding: Vec<f32> = if let Some(ref eu) = emb_url {
-            get_embedding(&client, eu, &content).await
-        } else {
-            vec![]
-        };
+    // 並行計算所有事實的 embedding（join_all 取代 sequential loop）
+    let embeddings: Vec<Vec<f32>> = if let Some(ref eu) = emb_url {
+        let futs: Vec<_> = parsed.iter()
+            .map(|(content, _)| get_embedding(&client, eu, content))
+            .collect();
+        futures::future::join_all(futs).await
+    } else {
+        vec![vec![]; parsed.len()]
+    };
 
+    let mut inserted = 0u32;
+    let now_dt = surrealdb::sql::Datetime::from(chrono::Utc::now());
+
+    for ((content, category), fact_embedding) in parsed.iter().zip(embeddings.iter()) {
         // 向量去重：若已有相似度 > 0.88 的事實則更新，否則插入
         let existing_id: Option<String> = if !fact_embedding.is_empty() {
             #[derive(Deserialize)]
@@ -4416,34 +4442,29 @@ pub async fn extract_memory_facts(
             None
         };
 
+        let emb_val: serde_json::Value = if !fact_embedding.is_empty() {
+            let v: Vec<f64> = fact_embedding.iter().map(|&x| x as f64).collect();
+            serde_json::json!(v)
+        } else {
+            serde_json::Value::Null
+        };
+
         if let Some(fid) = existing_id {
             // 更新現有事實（newer content wins）
-            let emb_val: serde_json::Value = if !fact_embedding.is_empty() {
-                let v: Vec<f64> = fact_embedding.iter().map(|&x| x as f64).collect();
-                serde_json::json!(v)
-            } else {
-                serde_json::Value::Null
-            };
             let _ = vault_db.query(
                 "UPDATE memory_facts SET content = $content, category = $cat, \
                                         embedding = $emb, updated_at = $now \
                  WHERE fact_id = $fid"
             )
             .bind(("fid", fid))
-            .bind(("content", content))
-            .bind(("cat", category))
+            .bind(("content", content.clone()))
+            .bind(("cat", category.clone()))
             .bind(("emb", emb_val))
             .bind(("now", now_dt.clone()))
             .await;
         } else {
             // 插入新事實
             let fact_id = uuid::Uuid::new_v4().to_string();
-            let emb_val: serde_json::Value = if !fact_embedding.is_empty() {
-                let v: Vec<f64> = fact_embedding.iter().map(|&x| x as f64).collect();
-                serde_json::json!(v)
-            } else {
-                serde_json::Value::Null
-            };
             let _ = vault_db.query(
                 "INSERT INTO memory_facts \
                  (fact_id, vault_id, content, category, embedding, \
@@ -4452,12 +4473,44 @@ pub async fn extract_memory_facts(
             )
             .bind(("fid", fact_id))
             .bind(("vid", vault_id.clone()))
-            .bind(("content", content))
-            .bind(("cat", category))
+            .bind(("content", content.clone()))
+            .bind(("cat", category.clone()))
             .bind(("emb", emb_val))
             .bind(("now", now_dt.clone()))
             .await;
             inserted += 1;
+        }
+    }
+
+    // LRU eviction：超過 500 條時刪 access_count 最低且最舊的多餘事實
+    const MAX_FACTS: i64 = 500;
+    {
+        #[derive(Deserialize)]
+        struct CntRow { cnt: i64 }
+        let mut cr = vault_db.query(
+            "SELECT count() AS cnt FROM memory_facts WHERE vault_id = $vid GROUP ALL"
+        )
+        .bind(("vid", vault_id.clone()))
+        .await.ok();
+        let total: i64 = cr.as_mut()
+            .and_then(|r| r.take::<Vec<CntRow>>(0).ok())
+            .and_then(|v| v.into_iter().next())
+            .map(|r| r.cnt)
+            .unwrap_or(0);
+
+        if total > MAX_FACTS {
+            let excess = total - MAX_FACTS;
+            // 刪除 access_count 最低、最久未更新的事實
+            let _ = vault_db.query(
+                "DELETE memory_facts WHERE id IN (\
+                   SELECT id FROM memory_facts WHERE vault_id = $vid \
+                   ORDER BY access_count ASC, updated_at ASC \
+                   LIMIT $excess\
+                 )"
+            )
+            .bind(("vid", vault_id.clone()))
+            .bind(("excess", excess))
+            .await;
         }
     }
 

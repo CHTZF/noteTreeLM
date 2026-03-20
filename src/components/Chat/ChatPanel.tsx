@@ -70,6 +70,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const tokenCountRef = useRef(0)
   const sessionWriteApprovedRef = useRef(false)
   const userMsgCountRef = useRef(0)
+  // 追蹤上次 extract_memory_facts 時的訊息數量，避免 auto-save 與 clearChat 重複萃取
+  const lastExtractedMsgCountRef = useRef(0)
 
   // Per-conversation draft state (input + chips), keyed by conversationId
   type DraftState = { input: string; noteSuggestions: { absPath: string; label: string }[] }
@@ -593,6 +595,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
           .map(m => ({ role: m.role, content: m.content }))
         if (snapshotMsgs.length >= 2) {
           invoke('save_memory_session', { messages: snapshotMsgs }).catch(() => {})
+          lastExtractedMsgCountRef.current = snapshotMsgs.length
           invoke('extract_memory_facts', { messages: snapshotMsgs }).catch(() => {})
         }
       }
@@ -637,11 +640,17 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     const meaningfulMsgs = messages.filter(m => m.role === 'user' || m.role === 'assistant')
     if (meaningfulMsgs.length >= 2) {
       const chatMessages = meaningfulMsgs.map(m => ({ role: m.role, content: m.content }))
+      // 若 auto-save 距今不足 4 條新訊息則跳過 extract（避免重複萃取同份資料）
+      const newSinceLastExtract = chatMessages.length - lastExtractedMsgCountRef.current
       invoke('save_memory_session', { messages: chatMessages })
-        .then(() => invoke('extract_memory_facts', { messages: chatMessages }).catch(() => {}))
+        .then(() => newSinceLastExtract >= 4
+          ? invoke('extract_memory_facts', { messages: chatMessages }).catch(() => {})
+          : Promise.resolve()
+        )
         .then(() => invoke('distill_preferences').catch(() => {}))
         .then(() => invoke('analyze_tool_patterns').catch(() => {}))
         .catch(() => {})
+      lastExtractedMsgCountRef.current = 0
     }
     setRatings({})
     setMessages([])
