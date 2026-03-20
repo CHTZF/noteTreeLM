@@ -1,7 +1,6 @@
 use crate::{db::queries, error::AppError, state::AppState};
 use crate::db::surreal::SurrealDb;
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, State};
 

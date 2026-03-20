@@ -1,21 +1,18 @@
-use crate::{db::queries, error::AppError, state::AppState};
+use crate::{error::AppError, state::AppState};
 use crate::db::surreal::SurrealDb;
 use crate::runtime::memory_agent::{
     parse_text_tool_calls, tool_query_memory,
 };
-use chrono::Local;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, State};
-use tokio::io::AsyncReadExt;
 
-// Re-export from sub-modules so lib.rs imports continue to work unchanged
 // ─── Re-exports from sub-modules ──────────────────────────────────────────────
 pub use super::server::{
     get_embedding, warmup_llama_server,
@@ -23,7 +20,7 @@ pub use super::server::{
     warmup_embedding_server, get_embedding_server_status, check_embedding_endpoint,
     start_embedding_server, stop_embedding_server, restart_embedding_server,
 };
-pub(crate) use super::server::{ensure_server_running, ensure_embedding_server_running};
+pub(crate) use super::server::ensure_server_running;
 pub use super::external_ai::{
     stream_chat_external, process_with_llm,
     call_external_ai_tool, ExtAiConfig,
@@ -36,7 +33,6 @@ pub use super::memory::{
     save_memory_session, query_memory,
     distill_preferences, extract_memory_facts,
     rate_response, get_conversation_ratings, analyze_tool_patterns,
-    MemoryRuleEntry, MemoryResult,
 };
 pub(crate) use super::memory::retrieve_relevant_facts;
 

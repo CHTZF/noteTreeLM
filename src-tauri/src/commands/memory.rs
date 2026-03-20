@@ -3,7 +3,6 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use tauri::State;
 
 use super::ai::ChatMessage;
