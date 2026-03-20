@@ -3863,6 +3863,39 @@ pub async fn distill_preferences(state: State<'_, AppState>) -> Result<(), AppEr
     Ok(())
 }
 
+/// 記錄使用者對回覆的評分（好/壞），供 analyze_tool_patterns 使用
+#[tauri::command]
+pub async fn rate_response(
+    state: State<'_, AppState>,
+    conversation_id: Option<String>,
+    content_hash: String,
+    rating: String,  // "good" | "bad"
+) -> Result<(), AppError> {
+    if !matches!(rating.as_str(), "good" | "bad") { return Ok(()); }
+    let vault_id = match state.get_vault_id().await {
+        Ok(vid) => vid,
+        Err(_) => return Ok(()),
+    };
+    let now_dt = surrealdb::sql::Datetime::from(chrono::Utc::now());
+    let id = uuid::Uuid::new_v4().to_string();
+    let conv_id = conversation_id.unwrap_or_default();
+
+    let _ = state.db.query(
+        "INSERT INTO response_feedback \
+         (id, vault_id, conversation_id, content_hash, rating, created_at) \
+         VALUES ($id, $vid, $conv, $hash, $rating, $now)"
+    )
+    .bind(("id", id))
+    .bind(("vid", vault_id))
+    .bind(("conv", conv_id))
+    .bind(("hash", content_hash))
+    .bind(("rating", rating))
+    .bind(("now", now_dt))
+    .await;
+
+    Ok(())
+}
+
 /// 分析最近對話中的工具呼叫序列，自動生成/更新技能規範（auto_tool_calls）
 #[tauri::command]
 pub async fn analyze_tool_patterns(state: State<'_, AppState>) -> Result<u32, AppError> {
@@ -3883,21 +3916,38 @@ pub async fn analyze_tool_patterns(state: State<'_, AppState>) -> Result<u32, Ap
 
     // 讀取最近 30 筆對話（包含完整 tool call 歷史）
     #[derive(Deserialize)]
-    struct ConvRow { messages_json: String }
+    struct ConvRow { id: String, messages_json: String }
     let mut resp = match vault_db.query(
-        "SELECT messages_json FROM conversations ORDER BY updated_at DESC LIMIT 30"
+        "SELECT record::id(id) AS id, messages_json FROM conversations ORDER BY updated_at DESC LIMIT 30"
     ).await {
         Ok(r) => r,
         Err(_) => return Ok(0),
     };
     let rows: Vec<ConvRow> = resp.take(0).unwrap_or_default();
+
+    // 載入有 'bad' 評分的 conversation_id 集合
+    #[derive(Deserialize)]
+    struct FeedbackRow { conversation_id: String }
+    let bad_convs: std::collections::HashSet<String> = {
+        let mut fr = vault_db.query(
+            "SELECT conversation_id FROM response_feedback \
+             WHERE vault_id = $vid AND rating = 'bad'"
+        )
+        .bind(("vid", vault_id.clone()))
+        .await.ok();
+        let frows: Vec<FeedbackRow> = fr.as_mut()
+            .and_then(|r| r.take::<Vec<FeedbackRow>>(0).ok())
+            .unwrap_or_default();
+        frows.into_iter().map(|r| r.conversation_id).collect()
+    };
+
     if rows.is_empty() { return Ok(0); }
 
     // 提取每筆對話的 tool call 序列
     let mut sequence_counts: std::collections::HashMap<Vec<String>, u32> =
         std::collections::HashMap::new();
 
-    for row in &rows {
+    for row in rows.iter().filter(|r| !bad_convs.contains(&r.id)) {
         let Ok(msgs) = serde_json::from_str::<serde_json::Value>(&row.messages_json) else { continue };
         let Some(arr) = msgs.as_array() else { continue };
 

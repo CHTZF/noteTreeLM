@@ -41,6 +41,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const [lastMemoryPath] = useState<string | null>(null)  // 保留供 send dep array
   const [showClearPrompt, setShowClearPrompt] = useState(false)
   const [savingWebMsgIdx, setSavingWebMsgIdx] = useState<number | null>(null)
+  const [ratings, setRatings] = useState<Record<number, 'good' | 'bad'>>({})
 
   // ─── In-conversation skill creation ───────────────────────────────────────
   type SkillPreview = {
@@ -114,6 +115,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       const filtered = msgs.filter(m => m.role === 'user' || m.role === 'assistant')
       console.log('[ChatPanel] parsed', msgs.length, 'msgs, filtered to', filtered.length)
       setMessages(filtered.map(m => ({ role: m.role as 'user' | 'assistant', content: m.content })))
+      setRatings({})
     } catch (e) {
       console.error('[ChatPanel] loadConversationMessages error:', e)
       // Stale conversation ID — clear it and show empty screen
@@ -121,6 +123,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       invoke('set_last_chat_conversation_id', { username, conversationId: null }).catch(() => {})
       setConversationId(null)
       setMessages([])
+      setRatings({})
     }
   }, [])
 
@@ -162,12 +165,14 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       setConversationId(null)
       invoke('set_last_chat_conversation_id', { username, conversationId: null }).catch(() => {})
       setMessages([])
+      setRatings({})
       return
     }
     switchConversation(conversationId, id)
     setConversationId(id)
     invoke('set_last_chat_conversation_id', { username, conversationId: id }).catch(() => {})
     setMessages([])
+    setRatings({})
   }, [conversationId, switchConversation])
 
   const isConfigured = !!settings.llama_cli_path && !!settings.llm_model_path
@@ -614,6 +619,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         .then(() => invoke('analyze_tool_patterns').catch(() => {}))
         .catch(() => {})
     }
+    setRatings({})
     setMessages([])
     setError('')
     setStreamingText('')
@@ -1000,6 +1006,18 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
                   onExtractSkill={msg.role === 'assistant' && !isStreaming && capturedUser
                     ? () => doExtractSkill(capturedUser, msg.content)
                     : undefined}
+                  rating={ratings[i]}
+                  onRate={msg.role === 'assistant' && !isStreaming
+                    ? (r: 'good' | 'bad') => {
+                        setRatings(prev => ({ ...prev, [i]: r }))
+                        const hash = msg.content.slice(0, 150)
+                        invoke('rate_response', {
+                          conversationId: conversationId ?? undefined,
+                          contentHash: hash,
+                          rating: r,
+                        }).catch(() => {})
+                      }
+                    : undefined}
                 />
               )
             })
@@ -1280,12 +1298,16 @@ function MessageBubble({
   onSaveWeb,
   savingWeb,
   onExtractSkill,
+  rating,
+  onRate,
 }: {
   message: Message
   streaming?: boolean
   onSaveWeb?: () => void
   savingWeb?: boolean
   onExtractSkill?: () => void
+  rating?: 'good' | 'bad'
+  onRate?: (r: 'good' | 'bad') => void
 }) {
   const isUser = message.role === 'user'
   const isTool = message.role === 'tool'
@@ -1344,8 +1366,8 @@ function MessageBubble({
             <style>{`@keyframes blink { 0%, 100% { opacity: 1 } 50% { opacity: 0 } }`}</style>
           )}
         </div>
-        {!isUser && !isTool && !isNotice && (onSaveWeb || onExtractSkill) && (
-          <div style={{ display: 'flex', gap: '4px', marginTop: '2px' }}>
+        {!isUser && !isTool && !isNotice && (onSaveWeb || onExtractSkill || onRate) && (
+          <div style={{ display: 'flex', gap: '4px', marginTop: '2px', alignItems: 'center' }}>
             {onSaveWeb && (
               <button
                 className={message.savedWeb ? 'import-panel-v2__saved-btn' : 'import-panel-v2__save-btn'}
@@ -1365,6 +1387,32 @@ function MessageBubble({
                   color: 'var(--color-text-muted)', cursor: 'pointer',
                 }}
               >📌 轉為技能規範</button>
+            )}
+            {onRate && (
+              <>
+                <button
+                  onClick={() => !rating && onRate('good')}
+                  title="這個回覆有幫助"
+                  style={{
+                    fontSize: '11px', padding: '2px 6px', borderRadius: '10px',
+                    background: rating === 'good' ? 'rgba(48,209,88,0.15)' : 'transparent',
+                    border: `1px solid ${rating === 'good' ? 'rgba(48,209,88,0.5)' : 'var(--color-border)'}`,
+                    color: rating === 'good' ? '#30d158' : 'var(--color-text-muted)',
+                    cursor: rating ? 'default' : 'pointer',
+                  }}
+                >👍</button>
+                <button
+                  onClick={() => !rating && onRate('bad')}
+                  title="這個回覆不夠好"
+                  style={{
+                    fontSize: '11px', padding: '2px 6px', borderRadius: '10px',
+                    background: rating === 'bad' ? 'rgba(255,69,58,0.15)' : 'transparent',
+                    border: `1px solid ${rating === 'bad' ? 'rgba(255,69,58,0.5)' : 'var(--color-border)'}`,
+                    color: rating === 'bad' ? '#ff453a' : 'var(--color-text-muted)',
+                    cursor: rating ? 'default' : 'pointer',
+                  }}
+                >👎</button>
+              </>
             )}
           </div>
         )}
