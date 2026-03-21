@@ -532,6 +532,171 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
+    // link_notes — 在筆記 A 中插入 [[筆記B]] 反向連結
+    {
+        let vp = ctx.vault_path.clone();
+        registry.register(
+            "link_notes".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let from_path = args["from_path"].as_str().unwrap_or("").to_string();
+                    let to_path = args["to_path"].as_str().unwrap_or("").to_string();
+                    let section = args["section"].as_str().unwrap_or("").to_string();
+                    let vp = vp.clone();
+                    Box::pin(async move {
+                        if from_path.is_empty() || to_path.is_empty() {
+                            return Err("from_path 和 to_path 為必填".to_string());
+                        }
+                        let from_rel = if from_path.ends_with(".md") { from_path.clone() } else { format!("{}.md", from_path) };
+                        let abs = std::path::PathBuf::from(&vp).join(&from_rel);
+                        let content = tokio::fs::read_to_string(&abs).await
+                            .map_err(|e| format!("讀取失敗：{}", e))?;
+                        // Build link text: [[stem_name]]
+                        let to_stem = std::path::Path::new(&to_path)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| to_path.trim_end_matches(".md").to_string());
+                        let link = format!("[[{}]]", to_stem);
+                        // Check if already linked
+                        if content.contains(&link) {
+                            return Ok(Value::String(format!("「{}」已包含 {} 連結，不需重複加入", from_rel, link)));
+                        }
+                        // Insert into specified section or append Related section
+                        let new_content = if !section.is_empty() {
+                            // Find section heading and insert after it
+                            let heading = format!("## {}", section);
+                            if let Some(pos) = content.find(&heading) {
+                                let after_heading = pos + heading.len();
+                                let next_section = content[after_heading..].find("\n## ").map(|p| after_heading + p);
+                                let insert_at = next_section.unwrap_or(content.len());
+                                let before = content[..insert_at].trim_end();
+                                let after = &content[insert_at..];
+                                format!("{}\n{}\n{}", before, link, after)
+                            } else {
+                                // Section not found, append Related section
+                                format!("{}\n\n## {}\n{}\n", content.trim_end(), section, link)
+                            }
+                        } else {
+                            // Check for existing Related / Links section
+                            let rel_heading = if content.contains("## Related") { "## Related" }
+                                else if content.contains("## Links") { "## Links" }
+                                else if content.contains("## 相關") { "## 相關" }
+                                else { "" };
+                            if !rel_heading.is_empty() {
+                                if let Some(pos) = content.find(rel_heading) {
+                                    let after = pos + rel_heading.len();
+                                    let next_section = content[after..].find("\n## ").map(|p| after + p);
+                                    let insert_at = next_section.unwrap_or(content.len());
+                                    let before = content[..insert_at].trim_end();
+                                    let rest = &content[insert_at..];
+                                    format!("{}\n{}\n{}", before, link, rest)
+                                } else {
+                                    format!("{}\n\n## Related\n{}\n", content.trim_end(), link)
+                                }
+                            } else {
+                                format!("{}\n\n## Related\n{}\n", content.trim_end(), link)
+                            }
+                        };
+                        tokio::fs::write(&abs, &new_content).await
+                            .map_err(|e| format!("寫入失敗：{}", e))?;
+                        Ok(Value::String(format!("✅ 已在「{}」加入連結 {}", from_rel, link)))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // generate_moc — 為資料夾生成 Map of Contents（索引筆記）
+    {
+        let vp = ctx.vault_path.clone();
+        let db = ctx.vault_db.clone();
+        let vid = ctx.vault_id.clone();
+        registry.register(
+            "generate_moc".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let folder = args["folder"].as_str().unwrap_or("").to_string();
+                    let output_path = args["output_path"].as_str().unwrap_or("").to_string();
+                    let vp = vp.clone();
+                    let db = db.clone();
+                    let vid = vid.clone();
+                    Box::pin(async move {
+                        if folder.is_empty() { return Err("請提供資料夾路徑".to_string()); }
+                        let prefix = if folder.ends_with('/') { folder.clone() } else { format!("{}/", folder) };
+                        #[derive(serde::Deserialize)]
+                        struct NoteRow { path: String, title: Option<String> }
+                        let mut resp = db.query(
+                            "SELECT path, title FROM notes \
+                             WHERE vault_id = $vid AND string::starts_with(path, $prefix) \
+                             ORDER BY path ASC LIMIT 200"
+                        )
+                        .bind(("vid", vid.clone()))
+                        .bind(("prefix", prefix.clone()))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        let rows: Vec<NoteRow> = resp.take(0).unwrap_or_default();
+                        if rows.is_empty() {
+                            return Ok(Value::String(format!("資料夾「{}」中沒有筆記，無法生成 MOC", folder)));
+                        }
+                        // Group by sub-folder
+                        let folder_name = folder.split('/').last().unwrap_or(&folder);
+                        let now = chrono::Local::now();
+                        let mut moc = format!(
+                            "---\ntitle: {folder_name} Index\ncreated: {}\ntags:\n  - moc\n  - index\n---\n\n# {folder_name}\n\n> 自動生成的目錄筆記（{}）\n\n",
+                            now.to_rfc3339(), now.format("%Y-%m-%d %H:%M")
+                        );
+                        // Group notes by immediate sub-folder
+                        let mut groups: std::collections::BTreeMap<String, Vec<&NoteRow>> = std::collections::BTreeMap::new();
+                        for row in &rows {
+                            let rel = row.path.strip_prefix(&prefix).unwrap_or(&row.path);
+                            let sub = if rel.contains('/') {
+                                rel.split('/').next().unwrap_or("").to_string()
+                            } else {
+                                String::new() // top-level
+                            };
+                            groups.entry(sub).or_default().push(row);
+                        }
+                        // Top-level notes first
+                        if let Some(top) = groups.remove("") {
+                            moc.push_str("## 筆記\n\n");
+                            for row in top {
+                                let stem = std::path::Path::new(&row.path)
+                                    .file_stem().map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                let title = row.title.as_deref().unwrap_or(&stem);
+                                moc.push_str(&format!("- [[{}]] — {}\n", stem, title));
+                            }
+                            moc.push('\n');
+                        }
+                        // Sub-folders
+                        for (sub, notes) in &groups {
+                            moc.push_str(&format!("## {}\n\n", sub));
+                            for row in notes {
+                                let stem = std::path::Path::new(&row.path)
+                                    .file_stem().map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                let title = row.title.as_deref().unwrap_or(&stem);
+                                moc.push_str(&format!("- [[{}]] — {}\n", stem, title));
+                            }
+                            moc.push('\n');
+                        }
+                        let out_path = if output_path.is_empty() {
+                            format!("{}/index.md", folder.trim_end_matches('/'))
+                        } else {
+                            if output_path.ends_with(".md") { output_path.clone() } else { format!("{}.md", output_path) }
+                        };
+                        let result = crate::commands::ai::tool_create_note(&out_path, &moc, &vp, Some((db, vid))).await;
+                        if result.contains("失敗") { Err(result) } else {
+                            Ok(Value::String(format!("✅ 已生成 MOC：{} （共 {} 篇筆記）", out_path, rows.len())))
+                        }
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
     // schedule_task — 插入 scheduled_tasks 表
     {
         let db = ctx.vault_db.clone();

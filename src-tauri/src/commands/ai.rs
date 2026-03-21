@@ -1736,6 +1736,116 @@ pub fn vault_tools() -> serde_json::Value {
 適合使用者詢問知識庫概況，或需要對知識庫健康度做評估時使用。",
                 "parameters": {"type": "object", "properties": {}, "required": []}
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_by_tag",
+                "description": "以 frontmatter tag 標籤過濾筆記。\
+比 search_vault 更精準：當使用者明確說「給我標籤是 X 的筆記」時使用此工具。\
+標籤名稱不區分大小寫。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "tag": {"type": "string", "description": "要搜尋的標籤名稱（如 'project'、'done'、'reading'）"},
+                        "limit": {"type": "number", "description": "最多返回幾篇（預設 50）"}
+                    },
+                    "required": ["tag"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "extract_action_items",
+                "description": "從筆記（或整個資料夾）中提取待辦事項：包含 `- [ ]` checkbox、`TODO:`、`ACTION:`、`FIXME:` 標記。\
+適合使用者說「幫我整理一下有什麼待辦」或「這個資料夾有哪些 TODO」時使用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "單一筆記的相對路徑（path 和 folder 二擇一）"},
+                        "folder": {"type": "string", "description": "掃描整個資料夾的路徑（path 和 folder 二擇一）"},
+                        "include_done": {"type": "boolean", "description": "是否包含已完成的 [x] 項目（預設 false）"}
+                    },
+                    "required": []
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "find_orphan_notes",
+                "description": "找出知識庫中沒有任何反向連結的孤立筆記（沒有任何其他筆記引用它們）。\
+適合做知識庫健康診斷，找出遺忘或未整合的筆記。\
+執行後建議配合 find_similar_notes + link_notes 建立連結。",
+                "parameters": {"type": "object", "properties": {}, "required": []}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_recent_notes",
+                "description": "列出最近 N 天內修改的筆記，按修改時間排序。\
+適合使用者問「最近在寫什麼」或「這週修改了哪些筆記」時使用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "days": {"type": "number", "description": "往回查幾天（預設 7）"},
+                        "limit": {"type": "number", "description": "最多返回幾篇（預設 20）"}
+                    },
+                    "required": []
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "extract_note_links",
+                "description": "取出筆記中所有出向的 [[wiki link]] 連結，用於分析知識圖譜的出向連結。\
+與 get_note_backlinks（反向）相對，這是正向（此筆記連到哪裡）。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "筆記相對路徑（含 .md）"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "link_notes",
+                "description": "在筆記 A（from_path）中插入指向筆記 B（to_path）的 [[wiki link]]。\
+若 from_path 已有 Related/Links/相關 章節則插入其中，否則自動在末尾新增 ## Related 章節。\
+【操作序列】：若路徑不確定 → 先 search_vault 取得精確路徑，再呼叫本工具。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "from_path": {"type": "string", "description": "要插入連結的筆記路徑（被修改方）"},
+                        "to_path": {"type": "string", "description": "要被連結到的目標筆記路徑"},
+                        "section": {"type": "string", "description": "插入到指定章節名稱（可選，如 'Related'、'See Also'）"}
+                    },
+                    "required": ["from_path", "to_path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "generate_moc",
+                "description": "為指定資料夾自動生成 Map of Contents（MOC）索引筆記。\
+輸出包含資料夾內所有筆記的 [[wiki link]] 清單，按子資料夾分組。\
+預設輸出至 {folder}/index.md，也可指定 output_path。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "folder": {"type": "string", "description": "要生成 MOC 的資料夾路徑（如 'projects' 或 'notes/2026'）"},
+                        "output_path": {"type": "string", "description": "MOC 筆記的輸出路徑（可選，預設 {folder}/index.md）"}
+                    },
+                    "required": ["folder"]
+                }
+            }
         }
     ])
 }
@@ -1974,8 +2084,50 @@ pub async fn seed_agent_skills(db: &SurrealDb, vault_id: &str, emb_url: Option<&
             id: "builtin_knowledge_graph",
             title: "探索知識圖譜關聯",
             trigger: "哪些筆記連到這篇、反向連結、知識圖譜、找出關聯筆記、這篇被哪些筆記引用、backlinks、linked mentions、who links here、知識網絡、找出所有引用、筆記之間的關係、知識關聯圖、探索連結",
-            behavior: "步驟1：若路徑不確定，呼叫 search_vault 取得目標筆記的精確路徑。步驟2：呼叫 get_note_backlinks（path 填目標路徑）取得所有反向連結。步驟3：呼叫 find_similar_notes（query 填目標筆記標題或主題）補充語意上相關但未明確連結的筆記。步驟4：整合回覆：（a）直接反向連結清單；（b）語意相關筆記清單；（c）建議可建立連結的筆記。",
-            tools: &["search_vault", "get_note_backlinks", "find_similar_notes"],
+            behavior: "步驟1：若路徑不確定，呼叫 search_vault 取得目標筆記的精確路徑。步驟2：呼叫 get_note_backlinks（path 填目標路徑）取得所有反向連結。步驟3：呼叫 extract_note_links（path 填目標路徑）取得出向連結。步驟4：呼叫 find_similar_notes（query 填目標筆記標題或主題）補充語意上相關但未明確連結的筆記。步驟5：整合回覆：（a）反向連結清單；（b）出向連結清單；（c）語意相關但未連結的筆記，並建議可用 link_notes 建立連結。",
+            tools: &["search_vault", "get_note_backlinks", "extract_note_links", "find_similar_notes", "link_notes"],
+        },
+        BuiltinSkill {
+            id: "builtin_tag_browse",
+            title: "以標籤瀏覽筆記",
+            trigger: "標籤是X的筆記、有tag X的筆記、找tag、按標籤查、search by tag、filter by tag、給我標籤X的、tag filter、以標籤篩選、顯示所有X標籤、標籤搜尋、有哪些筆記有這個標籤、找出有X tag的",
+            behavior: "步驟1：從使用者訊息中提取標籤名稱。步驟2：呼叫 search_by_tag（tag 填標籤名稱）取得符合的筆記列表。步驟3：回覆找到的筆記清單。步驟4（可選）：若使用者想看特定筆記的內容，呼叫 read_note 或 open_note。",
+            tools: &["search_by_tag", "read_note", "open_note"],
+        },
+        BuiltinSkill {
+            id: "builtin_task_extraction",
+            title: "提取待辦事項/任務清單",
+            trigger: "有什麼待辦、幫我整理TODO、列出所有待辦、找出action item、這資料夾有哪些任務、extract tasks、list todos、找出所有TODO、整理一下代辦事項、有哪些未完成的、把待辦列出來、任務清單、action items、check todos、pending tasks",
+            behavior: "步驟1：確認掃描範圍（單一筆記或整個資料夾）。若使用者指定筆記 → path 參數；若指定資料夾 → folder 參數；若未指定 → 先呼叫 list_structure 讓使用者選擇。步驟2：呼叫 extract_action_items（填入 path 或 folder）取得所有待辦事項。步驟3：以清單格式回覆，標示來源筆記。步驟4（可選）：若使用者想排程某個待辦，呼叫 get_current_datetime + schedule_task 完成排程。",
+            tools: &["extract_action_items", "list_structure", "get_current_datetime", "schedule_task"],
+        },
+        BuiltinSkill {
+            id: "builtin_vault_health",
+            title: "知識庫健康診斷",
+            trigger: "知識庫健康、診斷筆記庫、找孤立筆記、哪些筆記沒有連結、vault health、orphan notes、孤立筆記、知識庫問題、找出未連接的、沒被引用的筆記、孤兒筆記、診斷一下我的知識庫、幫我找出問題、知識庫整理診斷",
+            behavior: "步驟1：呼叫 get_vault_stats 取得知識庫概況（筆記數、字數等）。步驟2：呼叫 find_orphan_notes 找出所有沒有反向連結的孤立筆記。步驟3：整合報告：（a）知識庫概況；（b）孤立筆記清單；（c）建議行動（用 find_similar_notes 為每篇孤立筆記找相關筆記，再用 link_notes 建立連結）。步驟4（可選）：若使用者同意修復，對孤立筆記逐一呼叫 find_similar_notes，找到相關筆記後呼叫 link_notes 建立連結。",
+            tools: &["get_vault_stats", "find_orphan_notes", "find_similar_notes", "link_notes"],
+        },
+        BuiltinSkill {
+            id: "builtin_generate_index",
+            title: "生成資料夾目錄筆記（MOC）",
+            trigger: "幫我生成目錄、建立索引筆記、generate MOC、create index、幫我做一個索引、生成 Map of Contents、這個資料夾的目錄、建立目錄頁、資料夾索引、自動生成目錄、建立 MOC 筆記、index note、幫我整理一個目錄",
+            behavior: "步驟1：確認目標資料夾路徑（若使用者未指定，呼叫 list_structure 列出可選資料夾）。步驟2：（可選）詢問使用者是否要自訂輸出路徑，或使用預設的 {folder}/index.md。步驟3：呼叫 generate_moc（folder 填資料夾路徑，output_path 可選）生成 MOC 筆記。步驟4：告知使用者 MOC 已生成在哪個路徑，並簡述包含幾篇筆記。",
+            tools: &["list_structure", "generate_moc"],
+        },
+        BuiltinSkill {
+            id: "builtin_recent_activity",
+            title: "查看最近筆記活動",
+            trigger: "最近寫了什麼、這週修改了什麼、最近的筆記、recent notes、recently modified、最近幾天的筆記、最近活動、看看最近在做什麼、這幾天有什麼更新、最近有哪些變動、recent activity、我最近在研究什麼、昨天改了什麼",
+            behavior: "步驟1：呼叫 list_recent_notes（days 根據使用者說的時間範圍填入，預設 7；使用者說「昨天」填 1、「這週」填 7、「這個月」填 30）取得最近修改的筆記。步驟2：以清單格式回覆，包含筆記標題、路徑、修改時間、字數。步驟3（可選）：若使用者想深入了解某篇，呼叫 open_note 或 read_note。",
+            tools: &["list_recent_notes", "open_note", "read_note"],
+        },
+        BuiltinSkill {
+            id: "builtin_link_builder",
+            title: "建立筆記間連結",
+            trigger: "幫我把這兩篇筆記連起來、加一個連結到另一篇、在這篇筆記加入wiki連結、link two notes、create link、建立知識連結、把這篇連到那篇、在筆記裡加入參考連結、幫我建立連結、把A連到B、加上相關筆記連結、建立交叉連結",
+            behavior: "步驟1：確認 from_path（要加連結的筆記）和 to_path（要被連結的目標筆記）。若路徑不確定，分別呼叫 search_vault 取得精確路徑。步驟2（可選）：呼叫 extract_note_links（path 填 from_path）確認是否已有連結，避免重複。步驟3：呼叫 link_notes（from_path、to_path、section 可選）插入 [[wiki link]]。步驟4：回覆已建立連結的確認，並說明連結插入在哪個章節。",
+            tools: &["search_vault", "extract_note_links", "link_notes"],
         },
     ];
 

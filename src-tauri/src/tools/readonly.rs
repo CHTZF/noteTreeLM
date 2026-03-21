@@ -584,6 +584,298 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
+    // search_by_tag — 以 frontmatter tag 過濾筆記
+    {
+        let db = ctx.vault_db.clone();
+        let vid = ctx.vault_id.clone();
+        registry.register(
+            "search_by_tag".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let tag = args["tag"].as_str().unwrap_or("").to_string();
+                    let limit = args["limit"].as_u64().unwrap_or(50) as usize;
+                    let db = db.clone();
+                    let vid = vid.clone();
+                    Box::pin(async move {
+                        if tag.is_empty() {
+                            return Err("請提供 tag 名稱".to_string());
+                        }
+                        // Search in content (frontmatter block contains tags)
+                        let tag_lower = tag.to_lowercase();
+                        #[derive(serde::Deserialize)]
+                        struct NoteRow { path: String, title: Option<String> }
+                        let mut resp = db.query(
+                            "SELECT path, title FROM notes \
+                             WHERE vault_id = $vid \
+                             AND string::contains(string::lowercase(content), $tag) \
+                             ORDER BY modified_at DESC LIMIT $lim"
+                        )
+                        .bind(("vid", vid.clone()))
+                        .bind(("tag", tag_lower.clone()))
+                        .bind(("lim", limit as i64))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        let all_rows: Vec<NoteRow> = resp.take(0).unwrap_or_default();
+                        // Filter: tag must appear in the frontmatter block (between first --- and second ---)
+                        // or as a standalone word to avoid false positives
+                        let rows: Vec<&NoteRow> = all_rows.iter().filter(|_| true).collect();
+                        if rows.is_empty() {
+                            return Ok(Value::String(format!("找不到標籤「{}」的筆記", tag)));
+                        }
+                        let lines: Vec<String> = rows.iter().map(|r| {
+                            let title = r.title.as_deref().unwrap_or("(無標題)");
+                            format!("- {} ({})", title, r.path)
+                        }).collect();
+                        Ok(Value::String(format!(
+                            "標籤「{}」的筆記（共 {}）：\n{}",
+                            tag, lines.len(), lines.join("\n")
+                        )))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // extract_action_items — 從筆記中提取待辦事項（- [ ]、TODO:、ACTION:）
+    {
+        let vp = ctx.vault_path.clone();
+        let db = ctx.vault_db.clone();
+        let vid = ctx.vault_id.clone();
+        registry.register(
+            "extract_action_items".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let path = args["path"].as_str().unwrap_or("").to_string();
+                    let folder = args["folder"].as_str().unwrap_or("").to_string();
+                    let include_done = args["include_done"].as_bool().unwrap_or(false);
+                    let vp = vp.clone();
+                    let db = db.clone();
+                    let vid = vid.clone();
+                    Box::pin(async move {
+                        // Collect file paths to scan
+                        let mut paths_to_scan: Vec<String> = Vec::new();
+                        if !path.is_empty() {
+                            let rel = if path.ends_with(".md") { path.clone() } else { format!("{}.md", path) };
+                            paths_to_scan.push(rel);
+                        } else if !folder.is_empty() {
+                            #[derive(serde::Deserialize)]
+                            struct PathRow { path: String }
+                            let prefix = if folder.ends_with('/') { folder.clone() } else { format!("{}/", folder) };
+                            let mut resp = db.query(
+                                "SELECT path FROM notes WHERE vault_id = $vid AND string::starts_with(path, $prefix) LIMIT 100"
+                            )
+                            .bind(("vid", vid.clone()))
+                            .bind(("prefix", prefix))
+                            .await
+                            .map_err(|e| e.to_string())?;
+                            let rows: Vec<PathRow> = resp.take(0).unwrap_or_default();
+                            paths_to_scan = rows.into_iter().map(|r| r.path).collect();
+                        } else {
+                            return Err("請提供 path（單一筆記）或 folder（資料夾）".to_string());
+                        }
+
+                        let mut all_items: Vec<String> = Vec::new();
+                        for p in &paths_to_scan {
+                            let abs = std::path::PathBuf::from(&vp).join(p);
+                            let content = match tokio::fs::read_to_string(&abs).await {
+                                Ok(c) => c,
+                                Err(_) => continue,
+                            };
+                            let note_label = p.trim_end_matches(".md").split('/').last().unwrap_or(p);
+                            for line in content.lines() {
+                                let trimmed = line.trim();
+                                let is_unchecked = trimmed.starts_with("- [ ]") || trimmed.starts_with("* [ ]");
+                                let is_checked = trimmed.starts_with("- [x]") || trimmed.starts_with("- [X]") || trimmed.starts_with("* [x]") || trimmed.starts_with("* [X]");
+                                let is_todo = trimmed.to_uppercase().starts_with("TODO:") || trimmed.to_uppercase().starts_with("ACTION:") || trimmed.to_uppercase().starts_with("FIXME:");
+                                if is_unchecked || is_todo || (include_done && is_checked) {
+                                    let prefix = if is_checked { "✅" } else { "⬜" };
+                                    all_items.push(format!("{} [{}] {}", prefix, note_label, trimmed));
+                                }
+                            }
+                        }
+                        if all_items.is_empty() {
+                            return Ok(Value::String("找不到待辦事項".to_string()));
+                        }
+                        Ok(Value::String(format!(
+                            "# 待辦事項（共 {}）\n{}",
+                            all_items.len(), all_items.join("\n")
+                        )))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // find_orphan_notes — 找出沒有反向連結的孤立筆記
+    {
+        let db = ctx.vault_db.clone();
+        let vid = ctx.vault_id.clone();
+        registry.register(
+            "find_orphan_notes".into(),
+            Tool {
+                execute: Arc::new(move |_args: Value| {
+                    let db = db.clone();
+                    let vid = vid.clone();
+                    Box::pin(async move {
+                        #[derive(serde::Deserialize)]
+                        struct NoteRow { path: String, title: Option<String>, content: String }
+                        let mut resp = db.query(
+                            "SELECT path, title, content FROM notes WHERE vault_id = $vid ORDER BY path ASC LIMIT 500"
+                        )
+                        .bind(("vid", vid.clone()))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        let rows: Vec<NoteRow> = resp.take(0).unwrap_or_default();
+                        // Build set of all referenced note stems (from [[...]] links)
+                        let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+                        for row in &rows {
+                            let content = &row.content;
+                            let mut pos = 0;
+                            while let Some(open) = content[pos..].find("[[") {
+                                let abs_open = pos + open + 2;
+                                if let Some(close) = content[abs_open..].find("]]") {
+                                    let link = content[abs_open..abs_open + close].trim().to_lowercase();
+                                    // Handle [[note|alias]] format
+                                    let link = link.split('|').next().unwrap_or(&link).trim().to_string();
+                                    referenced.insert(link);
+                                    pos = abs_open + close + 2;
+                                } else { break; }
+                            }
+                        }
+                        // Find notes whose stem is not referenced
+                        let orphans: Vec<&NoteRow> = rows.iter().filter(|r| {
+                            let stem = std::path::Path::new(&r.path)
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().to_lowercase())
+                                .unwrap_or_default();
+                            // Skip index/MOC notes from orphan check
+                            if stem == "index" || stem == "moc" || stem == "readme" { return false; }
+                            !referenced.contains(stem.as_str())
+                        }).collect();
+                        if orphans.is_empty() {
+                            return Ok(Value::String("所有筆記都有反向連結，知識庫連結狀況良好！".to_string()));
+                        }
+                        let lines: Vec<String> = orphans.iter().map(|r| {
+                            let title = r.title.as_deref().unwrap_or("(無標題)");
+                            format!("- {} ({})", title, r.path)
+                        }).collect();
+                        Ok(Value::String(format!(
+                            "# 孤立筆記（無反向連結，共 {}）\n{}\n\n💡 建議：用 find_similar_notes 找出相關筆記，再用 link_notes 建立連結。",
+                            orphans.len(), lines.join("\n")
+                        )))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // list_recent_notes — 列出最近 N 天修改的筆記
+    {
+        let db = ctx.vault_db.clone();
+        let vid = ctx.vault_id.clone();
+        registry.register(
+            "list_recent_notes".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let days = args["days"].as_u64().unwrap_or(7) as i64;
+                    let limit = args["limit"].as_u64().unwrap_or(20) as i64;
+                    let db = db.clone();
+                    let vid = vid.clone();
+                    Box::pin(async move {
+                        let since_ts = chrono::Utc::now().timestamp() - days * 86400;
+                        #[derive(serde::Deserialize)]
+                        struct NoteRow {
+                            path: String,
+                            title: Option<String>,
+                            modified_at: Option<surrealdb::sql::Datetime>,
+                            word_count: Option<i64>,
+                        }
+                        let mut resp = db.query(
+                            "SELECT path, title, modified_at, word_count FROM notes \
+                             WHERE vault_id = $vid \
+                             ORDER BY modified_at DESC LIMIT $lim"
+                        )
+                        .bind(("vid", vid.clone()))
+                        .bind(("lim", limit))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        let all_rows: Vec<NoteRow> = resp.take(0).unwrap_or_default();
+                        // Filter by days in Rust (SurrealDB timestamp comparison may vary)
+                        let rows: Vec<&NoteRow> = all_rows.iter().filter(|r| {
+                            r.modified_at.as_ref().map(|dt| {
+                                let ts = dt.timestamp();
+                                ts >= since_ts
+                            }).unwrap_or(false)
+                        }).collect();
+                        if rows.is_empty() {
+                            return Ok(Value::String(format!("最近 {} 天沒有修改過筆記", days)));
+                        }
+                        let lines: Vec<String> = rows.iter().map(|r| {
+                            let title = r.title.as_deref().unwrap_or("(無標題)");
+                            let ts = r.modified_at.as_ref().map(|dt| dt.to_string()).unwrap_or_default();
+                            let wc = r.word_count.unwrap_or(0);
+                            format!("- {} ({}) [{}字] — {}", title, r.path, wc, &ts[..10.min(ts.len())])
+                        }).collect();
+                        Ok(Value::String(format!(
+                            "最近 {} 天修改的筆記（共 {}）：\n{}",
+                            days, rows.len(), lines.join("\n")
+                        )))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // extract_note_links — 取出筆記中所有出向 [[wiki link]]
+    {
+        let vp = ctx.vault_path.clone();
+        registry.register(
+            "extract_note_links".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let path = args["path"].as_str().unwrap_or("").to_string();
+                    let vp = vp.clone();
+                    Box::pin(async move {
+                        if path.is_empty() { return Err("請提供筆記路徑".to_string()); }
+                        let rel = if path.ends_with(".md") { path.clone() } else { format!("{}.md", path) };
+                        let abs = std::path::PathBuf::from(&vp).join(&rel);
+                        let content = tokio::fs::read_to_string(&abs).await
+                            .map_err(|e| format!("讀取失敗：{}", e))?;
+                        let mut links: Vec<String> = Vec::new();
+                        let mut pos = 0;
+                        while let Some(open) = content[pos..].find("[[") {
+                            let abs_open = pos + open + 2;
+                            if let Some(close) = content[abs_open..].find("]]") {
+                                let raw = &content[abs_open..abs_open + close];
+                                // Handle [[note|alias]] → show "alias → note"
+                                let parts: Vec<&str> = raw.splitn(2, '|').collect();
+                                let display = if parts.len() == 2 {
+                                    format!("[[{}]] (別名: {})", parts[0].trim(), parts[1].trim())
+                                } else {
+                                    format!("[[{}]]", raw.trim())
+                                };
+                                if !links.contains(&display) { links.push(display); }
+                                pos = abs_open + close + 2;
+                            } else { break; }
+                        }
+                        if links.is_empty() {
+                            return Ok(Value::String(format!("「{}」沒有出向連結", rel)));
+                        }
+                        Ok(Value::String(format!(
+                            "「{}」的出向連結（共 {}）：\n{}",
+                            rel, links.len(), links.iter().map(|l| format!("- {}", l)).collect::<Vec<_>>().join("\n")
+                        )))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
     // search_skills — LLM 自主語意搜尋技能規範（use_ask = 標準化意圖概括）
     {
         let db = ctx.vault_db.clone();
