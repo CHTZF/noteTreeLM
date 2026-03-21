@@ -40,6 +40,8 @@ import SetupWizard from './components/Setup/SetupWizard'
 import TitleBar from './components/TitleBar/TitleBar'
 import { useAuthStore } from './stores/authStore'
 import Toast, { toast } from './components/common/Toast'
+import ServerStatusBar from './components/common/ServerStatusBar'
+import { useTranslation } from 'react-i18next'
 import './styles/App.css'
 
 const GRAPH_TAB = '__graph__'
@@ -137,13 +139,15 @@ export default function App() {
   // 首次掛載驗證 session
   useEffect(() => { checkSession() }, [])
 
+  const { t } = useTranslation()
+
   // Auth loading splash
   if (authLoading) {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100vh', background: 'var(--color-bg-base)' }}>
         <TitleBar />
         <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--color-text-muted)', fontSize: '13px' }}>
-          載入中…
+          {t('app.loading')}
         </div>
       </div>
     )
@@ -161,6 +165,7 @@ export default function App() {
 }
 
 function AppMain() {
+  const { t } = useTranslation()
   const { session, logout: authLogout } = useAuthStore()
   const { load: loadSettings, settings, savePersonal: saveSettings, saveSystem } = useSettingsStore()
   const { scanVault, setupWatchers, readNote } = useVaultStore()
@@ -345,10 +350,10 @@ function AppMain() {
         toast.error(line.replace('[server:error] ', ''), { duration: 0 })
       } else if (line.includes('等待模型載入') || line.includes('模型載入中')) {
         if (loadingToastId === null)
-          loadingToastId = toast.info('whisper-server 載入模型中，請稍候…', { duration: 0 })
+          loadingToastId = toast.info(t('app.whisper_loading'), { duration: 0 })
       } else if (line.includes('就緒')) {
         if (loadingToastId !== null) { toast.dismiss(loadingToastId); loadingToastId = null }
-        toast.info('whisper-server 已就緒')
+        toast.info(t('app.whisper_ready'))
       }
     }).then(fn => { if (cancelled) fn(); else unlisten = fn })
     return () => { cancelled = true; unlisten?.() }
@@ -365,10 +370,10 @@ function AppMain() {
         toast.error(line.replace('[server:error] ', ''), { duration: 0 })
       } else if (line.includes('等待模型載入') || line.includes('模型載入中')) {
         if (loadingToastId === null)
-          loadingToastId = toast.info('llama-server 載入模型中，請稍候…', { duration: 0 })
+          loadingToastId = toast.info(t('app.llm_loading'), { duration: 0 })
       } else if (line.includes('就緒')) {
         if (loadingToastId !== null) { toast.dismiss(loadingToastId); loadingToastId = null }
-        toast.info('llama-server 已就緒')
+        toast.info(t('app.llm_ready'))
       }
     }).then(fn => { if (cancelled) fn(); else unlisten = fn })
     return () => { cancelled = true; unlisten?.() }
@@ -672,8 +677,7 @@ function AppMain() {
     const closingTab = leaf.tabs.find(t => t.id === tabId)
     if (closingTab && (closingTab.path === CHAT_TAB || closingTab.path === LIVE_CHAT_TAB)) {
       if (chatActiveRef.current.get(tabId)) {
-        const name = closingTab.path === CHAT_TAB ? 'Chat' : 'Live Chat'
-        if (!window.confirm(`${name} 仍在對談中，確認要關閉嗎？`)) return
+        if (!window.confirm(t('app.chat_active_confirm'))) return
       }
       chatActiveRef.current.delete(tabId)
     }
@@ -1090,7 +1094,7 @@ function AppMain() {
         <TitleBar />
         <div className="app-loading">
           <div className="app-loading-spinner" />
-          <span>載入中…</span>
+          <span>{t('app.loading')}</span>
         </div>
       </div>
     )
@@ -1132,7 +1136,7 @@ function AppMain() {
           {/* 收合 / 展開 — 最上方 */}
           <button
             className="icon-menubar-btn"
-            title={leftPanel ? '收合側欄' : '展開側欄'}
+            title={leftPanel ? t('sidebar.collapse') : t('sidebar.expand')}
             onClick={() => setLeftPanel(p => p ? null : 'files')}
           ><FontAwesomeIcon icon={leftPanel ? faChevronLeft : faChevronRight} /></button>
 
@@ -1141,12 +1145,12 @@ function AppMain() {
           {/* 側欄面板切換 */}
           <button
             className={`icon-menubar-btn${leftPanel === 'files' ? ' active' : ''}`}
-            title="檔案"
+            title={t('sidebar.files')}
             onClick={() => setLeftPanel(p => p === 'files' ? null : 'files')}
           ><FontAwesomeIcon icon={faFolderTree} /></button>
           <button
             className={`icon-menubar-btn${leftPanel === 'search' ? ' active' : ''}`}
-            title="搜尋"
+            title={t('sidebar.search')}
             onClick={() => setLeftPanel(p => p === 'search' ? null : 'search')}
           ><FontAwesomeIcon icon={faMagnifyingGlass} /></button>
           {settings.debug_mode && (
@@ -1162,51 +1166,51 @@ function AppMain() {
           {/* 特殊頁籤：圖譜 / Agent / Chat / Live Chat */}
           <button
             className={`icon-menubar-btn${currentPath === GRAPH_TAB ? ' active' : ''}`}
-            title="圖譜"
+            title={t('tabs.graph')}
             onClick={openGraphTab}
           ><FontAwesomeIcon icon={faSitemap} /></button>
 
           {(settings.show_agent_tools ?? true) && (
             <button
               className={`icon-menubar-btn${currentPath === AGENT_TOOLS_TAB ? ' active' : ''}`}
-              title="Agent Tool 測試台"
+              title={t('tabs.agent_tools')}
               onClick={() => openNote(AGENT_TOOLS_TAB)}
             ><FontAwesomeIcon icon={faBolt} /></button>
           )}
 
           <button
             className={`icon-menubar-btn${currentPath === IMPORT_TAB ? ' active' : ''}`}
-            title="知識匯入"
+            title={t('tabs.import')}
             onClick={() => openNote(IMPORT_TAB)}
           ><FontAwesomeIcon icon={faFileImport} /></button>
 
           <button
             className={`icon-menubar-btn${currentPath === KB_ASSIST_TAB ? ' active' : ''}`}
-            title="知識庫助手"
+            title={t('tabs.kb_assist')}
             onClick={() => openNote(KB_ASSIST_TAB)}
           ><FontAwesomeIcon icon={faShieldHalved} /></button>
 
           <button
             className={`icon-menubar-btn${currentPath === SKILLS_TAB ? ' active' : ''}`}
-            title="技能規範"
+            title={t('tabs.skills')}
             onClick={() => openNote(SKILLS_TAB)}
           ><FontAwesomeIcon icon={faSliders} /></button>
 
           <button
             className={`icon-menubar-btn${currentPath === AGENTS_TAB ? ' active' : ''}`}
-            title="Agents"
+            title={t('tabs.agents')}
             onClick={() => openNote(AGENTS_TAB)}
           ><FontAwesomeIcon icon={faBolt} /></button>
 
           {settings.enable_chat && <>
             <button
               className="icon-menubar-btn"
-              title="Chat"
+              title={t('tabs.chat')}
               onClick={() => openNote(CHAT_TAB)}
             ><FontAwesomeIcon icon={faComments} /></button>
             <button
               className="icon-menubar-btn"
-              title="Live Chat"
+              title={t('tabs.live_chat')}
               onClick={() => openNote(LIVE_CHAT_TAB)}
             ><FontAwesomeIcon icon={faMicrophone} /></button>
           </>}
@@ -1256,9 +1260,9 @@ function AppMain() {
 
                 {/* Menu items */}
                 {([
-                  { icon: faUser, label: '個人化設定', action: () => { openNote(SETTINGS_TAB); setUserMenuOpen(false) } },
-                  { icon: faGear, label: '系統設定', action: () => { openNote(SYSTEM_SETTINGS_TAB); setUserMenuOpen(false) } },
-                  { icon: faCircleQuestion, label: '取得幫助', action: () => { openNote(HELP_TAB); setUserMenuOpen(false) } },
+                  { icon: faUser, label: t('settings.title'), action: () => { openNote(SETTINGS_TAB); setUserMenuOpen(false) } },
+                  { icon: faGear, label: t('settings.system_title'), action: () => { openNote(SYSTEM_SETTINGS_TAB); setUserMenuOpen(false) } },
+                  { icon: faCircleQuestion, label: t('help.title'), action: () => { openNote(HELP_TAB); setUserMenuOpen(false) } },
                 ] as const).map(item => (
                   <button key={item.label} onClick={item.action} style={{
                     display: 'flex', alignItems: 'center', gap: '10px',
@@ -1277,8 +1281,8 @@ function AppMain() {
                 <div style={{ height: '1px', background: 'var(--color-border)', margin: '4px 0' }} />
 
                 {([
-                  { icon: faArrowRightArrowLeft, label: '工作區管理', action: () => { setShowVaultManager(true); setUserMenuOpen(false) } },
-                  { icon: faTrash, label: '垃圾桶', action: () => { openNote(TRASH_TAB); setUserMenuOpen(false) } },
+                  { icon: faArrowRightArrowLeft, label: t('vault.select_title'), action: () => { setShowVaultManager(true); setUserMenuOpen(false) } },
+                  { icon: faTrash, label: t('trash.title'), action: () => { openNote(TRASH_TAB); setUserMenuOpen(false) } },
                 ] as const).map(item => (
                   <button key={item.label} onClick={item.action} style={{
                     display: 'flex', alignItems: 'center', gap: '10px',
@@ -1306,7 +1310,7 @@ function AppMain() {
                   onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
                 >
                   <FontAwesomeIcon icon={faArrowRightFromBracket} style={{ width: '14px', flexShrink: 0 }} />
-                  登出
+                  {t('auth.logout')}
                 </button>
               </div>
             )}
@@ -1329,6 +1333,7 @@ function AppMain() {
           <div style={{ display: leftPanel === 'debug' ? 'flex' : 'none', flex: 1, flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
             <DebugPanel />
           </div>
+          <ServerStatusBar onOpenSettings={() => openNote(SYSTEM_SETTINGS_TAB)} />
         </aside>
 
         {/* 左側分隔線 */}

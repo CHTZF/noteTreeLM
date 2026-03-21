@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
+import { useTranslation } from 'react-i18next'
 import { invoke } from '@tauri-apps/api/core'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
 import { type IconDefinition } from '@fortawesome/fontawesome-svg-core'
@@ -275,6 +276,7 @@ interface FileTreeProps {
 }
 
 export default function FileTree({ onOpenNote, onOpenNoteInNewTab }: FileTreeProps) {
+  const { t } = useTranslation()
   const { fileTree, createNote, createFolder, importImage } = useVaultStore()
   const { currentPath } = useEditorStore()
   const { settings } = useSettingsStore()
@@ -333,9 +335,9 @@ export default function FileTree({ onOpenNote, onOpenNoteInNewTab }: FileTreePro
       {/* Header — icon buttons only */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', padding: '4px 6px', borderBottom: '1px solid var(--color-border)', gap: '1px' }}>
         {([
-          { icon: faPlus,        title: '新增筆記',         onClick: handleNewNote },
-          { icon: faFolderPlus,  title: '新增資料夾',       onClick: handleNewFolder },
-          { icon: faFileArrowUp, title: '匯入檔案',         onClick: handleImportFile },
+          { icon: faPlus,        title: t('file_tree.new_note'),    onClick: handleNewNote },
+          { icon: faFolderPlus,  title: t('file_tree.new_folder'),  onClick: handleNewFolder },
+          { icon: faFileArrowUp, title: t('common.import'),         onClick: handleImportFile },
           { icon: faArrowDownAZ, title: '依名稱升序（A→Z）', onClick: () => applySortByName(fileTree, 'asc') },
           { icon: faArrowUpZA,   title: '依名稱降序（Z→A）', onClick: () => applySortByName(fileTree, 'desc') },
         ] as const).map(btn => (
@@ -352,7 +354,7 @@ export default function FileTree({ onOpenNote, onOpenNoteInNewTab }: FileTreePro
         <div style={{ padding: '6px 8px', borderBottom: '1px solid var(--color-border)' }}>
           <input ref={noteInputRef} value={noteInputTitle} onChange={(e) => setNoteInputTitle(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter') handleNoteSubmit(); if (e.key === 'Escape') { setShowNoteInput(false); setNoteInputTitle('') } }}
-            onBlur={handleNoteSubmit} placeholder="筆記標題…"
+            onBlur={handleNoteSubmit} placeholder={t('editor.untitled') + '…'}
             style={{ width: '100%', padding: '5px 8px', boxSizing: 'border-box', background: 'var(--color-bg-base)', border: '1px solid var(--color-accent)', borderRadius: '4px', color: 'var(--color-text-primary)', fontSize: '13px', outline: 'none' }} />
         </div>
       )}
@@ -370,7 +372,7 @@ export default function FileTree({ onOpenNote, onOpenNoteInNewTab }: FileTreePro
       <div ref={treeRef} style={{ flex: 1, overflowY: 'auto', padding: '4px 0', outline: 'none', outlineOffset: '-2px', transition: 'outline 0.08s', borderRadius: '4px' }}>
         {fileTree.length === 0 ? (
           <div style={{ padding: '20px 12px', color: 'var(--color-text-muted)', fontSize: '13px', textAlign: 'center' }}>
-            <p>還沒有筆記</p><p style={{ marginTop: '8px' }}>點擊 + 新增第一篇</p>
+            <p>{t('file_tree.empty')}</p><p style={{ marginTop: '8px' }}>{t('file_tree.empty_hint')}</p>
           </div>
         ) : fileTree.map((node) => (
           <TreeNode key={node.path} node={node} depth={0} currentPath={currentPath} vaultPath={settings.system_current_vault_path} onOpenNote={onOpenNote} onOpenNoteInNewTab={onOpenNoteInNewTab} />

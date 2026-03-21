@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { useTranslation } from 'react-i18next'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useAuthStore } from '../../stores/authStore'
 import { useEditorStore } from '../../stores/editorStore'
@@ -14,6 +15,7 @@ import { Message, SkillPreview, DraftState, ORCHESTRATOR_SYSTEM } from './types'
 import type { AgentSkill } from '../../types/models'
 
 export default function ChatPanel({ liveChatActive = false, onActiveChange, onOpenNote }: { liveChatActive?: boolean; onActiveChange?: (active: boolean) => void; onOpenNote?: (path: string) => void }) {
+  const { t } = useTranslation()
   const { settings } = useSettingsStore()
   const { session } = useAuthStore()
   const { content: noteContent, currentPath } = useEditorStore()
@@ -941,7 +943,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
                     cursor: isCompressing || isStreaming ? 'not-allowed' : 'pointer',
                     opacity: isCompressing || isStreaming ? 0.5 : 1,
                   }}
-                >{isCompressing ? '壓縮中…' : '壓縮記憶'}</button>
+                >{isCompressing ? t('chat.thinking') : '壓縮記憶'}</button>
                 {showClearPrompt ? (
                   <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                     <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>要先壓縮？</span>
@@ -953,7 +955,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
                     <button
                       onClick={clearChat}
                       style={{ fontSize: '11px', padding: '2px 8px', borderRadius: '4px', background: 'var(--color-bg-overlay)', border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)', cursor: 'pointer' }}
-                    >直接清除</button>
+                    >{t('chat.clear')}</button>
                   </div>
                 ) : (
                 <button
@@ -1239,11 +1241,11 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
               <button
                 onClick={() => handleWriteConfirm(true)}
                 style={{ padding: '4px 12px', borderRadius: '4px', background: 'var(--color-accent)', color: '#fff', border: 'none', cursor: 'pointer', fontSize: '12px' }}
-              >允許</button>
+              >{t('chat.allow_once')}</button>
               <button
                 onClick={() => handleWriteConfirm(false)}
                 style={{ padding: '4px 12px', borderRadius: '4px', background: 'transparent', color: 'var(--color-text-secondary)', border: '1px solid var(--color-border)', cursor: 'pointer', fontSize: '12px' }}
-              >拒絕</button>
+              >{t('chat.deny')}</button>
             </div>
           </div>
         )}
@@ -1326,7 +1328,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
             disabled={isStreaming || !isConfigured}
-            placeholder={isConfigured ? '輸入訊息…' : '請先設定 llama CLI'}
+            placeholder={isConfigured ? t('chat.placeholder') : '請先設定 llama CLI'}
             rows={1}
             style={{
               flex: 1, resize: 'none', padding: '7px 10px',

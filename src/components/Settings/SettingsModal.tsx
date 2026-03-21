@@ -2,11 +2,13 @@ import { useState, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { open, ask, message } from '@tauri-apps/plugin-dialog'
+import { useTranslation } from 'react-i18next'
 import { useSettingsStore, SYSTEM_KEYS, SystemSettings } from '../../stores/settingsStore'
 import { useAuthStore } from '../../stores/authStore'
 import { Settings, DEFAULT_SETTINGS } from '../../types/settings'
 import ModelDownloader, { WHISPER_MODELS, LLM_MODELS, EMBEDDING_MODELS } from './ModelDownloader'
 import { toast } from '../common/Toast'
+import { SUPPORTED_LANGUAGES } from '../../i18n'
 
 function fmtBytes(bytes: number): string {
   if (bytes === 0) return '0 B'
@@ -66,6 +68,7 @@ interface RepairLog {
 }
 
 export default function SettingsModal({ onClose, inline, mode = 'personal' }: SettingsModalProps) {
+  const { t, i18n } = useTranslation()
   const { settings, savePersonal, saveSystem, loadSystem, systemSettings, getApiKey, setApiKey } = useSettingsStore()
   const { session } = useAuthStore()
 
@@ -571,8 +574,8 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
 
 
   const tabs: [Tab, string][] = mode === 'system'
-    ? [['ai', '外部 AI'], ['voice', 'Whisper'], ['local', 'Local LLM'], ['advanced', '進階'], ['raw', '設定檔']]
-    : [['account', '帳號'], ['general', '一般'], ['advanced', '進階'], ['memory', '記憶規則'], ['raw', '設定檔']]
+    ? [['ai', t('settings.tab.ai')], ['voice', t('settings.tab.voice')], ['local', t('settings.tab.local')], ['advanced', t('settings.tab.advanced')], ['raw', t('settings.tab.raw')]]
+    : [['account', t('settings.tab.account')], ['general', t('settings.tab.general')], ['advanced', t('settings.tab.advanced')], ['memory', t('settings.tab.memory')], ['raw', t('settings.tab.raw')]]
 
   const handleChangePassword = async () => {
     if (!newPassword || newPassword !== confirmPassword) {
@@ -644,7 +647,7 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
     <div id="settings-modal" style={modalInnerStyle}>
         {/* Header */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '14px 20px', borderBottom: '1px solid var(--color-border)', flexShrink: 0 }}>
-          <span style={{ fontSize: '15px', fontWeight: 600, color: 'var(--color-text-primary)' }}>{mode === 'system' ? '系統設定' : '個人化設定'}</span>
+          <span style={{ fontSize: '15px', fontWeight: 600, color: 'var(--color-text-primary)' }}>{mode === 'system' ? t('settings.system_title') : t('settings.title')}</span>
           {!inline && onClose && (
             <button onClick={onClose}
               style={{ color: 'var(--color-text-secondary)', fontSize: '20px', lineHeight: 1, width: '28px', height: '28px', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '4px' }}
@@ -780,6 +783,18 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
             </>}
 
             {tab === 'general' && <>
+              <div style={fieldStyle}>
+                <label style={labelStyle}>{t('settings.general.language_label')}</label>
+                <select
+                  value={i18n.language}
+                  onChange={(e) => i18n.changeLanguage(e.target.value)}
+                  style={inputStyle}
+                >
+                  {SUPPORTED_LANGUAGES.map(lang => (
+                    <option key={lang.code} value={lang.code}>{lang.label}</option>
+                  ))}
+                </select>
+              </div>
               <div style={fieldStyle}>
                 <label style={labelStyle}>佈景主題</label>
                 <select value={draft.theme} onChange={(e) => up({ theme: e.target.value as any })} style={inputStyle}>
