@@ -416,6 +416,122 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
+    // compress_to_knowledge — 儲存重要知識/洞見到 knowledge/ 資料夾
+    {
+        let vp = ctx.vault_path.clone();
+        let db = ctx.vault_db.clone();
+        let vid = ctx.vault_id.clone();
+        registry.register(
+            "compress_to_knowledge".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let title = args["title"].as_str().unwrap_or("").to_string();
+                    let content = args["content"].as_str().unwrap_or("").to_string();
+                    let tags: Vec<String> = args["tags"].as_array()
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    let vp = vp.clone();
+                    let db = db.clone();
+                    let vid = vid.clone();
+                    Box::pin(async move {
+                        if title.is_empty() { return Err("title 為必填".to_string()); }
+                        if content.is_empty() { return Err("content 為必填".to_string()); }
+                        let now = chrono::Local::now();
+                        let date_str = now.format("%Y-%m-%d").to_string();
+                        let tags_yaml = if tags.is_empty() {
+                            "  - knowledge".to_string()
+                        } else {
+                            tags.iter().map(|t| format!("  - {}", t)).collect::<Vec<_>>().join("\n")
+                        };
+                        let full_content = format!(
+                            "---\ntitle: {}\ncreated: {}\ntags:\n{}\nsource: ai_compressed\n---\n\n{}\n",
+                            title, now.to_rfc3339(), tags_yaml, content
+                        );
+                        let safe_title: String = title.chars()
+                            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                            .collect();
+                        let path = format!("knowledge/{}_{}.md", date_str, safe_title);
+                        let result = crate::commands::ai::tool_create_note(&path, &full_content, &vp, Some((db, vid))).await;
+                        if result.contains("失敗") { Err(result) } else { Ok(Value::String(format!("✅ 已儲存知識至 {}", path))) }
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
+    // update_note_frontmatter — 局部更新 YAML frontmatter 欄位（不覆蓋正文）
+    {
+        let vp = ctx.vault_path.clone();
+        registry.register(
+            "update_note_frontmatter".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let path = args["path"].as_str().unwrap_or("").to_string();
+                    let fields = args["fields"].clone();
+                    let vp = vp.clone();
+                    Box::pin(async move {
+                        if path.is_empty() { return Err("path 為必填".to_string()); }
+                        if !fields.is_object() { return Err("fields 必須為物件（鍵值對）".to_string()); }
+                        let rel = if path.ends_with(".md") { path.clone() } else { format!("{}.md", path) };
+                        let abs = std::path::PathBuf::from(&vp).join(&rel);
+                        let original = tokio::fs::read_to_string(&abs).await
+                            .map_err(|e| format!("讀取失敗：{}", e))?;
+                        let new_content = if original.starts_with("---") {
+                            let after_first = &original[3..];
+                            if let Some(end_pos) = after_first.find("\n---") {
+                                let fm_content = &after_first[..end_pos];
+                                let body = &after_first[end_pos + 4..];
+                                let mut lines: Vec<String> = fm_content.lines().map(|l| l.to_string()).collect();
+                                if let Some(obj) = fields.as_object() {
+                                    for (key, val) in obj {
+                                        let val_str = match val {
+                                            serde_json::Value::String(s) => s.clone(),
+                                            serde_json::Value::Array(arr) => {
+                                                let items: Vec<String> = arr.iter()
+                                                    .filter_map(|v| v.as_str().map(String::from))
+                                                    .collect();
+                                                format!("[{}]", items.join(", "))
+                                            }
+                                            v => v.to_string(),
+                                        };
+                                        let key_prefix = format!("{}:", key);
+                                        let mut found = false;
+                                        for line in &mut lines {
+                                            if line.starts_with(&key_prefix) {
+                                                *line = format!("{}: {}", key, val_str);
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                        if !found { lines.push(format!("{}: {}", key, val_str)); }
+                                    }
+                                }
+                                format!("---\n{}\n---{}", lines.join("\n"), body)
+                            } else { original }
+                        } else {
+                            let mut fm = vec!["---".to_string()];
+                            if let Some(obj) = fields.as_object() {
+                                for (key, val) in obj {
+                                    let vs = match val { serde_json::Value::String(s) => s.clone(), v => v.to_string() };
+                                    fm.push(format!("{}: {}", key, vs));
+                                }
+                            }
+                            fm.push("---".to_string());
+                            fm.push(String::new());
+                            fm.push(original);
+                            fm.join("\n")
+                        };
+                        tokio::fs::write(&abs, &new_content).await
+                            .map_err(|e| format!("寫入失敗：{}", e))?;
+                        Ok(Value::String(format!("✅ 已更新 {} 的 frontmatter 欄位", rel)))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
+
     // schedule_task — 插入 scheduled_tasks 表
     {
         let db = ctx.vault_db.clone();

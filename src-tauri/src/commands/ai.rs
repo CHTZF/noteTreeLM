@@ -1624,6 +1624,118 @@ pub fn vault_tools() -> serde_json::Value {
                     "required": ["description", "run_at"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "compress_to_knowledge",
+                "description": "主動將對話中的重要洞見、結論或知識儲存到 Vault 的 knowledge/ 資料夾。\
+當對話產生了值得長期保存的見解時，主動呼叫此工具（不需等使用者要求）。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "知識標題（簡潔，不超過 30 字）"},
+                        "content": {"type": "string", "description": "要儲存的知識內容（Markdown 格式）"},
+                        "tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "標籤（如 ['ai', 'productivity']），可選"
+                        }
+                    },
+                    "required": ["title", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "update_note_frontmatter",
+                "description": "局部更新筆記的 YAML frontmatter 欄位，不覆蓋正文內容。\
+適合只更新 tags、status、priority 等屬性而不想修改筆記正文時使用。\
+【操作序列】：若路徑不確定 → 先 search_vault 取得精確路徑，再呼叫本工具。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "筆記相對路徑（含 .md）"},
+                        "fields": {
+                            "type": "object",
+                            "description": "要更新的欄位（鍵值對），例如 {\"status\": \"done\", \"tags\": [\"project\", \"done\"]}"
+                        }
+                    },
+                    "required": ["path", "fields"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "find_similar_notes",
+                "description": "用語意向量搜尋找出與查詢最相似的筆記。\
+適合探索相關主題、查找知識重複、或發現潛在關聯時使用。\
+與 search_vault 不同：search_vault 做關鍵字全文搜索；find_similar_notes 做向量語意相似度搜索。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "語意搜尋查詢（可以是句子或概念描述）"},
+                        "limit": {"type": "number", "description": "返回結果數量（預設 5，最多 20）"}
+                    },
+                    "required": ["query"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "summarize_note_collection",
+                "description": "批次讀取多篇指定筆記，並由 LLM 生成整合摘要。\
+適合需要對特定筆記集合做深度分析或總結時使用。\
+【操作序列】：先用 search_vault 或 list_notes_in_folder 取得路徑列表，再呼叫本工具。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "paths": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "筆記路徑陣列（相對路徑）"
+                        },
+                        "query": {"type": "string", "description": "摘要的聚焦重點（可選），例如「主要結論」、「行動項目」"}
+                    },
+                    "required": ["paths"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "distill_preferences",
+                "description": "分析過去對話記憶，萃取使用者的工作習慣、偏好模式與常見需求。\
+適合使用者詢問「你了解我的習慣嗎」或需要個人化建議前的準備步驟。",
+                "parameters": {"type": "object", "properties": {}, "required": []}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_note_backlinks",
+                "description": "查詢哪些筆記連結至指定筆記（反向連結）。\
+用於了解知識圖譜中的關聯性，或找出引用某篇筆記的所有來源。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "目標筆記的相對路徑（含 .md）"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_vault_stats",
+                "description": "取得知識庫的整體統計資料：筆記總數、資料夾數、總字數、最近修改的筆記。\
+適合使用者詢問知識庫概況，或需要對知識庫健康度做評估時使用。",
+                "parameters": {"type": "object", "properties": {}, "required": []}
+            }
         }
     ])
 }
@@ -1829,6 +1941,41 @@ pub async fn seed_agent_skills(db: &SurrealDb, vault_id: &str, emb_url: Option<&
             trigger: "排程、設定提醒、定時任務、設定鬧鐘、幫我排程、提醒我、到時候提醒、設定時間、定時提醒、schedule、remind me、set reminder、set alarm、幫我設一個提醒、X點提醒我、明天提醒、每天提醒、固定時間、重複執行、定期通知、設定排程任務、每週提醒",
             behavior: "步驟1：呼叫 get_current_datetime 取得現在時間（作為計算相對時間的基準）。步驟2：根據使用者描述確定：（a）任務描述 description、（b）執行時間 run_at（ISO 8601 格式，需含時區，例如 2026-03-22T09:00:00+08:00）、（c）若需重複則填 repeat_interval_seconds（秒數，如每天=86400、每週=604800，不重複則填 0）。步驟3：呼叫 schedule_task（description、run_at、repeat_interval_seconds）完成排程。步驟4：回覆使用者已排程的時間與任務內容。",
             tools: &["get_current_datetime", "schedule_task"],
+        },
+        BuiltinSkill {
+            id: "builtin_save_knowledge",
+            title: "儲存知識/洞見到知識庫",
+            trigger: "儲存這個知識、把這個記下來、存成知識、記錄這個洞見、把這段存進知識庫、幫我歸納存檔、這個值得記錄、存到knowledge、儲存這次的結論、把這個整理成知識卡、save knowledge、compress to knowledge、知識壓縮、歸納成知識、把這個存起來、幫我保存這個見解",
+            behavior: "步驟1：分析對話內容，歸納核心知識點（若使用者有指定內容則直接使用）。步驟2：確定標題（簡潔，不超過 30 字）、內容（結構化 Markdown）、標籤（2-4 個相關主題詞）。步驟3：呼叫 compress_to_knowledge（title、content、tags）將知識存入 knowledge/ 資料夾。步驟4：告知使用者已儲存的路徑，並簡述儲存的主要知識點。",
+            tools: &["compress_to_knowledge", "find_similar_notes"],
+        },
+        BuiltinSkill {
+            id: "builtin_deep_research",
+            title: "深度研究整合（多篇筆記）",
+            trigger: "深度研究、整合多篇筆記、綜合分析、跨筆記整理、找出關聯、知識整合、comprehensive research、deep dive、幫我深入研究、把相關筆記都找出來整合、綜合所有相關資料、跨文件分析、全面整理、多篇整合摘要、相關筆記分析",
+            behavior: "步驟1：呼叫 search_vault（query 填研究主題）找出相關筆記清單。步驟2：呼叫 find_similar_notes（query 填研究主題，limit 填 8）補充向量語意相近的筆記。步驟3：合併兩個清單，去除重複，選出最相關的 5-8 篇。步驟4：呼叫 summarize_note_collection（paths 填選出的路徑陣列，query 填研究重點）生成整合摘要。步驟5：根據摘要回答使用者，並列出來源筆記路徑。",
+            tools: &["search_vault", "find_similar_notes", "summarize_note_collection", "read_note"],
+        },
+        BuiltinSkill {
+            id: "builtin_personal_insight",
+            title: "個人洞察與知識庫分析",
+            trigger: "分析我的知識庫、了解我的習慣、知識庫健康度、我的學習模式、分析我的筆記習慣、你了解我的偏好嗎、知識庫概況、vault analytics、analyze my vault、我有多少筆記、知識庫統計、個人化建議、了解我的學習習慣、幫我分析一下知識庫、我的知識圖譜",
+            behavior: "步驟1：呼叫 get_vault_stats 取得知識庫整體統計（筆記數、資料夾數、字數、最近修改）。步驟2：呼叫 distill_preferences 分析使用者偏好（從對話記憶萃取）。步驟3：根據統計與偏好，提供個人化洞察：（a）知識庫概況評估；（b）可能的盲點或未覆蓋領域；（c）改善建議（例如整理、分類、建立筆記等）。步驟4：若使用者想了解特定筆記的關聯，呼叫 get_note_backlinks 分析反向連結。",
+            tools: &["get_vault_stats", "distill_preferences", "get_note_backlinks", "find_similar_notes"],
+        },
+        BuiltinSkill {
+            id: "builtin_update_metadata",
+            title: "更新筆記屬性/標籤",
+            trigger: "更新標籤、修改屬性、加上標籤、改狀態、標記已完成、更新 frontmatter、add tag、update status、mark as done、幫我加個標籤、把這篇標記為、更新筆記的 tags、改一下 status、幫我更新屬性、修改 metadata、設定優先級",
+            behavior: "步驟1：若路徑不確定，呼叫 search_vault 取得目標筆記的精確路徑。步驟2：確認要更新的欄位（如 tags、status、priority、due_date 等）與新值。步驟3：呼叫 update_note_frontmatter（path 填精確路徑，fields 填要更新的鍵值對，例如 {\"status\": \"done\", \"tags\": [\"project\", \"archived\"]}）。步驟4：回覆使用者已更新的欄位與新值。",
+            tools: &["search_vault", "update_note_frontmatter"],
+        },
+        BuiltinSkill {
+            id: "builtin_knowledge_graph",
+            title: "探索知識圖譜關聯",
+            trigger: "哪些筆記連到這篇、反向連結、知識圖譜、找出關聯筆記、這篇被哪些筆記引用、backlinks、linked mentions、who links here、知識網絡、找出所有引用、筆記之間的關係、知識關聯圖、探索連結",
+            behavior: "步驟1：若路徑不確定，呼叫 search_vault 取得目標筆記的精確路徑。步驟2：呼叫 get_note_backlinks（path 填目標路徑）取得所有反向連結。步驟3：呼叫 find_similar_notes（query 填目標筆記標題或主題）補充語意上相關但未明確連結的筆記。步驟4：整合回覆：（a）直接反向連結清單；（b）語意相關筆記清單；（c）建議可建立連結的筆記。",
+            tools: &["search_vault", "get_note_backlinks", "find_similar_notes"],
         },
     ];
 
