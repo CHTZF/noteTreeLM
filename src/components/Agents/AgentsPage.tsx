@@ -86,6 +86,15 @@ export default function AgentsPage() {
     return () => { unlisten.then(fn => fn()) }
   }, [loadEphemeral])
 
+  // 監聽種子完成事件（解決 builtin agent/skill 在 2s warmup 後才插入的 race condition）
+  useEffect(() => {
+    const unlisten = listen('agent:seeded', () => {
+      loadDefs()
+      loadSkills()
+    })
+    return () => { unlisten.then(fn => fn()) }
+  }, [loadDefs, loadSkills])
+
   const handleToggle = async (def_id: string, is_active: boolean) => {
     await invoke('toggle_agent_definition', { defId: def_id, isActive: is_active })
     setDefs(prev => prev.map(d => d.def_id === def_id ? { ...d, is_active } : d))

@@ -89,8 +89,10 @@ export default function ImportPanel() {
   const [detailItem, setDetailItem] = useState<KnowledgeItem | null>(null)
   const [detailNoteCards, setDetailNoteCards] = useState<KBCardSuggestion[]>([])
   const [detailSkills, setDetailSkills] = useState<AgentSkill[]>([])
-  const [loadingSuggestions, setLoadingSuggestions] = useState(false)
-  const [suggestionError, setSuggestionError] = useState<string | null>(null)
+  const [loadingNoteCards, setLoadingNoteCards] = useState(false)
+  const [loadingSkillCards, setLoadingSkillCards] = useState(false)
+  const [noteCardError, setNoteCardError] = useState<string | null>(null)
+  const [skillCardError, setSkillCardError] = useState<string | null>(null)
 
   // ── Load knowledge items ────────────────────────────────────────────────────
   const loadItems = useCallback(async () => {
@@ -296,27 +298,45 @@ export default function ImportPanel() {
     }
   }, [view, loadItems])
 
-  // ── Load detail view ────────────────────────────────────────────────────────
-  const runSuggestions = useCallback(async (item: KnowledgeItem) => {
-    setLoadingSuggestions(true)
-    setSuggestionError(null)
-    const unlisten = await listen<{
-      item_id: string
-      note_cards: KBCardSuggestion[]
-      skill_cards: AgentSkill[]
-    }>('kb:suggestions_ready', e => {
-      if (e.payload.item_id !== item.item_id) return
-      setDetailNoteCards(e.payload.note_cards)
-      setDetailSkills(e.payload.skill_cards)
-      setLoadingSuggestions(false)
-      unlisten()
-      window.dispatchEvent(new CustomEvent('skills-changed'))
-    })
+  // ── 筆記卡片：獨立建立 ───────────────────────────────────────────────────────
+  const runNoteCards = useCallback(async (item: KnowledgeItem) => {
+    setLoadingNoteCards(true)
+    setNoteCardError(null)
+    const unlisten = await listen<{ item_id: string; note_cards: KBCardSuggestion[] }>(
+      'kb:note_cards_ready', e => {
+        if (e.payload.item_id !== item.item_id) return
+        setDetailNoteCards(e.payload.note_cards)
+        setLoadingNoteCards(false)
+        unlisten()
+      }
+    )
     try {
-      await invoke('suggest_kb_cards_for_item', { itemId: item.item_id })
+      await invoke('suggest_note_cards_for_item', { itemId: item.item_id })
     } catch (e) {
-      setLoadingSuggestions(false)
-      setSuggestionError(fmtError(e))
+      setLoadingNoteCards(false)
+      setNoteCardError(fmtError(e))
+      unlisten()
+    }
+  }, [])
+
+  // ── 技能規範：獨立建立 ───────────────────────────────────────────────────────
+  const runSkillCards = useCallback(async (item: KnowledgeItem) => {
+    setLoadingSkillCards(true)
+    setSkillCardError(null)
+    const unlisten = await listen<{ item_id: string; skill_cards: AgentSkill[] }>(
+      'kb:skill_cards_ready', e => {
+        if (e.payload.item_id !== item.item_id) return
+        setDetailSkills(e.payload.skill_cards)
+        setLoadingSkillCards(false)
+        unlisten()
+        window.dispatchEvent(new CustomEvent('skills-changed'))
+      }
+    )
+    try {
+      await invoke('suggest_skill_cards_for_item', { itemId: item.item_id })
+    } catch (e) {
+      setLoadingSkillCards(false)
+      setSkillCardError(fmtError(e))
       unlisten()
     }
   }, [])
@@ -325,7 +345,8 @@ export default function ImportPanel() {
     setDetailItem(item)
     setDetailNoteCards([])
     setDetailSkills([])
-    setSuggestionError(null)
+    setNoteCardError(null)
+    setSkillCardError(null)
     setView({ type: 'detail', itemId: item.item_id })
 
     // 同步載入該知識項目已存在的 skills（前次產生的）
@@ -628,45 +649,26 @@ export default function ImportPanel() {
               </div>
             </div>
 
-            {/* AI 建議：錯誤提示 + 重試 */}
-            {suggestionError && !loadingSuggestions && (
-              <div className="import-panel-v2__suggestion-error">
-                <span>⚠ 建議生成失敗：{suggestionError}</span>
-                <button
-                  className="import-panel-v2__retry-btn"
-                  onClick={() => detailItem && runSuggestions(detailItem)}
-                >
-                  重新生成
-                </button>
-              </div>
-            )}
-            {!suggestionError && !loadingSuggestions && detailNoteCards.length === 0 && detailSkills.length === 0 && (
-              <div className="import-panel-v2__suggestion-error">
-                <span>AI 建議為空（LLM 可能回傳格式有誤）</span>
-                <button
-                  className="import-panel-v2__retry-btn"
-                  onClick={() => detailItem && runSuggestions(detailItem)}
-                >
-                  重新生成
-                </button>
-              </div>
-            )}
-
             {/* AI 建議筆記卡片 */}
             <div className="import-panel-v2__detail-cards">
               <span className="import-panel-v2__detail-label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                 <FontAwesomeIcon icon={faLightbulb} /> AI 建議筆記卡片
-                {loadingSuggestions && <FontAwesomeIcon icon={faSpinner} spin style={{ marginLeft: 6 }} />}
-                {!loadingSuggestions && (
+                {loadingNoteCards && <FontAwesomeIcon icon={faSpinner} spin style={{ marginLeft: 6 }} />}
+                {!loadingNoteCards && (
                   <button
                     className="import-panel-v2__retry-btn"
                     style={{ marginLeft: 4 }}
-                    onClick={() => detailItem && runSuggestions(detailItem)}
+                    onClick={() => detailItem && runNoteCards(detailItem)}
                   >
                     建立
                   </button>
                 )}
               </span>
+              {noteCardError && (
+                <div className="import-panel-v2__suggestion-error">
+                  <span>⚠ {noteCardError}</span>
+                </div>
+              )}
               {detailNoteCards.length > 0 ? (
                 <div className="import-panel-v2__detail-cards-body">
                   {detailNoteCards.map((card, i) => (
@@ -677,7 +679,7 @@ export default function ImportPanel() {
                     </div>
                   ))}
                 </div>
-              ) : !loadingSuggestions ? (
+              ) : !loadingNoteCards ? (
                 <div className="import-panel-v2__empty-hint">暫無建議</div>
               ) : null}
             </div>
@@ -686,18 +688,23 @@ export default function ImportPanel() {
             <div className="import-panel-v2__detail-skills">
               <span className="import-panel-v2__detail-label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                 <FontAwesomeIcon icon={faBolt} /> AI 建議技能規範
-                {loadingSuggestions && <FontAwesomeIcon icon={faSpinner} spin style={{ marginLeft: 6 }} />}
-                {!loadingSuggestions && (
+                {loadingSkillCards && <FontAwesomeIcon icon={faSpinner} spin style={{ marginLeft: 6 }} />}
+                {!loadingSkillCards && (
                   <button
                     className="import-panel-v2__retry-btn"
                     style={{ marginLeft: 4 }}
-                    onClick={() => detailItem && runSuggestions(detailItem)}
+                    onClick={() => detailItem && runSkillCards(detailItem)}
                   >
                     建立
                   </button>
                 )}
               </span>
-              {detailSkills.length === 0 && !loadingSuggestions && (
+              {skillCardError && (
+                <div className="import-panel-v2__suggestion-error">
+                  <span>⚠ {skillCardError}</span>
+                </div>
+              )}
+              {detailSkills.length === 0 && !loadingSkillCards && (
                 <div className="import-panel-v2__empty-hint">暫無技能規範</div>
               )}
               {detailSkills.map(skill => (

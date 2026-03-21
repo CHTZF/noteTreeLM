@@ -1809,6 +1809,27 @@ pub async fn seed_agent_skills(db: &SurrealDb, vault_id: &str, emb_url: Option<&
             behavior: "步驟1：呼叫 web_search（query 填具體搜尋關鍵字），取得最新網路資訊。步驟2：根據搜尋結果摘要回答使用者。步驟3（可選）：若需要更深入分析或問題超出搜尋範圍，呼叫 call_external_ai（query 填完整問題）補充回答。",
             tools: &["web_search", "call_external_ai"],
         },
+        BuiltinSkill {
+            id: "builtin_create_skill",
+            title: "新增/建立技能規範",
+            trigger: "新增技能、建立技能、設計技能規範、幫我建立skill、新增skill、新建技能、create skill、design skill、建一個技能、幫我設計一個skill、新增一個agent技能、我要建立技能、建立技能規範、新增行為規則",
+            behavior: "步驟1：請使用者描述技能的目的（觸發情境、希望AI執行什麼操作）。步驟2：根據描述，組成以下欄位呼叫 create_agent_skill：title（技能標題）、trigger（觸發語境描述）、behavior（分步驟操作說明）、injection_mode（'passive' 或 'active'）。步驟3：呼叫成功後告知使用者技能已建立，並說明什麼情況下此技能會被觸發。",
+            tools: &["create_agent_skill"],
+        },
+        BuiltinSkill {
+            id: "builtin_suggest_note_cards",
+            title: "AI 建議筆記卡片",
+            trigger: "幫我建立筆記卡片、建立知識卡片、整理成卡片、幫我產生筆記卡片、建議筆記卡片、生成卡片、suggest note cards、create note card、知識卡片建議、幫我做成卡片、把這個整理成卡片、幫我萃取卡片、建立 concept 卡片、建立 procedure 卡片、建立 reference 卡片",
+            behavior: "步驟1：呼叫 search_vault 或 read_note 取得使用者指定的知識內容（若使用者已提供內容則跳過）。步驟2：分析內容，依 concept（概念定義）、procedure（操作步驟）、reference（參考資料）三種模板各生成 1 張筆記卡片建議，每張包含：標題、模板類型、完整 Markdown 內容（含 frontmatter status/tags）、建立理由。步驟3：呼叫 plan_announce 列出將建立的卡片清單，deferred_tools 填 create_note。步驟4：使用者確認後，逐一呼叫 create_note 將每張卡片寫入 Vault（路徑格式：cards/[標題].md）。",
+            tools: &["search_vault", "read_note", "create_note", "plan_announce"],
+        },
+        BuiltinSkill {
+            id: "builtin_schedule_task",
+            title: "排程/提醒任務",
+            trigger: "排程、設定提醒、定時任務、設定鬧鐘、幫我排程、提醒我、到時候提醒、設定時間、定時提醒、schedule、remind me、set reminder、set alarm、幫我設一個提醒、X點提醒我、明天提醒、每天提醒、固定時間、重複執行、定期通知、設定排程任務、每週提醒",
+            behavior: "步驟1：呼叫 get_current_datetime 取得現在時間（作為計算相對時間的基準）。步驟2：根據使用者描述確定：（a）任務描述 description、（b）執行時間 run_at（ISO 8601 格式，需含時區，例如 2026-03-22T09:00:00+08:00）、（c）若需重複則填 repeat_interval_seconds（秒數，如每天=86400、每週=604800，不重複則填 0）。步驟3：呼叫 schedule_task（description、run_at、repeat_interval_seconds）完成排程。步驟4：回覆使用者已排程的時間與任務內容。",
+            tools: &["get_current_datetime", "schedule_task"],
+        },
     ];
 
     // 每次啟動刪除並重建所有 builtin skills，確保 tool_calls / behavior 始終是最新版

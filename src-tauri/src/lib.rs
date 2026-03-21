@@ -28,6 +28,7 @@ use commands::{
                        get_brave_search_usage, sync_brave_key_id,
                        save_knowledge_item, list_knowledge_items, get_knowledge_item,
                        delete_knowledge_item, rename_knowledge_item, suggest_kb_cards_for_item,
+                       suggest_note_cards_for_item, suggest_skill_cards_for_item,
                        get_cached_page,
                        save_agent_skill, list_agent_skills, toggle_agent_skill, delete_agent_skill,
                        update_agent_skill, compress_conversation_to_knowledge,
@@ -35,7 +36,7 @@ use commands::{
     knowledge_import::auto_check_all_sessions,
     agent_def::{list_agent_definitions, save_agent_definition, update_agent_definition,
                 delete_agent_definition, toggle_agent_definition, wake_agent_definition,
-                list_ephemeral_agents, clear_ephemeral_agents},
+                list_ephemeral_agents, clear_ephemeral_agents, seed_agent_definitions},
     settings::{get_settings, save_personal_settings, get_system_settings, save_system_settings, get_api_key, set_api_key,
                get_vault_last_note, set_vault_last_note, check_vcredist,
                get_last_chat_conversation_id, set_last_chat_conversation_id,
@@ -222,10 +223,13 @@ pub fn run() {
                     };
                     seed_agent_tools(&db_seed, emb_url.as_deref()).await;
 
-                    // 內建 skill 種子（per-vault，幂等）
+                    // 內建 skill / agent definitions 種子（per-vault，幂等）
                     if let Ok(Some(vp)) = db::queries::get_setting(&db_seed, "system_current_vault_path").await {
                         if !vp.is_empty() {
                             seed_agent_skills(&db_seed, &vp, emb_url.as_deref()).await;
+                            seed_agent_definitions(&db_seed, &vp, emb_url.as_deref()).await;
+                            // 通知前端重新載入 agents / skills（解決 race condition）
+                            let _ = app_handle.emit("agent:seeded", serde_json::json!({}));
                         }
                     }
                 }
@@ -391,6 +395,8 @@ pub fn run() {
             delete_knowledge_item,
             rename_knowledge_item,
             suggest_kb_cards_for_item,
+            suggest_note_cards_for_item,
+            suggest_skill_cards_for_item,
             get_cached_page,
             save_agent_skill,
             list_agent_skills,

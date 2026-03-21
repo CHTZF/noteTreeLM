@@ -5,7 +5,7 @@ use serde_json::Value;
 use tauri::{Emitter, Manager};
 
 use crate::commands::ai::{
-    tool_list_recent_conversations, tool_create_agent_skill, call_external_ai_via_db, vault_tools,
+    tool_list_recent_conversations, call_external_ai_via_db, vault_tools,
 };
 use crate::commands::knowledge_import::tool_web_search;
 use crate::runtime::system_agent::{AgentRequest, NewSkillSpec};
@@ -211,26 +211,50 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // create_agent_skill — reflection agent 建立新技能規範
+    // create_agent_skill — 透過 generate_skills_via_tool_call 建立技能規範（LLM 知悉所有工具）
     {
-        let db = ctx.vault_db.clone();
+        let db  = ctx.vault_db.clone();
         let vid = ctx.vault_id.clone();
         let emb = ctx.emb_url.clone();
+        let app = ctx.app.clone();
         registry.register(
             "create_agent_skill".into(),
             Tool {
                 execute: Arc::new(move |args: Value| {
                     let title          = args["title"].as_str().unwrap_or("").to_string();
-                    let trigger        = args["trigger"].as_str().unwrap_or("").to_string();
+                    let trigger_hint   = args["trigger"].as_str().unwrap_or("").to_string();
                     let behavior       = args["behavior"].as_str().unwrap_or("").to_string();
                     let injection_mode = args["injection_mode"].as_str().unwrap_or("passive").to_string();
                     let db  = db.clone();
                     let vid = vid.clone();
                     let emb = emb.clone();
+                    let app = app.clone();
                     Box::pin(async move {
-                        Ok(Value::String(
-                            tool_create_agent_skill(&db, &vid, &title, &trigger, &behavior, &injection_mode, emb.as_deref()).await
-                        ))
+                        // 取得 llama server URL
+                        let app_state = app.state::<crate::state::AppState>();
+                        let port = *app_state.llama_actual_port.lock().await;
+                        let Some(base_url) = port.map(|p| format!("http://127.0.0.1:{}", p)) else {
+                            return Err("LLM server 未啟動，無法建立技能規範".to_string());
+                        };
+                        let client = reqwest::Client::new();
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        // 以 title + trigger + behavior 組成知識上下文
+                        let context = format!(
+                            "技能標題：{}\n觸發語境：{}\n行為描述：{}\n注入模式：{}",
+                            title, trigger_hint, behavior, injection_mode
+                        );
+                        let skills = crate::commands::knowledge_import::generate_skills_via_tool_call(
+                            &client, &base_url, &db, &vid, "", &context, emb.as_deref(), now_ms,
+                        ).await;
+                        if skills.is_empty() {
+                            Ok(Value::String("技能建立失敗：LLM 未能生成有效技能規範".to_string()))
+                        } else {
+                            Ok(Value::String(format!(
+                                "✅ 已建立 {} 個技能規範：{}",
+                                skills.len(),
+                                skills.iter().map(|s| s.title.as_str()).collect::<Vec<_>>().join("、")
+                            )))
+                        }
                     })
                 }),
                 rollback: None,

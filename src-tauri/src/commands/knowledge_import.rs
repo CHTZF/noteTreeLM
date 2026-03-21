@@ -2832,6 +2832,372 @@ pub async fn delete_agent_skill(
     Ok(())
 }
 
+/// 透過 tool-calling 讓 LLM 自行決定技能規範的 tool_calls（知道全部工具）。
+/// LLM 唯一可呼叫的工具是 create_agent_skill，可呼叫 1-2 次。
+/// 回傳持久化後的 AgentSkillRecord 列表。
+pub async fn generate_skills_via_tool_call(
+    client: &reqwest::Client,
+    base_url: &str,
+    db: &crate::db::surreal::SurrealDb,
+    vault_id: &str,
+    item_id: &str,
+    knowledge_context: &str,
+    emb_url: Option<&str>,
+    now_ms: i64,
+) -> Vec<AgentSkillRecord> {
+    // 從 vault_tools() 提取所有工具名稱+描述，以文字形式注入 system prompt
+    let tools_desc: String = crate::commands::ai::vault_tools()
+        .as_array()
+        .map(|arr| {
+            arr.iter().filter_map(|t| {
+                let f = t.get("function")?;
+                let name = f.get("name")?.as_str()?;
+                let desc = f.get("description")?.as_str().unwrap_or("");
+                Some(format!("- **{}**: {}", name, desc.lines().next().unwrap_or(desc)))
+            }).collect::<Vec<_>>().join("\n")
+        })
+        .unwrap_or_default();
+
+    let system_prompt = format!(
+        "你是技能規範生成助理。根據以下知識內容，設計 1-2 個 Agent 技能規範。\n\
+         \n\
+         ## 系統可用工具（tool_calls 只能從此清單選擇）\n\
+         {tools_desc}\n\
+         \n\
+         ## 規則\n\
+         - trigger 以「當…時」開頭，明確描述觸發情境\n\
+         - behavior 為具體可執行的操作指令（先做A，再做B）\n\
+         - tool_calls 只選真正需要的工具，寧少勿多\n\
+         - injection_mode：passive（embedding 比對觸發）或 active（永遠注入）\n\
+         - agent_scope：all / main / search / write / research / memory\n\
+         - 若知識不適合產生技能，不要呼叫工具\n\
+         請呼叫 create_agent_skill 建立技能規範（最多 2 次）。"
+    );
+
+    // create_agent_skill 是唯一可呼叫的工具
+    let callable_tool = serde_json::json!([{
+        "type": "function",
+        "function": {
+            "name": "create_agent_skill",
+            "description": "建立新技能規範（預設未啟用，使用者可審核後啟用）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title":          { "type": "string", "description": "技能標題" },
+                    "trigger":        { "type": "string", "description": "觸發情境描述，以「當…時」開頭" },
+                    "behavior":       { "type": "string", "description": "具體操作指令" },
+                    "tool_calls":     { "type": "array", "items": { "type": "string" },
+                                        "description": "此技能啟用時注入的工具名稱列表" },
+                    "injection_mode": { "type": "string", "enum": ["passive", "active"],
+                                        "description": "passive = embedding 比對觸發，active = 永遠注入" },
+                    "agent_scope":    { "type": "string",
+                                        "enum": ["all","main","search","write","research","memory"],
+                                        "description": "適用的 agent 範疇" }
+                },
+                "required": ["title", "trigger", "behavior"]
+            }
+        }
+    }]);
+
+    let body = serde_json::json!({
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user",   "content": knowledge_context },
+        ],
+        "tools": callable_tool,
+        "tool_choice": "auto",
+        "stream": false,
+        "temperature": 0.3,
+        "max_tokens": 1200,
+    });
+
+    let Ok(resp) = client
+        .post(format!("{}/v1/chat/completions", base_url))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(90))
+        .send().await
+    else { return vec![]; };
+
+    let Ok(json) = resp.json::<serde_json::Value>().await
+    else { return vec![]; };
+
+    // 解析 tool_calls（LLM 可能呼叫 1-2 次 create_agent_skill）
+    let tool_calls = json
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut saved: Vec<AgentSkillRecord> = Vec::new();
+
+    for tc in &tool_calls {
+        let fn_name = tc.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or("");
+        if fn_name != "create_agent_skill" { continue; }
+
+        let args_str = tc.pointer("/function/arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+        let Ok(args) = serde_json::from_str::<serde_json::Value>(args_str) else { continue; };
+
+        let title   = args["title"].as_str().unwrap_or("未命名技能").to_string();
+        let trigger = args["trigger"].as_str().unwrap_or("").to_string();
+        let behavior= args["behavior"].as_str().unwrap_or("").to_string();
+        let mode    = match args["injection_mode"].as_str() {
+            Some("active") => "active",
+            _              => "passive",
+        };
+        let scope = valid_scope(args["agent_scope"].as_str().unwrap_or("all")).to_string();
+
+        // 驗證 tool_calls：每個名稱必須存在於 vault_tools()
+        let valid_names: std::collections::HashSet<String> = crate::commands::ai::vault_tools()
+            .as_array().map(|arr| {
+                arr.iter().filter_map(|t| {
+                    t.pointer("/function/name")?.as_str().map(|s| s.to_string())
+                }).collect()
+            }).unwrap_or_default();
+
+        let tool_calls_vec: Vec<String> = args["tool_calls"]
+            .as_array()
+            .map(|a| a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .filter(|n| valid_names.contains(n))
+                .collect())
+            .unwrap_or_default();
+
+        // 計算 trigger embedding
+        let trigger_embedding: Option<Vec<f32>> = if let Some(url) = emb_url {
+            let v = crate::commands::ai::get_embedding(client, url, &trigger).await;
+            if v.is_empty() { None } else { Some(v) }
+        } else { None };
+
+        let skill_id = uuid::Uuid::new_v4().to_string();
+        let insert_result = db.query(
+            "INSERT INTO agent_skills \
+             (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
+              tool_calls, is_active, injection_mode, agent_scope, trigger_count, trigger_embedding, created_at) \
+             VALUES ($sid, $vid, $kid, $title, $trigger, $behavior, \
+                     $tools, false, $mode, $scope, 0, $emb, time::now())"
+        )
+        .bind(("sid",     skill_id.clone()))
+        .bind(("vid",     vault_id.to_owned()))
+        .bind(("kid",     item_id.to_owned()))
+        .bind(("title",   title.clone()))
+        .bind(("trigger", trigger.clone()))
+        .bind(("behavior",behavior.clone()))
+        .bind(("tools",   tool_calls_vec.clone()))
+        .bind(("mode",    mode.to_string()))
+        .bind(("scope",   scope.clone()))
+        .bind(("emb",     trigger_embedding))
+        .await;
+
+        if let Err(e) = insert_result {
+            eprintln!("[generate_skills] INSERT agent_skills FAILED: {e}");
+            continue;
+        }
+
+        saved.push(AgentSkillRecord {
+            skill_id,
+            vault_id: vault_id.to_owned(),
+            knowledge_item_id: item_id.to_owned(),
+            title,
+            trigger,
+            behavior,
+            tool_calls: tool_calls_vec,
+            is_active: false,
+            injection_mode: mode.to_string(),
+            agent_scope: scope,
+            trigger_count: 0,
+            last_triggered_at: None,
+            created_at: now_ms,
+        });
+    }
+
+    saved
+}
+
+// ── 共用：載入知識項目 ─────────────────────────────────────────────────────
+async fn load_ki_context(
+    db: &crate::db::surreal::SurrealDb,
+    vault_id: &str,
+    item_id: &str,
+) -> Result<(String, String, String), AppError> {
+    #[derive(Deserialize)]
+    struct KIRow2 { title: String, ai_summary: String, source_refs: Option<serde_json::Value> }
+    let mut resp = db.query(
+        "SELECT title, ai_summary, source_refs FROM knowledge_items \
+         WHERE vault_id = $vid AND item_id = $iid LIMIT 1"
+    )
+    .bind(("vid", vault_id.to_string()))
+    .bind(("iid", item_id.to_string()))
+    .await.map_err(|e| AppError::Database(e.to_string()))?;
+
+    let row = resp.take::<Vec<KIRow2>>(0)
+        .map_err(|e| AppError::Database(format!("KIRow deserialize: {e}")))?
+        .into_iter().next()
+        .ok_or_else(|| AppError::Import(format!("knowledge item not found: {}", item_id)))?;
+
+    let source_refs: Vec<KnowledgeRef> = row.source_refs
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let refs_text = source_refs.iter()
+        .map(|r| format!("- [{}]({})", r.title, r.path))
+        .collect::<Vec<_>>().join("\n");
+
+    let user_content = format!(
+        "## 標題\n{}\n\n## AI 整理摘要\n{}\n\n## 來源\n{}",
+        row.title, row.ai_summary, refs_text
+    );
+    Ok((row.title, row.ai_summary, user_content))
+}
+
+// ── 筆記卡片 system prompt（共用）────────────────────────────────────────────
+fn note_card_system_prompt() -> &'static str {
+    r#"你是知識管理 AI 助理，根據提供的知識內容，回傳嚴格 JSON（不含其他文字）：
+
+{
+  "note_cards": [
+    {
+      "title": "卡片標題",
+      "template": "concept | procedure | reference",
+      "content": "完整 markdown（含 frontmatter）",
+      "reason": "為什麼值得建立這張卡片"
+    }
+  ]
+}
+
+規則：
+- 2-3 張，template 限 concept/procedure/reference
+- content frontmatter 格式：---\nstatus: draft\ntags: [concept]\n---
+
+note_cards content 格式範例（concept）：
+---
+status: draft
+tags: [concept]
+---
+
+# 標題
+
+## 定義
+
+> 簡短定義
+
+## 詳細說明
+
+（從知識摘要中提取的核心內容）
+
+## 來源
+
+- 原始知識標題"#
+}
+
+/// 只生成筆記卡片建議（不觸發技能規範）。
+/// 完成後 emit kb:note_cards_ready 事件。
+#[tauri::command]
+pub async fn suggest_note_cards_for_item(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    item_id: String,
+) -> Result<(), AppError> {
+    let vault_id = state.get_vault_id().await?;
+    let db = &state.db;
+    let (_, _, user_content) = load_ki_context(db, &vault_id, &item_id).await?;
+
+    let base_url = crate::commands::ai::ensure_server_running(state.inner(), &app).await
+        .map_err(|e| AppError::AI(e.to_string()))?;
+    let client = reqwest::Client::new();
+
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": note_card_system_prompt()},
+            {"role": "user",   "content": &user_content},
+        ],
+        "stream": false,
+        "temperature": 0.3,
+        "max_tokens": 1500,
+    });
+    let response = client
+        .post(format!("{}/v1/chat/completions", base_url))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(90))
+        .send().await.map_err(|e| AppError::AI(e.to_string()))?;
+
+    let json: serde_json::Value = response.json().await
+        .map_err(|e| AppError::AI(format!("回應解析失敗：{}", e)))?;
+    let raw = json["choices"][0]["message"]["content"]
+        .as_str().unwrap_or("").trim().to_string();
+    let obj_start = raw.find('{').unwrap_or(0);
+    let obj_end   = raw.rfind('}').map(|i| i + 1).unwrap_or(raw.len());
+
+    #[derive(Deserialize, Default)]
+    struct NoteCardsOnly { #[serde(default)] note_cards: Vec<KBCardSuggestion> }
+    let parsed: NoteCardsOnly = serde_json::from_str(&raw[obj_start..obj_end])
+        .unwrap_or_default();
+
+    // 持久化：清除同 item 舊建議
+    let now_ms = chrono::Local::now().timestamp_millis();
+    let _ = db.query(
+        "DELETE FROM kb_suggestions WHERE vault_id = $vid AND page_id = $pid"
+    ).bind(("vid", vault_id.clone())).bind(("pid", item_id.clone())).await;
+
+    for s in &parsed.note_cards {
+        let sid = uuid::Uuid::new_v4().to_string();
+        let _ = db.query(
+            "INSERT INTO kb_suggestions \
+             (suggestion_id, vault_id, session_id, page_id, title, template, content, reason, created_at) \
+             VALUES ($sid, $vid, $sess, $pid, $title, $tmpl, $content, $reason, $now)"
+        )
+        .bind(("sid", sid)).bind(("vid", vault_id.clone()))
+        .bind(("sess", item_id.clone())).bind(("pid", item_id.clone()))
+        .bind(("title", s.title.clone())).bind(("tmpl", s.template.clone()))
+        .bind(("content", s.content.clone())).bind(("reason", s.reason.clone()))
+        .bind(("now", now_ms))
+        .await;
+    }
+
+    let _ = app.emit("kb:note_cards_ready", serde_json::json!({
+        "item_id": &item_id,
+        "note_cards": &parsed.note_cards,
+    }));
+    Ok(())
+}
+
+/// 只生成技能規範建議（不觸發筆記卡片）。
+/// 完成後 emit kb:skill_cards_ready 事件。
+#[tauri::command]
+pub async fn suggest_skill_cards_for_item(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    item_id: String,
+) -> Result<(), AppError> {
+    let vault_id = state.get_vault_id().await?;
+    let db = &state.db;
+    let (_, _, user_content) = load_ki_context(db, &vault_id, &item_id).await?;
+
+    let base_url = crate::commands::ai::ensure_server_running(state.inner(), &app).await
+        .map_err(|e| AppError::AI(e.to_string()))?;
+    let client = reqwest::Client::new();
+    let now_ms = chrono::Local::now().timestamp_millis();
+
+    // 清除舊技能建議
+    let _ = db.query(
+        "DELETE FROM agent_skills WHERE vault_id = $vid AND knowledge_item_id = $kid"
+    ).bind(("vid", vault_id.clone())).bind(("kid", item_id.clone())).await;
+
+    let emb_url: Option<String> = {
+        let port = *state.embedding_actual_port.lock().await;
+        port.map(|p| format!("http://127.0.0.1:{}", p))
+    };
+
+    let saved_skills = generate_skills_via_tool_call(
+        &client, &base_url, db, &vault_id, &item_id,
+        &user_content, emb_url.as_deref(), now_ms,
+    ).await;
+
+    let _ = app.emit("kb:skill_cards_ready", serde_json::json!({
+        "item_id": &item_id,
+        "skill_cards": &saved_skills,
+    }));
+    Ok(())
+}
+
 /// 為知識項目生成 AI 建議卡片（筆記卡片 + 技能規範）。
 /// 改為非串流，LLM 回傳結構化 JSON；技能規範自動持久化並計算 embedding。
 /// 完成後發出 kb:suggestions_ready 事件。
@@ -2923,6 +3289,8 @@ tags: [concept]
     let base_url = crate::commands::ai::ensure_server_running(state.inner(), &app).await
         .map_err(|e| AppError::AI(e.to_string()))?;
     let client = reqwest::Client::new();
+
+    // ── Step A：note_cards（維持原本 JSON 方式）──────────────────────────
     let body = serde_json::json!({
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -2982,7 +3350,8 @@ tags: [concept]
         .await;
     }
 
-    // 持久化 skill_cards：清除舊建議再重新插入，並計算 trigger embedding
+    // ── Step B：skill_cards（tool-calling 方式，LLM 知道全部工具）──────────
+    // 清除舊建議
     let _ = db.query(
         "DELETE FROM agent_skills WHERE vault_id = $vid AND knowledge_item_id = $kid"
     ).bind(("vid", vault_id.clone())).bind(("kid", item_id.clone())).await;
@@ -2992,61 +3361,10 @@ tags: [concept]
         port.map(|p| format!("http://127.0.0.1:{}", p))
     };
 
-    let allowed = ["search_vault", "read_note", "list_structure"];
-    let mut saved_skills: Vec<AgentSkillRecord> = Vec::new();
-
-    for skill in &suggestions.skill_cards {
-        let skill_id = uuid::Uuid::new_v4().to_string();
-        let safe_tools: Vec<String> = skill.tool_calls.iter()
-            .filter(|t| allowed.contains(&t.as_str()))
-            .cloned().collect();
-
-        // 計算 trigger embedding（若 embedding server 就緒）
-        let trigger_embedding: Option<Vec<f32>> = if let Some(ref url) = emb_url {
-            let vec = crate::commands::ai::get_embedding(&client, url, &skill.trigger).await;
-            if vec.is_empty() { None } else { Some(vec) }
-        } else { None };
-
-        let mode = if skill.injection_mode == "active" { "active" } else { "passive" };
-        let scope = valid_scope(&skill.agent_scope).to_string();
-        let insert_result = db.query(
-            "INSERT INTO agent_skills \
-             (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
-              tool_calls, is_active, injection_mode, agent_scope, trigger_count, trigger_embedding, created_at) \
-             VALUES ($sid, $vid, $kid, $title, $trigger, $behavior, \
-                     $tools, false, $mode, $scope, 0, $emb, time::now())"
-        )
-        .bind(("sid", skill_id.clone()))
-        .bind(("vid", vault_id.clone()))
-        .bind(("kid", item_id.clone()))
-        .bind(("title", skill.title.clone()))
-        .bind(("trigger", skill.trigger.clone()))
-        .bind(("behavior", skill.behavior.clone()))
-        .bind(("tools", safe_tools.clone()))
-        .bind(("mode", mode.to_string()))
-        .bind(("scope", scope.clone()))
-        .bind(("emb", trigger_embedding))
-        .await;
-        if let Err(e) = insert_result {
-            eprintln!("[suggest_kb_cards] INSERT agent_skills FAILED: {e}");
-        }
-
-        saved_skills.push(AgentSkillRecord {
-            skill_id,
-            vault_id: vault_id.clone(),
-            knowledge_item_id: item_id.clone(),
-            title: skill.title.clone(),
-            trigger: skill.trigger.clone(),
-            behavior: skill.behavior.clone(),
-            tool_calls: safe_tools,
-            is_active: false,
-            injection_mode: skill.injection_mode.clone(),
-            agent_scope: scope,
-            trigger_count: 0,
-            last_triggered_at: None,
-            created_at: now_ms,
-        });
-    }
+    let saved_skills = generate_skills_via_tool_call(
+        &client, &base_url, db, &vault_id, &item_id,
+        &user_content, emb_url.as_deref(), now_ms,
+    ).await;
 
     // 發出 kb:suggestions_ready 事件（取代舊的 kb:suggestion_token / kb:suggestion_done）
     let _ = app.emit("kb:suggestions_ready", serde_json::json!({
@@ -3219,53 +3537,11 @@ tool_calls 只能包含：search_vault、read_note、list_structure（或空陣�
         });
     }
 
-    // ── 持久化 skill_candidates ────────────────────────────────────────────────
-    let allowed = ["search_vault", "read_note", "list_structure"];
-    let mut saved_skills: Vec<AgentSkillRecord> = Vec::new();
-
-    for skill in &compression.skill_candidates {
-        let skill_id = Uuid::new_v4().to_string();
-        let safe_tools: Vec<String> = skill.tool_calls.iter()
-            .filter(|t| allowed.contains(&t.as_str()))
-            .cloned().collect();
-
-        let trigger_embedding: Option<Vec<f32>> = if let Some(ref url) = emb_url {
-            let vec = get_embedding(&client, url, &skill.trigger).await;
-            if vec.is_empty() { None } else { Some(vec) }
-        } else { None };
-
-        let mode = if skill.injection_mode == "active" { "active" } else { "passive" };
-        let scope = valid_scope(&skill.agent_scope).to_string();
-        let _ = db.query(
-            "INSERT INTO agent_skills \
-             (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
-              tool_calls, is_active, injection_mode, agent_scope, trigger_count, trigger_embedding, created_at) \
-             VALUES ($sid, $vid, $kid, $title, $trigger, $behavior, \
-                     $tools, false, $mode, $scope, 0, $emb, time::now())"
-        )
-        .bind(("sid", skill_id.clone())).bind(("vid", vault_id.clone()))
-        .bind(("kid", item_id.clone())).bind(("title", skill.title.clone()))
-        .bind(("trigger", skill.trigger.clone())).bind(("behavior", skill.behavior.clone()))
-        .bind(("tools", safe_tools.clone())).bind(("mode", mode.to_string()))
-        .bind(("scope", scope.clone())).bind(("emb", trigger_embedding))
-        .await;
-
-        saved_skills.push(AgentSkillRecord {
-            skill_id,
-            vault_id: vault_id.clone(),
-            knowledge_item_id: item_id.clone(),
-            title: skill.title.clone(),
-            trigger: skill.trigger.clone(),
-            behavior: skill.behavior.clone(),
-            tool_calls: safe_tools,
-            is_active: false,
-            injection_mode: skill.injection_mode.clone(),
-            agent_scope: scope,
-            trigger_count: 0,
-            last_triggered_at: None,
-            created_at: now_ms,
-        });
-    }
+    // ── 持久化 skill_candidates（透過 generate_skills_via_tool_call，LLM 知悉所有工具）──────────
+    let saved_skills = generate_skills_via_tool_call(
+        &client, &base_url, db, &vault_id, &item_id,
+        &compression.knowledge_summary, emb_url.as_deref(), now_ms,
+    ).await;
 
     // emit kb:suggestions_ready（note_cards 為空，因為壓縮不產生筆記卡片）
     let _ = app.emit("kb:suggestions_ready", serde_json::json!({

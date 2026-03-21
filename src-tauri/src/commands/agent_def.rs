@@ -498,6 +498,189 @@ pub async fn wake_agent_definition(
     Ok(())
 }
 
+/// 種子內建 agent definitions（每次啟動幂等重建）。
+/// 包含：技能建立助理、排程助理、筆記整理助理。
+pub async fn seed_agent_definitions(db: &SurrealDb, vault_id: &str, emb_url: Option<&str>) {
+    if db.use_ns("notetreelm").use_db("main").await.is_err() { return; }
+
+    // 從 vault_tools() 提取所有工具清單（供技能建立助理 system_prompt 使用）
+    let tools_desc: String = crate::commands::ai::vault_tools()
+        .as_array()
+        .map(|arr| {
+            arr.iter().filter_map(|t| {
+                let f = t.get("function")?;
+                let name = f.get("name")?.as_str()?;
+                let desc = f.get("description")?.as_str().unwrap_or("");
+                Some(format!("- **{}**: {}", name, desc.lines().next().unwrap_or(desc)))
+            }).collect::<Vec<_>>().join("\n")
+        })
+        .unwrap_or_default();
+
+    struct BuiltinAgent {
+        id:         &'static str,
+        name:       &'static str,
+        description:&'static str,
+        kind:       &'static str,
+        tool_names: Vec<String>,
+        system_prompt: String,
+        max_rounds: i64,
+        trigger:    &'static str,
+    }
+
+    let agents: Vec<BuiltinAgent> = vec![
+        BuiltinAgent {
+            id:          "builtin_skill_builder",
+            name:        "技能建立助理",
+            description: "根據知識描述自動設計並建立 Agent 技能規範",
+            kind:        "sub",
+            tool_names:  vec!["create_agent_skill".to_string()],
+            system_prompt: format!(
+                "你是技能建立助理，專門根據描述設計 Agent 技能規範。\n\
+                 \n\
+                 ## 系統可用工具（tool_calls 只能從此清單選擇）\n\
+                 {tools_desc}\n\
+                 \n\
+                 ## 任務\n\
+                 根據使用者提供的知識描述或需求，呼叫 create_agent_skill 設計 1-2 個技能規範。\n\
+                 每個技能必須有清楚的觸發情境（trigger）、分步驟的行為描述（behavior）、\n\
+                 以及從上方清單中選擇真正需要的工具（tool_calls）。\n\
+                 只呼叫 create_agent_skill 工具，不要輸出其他文字。"
+            ),
+            max_rounds:  3,
+            trigger:     "建立技能規範、新增技能、幫我設計skill、創建技能、新建skill、design skill、create skill spec",
+        },
+        BuiltinAgent {
+            id:          "builtin_scheduler",
+            name:        "排程助理",
+            description: "幫使用者設定任務提醒、定時通知與週期性排程",
+            kind:        "sub",
+            tool_names:  vec!["get_current_datetime".to_string(), "schedule_task".to_string()],
+            system_prompt: "你是排程助理，專門幫使用者設定任務提醒與排程。\n\
+                 \n\
+                 ## 工作流程\n\
+                 1. 先呼叫 get_current_datetime 確認現在的時間與時區。\n\
+                 2. 根據使用者描述計算執行時間 run_at（ISO 8601 含時區，如 2026-03-22T09:00:00+08:00）。\n\
+                 3. 若需重複，填 repeat_interval_seconds（每天=86400、每週=604800、每月≈2592000，不重複填 0）。\n\
+                 4. 呼叫 schedule_task（description、run_at、repeat_interval_seconds）完成排程。\n\
+                 5. 用友善語氣確認排程結果（告知使用者會在何時收到提醒）。\n\
+                 \n\
+                 ## 注意\n\
+                 - 時間若使用者只說「明天」、「三點」等相對語，需結合步驟1的現在時間計算。\n\
+                 - 永遠確保 run_at 是未來時間。"
+                 .to_string(),
+            max_rounds:  3,
+            trigger:     "排程、設定提醒、定時任務、設定鬧鐘、幫我排程、提醒我、到時候提醒、schedule、remind me、set reminder、每天提醒、每週提醒、固定時間、重複執行",
+        },
+        BuiltinAgent {
+            id:          "builtin_note_card_advisor",
+            name:        "筆記卡片助理",
+            description: "根據知識內容分析並建立 concept/procedure/reference 型筆記卡片",
+            kind:        "sub",
+            tool_names:  vec![
+                "search_vault".to_string(), "read_note".to_string(),
+                "create_note".to_string(), "plan_announce".to_string(),
+            ],
+            system_prompt: "你是筆記卡片助理，專門根據知識內容生成結構化的筆記卡片。\n\
+                 \n\
+                 ## 卡片模板類型\n\
+                 - **concept**：概念定義卡，包含定義、詳細說明、範例\n\
+                 - **procedure**：操作步驟卡，包含前提條件、步驟清單、注意事項\n\
+                 - **reference**：參考資料卡，包含摘要、重要連結、關鍵點清單\n\
+                 \n\
+                 ## 每張卡片的 Markdown 格式\n\
+                 ```\n\
+                 ---\n\
+                 status: draft\n\
+                 tags: [concept]\n\
+                 ---\n\
+                 \n\
+                 # 標題\n\
+                 \n\
+                 ## 定義 / 步驟 / 摘要\n\
+                 （核心內容）\n\
+                 ```\n\
+                 \n\
+                 ## 工作流程\n\
+                 1. 若使用者指定筆記，呼叫 search_vault 或 read_note 取得原始內容。\n\
+                 2. 分析內容，決定適合哪些模板類型（通常 2-3 張）。\n\
+                 3. 呼叫 plan_announce 列出將建立的卡片清單，deferred_tools 填 create_note。\n\
+                 4. 使用者確認後，逐一呼叫 create_note（路徑格式：cards/[標題].md）。\n\
+                 5. 回覆使用者已建立的卡片列表。"
+                 .to_string(),
+            max_rounds:  5,
+            trigger:     "建立筆記卡片、知識卡片、建議卡片、整理成卡片、幫我做成卡片、suggest note card、create note card、concept 卡片、procedure 卡片、reference 卡片",
+        },
+        BuiltinAgent {
+            id:          "builtin_note_summarizer",
+            name:        "筆記整理助理",
+            description: "閱讀多篇筆記並產出摘要、彙整或結構化整理",
+            kind:        "sub",
+            tool_names:  vec![
+                "search_vault".to_string(), "list_notes_in_folder".to_string(),
+                "list_structure".to_string(), "read_note".to_string(),
+                "create_note".to_string(), "update_note".to_string(),
+                "plan_announce".to_string(),
+            ],
+            system_prompt: "你是筆記整理助理，專門閱讀多篇筆記並產出摘要或結構化整理。\n\
+                 \n\
+                 ## 工作流程\n\
+                 1. 用 search_vault 或 list_notes_in_folder 取得相關筆記清單。\n\
+                 2. 對清單中每篇筆記呼叫 read_note 讀取完整內容。\n\
+                 3. 彙整後輸出結構化摘要（分節標題、要點、結論）。\n\
+                 4. 若使用者希望儲存整理成果，呼叫 plan_announce 說明計畫，\n\
+                    使用者確認後再 create_note 或 update_note 寫入。\n\
+                 \n\
+                 ## 注意\n\
+                 - 摘要要忠實反映筆記原意，不要自行發明內容。\n\
+                 - 若筆記數量超過 10 篇，先列出清單讓使用者確認範圍再逐一閱讀。"
+                 .to_string(),
+            max_rounds:  8,
+            trigger:     "整理筆記、摘要多篇、幫我歸納、彙整資料、總結所有、整合多篇、summarize notes、consolidate、把這些筆記整理、歸納重點、統整一下、彙整成一篇、做個摘要、整理一份報告",
+        },
+    ];
+
+    // 每次啟動重建（確保 system_prompt / tool_names 始終最新）
+    let _ = db.query(
+        "DELETE agent_definitions WHERE vault_id = $vid AND is_builtin = true"
+    )
+    .bind(("vid", vault_id.to_string()))
+    .await;
+
+    let client = reqwest::Client::new();
+    let skill_ids: Vec<String> = vec![];
+
+    for agent in &agents {
+        let trigger_embedding: Option<Vec<f32>> = if let Some(url) = emb_url {
+            let emb = crate::commands::ai::get_embedding(&client, url, agent.trigger).await;
+            if emb.is_empty() { None } else { Some(emb) }
+        } else {
+            None
+        };
+
+        let _ = db.query(
+            "INSERT INTO agent_definitions \
+             (def_id, vault_id, name, description, kind, skill_ids, tool_names, \
+              system_prompt, max_rounds, is_active, is_builtin, trigger, trigger_embedding, created_at, \
+              status, use_count, last_used_at, slept_at) \
+             VALUES ($did, $vid, $name, $desc, $kind, $skills, $tools, \
+                     $prompt, $rounds, true, true, $trigger, $temb, time::now(), \
+                     'active', 0, NONE, NONE)"
+        )
+        .bind(("did",     agent.id.to_string()))
+        .bind(("vid",     vault_id.to_string()))
+        .bind(("name",    agent.name.to_string()))
+        .bind(("desc",    agent.description.to_string()))
+        .bind(("kind",    agent.kind.to_string()))
+        .bind(("skills",  skill_ids.clone()))
+        .bind(("tools",   agent.tool_names.clone()))
+        .bind(("prompt",  agent.system_prompt.clone()))
+        .bind(("rounds",  agent.max_rounds))
+        .bind(("trigger", agent.trigger.to_string()))
+        .bind(("temb",    trigger_embedding))
+        .await;
+    }
+}
+
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
