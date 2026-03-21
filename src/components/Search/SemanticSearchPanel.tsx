@@ -2,6 +2,7 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
+
 interface Props {
   onOpenNote: (path: string) => void
 }
@@ -150,6 +151,7 @@ export default function SemanticSearchPanel({ onOpenNote }: Props) {
     }
   }, [query])
 
+
   const handleReindex = async () => {
     setIndexing(true); setError(null); setProgress(null)
 
@@ -199,20 +201,22 @@ export default function SemanticSearchPanel({ onOpenNote }: Props) {
           <span style={{ fontSize: '11px', fontWeight: 600, letterSpacing: '0.07em', color: 'var(--color-text-secondary)', textTransform: 'uppercase' }}>
             語意搜尋
           </span>
-          <button
-            onClick={handleReindex}
-            disabled={indexing}
-            title="重建 chunk 索引（首次使用或新增大量筆記後）"
-            style={{
-              fontSize: '11px', padding: '2px 8px', borderRadius: '4px',
-              border: '1px solid var(--color-border)',
-              background: 'transparent', color: 'var(--color-text-muted)',
-              cursor: indexing ? 'wait' : 'pointer',
-              opacity: indexing ? 0.5 : 1,
-            }}
-          >
-            {indexing ? '索引中…' : '重建索引'}
-          </button>
+          <div style={{ display: 'flex', gap: '4px' }}>
+            <button
+              onClick={handleReindex}
+              disabled={indexing}
+              title="重建 chunk 索引（首次使用或新增大量筆記後）"
+              style={{
+                fontSize: '11px', padding: '2px 8px', borderRadius: '4px',
+                border: '1px solid var(--color-border)',
+                background: 'transparent', color: 'var(--color-text-muted)',
+                cursor: indexing ? 'wait' : 'pointer',
+                opacity: indexing ? 0.5 : 1,
+              }}
+            >
+              {indexing ? '索引中…' : '重建索引'}
+            </button>
+          </div>
         </div>
 
         {/* Stats row */}

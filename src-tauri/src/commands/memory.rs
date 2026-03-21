@@ -375,7 +375,7 @@ pub async fn distill_preferences(state: State<'_, AppState>) -> Result<(), AppEr
 
     let _ = vault_db.query(
         "INSERT INTO agent_skills \
-         (skill_id, vault_id, title, trigger, behavior, auto_tool_calls, \
+         (skill_id, vault_id, title, trigger, behavior, tool_calls, \
           is_active, injection_mode, trigger_count, created_at) \
          VALUES ($sid, $vid, $title, $trigger, $behavior, [], true, 'active', 0, $now)"
     )
@@ -458,7 +458,7 @@ pub async fn get_conversation_ratings(
 
 // ─── Tool Pattern Analysis ────────────────────────────────────────────────────
 
-/// 分析最近對話中的工具呼叫序列，自動生成/更新技能規範（auto_tool_calls）
+/// 分析最近對話中的工具呼叫序列，自動生成/更新技能規範（tool_calls）
 #[tauri::command]
 pub async fn analyze_tool_patterns(state: State<'_, AppState>) -> Result<u32, AppError> {
     let vault_id = match state.get_vault_id().await {
@@ -634,7 +634,7 @@ pub async fn analyze_tool_patterns(state: State<'_, AppState>) -> Result<u32, Ap
 
         let _ = vault_db.query(
             "INSERT INTO agent_skills \
-             (skill_id, vault_id, title, trigger, behavior, auto_tool_calls, \
+             (skill_id, vault_id, title, trigger, behavior, tool_calls, \
               is_active, injection_mode, trigger_count, created_at) \
              VALUES ($sid, $vid, $title, $trigger, $behavior, $tools, \
                      false, 'passive', 0, $now)"

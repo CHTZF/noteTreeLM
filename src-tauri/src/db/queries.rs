@@ -23,8 +23,7 @@ pub async fn get_setting(db: &SurrealDb, key: &str) -> crate::error::Result<Opti
 
 pub async fn set_setting(db: &SurrealDb, key: &str, value: &str) -> crate::error::Result<()> {
     db.query(
-        "INSERT INTO settings (key, value) VALUES ($key, $value)
-         ON DUPLICATE KEY UPDATE value = $value, updated_at = time::now()",
+        "UPSERT settings SET key = $key, value = $value, updated_at = time::now() WHERE key = $key",
     )
     .bind(("key", key.to_owned()))
     .bind(("value", value.to_owned()))
@@ -61,9 +60,7 @@ pub async fn set_user_setting(
     value: &str,
 ) -> crate::error::Result<()> {
     db.query(
-        "INSERT INTO user_settings (username, key, value)
-         VALUES ($username, $key, $value)
-         ON DUPLICATE KEY UPDATE value = $value, updated_at = time::now()",
+        "UPSERT user_settings SET username = $username, key = $key, value = $value, updated_at = time::now() WHERE username = $username AND key = $key",
     )
     .bind(("username", username.to_owned()))
     .bind(("key", key.to_owned()))
@@ -106,9 +103,7 @@ pub async fn set_vault_last_note(
     note_path: &str,
 ) -> crate::error::Result<()> {
     db.query(
-        "INSERT INTO vault_states (vault_path, last_open_note)
-         VALUES ($vault_path, $note_path)
-         ON DUPLICATE KEY UPDATE last_open_note = $note_path, updated_at = time::now()",
+        "UPSERT vault_states SET vault_path = $vault_path, last_open_note = $note_path, updated_at = time::now() WHERE vault_path = $vault_path",
     )
     .bind(("vault_path", vault_path.to_owned()))
     .bind(("note_path", note_path.to_owned()))

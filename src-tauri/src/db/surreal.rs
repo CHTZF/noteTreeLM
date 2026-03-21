@@ -10,12 +10,110 @@ pub type SurrealDb = Arc<Surreal<Db>>;
 
 /// Schema 版本：每次修改 apply_schema 或 insert_default_settings 時遞增，
 /// 確保已安裝的客戶端會重新執行一次 DDL，之後快取跳過。
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 7;
+
+// 要備份的 tables（搜尋無關的重要資料）
+const BACKUP_TABLES: &[&str] = &[
+    "settings", "user_settings", "users", "sessions",
+    "vault_states", "agent_skills", "agent_definitions",
+    "skill_usage_log", "conversations", "memory_rules",
+];
+
+/// 匯出指定 tables 到 JSON 備份檔（app_data_dir/db_backup.json）
+pub async fn export_backup(db: &Surreal<Db>, app_data_dir: &Path) -> crate::error::Result<()> {
+    let mut root = serde_json::Map::new();
+    for &table in BACKUP_TABLES {
+        let mut resp = db
+            .query(format!("SELECT * OMIT id FROM {}", table))
+            .await
+            .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+        let rows: Vec<serde_json::Value> = resp.take(0)
+            .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+        root.insert(table.to_string(), serde_json::Value::Array(rows));
+    }
+    let json = serde_json::to_string(&root)
+        .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+    tokio::fs::write(app_data_dir.join("db_backup.json"), json).await?;
+    Ok(())
+}
+
+/// 從備份檔還原 tables，回傳每個 table 還原的筆數
+async fn restore_backup(
+    db: &Surreal<Db>,
+    app_data_dir: &Path,
+) -> std::collections::HashMap<String, usize> {
+    let mut counts = std::collections::HashMap::new();
+    let backup_path = app_data_dir.join("db_backup.json");
+    let Ok(json) = tokio::fs::read_to_string(&backup_path).await else { return counts };
+    let Ok(root) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json)
+        else { return counts };
+    for (table, value) in &root {
+        let Some(rows) = value.as_array() else { continue };
+        if rows.is_empty() { continue }
+        let mut restored = 0usize;
+        for chunk in rows.chunks(50) {
+            let r: Result<Vec<serde_json::Value>, _> = db
+                .insert(table.as_str())
+                .content(chunk.to_vec())
+                .await;
+            if r.is_ok() { restored += chunk.len(); }
+        }
+        counts.insert(table.clone(), restored);
+    }
+    let _ = tokio::fs::remove_file(&backup_path).await;
+    counts
+}
+
+/// 寫入修復 log（app_data_dir/db_repair_logs/ 目錄下）
+async fn write_repair_log(
+    app_data_dir: &Path,
+    reason: &str,
+    result: &str,
+    restored_counts: &std::collections::HashMap<String, usize>,
+) {
+    let logs_dir = app_data_dir.join("db_repair_logs");
+    let _ = tokio::fs::create_dir_all(&logs_dir).await;
+
+    let ts = chrono::Utc::now();
+    let filename = format!("repair_{}.json", ts.format("%Y%m%d_%H%M%S"));
+
+    let log = serde_json::json!({
+        "timestamp": ts.to_rfc3339(),
+        "reason": reason,
+        "result": result,
+        "tables_restored": restored_counts,
+    });
+    let _ = tokio::fs::write(
+        logs_dir.join(filename),
+        serde_json::to_string_pretty(&log).unwrap_or_default(),
+    ).await;
+}
 
 /// 初始化 SurrealDB（embedded SurrealKV）
 /// 所有資料存於 app_data_dir/surrealdb/
 pub async fn init_db(app_data_dir: &Path) -> crate::error::Result<SurrealDb> {
     let db_path = app_data_dir.join("surrealdb");
+
+    // 若上次執行留下損壞標記，刪除舊 DB 並準備重建
+    let repair_flag = app_data_dir.join("db_needs_repair");
+    let repair_reason = if repair_flag.exists() {
+        let reason = tokio::fs::read_to_string(&repair_flag).await
+            .unwrap_or_else(|_| "未知原因".to_string());
+        let _ = tokio::fs::remove_dir_all(&db_path).await;
+        let _ = tokio::fs::remove_file(&repair_flag).await;
+        let _ = tokio::fs::remove_file(app_data_dir.join("schema_version")).await;
+        Some(reason)
+    } else {
+        None
+    };
+
+    // DB 目錄不存在（手動刪除或首次安裝）時，強制清除 schema_version 快取，
+    // 確保 apply_schema 重新執行以建立所有 table 與 UNIQUE index。
+    let db_was_empty = !db_path.exists();
+    if db_was_empty {
+        let _ = tokio::fs::remove_file(app_data_dir.join("schema_version")).await;
+    }
+
     tokio::fs::create_dir_all(&db_path).await?;
 
     let db = Surreal::new::<SurrealKv>(db_path.to_string_lossy().as_ref())
@@ -37,8 +135,32 @@ pub async fn init_db(app_data_dir: &Path) -> crate::error::Result<SurrealDb> {
         apply_schema(&db).await?;
         let _ = tokio::fs::write(&version_file, SCHEMA_VERSION.to_string()).await;
     } else {
-        // DDL 已快取，仍需插入可能新增的預設設定
         insert_default_settings(&db).await?;
+    }
+
+    // 若有備份檔（prepare_db_repair 產生）且 DB 剛被清空，還原後刪除備份並寫入 log
+    let backup_path = app_data_dir.join("db_backup.json");
+    if repair_reason.is_some() && backup_path.exists() {
+        let counts = restore_backup(&db, app_data_dir).await;
+        // 還原後刪除備份檔，避免下次啟動再次覆蓋使用者設定
+        let _ = tokio::fs::remove_file(&backup_path).await;
+        let reason = repair_reason.as_deref()
+            .unwrap_or("手動觸發修復（prepare_db_repair）");
+        let result = if counts.is_empty() {
+            "還原失敗：備份檔無有效資料"
+        } else {
+            "成功"
+        };
+        write_repair_log(app_data_dir, reason, result, &counts).await;
+    } else if let Some(reason) = &repair_reason {
+        // 有修復 flag 但無備份（panic hook 觸發時尚未備份）
+        write_repair_log(
+            app_data_dir, reason, "資料庫已重建，無備份可還原",
+            &std::collections::HashMap::new(),
+        ).await;
+    } else if backup_path.exists() {
+        // 有備份但未觸發修復（殘留檔案）→ 直接刪除，不覆蓋現有 DB
+        let _ = tokio::fs::remove_file(&backup_path).await;
     }
 
     Ok(Arc::new(db))
@@ -233,15 +355,15 @@ async fn apply_schema(db: &Surreal<Db>) -> crate::error::Result<()> {
         "DEFINE FIELD IF NOT EXISTS links      ON chunks TYPE array<string> DEFAULT [];",
         "DEFINE FIELD IF NOT EXISTS chunk_type ON chunks TYPE string DEFAULT 'text';",
         "DEFINE FIELD IF NOT EXISTS word_count ON chunks TYPE int DEFAULT 0;",
-        "DEFINE FIELD IF NOT EXISTS updated_at ON chunks TYPE datetime;",
+        "DEFINE FIELD IF NOT EXISTS updated_at ON chunks TYPE datetime DEFAULT time::now();",
         "DEFINE FIELD IF NOT EXISTS status     ON chunks TYPE string DEFAULT '';",
-        // embedding 欄位（Phase 3 時啟用 HNSW）
         "DEFINE FIELD IF NOT EXISTS embedding  ON chunks TYPE option<array<float>>;",
         "DEFINE INDEX IF NOT EXISTS idx_chunks_vault_file ON chunks FIELDS vault_id, file_path;",
         "DEFINE INDEX IF NOT EXISTS idx_chunks_vault_id   ON chunks FIELDS vault_id, chunk_id UNIQUE;",
-        // BM25 FTS on chunks
-        "DEFINE INDEX IF NOT EXISTS ft_chunks ON chunks FIELDS content SEARCH ANALYZER note_analyzer BM25;",
-        // HNSW vector index（Phase 3：啟用時需指定 DIMENSION N，目前略過）
+        // HNSW vector index for bge-m3 (1024-dim cosine)
+        // Records with embedding = NONE are automatically excluded from the index.
+        // FTS is handled by SQLite FTS5 (search.db); no BM25 index here.
+        "DEFINE INDEX IF NOT EXISTS idx_chunks_hnsw ON chunks FIELDS embedding HNSW DIMENSION 1024 DIST COSINE;",
 
         // ── Import Sessions（知識點匯入） ───────────────────────────
         "DEFINE TABLE IF NOT EXISTS import_sessions SCHEMAFULL;",
@@ -322,7 +444,7 @@ async fn apply_schema(db: &Surreal<Db>) -> crate::error::Result<()> {
         "DEFINE FIELD IF NOT EXISTS title                ON agent_skills TYPE string DEFAULT '';",
         "DEFINE FIELD IF NOT EXISTS trigger              ON agent_skills TYPE string DEFAULT '';",
         "DEFINE FIELD IF NOT EXISTS behavior             ON agent_skills TYPE string DEFAULT '';",
-        "DEFINE FIELD IF NOT EXISTS auto_tool_calls      ON agent_skills TYPE array<string> DEFAULT [];",
+        "DEFINE FIELD IF NOT EXISTS tool_calls      ON agent_skills TYPE array<string> DEFAULT [];",
         "DEFINE FIELD IF NOT EXISTS is_active            ON agent_skills TYPE bool DEFAULT true;",
         "DEFINE FIELD IF NOT EXISTS trigger_count        ON agent_skills TYPE int DEFAULT 0;",
         "DEFINE FIELD IF NOT EXISTS last_triggered_at    ON agent_skills TYPE option<datetime>;",
@@ -436,9 +558,10 @@ async fn insert_default_settings(db: &Surreal<Db>) -> crate::error::Result<()> {
         ("enable_auto_memory",  "false"),
         ("memory_threshold",    "20"),
     ];
+    // ON DUPLICATE KEY UPDATE value = value：key 已存在時保留現有值（真正 no-op）
     let batch = defaults.iter()
         .map(|(k, v)| format!(
-            "INSERT INTO settings (key, value) VALUES ('{}', '{}') ON DUPLICATE KEY UPDATE key = key;",
+            "INSERT INTO settings (`key`, `value`) VALUES ('{}', '{}') ON DUPLICATE KEY UPDATE `value` = `value`;",
             k, v
         ))
         .collect::<Vec<_>>()

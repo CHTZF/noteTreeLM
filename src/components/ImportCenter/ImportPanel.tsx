@@ -716,10 +716,10 @@ export default function ImportPanel() {
                     setDetailSkills(prev => prev.filter(s => s.skill_id !== id))
                     window.dispatchEvent(new CustomEvent('skills-changed'))
                   }}
-                  onUpdate={async (id, title, trigger, behavior, autoToolCalls, injectionMode, agentScope) => {
-                    await invoke('update_agent_skill', { skillId: id, title, trigger, behavior, autoToolCalls, injectionMode, agentScope })
+                  onUpdate={async (id, title, trigger, behavior, toolCalls, injectionMode, agentScope) => {
+                    await invoke('update_agent_skill', { skillId: id, title, trigger, behavior, toolCalls, injectionMode, agentScope })
                     setDetailSkills(prev => prev.map(s =>
-                      s.skill_id === id ? { ...s, title, trigger, behavior, auto_tool_calls: autoToolCalls, injection_mode: injectionMode as 'passive' | 'active', agent_scope: agentScope } : s
+                      s.skill_id === id ? { ...s, title, trigger, behavior, tool_calls: toolCalls, injection_mode: injectionMode as 'passive' | 'active', agent_scope: agentScope } : s
                     ))
                     window.dispatchEvent(new CustomEvent('skills-changed'))
                   }}
@@ -777,7 +777,7 @@ export function SkillsHub() {
         title: newTitle.trim(),
         trigger: newTrigger.trim(),
         behavior: newBehavior.trim(),
-        autoToolCalls: newTools,
+        toolCalls: newTools,
         injectionMode: newInjectionMode,
         agentScope: newAgentScope,
       })
@@ -791,10 +791,10 @@ export function SkillsHub() {
     }
   }
 
-  const handleUpdate = async (id: string, title: string, trigger: string, behavior: string, autoToolCalls: string[], injectionMode: string, agentScope: AgentScope) => {
-    await invoke('update_agent_skill', { skillId: id, title, trigger, behavior, autoToolCalls, injectionMode, agentScope })
+  const handleUpdate = async (id: string, title: string, trigger: string, behavior: string, toolCalls: string[], injectionMode: string, agentScope: AgentScope) => {
+    await invoke('update_agent_skill', { skillId: id, title, trigger, behavior, toolCalls, injectionMode, agentScope })
     setSkills(prev => prev.map(s =>
-      s.skill_id === id ? { ...s, title, trigger, behavior, auto_tool_calls: autoToolCalls, injection_mode: injectionMode as 'passive' | 'active', agent_scope: agentScope } : s
+      s.skill_id === id ? { ...s, title, trigger, behavior, tool_calls: toolCalls, injection_mode: injectionMode as 'passive' | 'active', agent_scope: agentScope } : s
     ))
   }
 
@@ -837,7 +837,7 @@ export function SkillsHub() {
             rows={3}
           />
           <div className="import-panel-v2__skill-edit-tools">
-            <span className="import-panel-v2__skill-edit-label">自動工具</span>
+            <span className="import-panel-v2__skill-edit-label">工具</span>
             {ALLOWED_TOOLS.map(tool => (
               <label key={tool} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11 }}>
                 <input
@@ -985,7 +985,13 @@ function fmtLastTriggered(ts: number | null): string | null {
   return `${days} 天前觸發`
 }
 
-const ALLOWED_TOOLS = ['search_vault', 'read_note', 'list_structure'] as const
+const ALLOWED_TOOLS = [
+  'search_vault', 'read_note', 'list_structure', 'list_notes_in_folder',
+  'open_note', 'create_note', 'update_note', 'append_to_note',
+  'delete_note', 'delete_folder', 'move_note', 'create_folder',
+  'plan_announce', 'query_memory', 'web_search', 'call_external_ai',
+  'get_current_datetime', 'show_toast',
+] as const
 const ALL_SCOPES: AgentScope[] = ['all', 'main', 'search', 'write', 'research', 'memory']
 const SCOPE_LABELS: Record<AgentScope, string> = {
   all: '全體', main: '主 Agent', search: '搜尋', write: '寫入', research: '研究', memory: '記憶',
@@ -1008,7 +1014,7 @@ function SkillCard({
   skill: AgentSkill
   onToggle: (id: string, active: boolean) => Promise<void>
   onDelete: (id: string) => Promise<void>
-  onUpdate?: (id: string, title: string, trigger: string, behavior: string, autoToolCalls: string[], injectionMode: string, agentScope: AgentScope) => Promise<void>
+  onUpdate?: (id: string, title: string, trigger: string, behavior: string, toolCalls: string[], injectionMode: string, agentScope: AgentScope) => Promise<void>
 }) {
   const [toggling, setToggling] = useState(false)
   const [editing, setEditing] = useState(false)
@@ -1016,7 +1022,7 @@ function SkillCard({
   const [editTitle, setEditTitle] = useState(skill.title)
   const [editTrigger, setEditTrigger] = useState(skill.trigger)
   const [editBehavior, setEditBehavior] = useState(skill.behavior)
-  const [editTools, setEditTools] = useState<string[]>(skill.auto_tool_calls)
+  const [editTools, setEditTools] = useState<string[]>(skill.tool_calls)
   const [editInjectionMode, setEditInjectionMode] = useState<'passive' | 'active'>(skill.injection_mode ?? 'passive')
   const [editAgentScope, setEditAgentScope] = useState<AgentScope>(skill.agent_scope ?? 'all')
 
@@ -1104,7 +1110,7 @@ function SkillCard({
             placeholder="應先...，再...，最後..."
           />
           <div className="import-panel-v2__skill-edit-tools">
-            <span className="import-panel-v2__skill-edit-label">自動工具</span>
+            <span className="import-panel-v2__skill-edit-label">工具</span>
             {ALLOWED_TOOLS.map(tool => (
               <label key={tool} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11 }}>
                 <input
@@ -1155,7 +1161,7 @@ function SkillCard({
               setEditTitle(skill.title)
               setEditTrigger(skill.trigger)
               setEditBehavior(skill.behavior)
-              setEditTools(skill.auto_tool_calls)
+              setEditTools(skill.tool_calls)
               setEditInjectionMode(skill.injection_mode ?? 'passive')
               setEditAgentScope(skill.agent_scope ?? 'all')
             }}>取消</button>
@@ -1165,8 +1171,8 @@ function SkillCard({
         <>
           <div className="import-panel-v2__skill-trigger"><strong>觸發：</strong>{skill.trigger}</div>
           <div className="import-panel-v2__skill-behavior"><strong>行為：</strong>{skill.behavior}</div>
-          {skill.auto_tool_calls.length > 0 && (
-            <div className="import-panel-v2__skill-tools">自動工具：{skill.auto_tool_calls.join('、')}</div>
+          {skill.tool_calls.length > 0 && (
+            <div className="import-panel-v2__skill-tools">工具：{skill.tool_calls.join('、')}</div>
           )}
           <div style={{ marginTop: 4, display: 'flex', gap: 4, flexWrap: 'wrap' }}>
             <span style={{

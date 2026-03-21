@@ -15,7 +15,7 @@ use tauri::{AppHandle, Emitter, State};
 
 // ─── Re-exports from sub-modules ──────────────────────────────────────────────
 pub use super::server::{
-    get_embedding, warmup_llama_server,
+    get_embedding, get_embeddings_batch, warmup_llama_server,
     stop_llama_server, get_llama_server_status, start_llama_server, restart_llama_server,
     warmup_embedding_server, get_embedding_server_status, check_embedding_endpoint,
     start_embedding_server, stop_embedding_server, restart_embedding_server,
@@ -505,6 +505,7 @@ pub async fn invoke_agent(
             vault_path.clone(),
             vault_db.clone(),
             vault_id_opt.clone().unwrap_or_default(),
+            state.sqlite.clone(),
             app.clone(),
             reg_emb_url.clone(),
             search_method_tx,
@@ -694,16 +695,23 @@ pub async fn invoke_agent(
                 .collect()
         };
 
-        let tools = vault_tools();
         let dispatcher = Dispatcher::new(Arc::clone(&registry));
         let tx = Arc::new(Transaction::new());
         let _ = tx.prepare().await;
         let mut final_text = String::new();
 
         // Skill pre-pass：active skills（永遠注入）+ passive skills（embedding 相似度匹配）
+        // 同時從命中的 skill.tool_calls 收集本輪所需工具子集（減少 context 用量）
         // 上限 1500 chars，保護 system message budget
-        if let Some(ref vid) = vault_id_opt {
-            if let Some((skill_text, _skill_titles)) = run_skill_pre_pass(
+        // 無 vault 或無 skill 觸發時的基本工具集（減少 context 用量）
+        // 無 skill 觸發時的最小工具集：search_skills 負責找出所需工具，plan_announce 寫入確認必需
+        let basic_tools = filter_vault_tools_by_names(&[
+            "search_skills".to_string(),
+            "plan_announce".to_string(),
+        ]);
+
+        let tools = if let Some(ref vid) = vault_id_opt {
+            if let Some((skill_text, skill_titles, required_tools)) = run_skill_pre_pass(
                 &vault_db, vid, &input, skill_emb_url.as_deref(), &client, "main",
                 query_vec_opt.clone(),  // 共用 memory 步驟已算好的向量
             ).await {
@@ -712,12 +720,29 @@ pub async fn invoke_agent(
                         let existing = sys["content"].as_str().unwrap_or("").to_string();
                         // 技能文字上限 1500 chars（防止過多 active skills 撐爆 context）
                         let skill_snippet: String = skill_text.chars().take(1500).collect();
-                        let new_content = format!("{}\n\n{}", existing, skill_snippet);
-                        *sys = serde_json::json!({"role": "system", "content": new_content});
+                        *sys = serde_json::json!({"role": "system", "content": format!("{}\n\n{}", existing, skill_snippet)});
                     }
                 }
+                // 技能觸發提示（前端顯示 ⚡ 套用技能：...）
+                if !skill_titles.is_empty() {
+                    (emit_fn)("agent:skills_activated".into(), serde_json::json!({
+                        "session_id": session_id,
+                        "titles": skill_titles,
+                    }));
+                }
+                // 命中的 skill 有指定 tool_calls → 只傳那些工具，大幅節省 context
+                if !required_tools.is_empty() {
+                    filter_vault_tools_by_names(&required_tools)
+                } else {
+                    basic_tools
+                }
+            } else {
+                basic_tools
             }
-        }
+        } else {
+            serde_json::Value::Array(vec![])  // 無 vault → 不給工具
+        };
+        let mut tools = tools;  // 允許 tool loop 中動態擴展（search_skills 命中後注入 skill tools）
 
         // 相關記憶注入（上限 1500 字元，切在筆記邊界避免截斷語義）
         if !memory_context.is_empty() {
@@ -784,7 +809,10 @@ pub async fn invoke_agent(
                 Some(Arc::clone(&state.agent_cancel)),
             ).await {
                 Ok(r) => r,
-                Err(e) => { eprintln!("[chat] llm error: {e}"); break; }
+                Err(e) => {
+                    eprintln!("[chat] llm error: {e}");
+                    return Err(AppError::AI(format!("{}", e)));
+                }
             };
             final_text = result.full_text.clone();
             if result.tool_calls.is_empty() { break; }
@@ -831,6 +859,36 @@ pub async fn invoke_agent(
 
             for ((tool_id, name, args), res) in result.tool_calls.iter().zip(results.iter()) {
                 let raw = res.as_str().map(String::from).unwrap_or_else(|| res.to_string());
+
+                // search_skills 動態注入：解析回傳 JSON，擴展本輪 tools 供後續 LLM 呼叫使用
+                let raw = if name == "search_skills" {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        // 擴展 tools（合併現有 + skill 指定工具）
+                        if let Some(arr) = v["required_tools"].as_array() {
+                            let names: Vec<String> = arr.iter()
+                                .filter_map(|x| x.as_str().map(String::from))
+                                .collect();
+                            if !names.is_empty() {
+                                // 合併現有 tools 中已有的（如 search_skills / plan_announce）+ skill tools
+                                let existing_names: Vec<String> = tools.as_array()
+                                    .map(|a| a.iter()
+                                        .filter_map(|t| t["function"]["name"].as_str().map(String::from))
+                                        .collect())
+                                    .unwrap_or_default();
+                                let mut all_names = existing_names;
+                                for n in &names { if !all_names.contains(n) { all_names.push(n.clone()); } }
+                                tools = filter_vault_tools_by_names(&all_names);
+                            }
+                        }
+                        // LLM 看到 behavior 文字，不是 JSON
+                        v["behavior"].as_str().map(String::from).unwrap_or(raw)
+                    } else {
+                        raw
+                    }
+                } else {
+                    raw
+                };
+
                 // Tool result 上限 3000 chars，防止大型 read_note 繞過 sliding window
                 const MAX_TOOL_RESULT: usize = 3000;
                 let res_str = if raw.chars().count() > MAX_TOOL_RESULT {
@@ -1027,7 +1085,7 @@ pub async fn tool_create_agent_skill(
     let result = db.query(
         "INSERT INTO agent_skills \
          (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
-          auto_tool_calls, is_active, injection_mode, trigger_count, trigger_embedding, created_at) \
+          tool_calls, is_active, injection_mode, trigger_count, trigger_embedding, created_at) \
          VALUES ($sid, $vid, 'reflection', $title, $trigger, $behavior, \
                  [], false, $mode, 0, $emb, time::now())"
     )
@@ -1519,6 +1577,27 @@ pub fn vault_tools() -> serde_json::Value {
         {
             "type": "function",
             "function": {
+                "name": "search_skills",
+                "description": "當使用者的請求沒有自動觸發技能時，主動搜尋語意相似的技能規範。\
+將你對使用者意圖的理解概括為簡短的 use_ask（標準化意圖，非原文）。\
+例如：使用者說「今天台北天氣如何」→ use_ask 為「查詢天氣」；「幫我 Google 一下新聞」→ use_ask 為「搜尋網路新聞」。\
+找到匹配技能後，請依照技能的 behavior 執行任務。\
+若沒有匹配技能，直接回應使用者即可。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "use_ask": {
+                            "type": "string",
+                            "description": "使用者意圖的標準化概括（簡短、通用），用於語意搜尋技能庫。例如「查詢天氣」、「搜尋新聞」、「整理筆記」"
+                        }
+                    },
+                    "required": ["use_ask"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "search_web",
                 "description": "搜尋網路（使用 Brave Search），取得即時資訊",
                 "parameters": {
@@ -1562,6 +1641,24 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm_a == 0.0 || norm_b == 0.0 { return 0.0; }
     dot / (norm_a * norm_b)
+}
+
+/// 從 vault_tools() 中過濾出指定名稱的工具子集。
+/// plan_announce 永遠包含（寫入確認機制必需）。
+fn filter_vault_tools_by_names(names: &[String]) -> serde_json::Value {
+    const ALWAYS_INCLUDE: &[&str] = &["plan_announce"];
+    let name_set: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+    let filtered: Vec<serde_json::Value> = vault_tools()
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| {
+            let n = t["function"]["name"].as_str().unwrap_or("");
+            name_set.contains(n) || ALWAYS_INCLUDE.contains(&n)
+        })
+        .collect();
+    serde_json::Value::Array(filtered)
 }
 
 /// 將 vault_tools() 清單種入 agent_tools 表（冪等）。
@@ -1610,6 +1707,144 @@ pub async fn seed_agent_tools(db: &SurrealDb, emb_url: Option<&str>) {
             .bind(("name", name))
             .await;
         }
+    }
+}
+
+/// 為指定 vault 種入內建 skill（幂等）。
+/// 每個 skill 定義 trigger（用於 embedding 比對）和 tool_calls（工具過濾子集）。
+/// 使用 knowledge_item_id = "__builtin__" 標記，避免與使用者建立的 skill 混淆。
+pub async fn seed_agent_skills(db: &SurrealDb, vault_id: &str, emb_url: Option<&str>) {
+    // 明確設定 namespace / database（背景 task 不繼承 session 狀態）
+    if db.use_ns("notetreelm").use_db("main").await.is_err() { return; }
+    struct BuiltinSkill {
+        id: &'static str,
+        title: &'static str,
+        trigger: &'static str,
+        behavior: &'static str,
+        tools: &'static [&'static str],
+    }
+
+    let skills: &[BuiltinSkill] = &[
+        BuiltinSkill {
+            id: "builtin_open_note",
+            title: "打開/查看筆記",
+            trigger: "打開、開啟、open、打開筆記、開啟文件、跳轉到筆記、查看筆記、幫我看某篇、看一下某個、切換到筆記、show me the note、open note、display note、navigate to、go to note、讓我看看、帶我去、開那篇",
+            behavior: "步驟1：呼叫 search_vault，傳入使用者提到的筆記名稱作為 query（若包含 .md 副檔名請去除，例如「音頻處理.md」→ query 傳「音頻處理」），取得精確的檔案路徑（格式如 folder/note.md）。步驟2：用步驟1取得的路徑呼叫 open_note。步驟3：只回覆「已打開 [筆記名稱]」，絕對不要輸出筆記內容。",
+            tools: &["search_vault", "open_note"],
+        },
+        BuiltinSkill {
+            id: "builtin_edit_note",
+            title: "編輯/修改筆記",
+            trigger: "修改、編輯、更新、改、修改筆記、編輯文件、更新內容、改一下某篇、幫我改、修改某段、重寫某節、edit note、update note、revise、幫我更新、把這段改成、把內容換成、調整一下、改掉、替換內容、覆寫",
+            behavior: "步驟1：呼叫 search_vault 取得目標筆記的精確路徑。步驟2：呼叫 read_note 讀取完整現有內容。步驟3：呼叫 plan_announce 告知使用者將修改哪個檔案、改什麼內容，deferred_tools 填 update_note。步驟4：使用者確認後，將修改後的完整內容呼叫 update_note 寫入（path 使用步驟1的路徑，content 是完整新內容）。",
+            tools: &["search_vault", "read_note", "update_note", "plan_announce"],
+        },
+        BuiltinSkill {
+            id: "builtin_create_note",
+            title: "新增/建立筆記",
+            trigger: "建立、新增、寫、記、建立新筆記、寫一篇、新增文件、記錄下來、幫我新增、建立一份、寫個筆記、create note、new note、write a note、幫我寫、新建一個、記一下、存成筆記、建立文件、新增一篇",
+            behavior: "步驟1：若使用者未指定資料夾，先呼叫 list_structure（path 傳空字串）查看現有目錄結構，選擇合適的存放位置。步驟2：呼叫 plan_announce，告知使用者將建立的檔案路徑與內容摘要，deferred_tools 填 create_note。步驟3：使用者確認後，呼叫 create_note（path 格式為 folder/filename.md，content 為完整 Markdown 內容）。",
+            tools: &["list_structure", "create_note", "plan_announce"],
+        },
+        BuiltinSkill {
+            id: "builtin_append_note",
+            title: "追加/補充筆記內容",
+            trigger: "在筆記末尾加、補充內容、追加到筆記、把這個加進去、加到筆記裡、繼續寫到某篇、append to note、add to note、在後面加上、補上去、加一段、繼續記錄、把這段加進",
+            behavior: "步驟1：呼叫 search_vault 取得目標筆記的精確路徑。步驟2：呼叫 plan_announce，說明要追加的內容，deferred_tools 填 append_to_note。步驟3：使用者確認後，呼叫 append_to_note（path 使用步驟1的路徑，content 為要追加的文字，會自動加在末尾不覆蓋原有內容）。",
+            tools: &["search_vault", "append_to_note", "plan_announce"],
+        },
+        BuiltinSkill {
+            id: "builtin_search_note",
+            title: "搜尋/查詢筆記",
+            trigger: "搜尋、找、查、搜尋筆記、找資料、查某個主題、有沒有寫過、幫我找、找找看、查詢相關筆記、search notes、find note、look up、我有沒有寫、我有記過嗎、筆記裡有沒有、幫我查一下、找找有沒有、知識庫裡有",
+            behavior: "步驟1：呼叫 search_vault，query 填入使用者問題中的關鍵字，取得相關筆記清單與摘要。步驟2：根據搜尋結果回覆使用者找到哪些筆記。步驟3（可選）：若使用者需要看完整內容，用搜尋結果中的路徑呼叫 read_note；若使用者要打開筆記，呼叫 open_note。",
+            tools: &["search_vault", "read_note", "open_note"],
+        },
+        BuiltinSkill {
+            id: "builtin_summarize_notes",
+            title: "整理/摘要多篇筆記",
+            trigger: "整理筆記、摘要多篇、幫我歸納、整合資料、總結所有、彙整、整理一份、summarize notes、consolidate、幫我做個總結、把這些筆記整理、歸納重點、統整一下、彙整成一篇、做個摘要",
+            behavior: "步驟1：呼叫 list_notes_in_folder（folder 填目標資料夾路徑）或 search_vault 取得相關筆記清單。步驟2：對清單中每篇筆記呼叫 read_note 讀取完整內容（路徑從步驟1取得）。步驟3：彙整所有內容後輸出摘要。步驟4（可選）：若使用者要存成新筆記，呼叫 plan_announce 確認後再 create_note 建立。",
+            tools: &["search_vault", "list_notes_in_folder", "read_note", "create_note", "update_note", "plan_announce"],
+        },
+        BuiltinSkill {
+            id: "builtin_browse_structure",
+            title: "瀏覽資料夾結構",
+            trigger: "看資料夾、瀏覽結構、有什麼筆記、列出所有、Vault 裡有什麼、資料夾有哪些、目錄結構、list folders、show structure、browse vault、我有哪些資料夾、筆記庫裡有什麼、幫我看一下有什麼檔案、目前有哪些筆記",
+            behavior: "步驟1：呼叫 list_structure（path 傳空字串表示根目錄）取得整個 Vault 的資料夾與檔案樹狀結構。步驟2：若使用者要看特定資料夾的筆記列表，呼叫 list_notes_in_folder（folder 填資料夾名稱，例如 'projects' 或 'projects/web'）。步驟3：以清單格式回覆結構內容。",
+            tools: &["list_structure", "list_notes_in_folder"],
+        },
+        BuiltinSkill {
+            id: "builtin_delete_note",
+            title: "刪除筆記",
+            trigger: "刪除筆記、移除文件、把某篇刪掉、刪掉這個筆記、清除某個文件、delete note、remove note、trash note、把這篇刪了、幫我刪、不要那篇了、刪除這份文件、清掉",
+            behavior: "步驟1：呼叫 search_vault 確認要刪除的筆記精確路徑。步驟2：呼叫 plan_announce，明確告知使用者「將永久刪除 [路徑]，此操作不可復原」，deferred_tools 填 delete_note。步驟3：等使用者明確確認後才呼叫 delete_note（path 使用步驟1的路徑）。若使用者取消則不執行。",
+            tools: &["search_vault", "delete_note", "plan_announce"],
+        },
+        BuiltinSkill {
+            id: "builtin_move_note",
+            title: "移動/重新命名筆記",
+            trigger: "移動筆記、重新命名、換個位置、改檔名、搬移、把筆記移到、重命名、move note、rename note、relocate、把這篇搬到、改個名字、換個名稱、移到另一個資料夾、把文件移過去",
+            behavior: "步驟1：呼叫 search_vault 確認來源筆記的精確路徑（from 參數）。步驟2：與使用者確認目標路徑（to 參數，格式如 new_folder/new_name.md）。步驟3：呼叫 plan_announce 說明搬移計畫，deferred_tools 填 move_note。步驟4：使用者確認後呼叫 move_note（from 填步驟1路徑，to 填目標路徑）。",
+            tools: &["search_vault", "move_note", "plan_announce"],
+        },
+        BuiltinSkill {
+            id: "builtin_organize_folders",
+            title: "整理資料夾架構",
+            trigger: "建立資料夾、整理目錄、新增分類、重新整理資料夾、建立分類結構、規劃目錄、create folder、organize folders、新增一個資料夾、幫我建個目錄、整理一下分類、建立子目錄、新增分類夾",
+            behavior: "步驟1：呼叫 list_structure（path 傳空字串）了解現有資料夾結構。步驟2：根據使用者需求規劃新架構，呼叫 plan_announce 說明整體計畫。步驟3：使用者確認後，依序呼叫 create_folder 建立新資料夾（path 填新資料夾路徑）。步驟4（可選）：若需搬移現有筆記，呼叫 move_note 逐一搬移。",
+            tools: &["list_structure", "create_folder", "move_note", "plan_announce"],
+        },
+        BuiltinSkill {
+            id: "builtin_query_memory",
+            title: "查詢過去對話記憶",
+            trigger: "之前說過什麼、記憶查詢、歷史對話、上次討論、我之前提到、你記得嗎、過去的對話、recall memory、what did I say、上次我們聊、你還記得、之前提過、我跟你說過、先前的對話、記得我說的",
+            behavior: "步驟1：從使用者問題中提取關鍵字（人名、主題、事件等）。步驟2：呼叫 query_memory（keywords 填提取的關鍵字陣列，若無關鍵字則傳空陣列取最新記憶）。步驟3：根據回傳的記憶內容回答使用者。",
+            tools: &["query_memory"],
+        },
+        BuiltinSkill {
+            id: "builtin_web_search",
+            title: "網路搜尋/外部資訊",
+            trigger: "搜尋網路、查最新資訊、Google 一下、查新聞、找外部資料、搜網路、最新消息、web search、search the web、look it up online、查天氣、今天天氣、現在幾度、股價、最新匯率、即時資訊、查一下網路、幫我搜尋、去網路上找、外部資訊、最新動態、新聞、時事、最近發生什麼",
+            behavior: "步驟1：呼叫 web_search（query 填具體搜尋關鍵字），取得最新網路資訊。步驟2：根據搜尋結果摘要回答使用者。步驟3（可選）：若需要更深入分析或問題超出搜尋範圍，呼叫 call_external_ai（query 填完整問題）補充回答。",
+            tools: &["web_search", "call_external_ai"],
+        },
+    ];
+
+    // 每次啟動刪除並重建所有 builtin skills，確保 tool_calls / behavior 始終是最新版
+    let _ = db.query("DELETE FROM agent_skills WHERE vault_id = $vid AND knowledge_item_id = '__builtin__'")
+        .bind(("vid", vault_id.to_string()))
+        .await;
+
+    let client = reqwest::Client::new();
+
+    for s in skills {
+        let tools_json: serde_json::Value = serde_json::Value::Array(
+            s.tools.iter().map(|t| serde_json::Value::String(t.to_string())).collect()
+        );
+
+        let trigger_embedding: Option<Vec<f32>> = if let Some(url) = emb_url {
+            let emb = get_embedding(&client, url, s.trigger).await;
+            if emb.is_empty() { None } else { Some(emb) }
+        } else {
+            None
+        };
+
+        let _ = db.query(
+            "INSERT INTO agent_skills \
+             (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
+              tool_calls, is_active, injection_mode, agent_scope, trigger_count, trigger_embedding, created_at) \
+             VALUES ($sid, $vid, '__builtin__', $title, $trigger, $behavior, \
+                     $tools, true, 'passive', 'all', 0, $emb, time::now())"
+        )
+        .bind(("sid", s.id.to_string()))
+        .bind(("vid", vault_id.to_string()))
+        .bind(("title", s.title.to_string()))
+        .bind(("trigger", s.trigger.to_string()))
+        .bind(("behavior", s.behavior.to_string()))
+        .bind(("tools", tools_json))
+        .bind(("emb", trigger_embedding))
+        .await;
     }
 }
 
@@ -1972,8 +2207,8 @@ fn filter_lines_by_comparison(content: &str, cmp: &Comparison) -> Vec<String> {
     matched
 }
 
-/// 全文搜索 Vault（使用 SurrealDB BM25 FTS），支援比較條件過濾
-pub(crate) async fn tool_search_vault(query: &str, vault_db: &SurrealDb, vault_id: &str, app: &AppHandle) -> String {
+/// 全文搜索 Vault（SQLite FTS5 + vector fallback），支援比較條件過濾
+pub(crate) async fn tool_search_vault(query: &str, vault_db: &SurrealDb, vault_id: &str, sqlite: Option<&crate::db::sqlite::SqliteConn>, app: &AppHandle) -> String {
     if query.trim().is_empty() {
         return "請提供搜索關鍵字".to_string();
     }
@@ -2004,7 +2239,7 @@ pub(crate) async fn tool_search_vault(query: &str, vault_db: &SurrealDb, vault_i
         .unwrap_or(0);
 
     if chunk_count > 0 && cmp.is_none() {
-        if let Ok(result) = search_chunks_with_graph(vault_db, vault_id, &fts_query).await {
+        if let Ok(result) = search_chunks_with_graph(vault_db, vault_id, &fts_query, sqlite).await {
             if !result.is_empty() {
                 return result;
             }
@@ -2088,18 +2323,40 @@ pub(crate) async fn tool_search_vault(query: &str, vault_db: &SurrealDb, vault_i
 }
 
 /// Chunk-based search + 1-hop graph expansion
-async fn search_chunks_with_graph(vault_db: &SurrealDb, vault_id: &str, fts_query: &str) -> Result<String, crate::error::AppError> {
-    // ── Step 1: BM25 FTS on chunks ─────────────────────────────────────
+async fn search_chunks_with_graph(vault_db: &SurrealDb, vault_id: &str, fts_query: &str, sqlite: Option<&crate::db::sqlite::SqliteConn>) -> Result<String, crate::error::AppError> {
+    // ── Step 1: SQLite FTS5 on chunks ─────────────────────────────────
     #[derive(Deserialize)]
     struct ChunkRow { file_path: String, section: String, content: String }
-    let mut resp = vault_db.query(
-        "SELECT file_path, section, content FROM chunks WHERE vault_id = $vid AND content @1@ $q ORDER BY search::score(1) DESC LIMIT 10"
-    )
-    .bind(("vid", vault_id.to_owned()))
-    .bind(("q", fts_query.to_owned()))
-    .await
-    .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
-    let chunk_rows: Vec<ChunkRow> = resp.take(0).map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+
+    let chunk_rows: Vec<ChunkRow> = if let Some(sq) = sqlite {
+        let sq = sq.clone();
+        let q = fts_query.to_owned();
+        let vid = vault_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            match sq.lock() {
+                Ok(conn) => crate::db::sqlite::fts_search(&conn, &vid, &q, false, 10)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|r| ChunkRow { file_path: r.file_path, section: r.section, content: r.content })
+                    .collect(),
+                Err(_) => vec![],
+            }
+        }).await.unwrap_or_default()
+    } else {
+        // Fallback: SurrealDB string contains (no BM25 index)
+        vault_db.query(
+            "SELECT file_path, section, content FROM chunks
+             WHERE vault_id = $vid
+               AND string::contains(string::lowercase(content), string::lowercase($q))
+             LIMIT 10"
+        )
+        .bind(("vid", vault_id.to_owned()))
+        .bind(("q", fts_query.to_owned()))
+        .await
+        .ok()
+        .and_then(|mut r| r.take(0).ok())
+        .unwrap_or_default()
+    };
 
     if chunk_rows.is_empty() {
         return Ok(String::new());
@@ -2437,7 +2694,7 @@ pub async fn set_note_status(
             let port = *state.embedding_actual_port.lock().await;
             port.map(|p| format!("http://127.0.0.1:{}", p))
         };
-        let _ = crate::vault::chunker::upsert_chunks(&state.db, &vault_id, &chunks, emb_url.as_deref()).await;
+        let _ = crate::vault::chunker::upsert_chunks(&state.db, Some(&state.sqlite), &vault_id, &chunks, emb_url.as_deref()).await;
     }
     // 若設為 verified，記錄 reviewed_at 時間戳
     if status == "verified" {
@@ -2499,6 +2756,7 @@ async fn execute_vault_tool(
     args: &serde_json::Value,
     vault_db: Option<(&SurrealDb, &str)>,
     vault_path: &str,
+    sqlite: Option<&crate::db::sqlite::SqliteConn>,
     app: &AppHandle,
     ext_config: &ExtAiConfig,
 ) -> String {
@@ -2515,7 +2773,7 @@ async fn execute_vault_tool(
         "search_vault" => {
             let query = args["query"].as_str().unwrap_or("");
             match vault_db {
-                Some((db, vid)) => tool_search_vault(query, db, vid, app).await,
+                Some((db, vid)) => tool_search_vault(query, db, vid, sqlite, app).await,
                 None => "Vault 資料庫未就緒".to_string(),
             }
         }
@@ -2733,6 +2991,7 @@ pub async fn run_tool_pipeline(
             &step.args,
             vault_db_ref,
             &vault_path,
+            Some(&state.sqlite),
             &app,
             &ext_config,
         ).await;
@@ -2828,6 +3087,7 @@ pub async fn test_vault_tool(
         &args,
         vault_id_opt.as_deref().map(|vid| (&db, vid)),
         &vault_path,
+        Some(&state.sqlite),
         &app,
         &ext_config,
     ).await;
@@ -2877,7 +3137,8 @@ struct ActiveSkillRow {
     title: String,
     trigger: String,
     behavior: String,
-    auto_tool_calls: Vec<String>,
+    #[serde(default)]
+    tool_calls: Vec<String>,
     #[allow(dead_code)]
     #[serde(default = "passive_str")]
     injection_mode: String,
@@ -2897,7 +3158,7 @@ async fn fetch_always_on_skills(
     caller_scope: &str,
 ) -> Vec<ActiveSkillRow> {
     let mut resp = db.query(
-        "SELECT skill_id, title, trigger, behavior, auto_tool_calls, injection_mode, \
+        "SELECT skill_id, title, trigger, behavior, tool_calls OR [] AS tool_calls, injection_mode, \
                 agent_scope OR 'all' AS agent_scope \
          FROM agent_skills \
          WHERE vault_id = $vid AND is_active = true AND injection_mode = 'active' \
@@ -2912,21 +3173,30 @@ async fn fetch_always_on_skills(
         .unwrap_or_default()
 }
 
+/// query 關鍵字命中技能的觸發條件（、, 分隔）
+fn keyword_matches_skill(query: &str, trigger: &str) -> bool {
+    trigger.split(['、', ',', '，']).any(|kw| {
+        let kw = kw.trim();
+        !kw.is_empty() && query.contains(kw)
+    })
+}
+
 /// 向量搜尋相似度 > SKILL_THRESHOLD 的 passive skills；
-/// 若 trigger_embedding 為 None，fallback 到文字 contains 匹配。
+/// 若 trigger_embedding 為 None，fallback 到關鍵字 contains 匹配。
 async fn search_passive_skills(
     db: &surrealdb::Surreal<surrealdb::engine::local::Db>,
     vault_id: &str,
+    query: &str,
     query_embedding: &[f32],
     caller_scope: &str,
 ) -> Vec<ActiveSkillRow> {
     const SKILL_THRESHOLD: f64 = 0.65;
 
     // 向量搜尋（有 embedding 的 passive skills）
-    let mut vector_results: Vec<ActiveSkillRow> = {
+    let mut vector_results: Vec<ActiveSkillRow> = if !query_embedding.is_empty() {
         let emb_val: Vec<f64> = query_embedding.iter().map(|&x| x as f64).collect();
         let mut resp = db.query(
-            "SELECT skill_id, title, trigger, behavior, auto_tool_calls, injection_mode, \
+            "SELECT skill_id, title, trigger, behavior, tool_calls OR [] AS tool_calls, injection_mode, \
                     agent_scope OR 'all' AS agent_scope \
              FROM agent_skills \
              WHERE vault_id = $vid AND is_active = true AND injection_mode != 'active' \
@@ -2944,18 +3214,20 @@ async fn search_passive_skills(
         resp.as_mut()
             .and_then(|r| r.take::<Vec<ActiveSkillRow>>(0).ok())
             .unwrap_or_default()
+    } else {
+        vec![]
     };
 
-    // Fallback：text contains 匹配（trigger_embedding 為 None 的 passive skills）
-    let mut text_results: Vec<ActiveSkillRow> = {
+    // 關鍵字匹配：對所有 passive skills 做 trigger keyword contains 檢查
+    // （補足向量搜尋閾值不夠時的精確命中，e.g. 「Google 一下」直接出現在 trigger 裡）
+    let mut keyword_results: Vec<ActiveSkillRow> = {
         let mut resp = db.query(
-            "SELECT skill_id, title, trigger, behavior, auto_tool_calls, injection_mode, \
+            "SELECT skill_id, title, trigger, behavior, tool_calls OR [] AS tool_calls, injection_mode, \
                     agent_scope OR 'all' AS agent_scope \
              FROM agent_skills \
              WHERE vault_id = $vid AND is_active = true AND injection_mode != 'active' \
                AND (agent_scope = 'all' OR agent_scope = NONE OR agent_scope = $scope) \
-               AND trigger_embedding = NONE \
-             LIMIT 10"
+             LIMIT 30"
         )
         .bind(("vid", vault_id.to_string()))
         .bind(("scope", caller_scope.to_string()))
@@ -2963,9 +3235,12 @@ async fn search_passive_skills(
         resp.as_mut()
             .and_then(|r| r.take::<Vec<ActiveSkillRow>>(0).ok())
             .unwrap_or_default()
+            .into_iter()
+            .filter(|s| keyword_matches_skill(query, &s.trigger))
+            .collect()
     };
 
-    vector_results.append(&mut text_results);
+    vector_results.append(&mut keyword_results);
     vector_results.truncate(4);
     vector_results
 }
@@ -3014,10 +3289,106 @@ async fn bump_skill_trigger_count(
     }
 }
 
+/// 工具用：根據 use_ask 語意搜尋最相似的技能規範。
+/// 回傳 Vec<(skill_id, title, behavior, tool_calls)>。
+pub(crate) async fn search_skills_for_tool(
+    db: &surrealdb::Surreal<surrealdb::engine::local::Db>,
+    vault_id: &str,
+    use_ask: &str,
+    emb_url: Option<&str>,
+    client: &reqwest::Client,
+) -> Vec<(String, String, String, Vec<String>)> {
+    let query_vec = if let Some(url) = emb_url {
+        get_embedding(client, url, use_ask).await
+    } else {
+        vec![]
+    };
+
+    let always_on = fetch_always_on_skills(db, vault_id, "main").await;
+    let passive = search_passive_skills(db, vault_id, use_ask, &query_vec, "main").await;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut matched = Vec::new();
+    for s in always_on.into_iter().chain(passive.into_iter()) {
+        if seen.insert(s.skill_id.clone()) {
+            matched.push(s);
+        }
+    }
+
+    matched.into_iter()
+        .map(|s| (s.skill_id, s.title, s.behavior, s.tool_calls))
+        .collect()
+}
+
+/// 將 use_ask 加入指定技能的 trigger 欄位，並重新計算 trigger_embedding。
+#[tauri::command]
+pub async fn add_skill_trigger(
+    skill_id: String,
+    use_ask: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let vault_id = state.get_vault_id().await.map_err(|e| e.to_string())?;
+    let db = &state.db;
+
+    #[derive(serde::Deserialize)]
+    struct SkillTrigger { trigger: String }
+
+    let mut resp = db.query(
+        "SELECT trigger FROM agent_skills WHERE vault_id = $vid AND skill_id = $sid LIMIT 1"
+    )
+    .bind(("vid", vault_id.clone()))
+    .bind(("sid", skill_id.clone()))
+    .await.map_err(|e| e.to_string())?;
+
+    let rows: Vec<SkillTrigger> = resp.take(0).unwrap_or_default();
+    let current_trigger = rows.into_iter().next().map(|r| r.trigger).unwrap_or_default();
+
+    let new_trigger = if current_trigger.is_empty() {
+        use_ask.clone()
+    } else {
+        format!("{}、{}", current_trigger, use_ask)
+    };
+
+    let emb_url = {
+        let port = *state.embedding_actual_port.lock().await;
+        port.map(|p| format!("http://127.0.0.1:{}", p))
+    };
+
+    let client = reqwest::Client::new();
+
+    if let Some(url) = &emb_url {
+        let new_embedding: Vec<f64> = get_embedding(&client, url, &new_trigger).await
+            .into_iter().map(|x| x as f64).collect();
+        if !new_embedding.is_empty() {
+            db.query(
+                "UPDATE agent_skills SET trigger = $trigger, trigger_embedding = $emb \
+                 WHERE vault_id = $vid AND skill_id = $sid"
+            )
+            .bind(("trigger", new_trigger))
+            .bind(("emb", new_embedding))
+            .bind(("vid", vault_id))
+            .bind(("sid", skill_id))
+            .await.map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+    }
+
+    db.query(
+        "UPDATE agent_skills SET trigger = $trigger WHERE vault_id = $vid AND skill_id = $sid"
+    )
+    .bind(("trigger", new_trigger))
+    .bind(("vid", vault_id))
+    .bind(("sid", skill_id))
+    .await.map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 /// Pre-pass 入口：
 /// 1. 主動注入（injection_mode = 'active'）：永遠注入，不做 embedding 比對。
 /// 2. 被動取用（injection_mode = 'passive'）：embed query → cosine 相似度 > 閾值才注入。
-/// 回傳 Some((injection_text, titles)) 若有任何符合的 skills，否則 None。
+/// 回傳 Some((injection_text, titles, required_tools)) 若有任何符合的 skills，否則 None。
+/// required_tools 為所有命中 skill 的 tool_calls 聯集，供呼叫端過濾工具清單。
 async fn run_skill_pre_pass(
     db: &surrealdb::Surreal<surrealdb::engine::local::Db>,
     vault_id: &str,
@@ -3026,23 +3397,21 @@ async fn run_skill_pre_pass(
     client: &reqwest::Client,
     caller_scope: &str,
     precomputed_embedding: Option<Vec<f32>>,  // 傳入已算好的向量，避免重複呼叫 /embedding
-) -> Option<(String, Vec<String>)> {
+) -> Option<(String, Vec<String>, Vec<String>)> {
     // 1. 主動注入 skills（不需要 embedding server）
     let always_on = fetch_always_on_skills(db, vault_id, caller_scope).await;
 
-    // 2. 被動取用 skills（需要 embedding server；優先使用外部傳入的向量）
-    let passive = if let Some(url) = emb_url {
-        let query_vec = match precomputed_embedding {
-            Some(v) if !v.is_empty() => v,
-            _ => get_embedding(client, url, query).await,
-        };
-        if query_vec.is_empty() {
-            vec![]
+    // 2. 被動取用 skills（有 embedding server → 向量搜尋；無 → 純關鍵字匹配）
+    let passive = {
+        let query_vec = if let Some(url) = emb_url {
+            match precomputed_embedding {
+                Some(v) if !v.is_empty() => v,
+                _ => get_embedding(client, url, query).await,
+            }
         } else {
-            search_passive_skills(db, vault_id, &query_vec, caller_scope).await
-        }
-    } else {
-        vec![]
+            vec![]
+        };
+        search_passive_skills(db, vault_id, query, &query_vec, caller_scope).await
     };
 
     // 合併，去重（active 優先）
@@ -3062,22 +3431,16 @@ async fn run_skill_pre_pass(
 
     let titles: Vec<String> = matched.iter().map(|s| s.title.clone()).collect();
 
+    // 收集所有命中 skill 的 tool_calls 聯集（供呼叫端做工具過濾，不再用文字 hint）
     let auto_tools: Vec<String> = matched.iter()
-        .flat_map(|s| s.auto_tool_calls.iter().cloned())
+        .flat_map(|s| s.tool_calls.iter().cloned())
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
 
-    let mut section = build_skill_injection_section(&matched);
+    let section = build_skill_injection_section(&matched);
 
-    if !auto_tools.is_empty() {
-        section.push_str(&format!(
-            "**自動工具提示**：請在第一輪回答前先呼叫以下工具以獲取相關知識：{}\n\n",
-            auto_tools.join("、")
-        ));
-    }
-
-    Some((section, titles))
+    Some((section, titles, auto_tools))
 }
 
 #[cfg(test)]

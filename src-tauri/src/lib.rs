@@ -16,7 +16,7 @@ use commands::{
          get_memory_rules, delete_memory_rule, confirm_write_tool,
          test_vault_tool, run_tool_pipeline, cancel_tool_test, cancel_agent, invoke_agent,
          set_note_status, confirm_search_method,
-         seed_agent_tools},
+         seed_agent_tools, seed_agent_skills, add_skill_trigger},
     conversation::{create_conversation, list_conversations, get_conversation,
                    delete_conversation, update_conversation_title, save_conversation_messages},
     download::*, graph::*, import::*, search::*,
@@ -79,21 +79,66 @@ pub fn run() {
 
             let app_handle = app.handle().clone();
 
+            // 設定 panic hook：偵測 SurrealDB BM25 B-tree 損壞
+            // 寫入 db_corruption_detected（供下次啟動時通知使用者），不自動修復
+            {
+                let data_dir = app_handle
+                    .path()
+                    .app_data_dir()
+                    .expect("無法取得 app data 目錄");
+                let flag_path = data_dir.join("db_corruption_detected");
+                let prev_hook = std::panic::take_hook();
+                std::panic::set_hook(Box::new(move |info| {
+                    let msg = info.to_string();
+                    if msg.contains("Duplicate insert key") || msg.contains("btree") {
+                        let reason = format!(
+                            "SurrealDB BM25 B-tree 損壞（{}）",
+                            msg.lines().next().unwrap_or("Duplicate insert key panic")
+                        );
+                        let _ = std::fs::write(&flag_path, &reason);
+                    }
+                    prev_hook(info);
+                }));
+            }
+
             // 同步完成最小必要初始化：SurrealDB 初始化 + manage state
-            let state = tauri::async_runtime::block_on(async {
+            // 同時讀取損壞通知 flag（若有）
+            let (state, corruption_msg) = tauri::async_runtime::block_on(async {
                 let app_data_dir = app_handle
                     .path()
                     .app_data_dir()
                     .expect("無法取得 app data 目錄");
 
+                // 讀取並清除損壞 flag
+                let flag = app_data_dir.join("db_corruption_detected");
+                let corruption = if flag.exists() {
+                    let msg = tokio::fs::read_to_string(&flag).await.ok();
+                    let _ = tokio::fs::remove_file(&flag).await;
+                    msg
+                } else {
+                    None
+                };
+
                 let surreal_db = db::surreal::init_db(&app_data_dir)
                     .await
                     .expect("SurrealDB 初始化失敗");
 
-                AppState::new(surreal_db)
+                let sqlite = db::sqlite::init_sqlite(&app_data_dir.join("search.db"))
+                    .expect("SQLite FTS5 初始化失敗");
+
+                (AppState::new(surreal_db, sqlite), corruption)
             });
 
             app_handle.manage(state);
+
+            // 若偵測到損壞，延遲 1.5s（等前端 ready）後 emit 通知
+            if let Some(reason) = corruption_msg {
+                let ah = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    let _ = ah.emit("db:corruption_detected", serde_json::json!({ "reason": reason }));
+                });
+            }
 
             // Windows：移除原生 title bar，改用自訂 TitleBar 元件
             #[cfg(target_os = "windows")]
@@ -176,6 +221,13 @@ pub fn run() {
                         port.map(|p| format!("http://127.0.0.1:{}", p))
                     };
                     seed_agent_tools(&db_seed, emb_url.as_deref()).await;
+
+                    // 內建 skill 種子（per-vault，幂等）
+                    if let Ok(Some(vp)) = db::queries::get_setting(&db_seed, "system_current_vault_path").await {
+                        if !vp.is_empty() {
+                            seed_agent_skills(&db_seed, &vp, emb_url.as_deref()).await;
+                        }
+                    }
                 }
 
                 // 自動更新：掃描開啟 auto_update 的 import sessions
@@ -305,6 +357,8 @@ pub fn run() {
             search,
             get_index_stats,
             reindex_vault_chunks,
+            prepare_db_repair,
+            list_repair_logs,
             search_vault_chunks,
             // Graph
             get_graph,
@@ -343,6 +397,7 @@ pub fn run() {
             toggle_agent_skill,
             delete_agent_skill,
             update_agent_skill,
+            add_skill_trigger,
             compress_conversation_to_knowledge,
             get_skill_usage_stats,
             extract_skill_from_exchange,

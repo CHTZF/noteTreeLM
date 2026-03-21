@@ -13,6 +13,7 @@ use tauri::AppHandle;
 use tokio::sync::Mutex;
 
 use crate::db::surreal::SurrealDb;
+use crate::db::sqlite::SqliteConn;
 use crate::runtime::system_agent::SystemAgentService;
 use crate::runtime::tool_registry::ToolRegistry;
 use crate::runtime::types::LlmFn;
@@ -26,6 +27,7 @@ pub(crate) struct BuildCtx {
     pub vault_path: String,
     pub vault_db: SurrealDb,
     pub vault_id: String,
+    pub sqlite: SqliteConn,
     pub app: AppHandle,
     pub emb_url: Option<String>,
     pub search_method_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
@@ -42,6 +44,7 @@ pub fn build_vault_registry(
     vault_path: String,
     vault_db: SurrealDb,
     vault_id: String,
+    sqlite: SqliteConn,
     app: AppHandle,
     emb_url: Option<String>,
     search_method_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
@@ -56,6 +59,7 @@ pub fn build_vault_registry(
         vault_path,
         vault_db,
         vault_id,
+        sqlite,
         app,
         emb_url,
         search_method_tx,

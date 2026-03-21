@@ -558,7 +558,7 @@ impl SystemAgentService {
         self.db.query(
             "INSERT INTO agent_skills \
              (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
-              injection_mode, is_active, trigger_embedding, auto_tool_calls, agent_scope, created_at) \
+              injection_mode, is_active, trigger_embedding, tool_calls, agent_scope, created_at) \
              VALUES ($id, $vid, '', $title, $trigger, $behavior, \
                      $mode, true, $temb, [], 'all', time::now())"
         )

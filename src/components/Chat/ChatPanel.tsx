@@ -11,6 +11,7 @@ import VoiceOverlay from '../common/VoiceOverlay'
 import ConversationList from './ConversationList'
 import MessageBubble from './MessageBubble'
 import { Message, SkillPreview, DraftState, ORCHESTRATOR_SYSTEM } from './types'
+import type { AgentSkill } from '../../types/models'
 
 export default function ChatPanel({ liveChatActive = false, onActiveChange, onOpenNote }: { liveChatActive?: boolean; onActiveChange?: (active: boolean) => void; onOpenNote?: (path: string) => void }) {
   const { settings } = useSettingsStore()
@@ -31,6 +32,10 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const writeConfirmMode = (settings.write_confirm_mode ?? 'always') as 'always' | 'once' | 'never'
   const [pendingWriteDisplay, setPendingWriteDisplay] = useState<string | null>(null)
   const [pendingSearchMethod, setPendingSearchMethod] = useState<{ query: string } | null>(null)
+  const [pendingSkillFound, setPendingSkillFound] = useState<{ skill_id: string; skill_title: string; use_ask: string } | null>(null)
+  const [pendingSkillNotFound, setPendingSkillNotFound] = useState<{ use_ask: string } | null>(null)
+  const [skillsForPicker, setSkillsForPicker] = useState<AgentSkill[]>([])
+  const [skillsPickerLoaded, setSkillsPickerLoaded] = useState(false)
   const [error, setError] = useState('')
   const [isCompressing, setIsCompressing] = useState(false)
   const [showClearPrompt, setShowClearPrompt] = useState(false)
@@ -355,7 +360,14 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages.length, streamingText])
 
-  // (lastMemoryPath 保留供 send dep array，但不再主動設定——記憶改走 compress_conversation_to_knowledge)
+  // 當 skill not found picker 出現時，拉取所有 active skills 供使用者選擇
+  useEffect(() => {
+    if (!pendingSkillNotFound) return
+    setSkillsPickerLoaded(false)
+    invoke<AgentSkill[]>('list_agent_skills', { knowledgeItemId: null, activeOnly: true })
+      .then(skills => { setSkillsForPicker(skills); setSkillsPickerLoaded(true) })
+      .catch(() => { setSkillsForPicker([]); setSkillsPickerLoaded(true) })
+  }, [pendingSkillNotFound])
 
   const handleWriteConfirm = useCallback(async (approved: boolean) => {
     if (approved && writeConfirmMode === 'once') {
@@ -409,6 +421,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     let unlistenSkillsActivated: (() => void) = () => {}
     let unlistenSkillSuggestion: (() => void) = () => {}
     let unlistenPreRouteDebug: (() => void) = () => {}
+    let unlistenSkillFound: (() => void) = () => {}
+    let unlistenSkillNotFound: (() => void) = () => {}
 
     // Clear previous suggestions at the start of each send
     setNoteSuggestions([])
@@ -451,6 +465,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         unlistenSkillsActivated,
         unlistenSkillSuggestion,
         unlistenPreRouteDebug,
+        unlistenSkillFound,
+        unlistenSkillNotFound,
       ] = await Promise.all([
         listen<{ session_id?: string; display?: string } | string>('agent:tool_call', (event) => {
           const display = typeof event.payload === 'string'
@@ -542,6 +558,22 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
             addLog('llm', 'info', msg)
           }
         ),
+        // search_skills 工具找到技能：對話框顯示搜尋提示 + 詢問是否加入觸發條件
+        listen<{ skill_id: string; skill_title: string; use_ask: string }>('agent:skill_found', (e) => {
+          setMessages(prev => [...prev, {
+            role: 'tool' as const,
+            content: `🔍 搜尋到技能：${e.payload.skill_title}（意圖：${e.payload.use_ask}）`,
+          }])
+          setPendingSkillFound(e.payload)
+        }),
+        // search_skills 找不到技能：讓使用者選擇要加入哪個 skill 的觸發條件
+        listen<{ use_ask: string }>('agent:skill_not_found', (e) => {
+          setMessages(prev => [...prev, {
+            role: 'tool' as const,
+            content: `❓ 找不到適合的技能（意圖：${e.payload.use_ask}）`,
+          }])
+          setPendingSkillNotFound(e.payload)
+        }),
       ])
 
       log('  呼叫 invoke("invoke_agent")')
@@ -605,6 +637,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       unlistenSkillsActivated()
       unlistenSkillSuggestion()
       unlistenPreRouteDebug()
+      unlistenSkillFound()
+      unlistenSkillNotFound()
       setPendingWriteDisplay(null)
       setPendingSearchMethod(null)
       setIsStreaming(false)
@@ -785,12 +819,12 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
 
   // 呼叫 LLM 萃取技能（可由關鍵字自動觸發或使用者點擊📌按鈕觸發）
   const doExtractSkill = useCallback(async (userMsg: string, assistantMsg: string) => {
-    setSkillPreview({ userMsg, assistantMsg, loading: true, title: '', trigger: '', behavior: '', autoToolCalls: [], injectionMode: 'passive' })
+    setSkillPreview({ userMsg, assistantMsg, loading: true, title: '', trigger: '', behavior: '', toolCalls: [], injectionMode: 'passive' })
     try {
-      const skill = await invoke<{ title: string; trigger: string; behavior: string; auto_tool_calls: string[] }>(
+      const skill = await invoke<{ title: string; trigger: string; behavior: string; tool_calls: string[] }>(
         'extract_skill_from_exchange', { userMsg, assistantMsg }
       )
-      setSkillPreview({ userMsg, assistantMsg, loading: false, title: skill.title, trigger: skill.trigger, behavior: skill.behavior, autoToolCalls: skill.auto_tool_calls, injectionMode: 'passive' })
+      setSkillPreview({ userMsg, assistantMsg, loading: false, title: skill.title, trigger: skill.trigger, behavior: skill.behavior, toolCalls: skill.tool_calls, injectionMode: 'passive' })
     } catch (e) {
       toast.error('技能萃取失敗：' + String(e))
       setSkillPreview(null)
@@ -807,7 +841,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         title: skillPreview.title,
         trigger: skillPreview.trigger,
         behavior: skillPreview.behavior,
-        autoToolCalls: skillPreview.autoToolCalls,
+        toolCalls: skillPreview.toolCalls,
         injectionMode: skillPreview.injectionMode,
       })
       toast.success(`技能「${skillPreview.title}」已建立`)
@@ -1111,6 +1145,80 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
                 style={{ padding: '4px 12px', borderRadius: '4px', background: 'transparent', color: 'var(--color-text-secondary)', border: '1px solid var(--color-border)', cursor: 'pointer', fontSize: '12px' }}
               >外部 AI</button>
             </div>
+          </div>
+        )}
+
+        {/* search_skills 命中技能：詢問是否將 use_ask 加入觸發條件 */}
+        {pendingSkillFound && (
+          <div style={{
+            margin: '0 8px 8px', padding: '10px 14px', borderRadius: '8px',
+            background: 'var(--color-bg-elevated)', border: '1px solid var(--color-accent)',
+            fontSize: '13px', flexShrink: 0,
+          }}>
+            <div style={{ marginBottom: '4px', color: 'var(--color-text-secondary)', fontSize: '12px' }}>
+              💡 找到相符技能：<strong>{pendingSkillFound.skill_title}</strong>
+            </div>
+            <div style={{ marginBottom: '8px', color: 'var(--color-text-primary)', fontSize: '12px' }}>
+              是否將「<code>{pendingSkillFound.use_ask}</code>」加入此技能的觸發條件，讓下次自動觸發？
+            </div>
+            <div style={{ display: 'flex', gap: '6px' }}>
+              <button
+                onClick={async () => {
+                  await invoke('add_skill_trigger', { skillId: pendingSkillFound.skill_id, useAsk: pendingSkillFound.use_ask })
+                  setPendingSkillFound(null)
+                }}
+                style={{ padding: '4px 12px', borderRadius: '4px', background: 'var(--color-accent)', color: '#fff', border: 'none', cursor: 'pointer', fontSize: '12px' }}
+              >加入觸發</button>
+              <button
+                onClick={() => setPendingSkillFound(null)}
+                style={{ padding: '4px 12px', borderRadius: '4px', background: 'transparent', color: 'var(--color-text-secondary)', border: '1px solid var(--color-border)', cursor: 'pointer', fontSize: '12px' }}
+              >略過</button>
+            </div>
+          </div>
+        )}
+
+        {/* search_skills 找不到技能：讓使用者選擇加入哪個 skill 的觸發條件 */}
+        {pendingSkillNotFound && (
+          <div style={{
+            margin: '0 8px 8px', padding: '10px 14px', borderRadius: '8px',
+            background: 'var(--color-bg-elevated)', border: '1px solid var(--color-warning)',
+            fontSize: '13px', flexShrink: 0, maxHeight: '280px', display: 'flex', flexDirection: 'column',
+          }}>
+            <div style={{ marginBottom: '6px', color: 'var(--color-text-secondary)', fontSize: '12px' }}>
+              找不到適合「<strong>{pendingSkillNotFound.use_ask}</strong>」的技能，請選擇要加入哪個技能的觸發條件：
+            </div>
+            <div style={{ overflowY: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: '4px' }}>
+              {!skillsPickerLoaded
+                ? <div style={{ color: 'var(--color-text-muted)', fontSize: '12px' }}>載入中…</div>
+                : skillsForPicker.length === 0
+                ? <div style={{ color: 'var(--color-text-muted)', fontSize: '12px' }}>目前沒有可用的技能，請先前往「知識中心 → 我的技能規範」建立技能。</div>
+                : skillsForPicker.map(skill => (
+                  <button
+                    key={skill.skill_id}
+                    onClick={async () => {
+                      await invoke('add_skill_trigger', { skillId: skill.skill_id, useAsk: pendingSkillNotFound.use_ask })
+                      setPendingSkillNotFound(null)
+                      setSkillsForPicker([])
+                      setSkillsPickerLoaded(false)
+                      toast.success(`已將「${pendingSkillNotFound.use_ask}」加入「${skill.title}」觸發條件`)
+                    }}
+                    style={{
+                      textAlign: 'left', padding: '5px 10px', borderRadius: '4px', border: '1px solid var(--color-border)',
+                      background: 'transparent', color: 'var(--color-text-primary)', cursor: 'pointer', fontSize: '12px',
+                    }}
+                  >
+                    {skill.title}
+                    <span style={{ marginLeft: '6px', color: 'var(--color-text-muted)', fontSize: '11px' }}>
+                      {skill.injection_mode === 'active' ? '● 常駐' : '○ 被動'}
+                    </span>
+                  </button>
+                ))
+              }
+            </div>
+            <button
+              onClick={() => { setPendingSkillNotFound(null); setSkillsForPicker([]); setSkillsPickerLoaded(false) }}
+              style={{ marginTop: '8px', alignSelf: 'flex-start', padding: '3px 10px', borderRadius: '4px', background: 'transparent', color: 'var(--color-text-muted)', border: '1px solid var(--color-border)', cursor: 'pointer', fontSize: '11px' }}
+            >略過</button>
           </div>
         )}
 

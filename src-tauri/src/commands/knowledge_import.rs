@@ -962,7 +962,7 @@ async fn import_page_inner(
 
     let now_ms = chrono::Utc::now().timestamp_millis();
     let chunks = crate::vault::chunker::chunk_note(&rel_note_path, &note_content, now_ms);
-    let _ = crate::vault::chunker::upsert_chunks(db, vault_id, &chunks, emb_url).await;
+    let _ = crate::vault::chunker::upsert_chunks(db, None, vault_id, &chunks, emb_url).await;
 
     let now_dt = surrealdb::sql::Datetime::from(chrono::Utc::now());
     let vid = vault_id.to_owned();
@@ -1054,7 +1054,7 @@ pub async fn import_page(
                 if let Some(Some(content)) = rows.into_iter().next().map(|r| r.content_md) {
                     let now_ms = chrono::Utc::now().timestamp_millis();
                     let chunks = crate::vault::chunker::chunk_note(&note_path, &content, now_ms);
-                    let _ = crate::vault::chunker::upsert_chunks(&db2, &vault_id2, &chunks, Some(&url)).await;
+                    let _ = crate::vault::chunker::upsert_chunks(&db2, None, &vault_id2, &chunks, Some(&url)).await;
                 }
             }
         });
@@ -1712,7 +1712,8 @@ pub struct AgentSkillSuggestion {
     pub title: String,
     pub trigger: String,          // "當問題涉及 X、Y、Z 時"
     pub behavior: String,         // agent 應執行的操作指令
-    pub auto_tool_calls: Vec<String>, // 自動呼叫的工具，限 search_vault/read_note/list_structure
+    #[serde(default)]
+    pub tool_calls: Vec<String>, // 自動呼叫的工具，限 search_vault/read_note/list_structure
     #[serde(default = "default_passive")]
     pub injection_mode: String,   // "passive"（embedding 比對）或 "active"（永遠注入）
     #[serde(default = "default_scope_all")]
@@ -1738,7 +1739,7 @@ pub struct AgentSkillRecord {
     pub title: String,
     pub trigger: String,
     pub behavior: String,
-    pub auto_tool_calls: Vec<String>,
+    pub tool_calls: Vec<String>,
     pub is_active: bool,
     pub injection_mode: String,   // "passive" | "active"
     pub agent_scope: String,      // "all" | "main" | "search" | "write" | "research" | "memory"
@@ -2143,7 +2144,7 @@ pub async fn create_kb_card_note(
             let port = *state.embedding_actual_port.lock().await;
             port.map(|p| format!("http://127.0.0.1:{}", p))
         };
-        let _ = crate::vault::chunker::upsert_chunks(&state.db, &vault_id, &chunks, emb_url.as_deref()).await;
+        let _ = crate::vault::chunker::upsert_chunks(&state.db, None, &vault_id, &chunks, emb_url.as_deref()).await;
     }
 
     // Mark suggestion as created (store note_path) and remove from suggestions list
@@ -2346,7 +2347,7 @@ pub async fn save_knowledge_item(
                 .await.ok();
             }
             // Now embed them using the chunker (re-upsert with embedding)
-            let _ = crate::vault::chunker::upsert_chunks(&db2, &vid2, &chunks, Some(&emb_url)).await;
+            let _ = crate::vault::chunker::upsert_chunks(&db2, None, &vid2, &chunks, Some(&emb_url)).await;
         });
     }
 
@@ -2483,7 +2484,7 @@ pub async fn save_agent_skill(
     title: String,
     trigger: String,
     behavior: String,
-    auto_tool_calls: Vec<String>,
+    tool_calls: Vec<String>,
     injection_mode: Option<String>,
     agent_scope: Option<String>,
 ) -> Result<AgentSkillRecord, AppError> {
@@ -2508,16 +2509,22 @@ pub async fn save_agent_skill(
         } else { None }
     } else { None };
 
-    // 篩選合法工具（防止任意工具被注入）
-    let allowed = ["search_vault", "read_note", "list_structure"];
-    let safe_tools: Vec<String> = auto_tool_calls.into_iter()
+    // 篩選合法工具
+    let allowed = [
+        "search_vault", "read_note", "list_structure", "list_notes_in_folder",
+        "open_note", "create_note", "update_note", "append_to_note",
+        "delete_note", "delete_folder", "move_note", "create_folder",
+        "plan_announce", "query_memory", "web_search", "call_external_ai",
+        "get_current_datetime", "show_toast",
+    ];
+    let safe_tools: Vec<String> = tool_calls.into_iter()
         .filter(|t| allowed.contains(&t.as_str()))
         .collect();
 
     db.query(
         "INSERT INTO agent_skills \
          (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
-          auto_tool_calls, is_active, injection_mode, agent_scope, trigger_count, trigger_embedding, created_at) \
+          tool_calls, is_active, injection_mode, agent_scope, trigger_count, trigger_embedding, created_at) \
          VALUES ($sid, $vid, $kid, $title, $trigger, $behavior, \
                  $tools, true, $mode, $scope, 0, $emb, time::now())"
     )
@@ -2541,7 +2548,7 @@ pub async fn save_agent_skill(
         title,
         trigger,
         behavior,
-        auto_tool_calls: safe_tools,
+        tool_calls: safe_tools,
         is_active: true,
         injection_mode: mode.to_string(),
         agent_scope: scope,
@@ -2673,7 +2680,7 @@ pub async fn update_agent_skill(
     title: String,
     trigger: String,
     behavior: String,
-    auto_tool_calls: Vec<String>,
+    tool_calls: Vec<String>,
     injection_mode: Option<String>,
     agent_scope: Option<String>,
 ) -> Result<(), AppError> {
@@ -2685,7 +2692,7 @@ pub async fn update_agent_skill(
     let scope = valid_scope(agent_scope.as_deref().unwrap_or("all")).to_string();
 
     let allowed = ["search_vault", "read_note", "list_structure"];
-    let safe_tools: Vec<String> = auto_tool_calls.into_iter()
+    let safe_tools: Vec<String> = tool_calls.into_iter()
         .filter(|t| allowed.contains(&t.as_str()))
         .collect();
 
@@ -2705,7 +2712,7 @@ pub async fn update_agent_skill(
 
     db.query(
         "UPDATE agent_skills SET title = $title, trigger = $trigger, behavior = $behavior, \
-         auto_tool_calls = $tools, injection_mode = $mode, agent_scope = $scope, trigger_embedding = $emb \
+         tool_calls = $tools, injection_mode = $mode, agent_scope = $scope, trigger_embedding = $emb \
          WHERE vault_id = $vid AND skill_id = $sid"
     )
     .bind(("title", title))
@@ -2740,7 +2747,8 @@ pub async fn list_agent_skills(
         title: String,
         trigger: String,
         behavior: String,
-        auto_tool_calls: Vec<String>,
+        #[serde(default)]
+        tool_calls: Vec<String>,
         is_active: bool,
         #[serde(default = "default_passive")]
         injection_mode: String,
@@ -2752,7 +2760,7 @@ pub async fn list_agent_skills(
     }
 
     let mut query = "SELECT skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
-                     auto_tool_calls, is_active, injection_mode OR 'passive' AS injection_mode, \
+                     tool_calls OR [] AS tool_calls, is_active, injection_mode OR 'passive' AS injection_mode, \
                      agent_scope OR 'all' AS agent_scope, \
                      trigger_count, last_triggered_at, created_at \
                      FROM agent_skills WHERE vault_id = $vid".to_string();
@@ -2777,7 +2785,7 @@ pub async fn list_agent_skills(
         title: r.title,
         trigger: r.trigger,
         behavior: r.behavior,
-        auto_tool_calls: r.auto_tool_calls,
+        tool_calls: r.tool_calls,
         is_active: r.is_active,
         injection_mode: r.injection_mode,
         agent_scope: r.agent_scope,
@@ -2874,7 +2882,7 @@ pub async fn suggest_kb_cards_for_item(
       "title": "技能標題",
       "trigger": "當問題涉及 X、Y、Z 時（描述觸發此技能的情境）",
       "behavior": "具體的操作指令：先做A，再做B，最後C（agent 應遵循的行為規範）",
-      "auto_tool_calls": ["search_vault"]
+      "tool_calls": ["search_vault"]
     }
   ]
 }
@@ -2884,7 +2892,7 @@ pub async fn suggest_kb_cards_for_item(
 - skill_cards：1-2 張
   - trigger 必須明確描述觸發情境，以「當…時」開頭
   - behavior 必須是可執行的操作指令，不能是模糊描述
-  - auto_tool_calls 只能包含：search_vault、read_note、list_structure（或空陣列）
+  - tool_calls 只能包含：search_vault、read_note、list_structure（或空陣列）
   - 若知識內容不適合產生 skill_cards，可回傳空陣列
 
 note_cards content 格式範例（concept）：
@@ -2989,7 +2997,7 @@ tags: [concept]
 
     for skill in &suggestions.skill_cards {
         let skill_id = uuid::Uuid::new_v4().to_string();
-        let safe_tools: Vec<String> = skill.auto_tool_calls.iter()
+        let safe_tools: Vec<String> = skill.tool_calls.iter()
             .filter(|t| allowed.contains(&t.as_str()))
             .cloned().collect();
 
@@ -3004,7 +3012,7 @@ tags: [concept]
         let insert_result = db.query(
             "INSERT INTO agent_skills \
              (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
-              auto_tool_calls, is_active, injection_mode, agent_scope, trigger_count, trigger_embedding, created_at) \
+              tool_calls, is_active, injection_mode, agent_scope, trigger_count, trigger_embedding, created_at) \
              VALUES ($sid, $vid, $kid, $title, $trigger, $behavior, \
                      $tools, false, $mode, $scope, 0, $emb, time::now())"
         )
@@ -3030,7 +3038,7 @@ tags: [concept]
             title: skill.title.clone(),
             trigger: skill.trigger.clone(),
             behavior: skill.behavior.clone(),
-            auto_tool_calls: safe_tools,
+            tool_calls: safe_tools,
             is_active: false,
             injection_mode: skill.injection_mode.clone(),
             agent_scope: scope,
@@ -3108,7 +3116,7 @@ pub async fn compress_conversation_to_knowledge(
       "title": "技能標題",
       "trigger": "當使用者問到...時（具體描述觸發情境）",
       "behavior": "應先...，再...，最後...（可執行的操作指令）",
-      "auto_tool_calls": []
+      "tool_calls": []
     }
   ]
 }
@@ -3120,7 +3128,7 @@ pub async fn compress_conversation_to_knowledge(
 4. 高密度 Q&A（問題有意義 + 答案有知識價值）
 
 skill_candidates：只萃取能直接改變未來 AI 行為的規則。若對話純屬閒聊或無可萃取規則，回傳空陣列。
-auto_tool_calls 只能包含：search_vault、read_note、list_structure（或空陣列）。"#;
+tool_calls 只能包含：search_vault、read_note、list_structure（或空陣列）。"#;
 
     let base_url = ensure_server_running(state.inner(), &app).await
         .map_err(|e| AppError::AI(e.to_string()))?;
@@ -3206,7 +3214,7 @@ auto_tool_calls 只能包含：search_vault、read_note、list_structure（或�
                 .await.ok();
             }
             if let Some(ref url) = emb_url2 {
-                let _ = crate::vault::chunker::upsert_chunks(&db2, &vid2, &chunks, Some(url)).await;
+                let _ = crate::vault::chunker::upsert_chunks(&db2, None, &vid2, &chunks, Some(url)).await;
             }
         });
     }
@@ -3217,7 +3225,7 @@ auto_tool_calls 只能包含：search_vault、read_note、list_structure（或�
 
     for skill in &compression.skill_candidates {
         let skill_id = Uuid::new_v4().to_string();
-        let safe_tools: Vec<String> = skill.auto_tool_calls.iter()
+        let safe_tools: Vec<String> = skill.tool_calls.iter()
             .filter(|t| allowed.contains(&t.as_str()))
             .cloned().collect();
 
@@ -3231,7 +3239,7 @@ auto_tool_calls 只能包含：search_vault、read_note、list_structure（或�
         let _ = db.query(
             "INSERT INTO agent_skills \
              (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
-              auto_tool_calls, is_active, injection_mode, agent_scope, trigger_count, trigger_embedding, created_at) \
+              tool_calls, is_active, injection_mode, agent_scope, trigger_count, trigger_embedding, created_at) \
              VALUES ($sid, $vid, $kid, $title, $trigger, $behavior, \
                      $tools, false, $mode, $scope, 0, $emb, time::now())"
         )
@@ -3249,7 +3257,7 @@ auto_tool_calls 只能包含：search_vault、read_note、list_structure（或�
             title: skill.title.clone(),
             trigger: skill.trigger.clone(),
             behavior: skill.behavior.clone(),
-            auto_tool_calls: safe_tools,
+            tool_calls: safe_tools,
             is_active: false,
             injection_mode: skill.injection_mode.clone(),
             agent_scope: scope,
@@ -3295,10 +3303,10 @@ pub async fn extract_skill_from_exchange(
   "title": "技能標題（10字以內）",
   "trigger": "當使用者...時（具體觸發條件，15-30字）",
   "behavior": "應先...，再...（具體、可執行的操作指令）",
-  "auto_tool_calls": []
+  "tool_calls": []
 }
 
-auto_tool_calls 只能包含：search_vault、read_note、list_structure（或空陣列）。
+tool_calls 只能包含：search_vault、read_note、list_structure（或空陣列）。
 若對話內容無可萃取的行為規則，trigger 欄填入「無法萃取」。"#;
 
     let conv = format!("使用者：{}\n\n助理：{}", user_msg, assistant_msg);
@@ -4076,7 +4084,7 @@ async fn background_import_search_results(
         // Store chunks
         let now_ms = chrono::Utc::now().timestamp_millis();
         let chunks = crate::vault::chunker::chunk_note(&note_path, &note_content, now_ms);
-        let _ = crate::vault::chunker::upsert_chunks(&db, &vault_id, &chunks, emb_url.as_deref()).await;
+        let _ = crate::vault::chunker::upsert_chunks(&db, None, &vault_id, &chunks, emb_url.as_deref()).await;
 
         // Update import_pages record
         let now_dt = surrealdb::sql::Datetime::from(chrono::Utc::now());

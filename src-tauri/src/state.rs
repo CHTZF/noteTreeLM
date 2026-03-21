@@ -5,6 +5,7 @@ use tokio::sync::{Mutex, RwLock};
 use reqwest;
 
 use crate::db::surreal::SurrealDb;
+use crate::db::sqlite::SqliteConn;
 use crate::error::AppError;
 use crate::runtime::system_agent::SystemAgentService;
 
@@ -58,6 +59,8 @@ pub struct AppState {
     pub api_key_cache: Arc<Mutex<HashMap<String, String>>>,
     /// 外部 AI 設定快取：key → value（ai_provider / ai_base_url / ai_model），使用者儲存後失效
     pub settings_cache: Arc<Mutex<HashMap<String, String>>>,
+    /// SQLite FTS5 search index（search.db）
+    pub sqlite: SqliteConn,
     /// 共用 HTTP client（所有 LLM / embedding 呼叫共用，避免重複建立 connection pool）
     pub http_client: reqwest::Client,
     /// Intent centroid 快取（confirm / cancel / interrupt 三組固定詞組的 embedding 平均值）
@@ -68,11 +71,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(db: SurrealDb) -> Self {
+    pub fn new(db: SurrealDb, sqlite: SqliteConn) -> Self {
         let system_agent = Arc::new(SystemAgentService::new(db.clone()));
         Self {
             system_agent,
             db,
+            sqlite,
             vault_path: Arc::new(RwLock::new(String::new())),
             llama_server: Arc::new(Mutex::new(None)),
             whisper_server: Arc::new(Mutex::new(None)),

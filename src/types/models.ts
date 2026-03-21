@@ -103,7 +103,7 @@ export interface AgentSkillSuggestion {
   title: string
   trigger: string
   behavior: string
-  auto_tool_calls: string[]
+  tool_calls: string[]
   injection_mode?: 'passive' | 'active'
   agent_scope?: AgentScope
 }
@@ -116,7 +116,7 @@ export interface AgentSkill {
   title: string
   trigger: string
   behavior: string
-  auto_tool_calls: string[]
+  tool_calls: string[]
   is_active: boolean
   injection_mode: 'passive' | 'active'  // 被動取用 | 主動注入
   agent_scope: AgentScope               // 適用的 agent 範圍

@@ -15,6 +15,18 @@ async fn embedding_url(state: &AppState) -> Option<String> {
     port.map(|p| format!("http://127.0.0.1:{}", p))
 }
 
+/// 將 SurrealDB 內部 channel 關閉錯誤（系統休眠造成）轉換為友善訊息。
+fn map_db_error(e: impl std::fmt::Display) -> AppError {
+    let s = e.to_string();
+    if s.contains("empty and closed channel") || s.contains("channel closed") {
+        AppError::Database(
+            "系統從休眠恢復後資料庫連線中斷，請關閉並重新開啟 App 後再試。".to_string()
+        )
+    } else {
+        AppError::Database(s)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Note {
     pub path: String,
@@ -176,7 +188,7 @@ pub async fn create_note(
     // 建立 chunks（忽略失敗，不影響主流程）
     let chunks = chunker::chunk_note(&rel_path, &content, now_ms);
     let emb_url = embedding_url(&state).await;
-    let _ = chunker::upsert_chunks(&db, &vault_id, &chunks, emb_url.as_deref()).await;
+    let _ = chunker::upsert_chunks(&db, Some(&state.sqlite), &vault_id, &chunks, emb_url.as_deref()).await;
 
     Ok(Note {
         path: rel_path,
@@ -262,7 +274,7 @@ pub async fn update_note(
     // 更新 chunks
     let chunks = chunker::chunk_note(&path, &content, now_ms);
     let emb_url = embedding_url(&state).await;
-    let _ = chunker::upsert_chunks(&db, &vault_id, &chunks, emb_url.as_deref()).await;
+    let _ = chunker::upsert_chunks(&db, Some(&state.sqlite), &vault_id, &chunks, emb_url.as_deref()).await;
 
     Ok(())
 }
@@ -375,7 +387,7 @@ pub async fn delete_note(
         .map_err(|e| AppError::Database(e.to_string()))?;
 
     // 刪除對應 chunks
-    let _ = chunker::delete_chunks(&db, &vault_id, &path).await;
+    let _ = chunker::delete_chunks(&db, Some(&state.sqlite), &vault_id, &path).await;
 
     Ok(DeleteResult { affected_links })
 }
@@ -1358,7 +1370,7 @@ async fn trash_single_note(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
     // 刪除 chunks，避免搜尋到已刪除的筆記
-    let _ = chunker::delete_chunks(db, vault_id, note_path).await;
+    let _ = chunker::delete_chunks(db, None, vault_id, note_path).await;
 
     let item_id = uuid::Uuid::new_v4().to_string();
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -1638,7 +1650,7 @@ pub async fn delete_trash_items(
                 let _ = tokio::fs::remove_file(&file_path).await;
             }
             // 清除殘留 chunks（正常 trash 流程已刪，這裡作為防護網）
-            let _ = chunker::delete_chunks(&db, &vault_id, &row.original_path).await;
+            let _ = chunker::delete_chunks(&db, Some(&state.sqlite), &vault_id, &row.original_path).await;
         }
         db.query("DELETE FROM trash_items WHERE vault_id = $vid AND item_id = $id")
             .bind(("vid", vault_id.clone()))
@@ -1818,6 +1830,65 @@ pub async fn get_index_stats(state: State<'_, AppState>) -> Result<serde_json::V
     Ok(json!({ "total": total, "chunked": chunked, "embedded": embedded }))
 }
 
+/// 列出所有修復 log（app_data_dir/db_repair_logs/*.json），由新到舊
+#[tauri::command]
+pub async fn list_repair_logs(app: tauri::AppHandle) -> Result<Vec<serde_json::Value>, AppError> {
+    use tauri::Manager;
+    let logs_dir = app.path().app_data_dir()
+        .map_err(|e: tauri::Error| AppError::Database(e.to_string()))?
+        .join("db_repair_logs");
+
+    if !logs_dir.exists() {
+        return Ok(vec![]);
+    }
+
+    let mut entries = tokio::fs::read_dir(&logs_dir).await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let mut files: Vec<(String, String)> = vec![]; // (filename, content)
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".json") { continue }
+        if let Ok(content) = tokio::fs::read_to_string(entry.path()).await {
+            files.push((name, content));
+        }
+    }
+    // 按檔名（時間戳）降序
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut logs = vec![];
+    for (filename, content) in files {
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&content) {
+            v["filename"] = serde_json::Value::String(filename);
+            logs.push(v);
+        }
+    }
+    Ok(logs)
+}
+
+/// 備份重要 tables → 寫入 db_needs_repair flag，使用者重啟後自動重建 DB
+/// 備份內容：settings / user_settings / users / sessions / vault_states /
+///           agent_skills / agent_definitions / skill_usage_log / conversations / memory_rules
+#[tauri::command]
+pub async fn prepare_db_repair(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), AppError> {
+    use tauri::Manager;
+    let app_data_dir = app.path().app_data_dir()
+        .map_err(|e: tauri::Error| AppError::Database(e.to_string()))?;
+
+    // 1. 匯出重要 tables
+    crate::db::surreal::export_backup(&state.db, &app_data_dir).await?;
+
+    // 2. 寫入修復 flag（重啟時 init_db 自動偵測）
+    tokio::fs::write(app_data_dir.join("db_needs_repair"), "1")
+        .await
+        .map_err(|e: std::io::Error| AppError::Database(e.to_string()))?;
+
+    Ok(())
+}
+
 /// 重新建立整個 vault 的 chunk 索引，逐筆 emit 進度事件
 #[tauri::command]
 pub async fn reindex_vault_chunks(
@@ -1840,20 +1911,113 @@ pub async fn reindex_vault_chunks(
     let mut resp = db
         .query("SELECT path, content FROM notes WHERE vault_id = $vid")
         .bind(("vid", vault_id.clone()))
-        .await.map_err(|e| AppError::Database(e.to_string()))?;
-    let notes: Vec<NotePathContent> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+        .await.map_err(map_db_error)?;
+    let notes: Vec<NotePathContent> = resp.take(0).map_err(map_db_error)?;
 
     let total = notes.len();
     let now = chrono::Utc::now().timestamp_millis();
 
-    for (i, note) in notes.iter().enumerate() {
-        let _ = app.emit("reindex:progress", ReindexProgress {
-            done: i,
-            total,
-            path: note.path.clone(),
-        });
-        let chunks = chunker::chunk_note(&note.path, &note.content, now);
-        chunker::upsert_chunks(&db, &vault_id, &chunks, emb_url.as_deref()).await?;
+    // 1a. 清除損壞的 ft_chunks BM25 index
+    //     REMOVE TABLE 做 KV range delete，不觸發 B-tree 逐筆操作 → 安全
+    //     副作用：所有 vault 的 chunks 都會清空，使用者需逐一重建索引
+    let _ = db.query("REMOVE TABLE chunks").await;
+
+    // 1b. 重建 chunks table schema（不含 HNSW index；HNSW 在資料全部寫入後才 bulk build）
+    //     SurrealDB 2.x 的 HNSW 在空 index 上逐筆 incremental insert 時有 panic bug，
+    //     解法是先插完資料，最後再 DEFINE INDEX 讓它一次 bulk build。
+    db.query(concat!(
+        "DEFINE TABLE IF NOT EXISTS chunks SCHEMAFULL;",
+        "DEFINE FIELD IF NOT EXISTS vault_id   ON chunks TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS chunk_id   ON chunks TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS file_path  ON chunks TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS section    ON chunks TYPE string DEFAULT '';",
+        "DEFINE FIELD IF NOT EXISTS content    ON chunks TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS links      ON chunks TYPE array<string> DEFAULT [];",
+        "DEFINE FIELD IF NOT EXISTS chunk_type ON chunks TYPE string DEFAULT 'text';",
+        "DEFINE FIELD IF NOT EXISTS word_count ON chunks TYPE int DEFAULT 0;",
+        "DEFINE FIELD IF NOT EXISTS updated_at ON chunks TYPE datetime DEFAULT time::now();",
+        "DEFINE FIELD IF NOT EXISTS status     ON chunks TYPE string DEFAULT '';",
+        "DEFINE FIELD IF NOT EXISTS embedding  ON chunks TYPE option<array<float>>;",
+        "DEFINE FIELD IF NOT EXISTS item_id    ON chunks TYPE option<string>;",
+        "DEFINE INDEX IF NOT EXISTS idx_chunks_vault_file ON chunks FIELDS vault_id, file_path;",
+        "DEFINE INDEX IF NOT EXISTS idx_chunks_vault_id   ON chunks FIELDS vault_id, chunk_id UNIQUE;",
+        "DEFINE INDEX IF NOT EXISTS idx_chunks_item_id    ON chunks FIELDS vault_id, item_id;",
+    )).await.map_err(map_db_error)?;
+
+    // 2. 收集所有 notes 的所有 chunks（純 CPU，無 IO）
+    let all_chunks: Vec<chunker::Chunk> = notes.iter()
+        .flat_map(|note| chunker::chunk_note(&note.path, &note.content, now))
+        .collect();
+    let chunk_total = all_chunks.len();
+
+    let _ = app.emit("reindex:progress", ReindexProgress {
+        done: 0, total: chunk_total, path: "計算 embedding 中…".to_string(),
+    });
+
+    // 3a. 平行 clean：rayon par_iter 跨所有 CPU core，全部完成後再進 embedding
+    //     spawn_blocking 讓 rayon 不阻塞 tokio executor
+    let all_cleaned: Vec<String> = {
+        let contents: Vec<String> = all_chunks.iter().map(|c| c.content.clone()).collect();
+        tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+            contents.par_iter()
+                .map(|c| chunker::clean_for_embedding(c))
+                .collect()
+        }).await.unwrap_or_else(|_| {
+            // fallback：若 spawn_blocking 失敗，退回單執行緒
+            all_chunks.iter().map(|c| chunker::clean_for_embedding(&c.content)).collect()
+        })
+    };
+
+    // 3b. Batch embedding：每 32 筆一次 HTTP 請求
+    //     llama.cpp /v1/embeddings 支援 array input，server 端批次 inference。
+    //     失敗時 get_embeddings_batch 內部 fallback 到個別請求。
+    const EMBED_BATCH: usize = 32;
+    let all_embeddings: Vec<Option<Vec<f32>>> = if let Some(ref url) = emb_url {
+        let client = state.http_client.clone();
+        let url = url.clone();
+        let mut results = Vec::with_capacity(chunk_total);
+        for (i, batch_cleaned) in all_cleaned.chunks(EMBED_BATCH).enumerate() {
+            let texts: Vec<&str> = batch_cleaned.iter().map(|s| s.as_str()).collect();
+            let vecs = crate::commands::ai::get_embeddings_batch(&client, &url, &texts).await;
+            for v in vecs {
+                results.push(if v.is_empty() { None } else { Some(v) });
+            }
+            let done_so_far = ((i + 1) * EMBED_BATCH).min(chunk_total);
+            let _ = app.emit("reindex:progress", ReindexProgress {
+                done: done_so_far,
+                total: chunk_total,
+                path: "計算 embedding 中…".to_string(),
+            });
+        }
+        results
+    } else {
+        vec![None; chunk_total]
+    };
+
+    // 4. 批次 INSERT（每 50 筆一次 round-trip）
+    let _ = app.emit("reindex:progress", ReindexProgress {
+        done: 0, total: chunk_total, path: "寫入索引中…".to_string(),
+    });
+    chunker::batch_insert_with_embeddings(&db, &vault_id, &all_chunks, &all_embeddings).await?;
+
+    // 5. 重建 SQLite FTS5 index（速度快，取代原本的 SurrealDB BM25）
+    let _ = app.emit("reindex:progress", ReindexProgress {
+        done: chunk_total, total: chunk_total, path: "重建搜尋索引…".to_string(),
+    });
+    {
+        let sqlite = state.sqlite.clone();
+        let fts_rows: Vec<(String, String, String, String, String)> = all_chunks.iter()
+            .map(|c| (c.id.clone(), c.file_path.clone(), c.section.clone(), c.content.clone(), c.status.clone()))
+            .collect();
+        let vid = vault_id.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(conn) = sqlite.lock() {
+                if let Err(e) = crate::db::sqlite::fts_rebuild_vault(&conn, &vid, &fts_rows) {
+                    log::error!("SQLite FTS rebuild failed: {e}");
+                }
+            }
+        }).await.ok();
     }
 
     // 完成
@@ -1921,11 +2085,13 @@ pub async fn search_vault_chunks(
             vec_diag = Some("vector_fail");
             vec![]
         } else {
+            // Brute-force cosine scan (no HNSW dependency).
+            // SurrealDB 2.x HNSW is unstable; brute-force is instant for <10k chunks.
             let vec_q = format!(
                 "SELECT file_path, section, content,
                         vector::similarity::cosine(embedding, $qvec) AS score
                  FROM chunks
-                 WHERE vault_id = $vid AND embedding != NONE{}
+                 WHERE vault_id = $vid AND embedding IS NOT NONE{}
                  ORDER BY score DESC
                  LIMIT 10",
                 status_clause
@@ -1938,7 +2104,7 @@ pub async fn search_vault_chunks(
                 .map_err(|e| AppError::Database(e.to_string()))?;
             let rows: Vec<ChunkRow> = resp.take(0).unwrap_or_default();
             if rows.is_empty() {
-                vec_diag = Some("no_vec_index");
+                vec_diag = Some("no_vec_results");
             } else {
                 search_method = "vector";
             }
@@ -1948,22 +2114,23 @@ pub async fn search_vault_chunks(
         vec![]
     };
 
-    // 2. Fallback A：BM25 全文搜尋
+    // 2. Fallback A：SQLite FTS5 全文搜尋
     let chunk_rows: Vec<ChunkRow> = if chunk_rows.is_empty() {
-        let bm25_q = format!(
-            "SELECT file_path, section, content FROM chunks
-             WHERE vault_id = $vid AND content @1@ $query{}
-             LIMIT 10",
-            status_clause
-        );
-        let mut resp = db
-            .query(&bm25_q)
-            .bind(("vid", vault_id.clone()))
-            .bind(("query", query.trim().to_owned()))
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-        let rows: Vec<ChunkRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
-        if !rows.is_empty() { search_method = "bm25"; }
+        let sqlite = state.sqlite.clone();
+        let q = query.trim().to_owned();
+        let vid = vault_id.clone();
+        let fts_rows = tokio::task::spawn_blocking(move || {
+            match sqlite.lock() {
+                Ok(conn) => crate::db::sqlite::fts_search(&conn, &vid, &q, verified_only, 10)
+                    .unwrap_or_default(),
+                Err(_) => vec![],
+            }
+        }).await.unwrap_or_default();
+
+        let rows: Vec<ChunkRow> = fts_rows.into_iter()
+            .map(|r| ChunkRow { file_path: r.file_path, section: r.section, content: r.content })
+            .collect();
+        if !rows.is_empty() { search_method = "fts5"; }
         rows
     } else {
         chunk_rows

@@ -414,6 +414,12 @@ function AppMain() {
         else if (action === 'open_note' && typeof payload === 'string') openNoteFromChat(payload)
         else console.warn('[ui:action] unknown action:', action, payload)
       })
+      const dbCorruptionUnlisten = await listen<{ reason: string }>('db:corruption_detected', e => {
+        toast.error(
+          `⚠️ 資料庫索引損壞（${e.payload.reason}）\n請前往「語意搜尋 → 修復 DB」完成修復後重啟 App。`,
+          { duration: 0 }
+        )
+      })
       const scheduleTriggeredUnlisten = await listen<{ task_id: string; description: string }>('schedule:triggered', e => {
         toast.info(`排程提醒：${e.payload.description}`)
       })
@@ -454,6 +460,7 @@ function AppMain() {
         openNoteUnlisten()
         uiToastUnlisten()
         uiActionUnlisten()
+        dbCorruptionUnlisten()
         scheduleTriggeredUnlisten()
         noteDeletedUnlisten()
         window.removeEventListener('note:renamed', handleNoteRenamed)

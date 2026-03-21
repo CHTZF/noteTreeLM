@@ -126,9 +126,10 @@ pub(crate) async fn ensure_server_running(
             "--host",
             "127.0.0.1",
             "--ctx-size",
-            "4096",
+            "8192",
             "--parallel",
             "1",
+            "--n-gpu-layers", "99",  // Metal/CUDA/Vulkan offload; llama.cpp 自動降回 CPU（無 GPU 時不 crash）
             "--embedding",
             "--pooling",
             "mean",
@@ -322,6 +323,79 @@ pub async fn get_embedding(client: &reqwest::Client, base_url: &str, text: &str)
     vec![]
 }
 
+/// Batch embedding: send multiple texts in one HTTP request.
+///
+/// Uses the OpenAI `/v1/embeddings` format with `"input": [...]`.
+/// Returns one `Vec<f32>` per input text (empty vec if that text failed).
+/// Falls back to individual `get_embedding` calls if the batch endpoint
+/// returns an unexpected format.
+pub async fn get_embeddings_batch(
+    client: &reqwest::Client,
+    base_url: &str,
+    texts: &[&str],
+) -> Vec<Vec<f32>> {
+    if texts.is_empty() {
+        return vec![];
+    }
+
+    // Helper: parse a batch response `data[].embedding` sorted by `index`.
+    fn extract_batch(json: &serde_json::Value, n: usize) -> Option<Vec<Vec<f32>>> {
+        let data = json["data"].as_array()?;
+        if data.is_empty() { return None; }
+        let mut out: Vec<(usize, Vec<f32>)> = Vec::with_capacity(data.len());
+        for item in data {
+            let idx = item["index"].as_u64().unwrap_or(0) as usize;
+            if let Some(arr) = item["embedding"].as_array() {
+                let v: Vec<f32> = arr.iter()
+                    .filter_map(|x| x.as_f64().map(|f| f as f32))
+                    .collect();
+                if !v.is_empty() { out.push((idx, v)); }
+            }
+        }
+        if out.is_empty() { return None; }
+        out.sort_by_key(|(i, _)| *i);
+        // Fill any missing indices with empty vecs
+        let mut result = vec![vec![]; n];
+        for (idx, v) in out {
+            if idx < n { result[idx] = v; }
+        }
+        Some(result)
+    }
+
+    let input = serde_json::json!(texts);
+
+    // Try /v1/embeddings with array input (primary)
+    for payload in [
+        serde_json::json!({ "input": input }),
+        serde_json::json!({ "input": input, "model": "embedding" }),
+    ] {
+        if let Ok(resp) = client
+            .post(format!("{}/v1/embeddings", base_url))
+            .json(&payload)
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    if let Some(batch) = extract_batch(&json, texts.len()) {
+                        return batch;
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: individual requests (preserves correct ordering)
+    let futs: Vec<_> = texts.iter().map(|t| {
+        let client = client.clone();
+        let base = base_url.to_owned();
+        let text = t.to_string();
+        async move { get_embedding(&client, &base, &text).await }
+    }).collect();
+    futures::future::join_all(futs).await
+}
+
 /// App 啟動時呼叫：若已設定路徑則背景預熱 llama-server
 pub async fn warmup_llama_server(state: &AppState, app: &AppHandle) {
     let configured = matches!(
@@ -492,16 +566,24 @@ pub(crate) async fn ensure_embedding_server_running(
         "[embed] 啟動 embedding-server：{}\n  模型：{}\n  埠：{}", bin.display(), model_path, port
     ));
 
+    let cpu_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .to_string();
+
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.args([
-        "--model", &model_path,
-        "--port", &port.to_string(),
-        "--host", "127.0.0.1",
-        "--ctx-size", "512",
-        "--parallel", "4",
+        "--model",       &model_path,
+        "--port",        &port.to_string(),
+        "--host",        "127.0.0.1",
+        "--ctx-size",    "512",
+        "--batch-size",  "2048",   // parallel(4) × ctx-size(512) — 一次 forward pass 的 token 上限
+        "--parallel",    "4",      // 4 個 text 同時塞入一次 forward pass
+        "--threads",     &cpu_threads,
+        "--n-gpu-layers","99",     // Apple Silicon Metal 全層 offload（無 GPU 時 llama.cpp 自動降回 CPU）
         "--embeddings",
         "--embedding",
-        "--pooling", "cls",
+        "--pooling",     "cls",
     ])
     .stdin(std::process::Stdio::null())
     .stdout(std::process::Stdio::null())

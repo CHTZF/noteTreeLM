@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { open } from '@tauri-apps/plugin-dialog'
+import { open, ask, message } from '@tauri-apps/plugin-dialog'
 import { useSettingsStore, SYSTEM_KEYS, SystemSettings } from '../../stores/settingsStore'
 import { useAuthStore } from '../../stores/authStore'
 import { Settings, DEFAULT_SETTINGS } from '../../types/settings'
@@ -57,11 +57,21 @@ const labelStyle: React.CSSProperties = {
 }
 const fieldStyle: React.CSSProperties = { marginBottom: '18px' }
 
+interface RepairLog {
+  filename: string
+  timestamp: string
+  reason: string
+  result: string
+  tables_restored: Record<string, number>
+}
+
 export default function SettingsModal({ onClose, inline, mode = 'personal' }: SettingsModalProps) {
   const { settings, savePersonal, saveSystem, loadSystem, systemSettings, getApiKey, setApiKey } = useSettingsStore()
   const { session } = useAuthStore()
 
   const [tab, setTab] = useState<Tab>(mode === 'system' ? 'ai' : 'general')
+  const [repairLogs, setRepairLogs] = useState<RepairLog[]>([])
+  const [expandedLog, setExpandedLog] = useState<string | null>(null)
   const [draft, setDraft] = useState<Settings>(() =>
     mode === 'system'
       ? { ...DEFAULT_SETTINGS, ...(systemSettings ?? {}) }
@@ -327,6 +337,13 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
       .finally(() => setMemoryRulesLoading(false))
   }, [tab])
 
+  useEffect(() => {
+    if (tab !== 'advanced') return
+    invoke<RepairLog[]>('list_repair_logs')
+      .then(setRepairLogs)
+      .catch(() => setRepairLogs([]))
+  }, [tab])
+
   const handleDeleteMemoryRule = async (id: number) => {
     await invoke('delete_memory_rule', { id }).catch(() => {})
     setMemoryRules((prev) => prev.filter((r) => r.id !== id))
@@ -358,6 +375,24 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
       ai_model: DEFAULT_MODEL[provider] ?? '',
       ai_base_url: DEFAULT_BASE_URL[provider] ?? '',
     })
+  }
+
+  const handleRepair = async () => {
+    const confirmed = await ask(
+      '此操作將備份設定、帳號、技能、Agent 定義及對話紀錄，\n然後在重啟時重建資料庫並自動還原。\n\n重啟後搜尋索引需重新執行 reindex。\n\n確定要繼續嗎？',
+      { title: '修復資料庫', kind: 'warning', okLabel: '確定修復', cancelLabel: '取消' }
+    )
+    if (!confirmed) return
+    try {
+      await invoke('prepare_db_repair')
+      await message('備份完成，請重新啟動 App。\n重啟後資料庫將自動修復並還原資料。', {
+        title: '修復準備完成', kind: 'info'
+      })
+    } catch (e: any) {
+      await message('修復準備失敗：' + (typeof e === 'string' ? e : JSON.stringify(e)), {
+        title: '錯誤', kind: 'error'
+      })
+    }
   }
 
   const handleSave = async () => {
@@ -536,7 +571,7 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
 
 
   const tabs: [Tab, string][] = mode === 'system'
-    ? [['ai', '外部 AI'], ['voice', 'Whisper'], ['local', 'Local LLM'], ['raw', '設定檔']]
+    ? [['ai', '外部 AI'], ['voice', 'Whisper'], ['local', 'Local LLM'], ['advanced', '進階'], ['raw', '設定檔']]
     : [['account', '帳號'], ['general', '一般'], ['advanced', '進階'], ['memory', '記憶規則'], ['raw', '設定檔']]
 
   const handleChangePassword = async () => {
@@ -1503,6 +1538,28 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
             </>}
 
             {tab === 'advanced' && <>
+              {mode === 'system' && (
+                <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px', marginTop: '8px' }}>
+                  <p style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)', margin: '0 0 6px' }}>
+                    資料庫修復
+                  </p>
+                  <p style={{ fontSize: '12px', color: 'var(--color-text-muted)', margin: '0 0 10px', lineHeight: 1.6 }}>
+                    備份設定、帳號、技能、Agent 定義及對話紀錄，重啟後自動重建資料庫並還原。重啟後搜尋索引需重新執行 reindex。
+                  </p>
+                  <button
+                    onClick={handleRepair}
+                    style={{
+                      padding: '6px 16px', borderRadius: '6px', fontSize: '13px',
+                      border: '1px solid var(--color-warning, #f59e0b)',
+                      background: 'transparent', color: 'var(--color-warning, #f59e0b)',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    修復 DB
+                  </button>
+                </div>
+              )}
+              {mode === 'personal' && (
               <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px', marginTop: '8px' }}>
                 <ToggleRow
                   label="Agent tool 測試"
@@ -1521,6 +1578,61 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                   <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 16px 0', lineHeight: 1.5 }}>
                     開啟後右側面板會新增 Debug 分頁，顯示語音錄音的詳細事件日誌。
                   </p>
+                )}
+              </div>
+              )}
+
+              {/* 資料庫修復紀錄 */}
+              <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px', marginTop: '8px' }}>
+                <p style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)', margin: '0 0 10px' }}>
+                  資料庫修復紀錄
+                </p>
+                {repairLogs.length === 0 ? (
+                  <p style={{ fontSize: '12px', color: 'var(--color-text-muted)', fontStyle: 'italic' }}>無修復紀錄</p>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                    {repairLogs.map((log) => (
+                      <div key={log.filename} style={{ border: '1px solid var(--color-border)', borderRadius: '6px', overflow: 'hidden' }}>
+                        <button
+                          onClick={() => setExpandedLog(expandedLog === log.filename ? null : log.filename)}
+                          style={{
+                            width: '100%', textAlign: 'left', background: 'var(--color-bg-elevated)',
+                            border: 'none', padding: '8px 12px', cursor: 'pointer',
+                            display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px',
+                          }}
+                        >
+                          <span style={{ fontSize: '12px', color: 'var(--color-text-primary)' }}>
+                            {new Date(log.timestamp).toLocaleString('zh-TW')}
+                          </span>
+                          <span style={{
+                            fontSize: '11px', padding: '1px 6px', borderRadius: '4px',
+                            background: log.result === '成功' ? 'var(--color-success-dim, #052e16)' : 'var(--color-warning-dim, #451a03)',
+                            color: log.result === '成功' ? 'var(--color-success, #4ade80)' : 'var(--color-warning, #f59e0b)',
+                          }}>
+                            {log.result === '成功' ? '修復成功' : log.result}
+                          </span>
+                          <span style={{ fontSize: '11px', color: 'var(--color-text-muted)', marginLeft: 'auto' }}>
+                            {expandedLog === log.filename ? '▲' : '▼'}
+                          </span>
+                        </button>
+                        {expandedLog === log.filename && (
+                          <div style={{ padding: '10px 12px', fontSize: '12px', lineHeight: 1.7, color: 'var(--color-text-secondary)' }}>
+                            <div><strong>原因：</strong>{log.reason}</div>
+                            <div style={{ marginTop: '6px' }}><strong>已還原 tables：</strong></div>
+                            {Object.keys(log.tables_restored).length === 0 ? (
+                              <div style={{ color: 'var(--color-text-muted)', fontStyle: 'italic' }}>無備份可還原</div>
+                            ) : (
+                              <ul style={{ margin: '4px 0 0 16px', padding: 0 }}>
+                                {Object.entries(log.tables_restored).map(([tbl, cnt]) => (
+                                  <li key={tbl}>{tbl}：{cnt} 筆</li>
+                                ))}
+                              </ul>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
                 )}
               </div>
             </>}

@@ -12,7 +12,7 @@ export type SkillPreview = {
   title: string
   trigger: string
   behavior: string
-  autoToolCalls: string[]
+  toolCalls: string[]
   injectionMode: 'passive' | 'active'
 }
 
