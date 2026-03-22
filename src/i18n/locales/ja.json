@@ -154,7 +154,7 @@
     "confirm_mode_once": "セッションごとに一度確認",
     "confirm_mode_never": "確認しない（自動許可）"
   },
-  "live_chat": { "title": "音声対話", "listening": "聴取中", "transcribing": "文字起こし中", "thinking": "回答中", "speaking": "再生中", "idle": "待機中", "pause": "一時停止", "resume": "再開", "clear": "クリア", "barge_in": "割り込み" },
+  "live_chat": { "title": "音声対話", "listening": "聴取中", "transcribing": "文字起こし中", "thinking": "思考中", "speaking": "回答中", "idle": "待機中", "pause": "一時停止", "resume": "再開", "clear": "クリア", "barge_in": "割り込み" },
   "file_tree": { "new_note": "新規ノート", "new_folder": "新規フォルダー", "rename": "名前変更", "delete": "削除", "move": "移動", "open": "開く", "open_in_new_tab": "新しいタブで開く", "empty": "ノートがありません", "empty_hint": "最初のノートを作成して始めましょう", "vault_label": "Vault", "context_new_note": "ここに新規ノート", "context_new_folder": "ここに新規フォルダー", "context_rename": "名前変更", "context_delete": "削除" },
   "search": { "title": "セマンティック検索", "placeholder": "Vault を検索…", "no_results": "結果が見つかりません", "results_count": "{{count}} 件" },
   "agents": { "title": "Agent 管理", "new": "新規 Agent", "builtin": "組み込み", "custom": "カスタム", "no_agents": "Agent がありません", "create_hint": "最初の Agent を作成", "status_active": "アクティブ", "status_sleeping": "スリープ中", "status_idle": "アイドル", "wake_up": "ウェイクアップ", "delete": "削除", "edit": "編集", "tools": "ツール", "trigger": "トリガー", "system_prompt": "システムプロンプト" },

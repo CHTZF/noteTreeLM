@@ -68,6 +68,8 @@ pub struct AppState {
     pub intent_centroids: Arc<Mutex<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>>>,
     /// 已設置標題的對話 ID 集合（in-memory）：防止 maybe_set_title 每輪重複 DB query
     pub titled_convs: Arc<Mutex<HashSet<String>>>,
+    /// Live chat 執行旗標：true 時 make_confirm_write 自動核准寫入（無需前端確認）
+    pub live_chat_active: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -102,6 +104,7 @@ impl AppState {
             http_client: reqwest::Client::new(),
             intent_centroids: Arc::new(Mutex::new(None)),
             titled_convs: Arc::new(Mutex::new(HashSet::new())),
+            live_chat_active: Arc::new(AtomicBool::new(false)),
         }
     }
 

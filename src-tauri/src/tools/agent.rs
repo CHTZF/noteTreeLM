@@ -18,9 +18,15 @@ use super::BuildCtx;
 fn make_confirm_write(app: &tauri::AppHandle) -> ConfirmWriteFn {
     let app_state = app.state::<crate::state::AppState>();
     let write_tx = Arc::clone(&app_state.write_confirm_tx);
+    let live_chat_active = Arc::clone(&app_state.live_chat_active);
     Arc::new(move |_display: String| {
         let tx = Arc::clone(&write_tx);
+        let live_active = Arc::clone(&live_chat_active);
         Box::pin(async move {
+            // Live chat 執行中 → 自動核准，不阻塞前端
+            if live_active.load(std::sync::atomic::Ordering::Relaxed) {
+                return true;
+            }
             let (ch_tx, ch_rx) = tokio::sync::oneshot::channel::<bool>();
             *tx.lock().await = Some(ch_tx);
             tokio::time::timeout(std::time::Duration::from_secs(60), ch_rx)
