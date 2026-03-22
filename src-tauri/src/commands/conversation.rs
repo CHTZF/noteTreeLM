@@ -202,6 +202,44 @@ pub async fn update_conversation_title(
     Ok(())
 }
 
+/// 取得或建立 live_chat 模式的唯一永久對話（每個 username 只有一個）
+/// 若已存在則直接回傳其 id；否則建立並回傳
+#[tauri::command]
+pub async fn get_or_create_live_chat_conversation(
+    state: State<'_, AppState>,
+    username: String,
+) -> Result<String, AppError> {
+    let db = &state.db;
+    #[derive(Deserialize)]
+    struct IdRow {
+        id: String,
+    }
+    let mut resp = db.query(
+        "SELECT record::id(id) AS id FROM conversations
+         WHERE mode = 'live_chat' AND account_id = $account_id
+         LIMIT 1"
+    )
+    .bind(("account_id", username.clone()))
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let rows: Vec<IdRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+    if let Some(row) = rows.into_iter().next() {
+        return Ok(row.id);
+    }
+
+    // 不存在，建立新的
+    let id = Uuid::new_v4().to_string();
+    db.query(
+        "INSERT INTO conversations (id, account_id, mode, title) VALUES ($id, $account_id, 'live_chat', 'Live Chat')"
+    )
+    .bind(("id", id.clone()))
+    .bind(("account_id", username.clone()))
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(id)
+}
+
 // ── Internal helpers（供 invoke_agent 呼叫，不走 Tauri command）────────────
 
 /// 過濾 messages_json，移除 tool call 相關訊息，只保留前端顯示需要的訊息：

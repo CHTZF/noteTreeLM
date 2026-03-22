@@ -1582,7 +1582,7 @@ async fn run_knowledge_query(
         .await.unwrap_or_default().unwrap_or_default();
     let model = queries::get_setting(db, "ai_model")
         .await.unwrap_or_default().unwrap_or_default();
-    let api_key = read_api_key(&app_state.api_key_cache, &provider).await;
+    let api_key = read_api_key(&app_state.api_key_cache, db, &provider).await;
 
     // 6. Stream tokens via appropriate provider
     let client = reqwest::Client::new();
@@ -3860,7 +3860,7 @@ async fn run_kb_query(
     // 4. AI streaming
     let provider = queries::get_setting(db, "ai_provider").await.unwrap_or_default().unwrap_or_default();
     let model = queries::get_setting(db, "ai_model").await.unwrap_or_default().unwrap_or_default();
-    let api_key = read_api_key(&app_state.api_key_cache, &provider).await;
+    let api_key = read_api_key(&app_state.api_key_cache, db, &provider).await;
 
     let response = if provider == "anthropic" {
         let body = serde_json::json!({
@@ -4200,12 +4200,13 @@ async fn increment_brave_used(db: &SurrealDb, key_id: &str) {
     let _ = queries::set_setting(db, &used_key, &new_used.to_string()).await;
 }
 
-/// Read Brave Search API key from OS keyring.
-fn read_brave_api_key() -> Option<String> {
-    keyring::Entry::new("com.notetreelm.app", "brave_search")
-        .ok()
-        .and_then(|e| e.get_password().ok())
-        .filter(|k| !k.is_empty())
+/// Read Brave Search API key from DB (decrypted).
+async fn read_brave_api_key(db: &crate::db::surreal::SurrealDb) -> Option<String> {
+    let enc = crate::db::queries::get_setting(db, "api_key_brave_search")
+        .await.unwrap_or_default()
+        .unwrap_or_default();
+    let plain = crate::crypto::decrypt_api_key(&enc);
+    if plain.is_empty() { None } else { Some(plain) }
 }
 
 /// Search via Brave Search API. Returns Ok(results) or Err(human-readable reason).
@@ -4398,7 +4399,7 @@ pub async fn tool_web_search(
     app: &AppHandle,
     emb_url: Option<&str>,
 ) -> String {
-    let api_key = match read_brave_api_key() {
+    let api_key = match read_brave_api_key(db).await {
         Some(k) => k,
         None => return "請至設定頁面設定 Brave Search API Key".to_string(),
     };

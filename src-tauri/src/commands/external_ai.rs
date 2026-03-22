@@ -34,9 +34,10 @@ pub async fn get_cached_setting(
     val
 }
 
-/// 從記憶體快取讀取 API 金鑰；cache miss 時查 keychain 並回填快取
+/// 從記憶體快取讀取 API 金鑰；cache miss 時查 DB 並回填快取（不再存取 keychain）
 pub(crate) async fn read_api_key(
     cache: &tokio::sync::Mutex<std::collections::HashMap<String, String>>,
+    db: &SurrealDb,
     provider: &str,
 ) -> String {
     if provider.is_empty() {
@@ -48,10 +49,11 @@ pub(crate) async fn read_api_key(
             return k.clone();
         }
     }
-    let key = keyring::Entry::new("com.notetreelm.app", provider)
-        .ok()
-        .and_then(|e| e.get_password().ok())
+    let db_key = format!("api_key_{}", provider);
+    let encrypted = queries::get_setting(db, &db_key)
+        .await.unwrap_or_default()
         .unwrap_or_default();
+    let key = crate::crypto::decrypt_api_key(&encrypted);
     cache.lock().await.insert(provider.to_string(), key.clone());
     key
 }
@@ -150,7 +152,7 @@ pub(crate) async fn call_external_ai_via_db(
     let provider = get_cached_setting(settings_cache, db, "ai_provider", "").await;
     let base_url = get_cached_setting(settings_cache, db, "ai_base_url", "https://api.openai.com/v1").await;
     let model = get_cached_setting(settings_cache, db, "ai_model", "gpt-4o").await;
-    let api_key = read_api_key(api_key_cache, &provider).await;
+    let api_key = read_api_key(api_key_cache, db, &provider).await;
     let config = ExtAiConfig { provider, base_url, model, api_key };
     call_external_ai_tool(query, &config, app).await
 }

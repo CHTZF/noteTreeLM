@@ -6,6 +6,7 @@ import { useSettingsStore } from '../../stores/settingsStore'
 import { useAuthStore } from '../../stores/authStore'
 import { useEditorStore } from '../../stores/editorStore'
 import { useDebugStore } from '../../stores/debugStore'
+import { useActivityStore } from '../../stores/activityStore'
 import { toast } from '../common/Toast'
 import { useVoiceRecorder } from '../../hooks/useVoiceRecorder'
 import VoiceOverlay from '../common/VoiceOverlay'
@@ -585,6 +586,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         messages: conversationId ? [] : llmMessages,
         system,
         conversationId: conversationId ?? undefined,
+        activityContext: useActivityStore.getState().getContextString() || null,
       })
 
       const finalContent = responseText || streamingRef.current

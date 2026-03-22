@@ -8,3 +8,4 @@ src-tauri/binaries
 src-tauri/gen
 *.gguf
 .DS_Store
+.claude/settings.local.json

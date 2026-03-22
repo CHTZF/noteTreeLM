@@ -8,6 +8,7 @@ pub mod graph;
 pub mod import;
 pub mod knowledge_import;
 pub mod memory;
+pub mod patterns;
 pub mod search;
 pub mod server;
 pub mod settings;

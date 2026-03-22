@@ -1,4 +1,7 @@
 import { useEffect, useState, useRef, useCallback, Fragment } from 'react'
+import { useActivityStore, type ActivitySource } from './stores/activityStore'
+import { useActivityContext } from './hooks/useActivityContext'
+import { usePatternDetector } from './hooks/usePatternDetector'
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
 import { open as openPath } from '@tauri-apps/plugin-shell'
@@ -22,6 +25,7 @@ import ChatPanel from './components/Chat/ChatPanel'
 import FileViewer from './components/FileViewer/FileViewer'
 import PreviewPanel from './components/Editor/PreviewPanel'
 import LiveChatPanel from './components/LiveChat/LiveChatPanel'
+import LiveChatSheet from './components/LiveChat/LiveChatSheet'
 import NoteStatusBadge from './components/Editor/NoteStatusBadge'
 import QuickOpen from './components/QuickOpen/QuickOpen'
 import SettingsModal from './components/Settings/SettingsModal'
@@ -172,11 +176,14 @@ function AppMain() {
   const { load: loadGraph } = useGraphStore()
   const { currentPath, pendingAnchor } = useEditorStore()
   const { push: navPush, back: navBack, forward: navForward, canGoBack, canGoForward } = useNavigationStore()
+  useActivityContext()   // 全域 selectionchange / copy 監聽
+  usePatternDetector()  // 行為模式偵測 + Bayesian 評分
 
   const [appReady, setAppReady] = useState(false)
   const [showSetupWizard, setShowSetupWizard] = useState(false)
   const [showVaultManager, setShowVaultManager] = useState(false)
   const [showQuickOpen, setShowQuickOpen] = useState(false)
+  const [liveChatSheetOpen, setLiveChatSheetOpen] = useState(false)
   const [showVcredistWarning, setShowVcredistWarning] = useState(false)
   const [userMenuOpen, setUserMenuOpen] = useState(false)
   const userMenuRef = useRef<HTMLDivElement>(null)
@@ -248,6 +255,14 @@ function AppMain() {
     }
   }, [paneRoot, focusedPaneId])
 
+  // ─── Sync all open pane paths to activityStore ────────────────────────
+  useEffect(() => {
+    const paths = getAllLeaves(paneRoot)
+      .map(l => l.tabs.find(t => t.id === l.activeTabId)?.path)
+      .filter((p): p is string => typeof p === 'string' && !p.startsWith('__'))
+    useActivityStore.getState().setOpenPaths(paths)
+  }, [paneRoot])
+
   // ─── Load content for non-focused panes ───────────────────────────────
   useEffect(() => {
     getAllLeaves(paneRoot)
@@ -262,14 +277,17 @@ function AppMain() {
   }, [paneRoot, focusedPaneId])
 
   // ─── Sync editor content to non-focused panes showing same file ────────
+  const editorContent = useEditorStore(s => s.content)
   useEffect(() => {
-    const { currentPath: editorPath, content } = useEditorStore.getState()
+    const editorPath = useEditorStore.getState().currentPath
     if (!editorPath) return
     getAllLeaves(paneRoot).filter(l => l.id !== focusedPaneId).forEach(leaf => {
       const tab = leaf.tabs.find(t => t.id === leaf.activeTabId)
-      if (tab?.path === editorPath) setPaneContents(prev => ({ ...prev, [leaf.id]: content }))
+      if (tab?.path === editorPath) {
+        setPaneContents(prev => prev[leaf.id] === editorContent ? prev : { ...prev, [leaf.id]: editorContent })
+      }
     })
-  })
+  }, [paneRoot, focusedPaneId, editorContent])
 
   // ─── Theme + font ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -481,6 +499,7 @@ function AppMain() {
       const meta = e.metaKey || e.ctrlKey
       if (meta && e.key === 'p' && !e.shiftKey) { e.preventDefault(); setShowQuickOpen(true) }
       if (meta && e.key === ',') { e.preventDefault(); openNote(SETTINGS_TAB) }
+      if (meta && e.altKey && e.key.toLowerCase() === 'i') { e.preventDefault(); setLiveChatSheetOpen(v => !v) }
       if (meta && e.key === '[') {
         e.preventDefault()
         const prev = navBack()
@@ -510,7 +529,18 @@ function AppMain() {
     })
   }, [])
 
-  const openNote = useCallback((path: string) => {
+  const openNote = useCallback((path: string, opts?: { source?: ActivitySource; fromPath?: string }) => {
+    // Activity tracking：只記錄真實筆記（非特殊 tab）
+    if (!path.startsWith('__')) {
+      const isWikilink = opts?.source === 'wikilink'
+      useActivityStore.getState().addAction({
+        type: isWikilink ? 'wikilink_click' : 'note_open',
+        path,
+        fromPath: opts?.fromPath,
+        source: opts?.source ?? 'tab',
+      })
+    }
+
     const root = paneRootRef.current
     const leafId = focusedPaneIdRef.current
     const leaf = findLeaf(root, leafId)
@@ -968,7 +998,7 @@ function AppMain() {
             return
           }
           const note = useVaultStore.getState().notes.find(n => n.title === title)
-          if (note) openNote(note.path)
+          if (note) openNote(note.path, { source: 'wikilink', fromPath: activePath })
         }}
       />
     )
@@ -1209,9 +1239,9 @@ function AppMain() {
               onClick={() => openNote(CHAT_TAB)}
             ><FontAwesomeIcon icon={faComments} /></button>
             <button
-              className="icon-menubar-btn"
-              title={t('tabs.live_chat')}
-              onClick={() => openNote(LIVE_CHAT_TAB)}
+              className={`icon-menubar-btn${liveChatSheetOpen ? ' active' : ''}`}
+              title={`${t('tabs.live_chat')} (⌘⌥I)`}
+              onClick={() => setLiveChatSheetOpen(v => !v)}
             ><FontAwesomeIcon icon={faMicrophone} /></button>
           </>}
 
@@ -1324,7 +1354,10 @@ function AppMain() {
         >
           <div style={{ display: leftPanel === 'files' ? 'flex' : 'none', flex: 1, flexDirection: 'column', overflow: 'hidden', minHeight: 0 }}>
             <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-              <FileTree onOpenNote={openNote} onOpenNoteInNewTab={openNoteInNewTab} />
+              <FileTree
+                onOpenNote={path => openNote(path, { source: 'filetree' })}
+                onOpenNoteInNewTab={openNoteInNewTab}
+              />
             </div>
           </div>
           <div style={{ display: leftPanel === 'search' ? 'flex' : 'none', flex: 1, flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
@@ -1364,7 +1397,7 @@ function AppMain() {
       {/* Quick Open */}
       {showQuickOpen && (
         <QuickOpen
-          onSelect={path => { openNote(path); setShowQuickOpen(false) }}
+          onSelect={path => { openNote(path, { source: 'quickopen' }); setShowQuickOpen(false) }}
           onClose={() => setShowQuickOpen(false)}
         />
       )}
@@ -1395,6 +1428,24 @@ function AppMain() {
           </div>
         ) : null
       })()}
+
+      {/* Live Chat Sheet — global overlay, app-level lifecycle */}
+      {liveChatSheetOpen && settings.enable_chat && (
+        <LiveChatSheet
+          open={liveChatSheetOpen}
+          onClose={() => setLiveChatSheetOpen(false)}
+          onOpenNote={path => { openNoteFromChat(path); setLiveChatSheetOpen(false) }}
+          onOpenTab={tab => {
+            const tabMap: Record<string, string> = {
+              settings: SETTINGS_TAB, trash: TRASH_TAB, agents: AGENTS_TAB, skills: SKILLS_TAB,
+            }
+            if (tabMap[tab]) openNote(tabMap[tab])
+          }}
+          onShowResults={paths => {
+            if (paths.length === 1) { openNoteFromChat(paths[0]); setLiveChatSheetOpen(false) }
+          }}
+        />
+      )}
 
       <Toast />
     </div>

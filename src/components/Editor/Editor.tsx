@@ -47,7 +47,7 @@ interface EditorProps {
   canGoForward?: boolean
   onBack?: () => void
   onForward?: () => void
-  onOpenNote: (path: string) => void
+  onOpenNote: (path: string, opts?: { source?: import('../../stores/activityStore').ActivitySource; fromPath?: string }) => void
 }
 
 export default function Editor({ onOpenNote }: EditorProps) {
@@ -653,7 +653,7 @@ export default function Editor({ onOpenNote }: EditorProps) {
       setPendingAnchor(anchor)
       return
     }
-    openNote(note.path)
+    onOpenNote(note.path, { source: 'wikilink', fromPath: currentPath ?? undefined })
     setPendingAnchor(anchor)
   }
 

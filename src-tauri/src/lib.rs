@@ -1,5 +1,6 @@
 #![recursion_limit = "512"]
 mod commands;
+pub mod crypto;
 mod db;
 mod error;
 pub mod runtime;
@@ -15,11 +16,12 @@ use commands::{
          stop_embedding_server, restart_embedding_server, check_embedding_endpoint,
          save_memory_session, query_memory, distill_preferences, analyze_tool_patterns, extract_memory_facts, rate_response, get_conversation_ratings, add_memory_rule,
          get_memory_rules, delete_memory_rule, confirm_write_tool,
-         test_vault_tool, run_tool_pipeline, cancel_tool_test, cancel_agent, invoke_agent,
+         test_vault_tool, run_tool_pipeline, cancel_tool_test, cancel_agent, invoke_agent, invoke_live_chat,
          set_note_status, confirm_search_method,
          seed_agent_tools, seed_agent_skills, add_skill_trigger},
     conversation::{create_conversation, list_conversations, get_conversation,
-                   delete_conversation, update_conversation_title, save_conversation_messages},
+                   delete_conversation, update_conversation_title, save_conversation_messages,
+                   get_or_create_live_chat_conversation},
     download::*, graph::*, import::*, search::*,
     knowledge_import::{create_import_session, list_import_sessions, delete_import_session,
                        fetch_site_outline, import_page, check_page_updates, get_session_pages,
@@ -43,6 +45,7 @@ use commands::{
                get_last_chat_conversation_id, set_last_chat_conversation_id,
                get_last_mode_conversation_id, set_last_mode_conversation_id,
                get_kb_chat_messages, save_kb_chat_messages},
+    patterns::{save_pattern, update_pattern_score, list_patterns, decay_patterns, set_pattern_intent},
     vault::*,
     voice::{transcribe_audio, stop_whisper_server, warmup_whisper_server,
             get_whisper_server_status, start_whisper_server, restart_whisper_server},
@@ -195,14 +198,19 @@ pub fn run() {
                     }
                 }
 
-                // 預載 API key 進記憶體快取（避免後續並發呼叫各自觸發 keychain）
+                // 初始化加密金鑰（讀取/生成 DB salt → HKDF → OnceLock）
+                // 必須在所有 encrypt/decrypt 呼叫之前執行
+                crate::crypto::init_encryption_key(&state.db).await;
+
+                // 預載 API key 進記憶體快取（從 DB 讀取並解密）
                 if let Ok(Some(provider)) = db::queries::get_setting(&state.db, "ai_provider").await {
                     if !provider.is_empty() {
-                        let key = keyring::Entry::new("com.notetreelm.app", &provider)
-                            .ok()
-                            .and_then(|e| e.get_password().ok())
+                        let db_key = format!("api_key_{}", provider);
+                        let plain = db::queries::get_setting(&state.db, &db_key)
+                            .await.unwrap_or_default()
+                            .map(|enc| crate::crypto::decrypt_api_key(&enc))
                             .unwrap_or_default();
-                        state.api_key_cache.lock().await.insert(provider, key);
+                        state.api_key_cache.lock().await.insert(provider, plain);
                     }
                 }
 
@@ -443,6 +451,7 @@ pub fn run() {
             delete_memory_rule,
             cancel_agent,
             invoke_agent,
+            invoke_live_chat,
             set_note_status,
             // Agent Definitions
             list_agent_definitions,
@@ -460,6 +469,7 @@ pub fn run() {
             delete_conversation,
             update_conversation_title,
             save_conversation_messages,
+            get_or_create_live_chat_conversation,
             // Download
             get_models_dir,
             get_downloaded_models,
@@ -475,6 +485,12 @@ pub fn run() {
             download_llama_server,
             get_coreml_model_path,
             download_coreml_model,
+            // Activity Pattern Learning
+            save_pattern,
+            update_pattern_score,
+            list_patterns,
+            decay_patterns,
+            set_pattern_intent,
             // DevTools (debug helper)
             open_devtools,
         ])

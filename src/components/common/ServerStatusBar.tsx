@@ -28,8 +28,9 @@ function Dot({ status }: { status: ServerStatus }) {
         borderRadius: '50%',
         background: STATUS_COLOR[status],
         flexShrink: 0,
-        animation: isAnimated ? `server-dot-pulse 2s ease-in-out infinite` : undefined,
-        animationDelay: status === 'loading' ? '0.5s' : undefined,
+        animation: isAnimated
+          ? `server-dot-pulse 2s ease-in-out ${status === 'loading' ? '0.5s' : '0s'} infinite`
+          : undefined,
       }}
     />
   )

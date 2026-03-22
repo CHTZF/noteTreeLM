@@ -10,7 +10,7 @@ pub type SurrealDb = Arc<Surreal<Db>>;
 
 /// Schema 版本：每次修改 apply_schema 或 insert_default_settings 時遞增，
 /// 確保已安裝的客戶端會重新執行一次 DDL，之後快取跳過。
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 // 要備份的 tables（搜尋無關的重要資料）
 const BACKUP_TABLES: &[&str] = &[
@@ -502,6 +502,22 @@ async fn apply_schema(db: &Surreal<Db>) -> crate::error::Result<()> {
         "DEFINE INDEX IF NOT EXISTS idx_sul_vault   ON skill_usage_log FIELDS vault_id;",
         "DEFINE INDEX IF NOT EXISTS idx_sul_skill   ON skill_usage_log FIELDS vault_id, skill_id;",
         "DEFINE INDEX IF NOT EXISTS idx_sul_date    ON skill_usage_log FIELDS vault_id, triggered_at;",
+
+        // ── activity_patterns：行為模式學習（Bayesian 評分） ─────────────
+        "DEFINE TABLE IF NOT EXISTS activity_patterns SCHEMAFULL;",
+        "DEFINE FIELD IF NOT EXISTS vault_id           ON activity_patterns TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS signature          ON activity_patterns TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS score              ON activity_patterns TYPE float DEFAULT 0.3;",
+        "DEFINE FIELD IF NOT EXISTS trigger_count      ON activity_patterns TYPE int DEFAULT 1;",
+        "DEFINE FIELD IF NOT EXISTS speak_count        ON activity_patterns TYPE int DEFAULT 0;",
+        "DEFINE FIELD IF NOT EXISTS deprecated         ON activity_patterns TYPE bool DEFAULT false;",
+        "DEFINE FIELD IF NOT EXISTS semantic_intent    ON activity_patterns TYPE option<string>;",
+        "DEFINE FIELD IF NOT EXISTS last_triggered_at  ON activity_patterns TYPE datetime DEFAULT time::now();",
+        "DEFINE FIELD IF NOT EXISTS last_decayed_at    ON activity_patterns TYPE option<datetime>;",
+        "DEFINE FIELD IF NOT EXISTS created_at         ON activity_patterns TYPE datetime DEFAULT time::now();",
+        "DEFINE FIELD IF NOT EXISTS updated_at         ON activity_patterns TYPE datetime DEFAULT time::now();",
+        "DEFINE INDEX IF NOT EXISTS idx_ap_vault_sig   ON activity_patterns FIELDS vault_id, signature UNIQUE;",
+        "DEFINE INDEX IF NOT EXISTS idx_ap_vault_score ON activity_patterns FIELDS vault_id, score;",
     ];
 
     // Batch all DDL into one query to avoid N sequential round-trips.
