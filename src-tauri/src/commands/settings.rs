@@ -291,6 +291,23 @@ async fn handle_vault_switch(app: AppHandle, state: AppState, new_path: String) 
                     let _ = crate::vault::chunker::reindex_all(&db, &vid, None).await;
                 });
             }
+            // 確保 memory_agent 系統排程存在
+            {
+                let run_at_ts = chrono::Utc::now().timestamp() + 8 * 3600;
+                let task_id = uuid::Uuid::new_v4().to_string();
+                let now_ts = chrono::Utc::now().timestamp();
+                let _ = state.db.query(
+                    "INSERT INTO scheduled_tasks \
+                     (task_id, vault_id, description, agent_type, agent_prompt, run_at_ts, repeat_interval_secs, status, created_at) \
+                     VALUES ($tid, $vid, 'Memory Agent', 'memory_agent', '請開始分析並提取記憶。', $ts, 28800, 'pending', $now) \
+                     ON DUPLICATE KEY UPDATE task_id = task_id"
+                )
+                .bind(("tid", task_id))
+                .bind(("vid", new_path.clone()))
+                .bind(("ts", run_at_ts))
+                .bind(("now", now_ts))
+                .await;
+            }
             let stop_tx = vault::watcher::start_watcher(app, path);
             *state.watcher_stop.lock().await = Some(stop_tx);
         }

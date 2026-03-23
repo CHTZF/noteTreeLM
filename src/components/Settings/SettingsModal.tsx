@@ -141,6 +141,8 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
 
   const [memoryRules, setMemoryRules] = useState<MemoryRuleEntry[]>([])
   const [memoryRulesLoading, setMemoryRulesLoading] = useState(false)
+  const [memoryAgentRunning, setMemoryAgentRunning] = useState(false)
+  const [memoryAgentMsg, setMemoryAgentMsg] = useState('')
   const [newRuleType, setNewRuleType] = useState<string>('temporal_exact_days')
   const [newRulePattern, setNewRulePattern] = useState('')
   const [newRuleValue, setNewRuleValue] = useState('')
@@ -1730,6 +1732,43 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                     onClick={handleAddMemoryRule}
                     style={{ padding: '4px 12px', borderRadius: '6px', fontSize: '12px', background: 'var(--color-accent-dim)', border: '1px solid var(--color-accent)', color: 'var(--color-accent)', cursor: 'pointer', whiteSpace: 'nowrap' }}
                   >+ 新增</button>
+                </div>
+              </div>
+
+              {/* 立即整合記憶 */}
+              <div style={{ marginTop: '20px', borderTop: '1px solid var(--color-border)', paddingTop: '16px' }}>
+                <span style={{ fontSize: '13px', fontWeight: 500, color: 'var(--color-text-primary)', display: 'block', marginBottom: '6px' }}>記憶整合</span>
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '0 0 12px', lineHeight: 1.5 }}>
+                  分析未處理的對話，透過 Claude CLI 提取有價值的記憶事實。每 8 小時自動執行，也可手動觸發。
+                </p>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                  <button
+                    disabled={memoryAgentRunning}
+                    onClick={async () => {
+                      setMemoryAgentRunning(true)
+                      setMemoryAgentMsg('')
+                      try {
+                        await invoke('trigger_memory_agent')
+                        setMemoryAgentMsg('記憶整合已在背景啟動，結果將寫入 vault/log/')
+                      } catch (e) {
+                        setMemoryAgentMsg(`啟動失敗：${e}`)
+                      } finally {
+                        setMemoryAgentRunning(false)
+                      }
+                    }}
+                    style={{
+                      padding: '6px 16px', borderRadius: '6px', fontSize: '12px',
+                      background: memoryAgentRunning ? 'var(--color-bg-elevated)' : 'var(--color-accent-dim)',
+                      border: '1px solid var(--color-accent)',
+                      color: memoryAgentRunning ? 'var(--color-text-muted)' : 'var(--color-accent)',
+                      cursor: memoryAgentRunning ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    {memoryAgentRunning ? '啟動中…' : '立即整合記憶'}
+                  </button>
+                  {memoryAgentMsg && (
+                    <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>{memoryAgentMsg}</span>
+                  )}
                 </div>
               </div>
             </>}

@@ -46,6 +46,8 @@ use commands::{
                get_last_mode_conversation_id, set_last_mode_conversation_id,
                get_kb_chat_messages, save_kb_chat_messages},
     patterns::{save_pattern, update_pattern_score, list_patterns, decay_patterns, set_pattern_intent},
+    memory_agent::{get_unprocessed_conversations, get_conversation_content, call_claude_cli,
+                   write_memory_log, mark_conversation_processed, trigger_memory_agent},
     vault::*,
     voice::{transcribe_audio, stop_whisper_server, warmup_whisper_server,
             get_whisper_server_status, start_whisper_server, restart_whisper_server},
@@ -182,6 +184,21 @@ pub fn run() {
                         state.set_vault_path_with_agent(vp.clone()).await;
                         // Agent 生命週期管理（sleep/delete）
                         commands::agent_def::check_agent_lifecycle(&state.db, &vp).await;
+                        // 確保 memory_agent 系統排程存在（8 小時重複，agent_type 唯一）
+                        let run_at_ts = chrono::Utc::now().timestamp() + 8 * 3600;
+                        let task_id = uuid::Uuid::new_v4().to_string();
+                        let now_ts = chrono::Utc::now().timestamp();
+                        let _ = state.db.query(
+                            "INSERT INTO scheduled_tasks \
+                             (task_id, vault_id, description, agent_type, agent_prompt, run_at_ts, repeat_interval_secs, status, created_at) \
+                             VALUES ($tid, $vid, 'Memory Agent', 'memory_agent', '請開始分析並提取記憶。', $ts, 28800, 'pending', $now) \
+                             ON DUPLICATE KEY UPDATE task_id = task_id"
+                        )
+                        .bind(("tid", task_id))
+                        .bind(("vid", vp.clone()))
+                        .bind(("ts", run_at_ts))
+                        .bind(("now", now_ts))
+                        .await;
                         let path = std::path::PathBuf::from(&vp);
                         if path.exists() {
                             // 背景補齊 chunk 索引（不阻塞啟動）
@@ -260,6 +277,8 @@ pub fn run() {
                         struct TaskRow {
                             task_id: String,
                             description: String,
+                            agent_type: Option<String>,
+                            agent_prompt: Option<String>,
                             repeat_interval_secs: i64,
                         }
 
@@ -267,7 +286,7 @@ pub fn run() {
                         if vid.is_empty() { continue; }
 
                         let mut resp = match state.db.query(
-                            "SELECT task_id, description, repeat_interval_secs \
+                            "SELECT task_id, description, agent_type, agent_prompt, repeat_interval_secs \
                              FROM scheduled_tasks \
                              WHERE vault_id = $vid AND status = 'pending' AND run_at_ts <= $now"
                         )
@@ -280,14 +299,20 @@ pub fn run() {
 
                         let due: Vec<TaskRow> = resp.take(0).unwrap_or_default();
                         for task in due {
-                            // 通知使用者
-                            let _ = ah_sched.emit("schedule:triggered", serde_json::json!({
-                                "task_id": task.task_id,
-                                "description": task.description,
-                            }));
+                            // 所有任務統一走 run_scheduled_agent，由 agent 決定執行內容
+                            {
+                                let ah2          = ah_sched.clone();
+                                let agent_type   = task.agent_type.clone();
+                                let agent_prompt = task.agent_prompt.clone();
+                                let description  = task.description.clone();
+                                tokio::spawn(async move {
+                                    commands::memory_agent::run_scheduled_agent(
+                                        &ah2, agent_type, agent_prompt, description,
+                                    ).await;
+                                });
+                            }
 
                             if task.repeat_interval_secs > 0 {
-                                // 重新排程
                                 let next_ts = now_ts + task.repeat_interval_secs;
                                 let _ = state.db.query(
                                     "UPDATE scheduled_tasks SET run_at_ts = $next \
@@ -297,7 +322,6 @@ pub fn run() {
                                 .bind(("tid", task.task_id.clone()))
                                 .await;
                             } else {
-                                // 標記完成
                                 let _ = state.db.query(
                                     "UPDATE scheduled_tasks SET status = 'done' WHERE task_id = $tid"
                                 )
@@ -485,6 +509,13 @@ pub fn run() {
             download_llama_server,
             get_coreml_model_path,
             download_coreml_model,
+            // Memory Agent
+            get_unprocessed_conversations,
+            get_conversation_content,
+            call_claude_cli,
+            write_memory_log,
+            mark_conversation_processed,
+            trigger_memory_agent,
             // Activity Pattern Learning
             save_pattern,
             update_pattern_score,

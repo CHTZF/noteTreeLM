@@ -708,6 +708,8 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                     let description = args["description"].as_str().unwrap_or("").to_string();
                     let run_at_str = args["run_at"].as_str().unwrap_or("").to_string();
                     let repeat_interval_secs = args["repeat_interval_seconds"].as_i64().unwrap_or(0);
+                    let agent_type = args["agent_type"].as_str().map(String::from);
+                    let agent_prompt = args["agent_prompt"].as_str().map(String::from);
                     let db = db.clone();
                     let vid = vid.clone();
                     Box::pin(async move {
@@ -724,12 +726,15 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                         let now_ts = chrono::Utc::now().timestamp();
 
                         let _ = db.query(
-                            "INSERT INTO scheduled_tasks (task_id, vault_id, description, run_at_ts, repeat_interval_secs, status, created_at) \
-                             VALUES ($tid, $vid, $desc, $ts, $interval, 'pending', $now)"
+                            "INSERT INTO scheduled_tasks \
+                             (task_id, vault_id, description, agent_type, agent_prompt, run_at_ts, repeat_interval_secs, status, created_at) \
+                             VALUES ($tid, $vid, $desc, $atype, $aprompt, $ts, $interval, 'pending', $now)"
                         )
                         .bind(("tid", task_id.clone()))
                         .bind(("vid", vid.clone()))
                         .bind(("desc", description.clone()))
+                        .bind(("atype", agent_type.clone()))
+                        .bind(("aprompt", agent_prompt.clone()))
                         .bind(("ts", run_at_ts))
                         .bind(("interval", repeat_interval_secs))
                         .bind(("now", now_ts))
@@ -741,10 +746,13 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                         } else {
                             String::new()
                         };
+                        let agent_info = agent_type
+                            .map(|t| format!("，呼叫 agent: {}", t))
+                            .unwrap_or_default();
 
                         Ok(Value::String(format!(
-                            "已排程「{}」於 {}{}（task_id: {}）",
-                            description, run_at_str, repeat_info, task_id
+                            "已排程「{}」於 {}{}{}（task_id: {}）",
+                            description, run_at_str, repeat_info, agent_info, task_id
                         )))
                     })
                 }),

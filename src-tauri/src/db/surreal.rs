@@ -215,6 +215,7 @@ async fn apply_schema(db: &Surreal<Db>) -> crate::error::Result<()> {
         "DEFINE FIELD IF NOT EXISTS mode          ON conversations TYPE string DEFAULT 'chat';",
         "DEFINE FIELD IF NOT EXISTS title         ON conversations TYPE string DEFAULT '';",
         "DEFINE FIELD IF NOT EXISTS messages_json ON conversations TYPE string DEFAULT '[]';",
+        "DEFINE FIELD IF NOT EXISTS memory_processed ON conversations TYPE bool DEFAULT false;",
         "DEFINE FIELD IF NOT EXISTS created_at    ON conversations TYPE datetime DEFAULT time::now();",
         "DEFINE FIELD IF NOT EXISTS updated_at    ON conversations TYPE datetime DEFAULT time::now();",
         "DEFINE INDEX IF NOT EXISTS idx_conv_mode_updated  ON conversations FIELDS mode, updated_at;",
@@ -518,6 +519,20 @@ async fn apply_schema(db: &Surreal<Db>) -> crate::error::Result<()> {
         "DEFINE FIELD IF NOT EXISTS updated_at         ON activity_patterns TYPE datetime DEFAULT time::now();",
         "DEFINE INDEX IF NOT EXISTS idx_ap_vault_sig   ON activity_patterns FIELDS vault_id, signature UNIQUE;",
         "DEFINE INDEX IF NOT EXISTS idx_ap_vault_score ON activity_patterns FIELDS vault_id, score;",
+
+        // ── scheduled_tasks：排程任務 ─────────────────────────────────────────
+        "DEFINE TABLE IF NOT EXISTS scheduled_tasks SCHEMAFULL;",
+        "DEFINE FIELD IF NOT EXISTS task_id              ON scheduled_tasks TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS vault_id             ON scheduled_tasks TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS description          ON scheduled_tasks TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS agent_type           ON scheduled_tasks TYPE option<string>;",
+        "DEFINE FIELD IF NOT EXISTS agent_prompt         ON scheduled_tasks TYPE option<string>;",
+        "DEFINE FIELD IF NOT EXISTS run_at_ts            ON scheduled_tasks TYPE int;",
+        "DEFINE FIELD IF NOT EXISTS repeat_interval_secs ON scheduled_tasks TYPE int DEFAULT 0;",
+        "DEFINE FIELD IF NOT EXISTS status               ON scheduled_tasks TYPE string DEFAULT 'pending';",
+        "DEFINE FIELD IF NOT EXISTS created_at           ON scheduled_tasks TYPE datetime DEFAULT time::now();",
+        "DEFINE INDEX IF NOT EXISTS idx_st_vault_status  ON scheduled_tasks FIELDS vault_id, status;",
+        "DEFINE INDEX IF NOT EXISTS idx_st_agent_type    ON scheduled_tasks FIELDS vault_id, agent_type UNIQUE;",
     ];
 
     // Batch all DDL into one query to avoid N sequential round-trips.

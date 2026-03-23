@@ -954,4 +954,28 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
+    // notify_user — 發送通知到前端（供排程 sub-agent 使用）
+    {
+        let app = ctx.app.clone();
+        registry.register(
+            "notify_user".into(),
+            Tool {
+                execute: Arc::new(move |args: Value| {
+                    let app = app.clone();
+                    let title   = args["title"].as_str().unwrap_or("排程提醒").to_string();
+                    let message = args["message"].as_str().unwrap_or("").to_string();
+                    let task_id = args["task_id"].as_str().unwrap_or("").to_string();
+                    Box::pin(async move {
+                        let _ = app.emit("schedule:triggered", serde_json::json!({
+                            "task_id":     task_id,
+                            "title":       title,
+                            "description": message,
+                        }));
+                        Ok(Value::String(format!("已通知使用者：{}", title)))
+                    })
+                }),
+                rollback: None,
+            },
+        );
+    }
 }

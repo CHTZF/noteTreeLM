@@ -279,7 +279,7 @@ pub(crate) async fn parallel_chunk_summarize(
 
 /// 封裝 OpenAI-compatible SSE 串流請求，返回 StreamResult
 /// 同時處理文字 token（emit llm:token）和 tool call fragments 的累積
-async fn send_streaming_request(
+pub(crate) async fn send_streaming_request(
     client: &reqwest::Client,
     base_url: &str,
     body: serde_json::Value,
@@ -1388,17 +1388,17 @@ live_respond 規則：\
 
 
 /// 串流過程中累積的單一 tool call 資料
-struct ToolCallAccumulator {
-    id: String,
-    name: String,
-    arguments: String, // 累積的 JSON fragment 字串
+pub(crate) struct ToolCallAccumulator {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) arguments: String, // 累積的 JSON fragment 字串
 }
 
 /// send_streaming_request 的回傳結果
-struct StreamResult {
-    full_text: String,
-    finish_reason: String,
-    tool_call_chunks: Vec<ToolCallAccumulator>,
+pub(crate) struct StreamResult {
+    pub(crate) full_text: String,
+    pub(crate) finish_reason: String,
+    pub(crate) tool_call_chunks: Vec<ToolCallAccumulator>,
 }
 
 /// 讀取最近對話，回傳摘要供 reflection agent 分析模式
@@ -3478,7 +3478,7 @@ fn ensure_md(path: &str) -> String {
 
 /// 從 StreamResult 提取所有 tool calls（native 格式優先，fallback 文字格式）
 /// 回傳 Vec<(tool_id, tool_name, tool_args)>，空 Vec 表示純文字回覆
-fn detect_tool_calls(
+pub(crate) fn detect_tool_calls(
     result: &StreamResult,
 ) -> Vec<(String, String, serde_json::Value)> {
     // Native OpenAI tool_calls 格式（可能多個）
