@@ -1,8 +1,10 @@
 mod daemon;
+mod mdns;
+mod server;
+mod tls;
 
 #[tokio::main]
 async fn main() {
-    // 初始化 tracing logger
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -10,10 +12,8 @@ async fn main() {
         )
         .init();
 
-    tracing::info!("noteTreeLM Service starting...");
-
     if let Err(e) = daemon::run().await {
-        tracing::error!("Service error: {}", e);
+        tracing::error!("Fatal error: {}", e);
         std::process::exit(1);
     }
 }

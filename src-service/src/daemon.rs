@@ -1,16 +1,31 @@
 use tokio::signal;
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    tracing::info!("Daemon initialized");
+    tracing::info!("noteTreeLM Service starting...");
 
-    // TODO Phase 2: TLS + HTTP server
-    // TODO Phase 3: Token auth
-    // TODO Phase 4: SurrealDB
-    // TODO Phase 5: AI servers + scheduler
+    // 1. 生成 TLS 憑證
+    let hostnames = crate::tls::collect_san_hostnames();
+    tracing::info!("TLS SAN hostnames: {:?}", hostnames);
+    let tls = crate::tls::generate_tls_cert(hostnames)?;
+    tracing::info!("TLS certificate generated, SPKI pin: {}", tls.spki_pin);
 
-    // Graceful shutdown：等待 SIGINT 或 SIGTERM
+    // 2. 啟動 mDNS 廣播
+    let _mdns = crate::mdns::start_mdns_broadcast(&tls.spki_pin)?;
+
+    // 3. 啟動 HTTPS server（在背景 task 跑）
+    let cert_pem = tls.cert_pem.clone();
+    let key_pem = tls.key_pem.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::server::run_https_server(cert_pem, key_pem, 7788).await {
+            tracing::error!("HTTPS server error: {}", e);
+        }
+    });
+
+    tracing::info!("Service ready on https://0.0.0.0:7788");
+
+    // 4. 等待 graceful shutdown
     shutdown_signal().await;
-    tracing::info!("Daemon shutting down gracefully...");
+    tracing::info!("Service shutting down...");
 
     Ok(())
 }
