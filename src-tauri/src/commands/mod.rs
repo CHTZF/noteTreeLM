@@ -2,6 +2,7 @@ pub mod agent_def;
 pub mod ai;
 pub mod auth;
 pub mod conversation;
+pub mod daemon;
 pub mod download;
 pub mod external_ai;
 pub mod graph;
