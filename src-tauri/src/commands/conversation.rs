@@ -67,13 +67,15 @@ pub async fn create_conversation(
     let db = &state.db;
     let id = Uuid::new_v4().to_string();
     let title = title.unwrap_or_default();
+    let vault_id = state.get_vault_uuid().await;
     db.query(
-        "INSERT INTO conversations (id, account_id, mode, title) VALUES ($id, $account_id, $mode, $title)"
+        "INSERT INTO conversations (id, account_id, mode, title, vault_id) VALUES ($id, $account_id, $mode, $title, $vault_id)"
     )
     .bind(("id", id.clone()))
     .bind(("account_id", username.clone()))
     .bind(("mode", mode.clone()))
     .bind(("title", title.clone()))
+    .bind(("vault_id", vault_id))
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
     Ok(id)

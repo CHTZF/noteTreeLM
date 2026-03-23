@@ -10,7 +10,7 @@ pub type SurrealDb = Arc<Surreal<Db>>;
 
 /// Schema 版本：每次修改 apply_schema 或 insert_default_settings 時遞增，
 /// 確保已安裝的客戶端會重新執行一次 DDL，之後快取跳過。
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 10;
 
 // 要備份的 tables（搜尋無關的重要資料）
 const BACKUP_TABLES: &[&str] = &[
@@ -178,10 +178,11 @@ async fn apply_schema(db: &Surreal<Db>) -> crate::error::Result<()> {
         "DEFINE INDEX IF NOT EXISTS idx_users_username ON users FIELDS username UNIQUE;",
 
         "DEFINE TABLE IF NOT EXISTS sessions SCHEMAFULL;",
-        "DEFINE FIELD IF NOT EXISTS token      ON sessions TYPE string;",
-        "DEFINE FIELD IF NOT EXISTS username   ON sessions TYPE string;",
-        "DEFINE FIELD IF NOT EXISTS created_at ON sessions TYPE datetime DEFAULT time::now();",
-        "DEFINE FIELD IF NOT EXISTS expires_at ON sessions TYPE datetime;",
+        "DEFINE FIELD IF NOT EXISTS token          ON sessions TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS username       ON sessions TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS expires_at     ON sessions TYPE int;",
+        "DEFINE FIELD IF NOT EXISTS auth_provider  ON sessions TYPE string DEFAULT 'local';",
+        "DEFINE FIELD IF NOT EXISTS created_at     ON sessions TYPE int DEFAULT 0;",
         "DEFINE INDEX IF NOT EXISTS idx_sessions_token    ON sessions FIELDS token UNIQUE;",
         "DEFINE INDEX IF NOT EXISTS idx_sessions_username ON sessions FIELDS username;",
 
@@ -533,6 +534,14 @@ async fn apply_schema(db: &Surreal<Db>) -> crate::error::Result<()> {
         "DEFINE FIELD IF NOT EXISTS created_at           ON scheduled_tasks TYPE datetime DEFAULT time::now();",
         "DEFINE INDEX IF NOT EXISTS idx_st_vault_status  ON scheduled_tasks FIELDS vault_id, status;",
         "DEFINE INDEX IF NOT EXISTS idx_st_agent_type    ON scheduled_tasks FIELDS vault_id, agent_type UNIQUE;",
+
+        // ── vaults：Vault 路徑 ↔ UUID 對應表 ────────────────────────────────
+        "DEFINE TABLE IF NOT EXISTS vaults SCHEMAFULL;",
+        "DEFINE FIELD IF NOT EXISTS vault_id   ON vaults TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS path       ON vaults TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS account    ON vaults TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS created_at ON vaults TYPE int DEFAULT 0;",
+        "DEFINE INDEX IF NOT EXISTS idx_vaults_path_account ON vaults FIELDS path, account UNIQUE;",
     ];
 
     // Batch all DDL into one query to avoid N sequential round-trips.

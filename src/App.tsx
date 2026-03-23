@@ -123,6 +123,7 @@ function reorderInLeaf(root: PaneNode, paneId: string, fromId: string, toId: str
 // ─── App ───────────────────────────────────────────────────────────────────
 export default function App() {
   const { session, isLoading: authLoading, checkSession } = useAuthStore()
+  const [appReady, setAppReady] = useState(false)
 
   // Windows platform detection — adds data-platform="windows" to body for CSS targeting
   useEffect(() => {
@@ -143,10 +144,23 @@ export default function App() {
   // 首次掛載驗證 session
   useEffect(() => { checkSession() }, [])
 
+  // DB/init 就緒偵測：先 poll is_app_ready（後端可能比前端先啟動完），再監聽 app:ready 事件
+  useEffect(() => {
+    let cancelled = false
+    let unlisten: (() => void) | null = null
+    invoke<boolean>('is_app_ready').then(ready => {
+      if (ready && !cancelled) setAppReady(true)
+    }).catch(() => {})
+    listen('app:ready', () => {
+      if (!cancelled) setAppReady(true)
+    }).then(fn => { if (cancelled) fn(); else unlisten = fn })
+    return () => { cancelled = true; unlisten?.() }
+  }, [])
+
   const { t } = useTranslation()
 
-  // Auth loading splash
-  if (authLoading) {
+  // Auth + app loading splash
+  if (authLoading || !appReady) {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100vh', background: 'var(--color-bg-base)' }}>
         <TitleBar />

@@ -65,6 +65,11 @@ fn open_devtools(window: tauri::WebviewWindow) {
     window.open_devtools();
 }
 
+#[tauri::command]
+fn is_app_ready(state: tauri::State<AppState>) -> bool {
+    state.app_ready.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -182,6 +187,27 @@ pub fn run() {
                 if let Ok(Some(vp)) = db::queries::get_setting(&state.db, "system_current_vault_path").await {
                     if !vp.is_empty() {
                         state.set_vault_path_with_agent(vp.clone()).await;
+
+                        // 從 sessions DB 取得目前登入的 username
+                        let username = {
+                            #[derive(serde::Deserialize)]
+                            struct SessionRow { username: String }
+                            let now_ts = chrono::Utc::now().timestamp();
+                            if let Ok(mut resp) = state.db.query(
+                                "SELECT username FROM sessions WHERE expires_at > $now ORDER BY expires_at DESC LIMIT 1"
+                            ).bind(("now", now_ts)).await {
+                                let rows: Vec<SessionRow> = resp.take(0).unwrap_or_default();
+                                rows.into_iter().next().map(|r| r.username).unwrap_or_default()
+                            } else {
+                                String::new()
+                            }
+                        };
+                        state.set_username(username.clone()).await;
+
+                        // 查詢或建立 vault UUID
+                        let vault_uuid = db::queries::get_or_create_vault_uuid(&state.db, &vp, &username).await;
+                        state.set_vault_uuid(vault_uuid.clone()).await;
+
                         // Agent 生命週期管理（sleep/delete）
                         commands::agent_def::check_agent_lifecycle(&state.db, &vp).await;
                         // 確保 memory_agent 系統排程存在（8 小時重複，agent_type 唯一）
@@ -195,7 +221,7 @@ pub fn run() {
                              ON DUPLICATE KEY UPDATE task_id = task_id"
                         )
                         .bind(("tid", task_id))
-                        .bind(("vid", vp.clone()))
+                        .bind(("vid", vault_uuid.clone()))
                         .bind(("ts", run_at_ts))
                         .bind(("now", now_ts))
                         .await;
@@ -262,6 +288,10 @@ pub fn run() {
 
                 // 自動更新：掃描開啟 auto_update 的 import sessions
                 auto_check_all_sessions(&app_handle, &state).await;
+
+                // 標記 app 初始化完成，通知前端
+                state.app_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = app_handle.emit("app:ready", serde_json::json!({}));
             });
 
             // 排程器：每分鐘檢查到期的 scheduled_tasks
@@ -276,21 +306,19 @@ pub fn run() {
                         #[derive(serde::Deserialize)]
                         struct TaskRow {
                             task_id: String,
+                            vault_id: String,
                             description: String,
                             agent_type: Option<String>,
                             agent_prompt: Option<String>,
                             repeat_interval_secs: i64,
                         }
 
-                        let vid = state.get_vault_path().await;
-                        if vid.is_empty() { continue; }
-
+                        // 查所有到期的任務，不限 active vault（每個任務已記錄自己的 vault_id）
                         let mut resp = match state.db.query(
-                            "SELECT task_id, description, agent_type, agent_prompt, repeat_interval_secs \
+                            "SELECT task_id, vault_id, description, agent_type, agent_prompt, repeat_interval_secs \
                              FROM scheduled_tasks \
-                             WHERE vault_id = $vid AND status = 'pending' AND run_at_ts <= $now"
+                             WHERE status = 'pending' AND run_at_ts <= $now"
                         )
-                        .bind(("vid", vid.clone()))
                         .bind(("now", now_ts))
                         .await {
                             Ok(r) => r,
@@ -302,12 +330,13 @@ pub fn run() {
                             // 所有任務統一走 run_scheduled_agent，由 agent 決定執行內容
                             {
                                 let ah2          = ah_sched.clone();
+                                let vault_id     = task.vault_id.clone();
                                 let agent_type   = task.agent_type.clone();
                                 let agent_prompt = task.agent_prompt.clone();
                                 let description  = task.description.clone();
                                 tokio::spawn(async move {
                                     commands::memory_agent::run_scheduled_agent(
-                                        &ah2, agent_type, agent_prompt, description,
+                                        &ah2, vault_id, agent_type, agent_prompt, description,
                                     ).await;
                                 });
                             }
@@ -524,6 +553,7 @@ pub fn run() {
             set_pattern_intent,
             // DevTools (debug helper)
             open_devtools,
+            is_app_ready,
         ])
         .build(tauri::generate_context!())
         .expect("noteTreeLM 構建失敗")

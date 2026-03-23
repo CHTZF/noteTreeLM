@@ -278,15 +278,21 @@ async fn handle_vault_switch(app: AppHandle, state: AppState, new_path: String) 
             let mut guard = state.watcher_stop.lock().await;
             drop(guard.take());
         }
-        // 更新 vault_path（新的 vault_id）
+        // 更新 vault_path
         state.set_vault_path(new_path.clone()).await;
+
+        // 查詢或建立 vault UUID
+        let username = state.get_username().await;
+        let vault_uuid = crate::db::queries::get_or_create_vault_uuid(&state.db, &new_path, &username).await;
+        state.set_vault_uuid(vault_uuid.clone()).await;
+
         // 初始化新 vault：啟動 watcher 並在背景補齊 chunk 索引
         let path = std::path::PathBuf::from(&new_path);
         if path.exists() {
             // 背景補齊 chunk 索引
             {
                 let db = state.db.clone();
-                let vid = new_path.clone();
+                let vid = vault_uuid.clone();
                 tokio::spawn(async move {
                     let _ = crate::vault::chunker::reindex_all(&db, &vid, None).await;
                 });
@@ -303,7 +309,7 @@ async fn handle_vault_switch(app: AppHandle, state: AppState, new_path: String) 
                      ON DUPLICATE KEY UPDATE task_id = task_id"
                 )
                 .bind(("tid", task_id))
-                .bind(("vid", new_path.clone()))
+                .bind(("vid", vault_uuid.clone()))
                 .bind(("ts", run_at_ts))
                 .bind(("now", now_ts))
                 .await;

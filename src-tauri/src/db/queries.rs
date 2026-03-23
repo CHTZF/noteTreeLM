@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use crate::db::surreal::SurrealDb;
+use uuid::Uuid;
 
 // ── 泛型輔助：從 SELECT 結果取第一個 value 欄位 ─────────────────────────
 #[derive(Deserialize)]
@@ -110,4 +111,44 @@ pub async fn set_vault_last_note(
     .await
     .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
     Ok(())
+}
+
+// ── Vault UUID ───────────────────────────────────────────────────────────────
+
+/// 查詢或建立 vault 記錄，回傳 vault_uuid
+pub async fn get_or_create_vault_uuid(
+    db: &SurrealDb,
+    path: &str,
+    account: &str,
+) -> String {
+    #[derive(Deserialize)]
+    struct Row { vault_id: String }
+
+    // 先查既有記錄
+    if let Ok(mut resp) = db.query(
+        "SELECT vault_id FROM vaults WHERE path = $path AND account = $account LIMIT 1"
+    )
+    .bind(("path", path.to_string()))
+    .bind(("account", account.to_string()))
+    .await {
+        let rows: Vec<Row> = resp.take(0).unwrap_or_default();
+        if let Some(row) = rows.into_iter().next() {
+            return row.vault_id;
+        }
+    }
+
+    // 新建
+    let uuid = Uuid::new_v4().to_string();
+    let now_ts = chrono::Utc::now().timestamp();
+    let _ = db.query(
+        "INSERT INTO vaults (vault_id, path, account, created_at) \
+         VALUES ($vid, $path, $account, $now)"
+    )
+    .bind(("vid", uuid.clone()))
+    .bind(("path", path.to_string()))
+    .bind(("account", account.to_string()))
+    .bind(("now", now_ts))
+    .await;
+
+    uuid
 }

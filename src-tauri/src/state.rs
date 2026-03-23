@@ -70,6 +70,12 @@ pub struct AppState {
     pub titled_convs: Arc<Mutex<HashSet<String>>>,
     /// Live chat 執行旗標：true 時 make_confirm_write 自動核准寫入（無需前端確認）
     pub live_chat_active: Arc<AtomicBool>,
+    /// 目前 Vault 的 UUID（DB 查詢使用，與 vault_path 分離）
+    pub vault_uuid: Arc<RwLock<String>>,
+    /// 目前登入的使用者名稱
+    pub username: Arc<RwLock<String>>,
+    /// DB/init 就緒旗標：背景 init task 完成後設為 true，通知前端可進入 App
+    pub app_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
@@ -105,6 +111,9 @@ impl AppState {
             intent_centroids: Arc::new(Mutex::new(None)),
             titled_convs: Arc::new(Mutex::new(HashSet::new())),
             live_chat_active: Arc::new(AtomicBool::new(false)),
+            vault_uuid: Arc::new(RwLock::new(String::new())),
+            username: Arc::new(RwLock::new(String::new())),
+            app_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -122,13 +131,29 @@ impl AppState {
         *self.vault_path.write().await = path;
     }
 
-    /// 取得目前 vault 的 ID（使用 vault_path）；Vault 未設定時回傳錯誤
+    /// 取得目前 vault 的 UUID；Vault 未設定時回傳錯誤
     pub async fn get_vault_id(&self) -> Result<String, AppError> {
-        let path = self.vault_path.read().await.clone();
-        if path.is_empty() {
-            Err(AppError::Vault("尚未設定 Vault 路徑".to_string()))
+        let uuid = self.vault_uuid.read().await.clone();
+        if uuid.is_empty() {
+            Err(AppError::Vault("尚未設定 Vault".to_string()))
         } else {
-            Ok(path)
+            Ok(uuid)
         }
+    }
+
+    pub async fn get_vault_uuid(&self) -> String {
+        self.vault_uuid.read().await.clone()
+    }
+
+    pub async fn set_vault_uuid(&self, uuid: String) {
+        *self.vault_uuid.write().await = uuid;
+    }
+
+    pub async fn get_username(&self) -> String {
+        self.username.read().await.clone()
+    }
+
+    pub async fn set_username(&self, name: String) {
+        *self.username.write().await = name;
     }
 }

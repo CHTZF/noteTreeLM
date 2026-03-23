@@ -210,9 +210,14 @@ pub async fn mark_conversation_processed(
 
 /// 手動觸發記憶 sub-agent（前端設定頁按鈕）
 #[tauri::command]
-pub async fn trigger_memory_agent(app: tauri::AppHandle) -> Result<(), AppError> {
+pub async fn trigger_memory_agent(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), AppError> {
+    let vault_uuid = state.get_vault_uuid().await;
+    let vault_path = state.get_vault_path().await;
+    if vault_uuid.is_empty() {
+        return Err(AppError::Vault("尚未設定 Vault".to_string()));
+    }
     tokio::spawn(async move {
-        run_memory_agent_loop(&app).await;
+        run_memory_agent_loop(&app, vault_uuid, vault_path).await;
     });
     Ok(())
 }
@@ -397,6 +402,7 @@ fn build_memory_registry(
 /// 排程器觸發時呼叫，根據 agent_type 路由到對應的執行邏輯
 pub async fn run_scheduled_agent(
     app: &tauri::AppHandle,
+    vault_id: String,
     agent_type: Option<String>,
     agent_prompt: Option<String>,
     description: String,
@@ -404,13 +410,36 @@ pub async fn run_scheduled_agent(
     use tauri::Manager;
     match agent_type.as_deref() {
         Some("memory_agent") => {
-            run_memory_agent_loop(app).await;
+            // 從 vaults table 用 vault_id (UUID) 取得 vault_path
+            let vault_path = {
+                #[derive(serde::Deserialize)]
+                struct VaultRow { path: String }
+                let state = app.state::<AppState>();
+                let mut resp = match state.db.query(
+                    "SELECT path FROM vaults WHERE vault_id = $vid LIMIT 1"
+                )
+                .bind(("vid", vault_id.clone()))
+                .await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        eprintln!("[scheduler] DB error querying vaults for vault_id={}", vault_id);
+                        return;
+                    }
+                };
+                let rows: Vec<VaultRow> = resp.take(0).unwrap_or_default();
+                rows.into_iter().next().map(|r| r.path).unwrap_or_default()
+            };
+            if vault_path.is_empty() {
+                eprintln!("[scheduler] vault not found for vault_id={}", vault_id);
+                return;
+            }
+            run_memory_agent_loop(app, vault_id, vault_path).await;
         }
         Some(unknown_type) => {
             // 未知 agent_type：用 vault registry 跑通用 sub-agent
             let state = app.state::<AppState>();
-            let vault_path = state.get_vault_path().await;
-            let vault_id = state.get_vault_id().await.unwrap_or_default();
+            // 使用任務指定的 vault_id，而非 active vault
+            let vault_path = vault_id.clone();
             if vault_path.is_empty() { return; }
 
             let base_url = {
@@ -459,7 +488,7 @@ pub async fn run_scheduled_agent(
             let registry = crate::tools::build_vault_registry(
                 vault_path.clone(),
                 state.db.clone(),
-                vault_id,
+                vault_id.clone(),
                 state.sqlite.clone(),
                 app.clone(),
                 Some(base_url_for_registry),
@@ -511,24 +540,17 @@ const SYSTEM_PROMPT: &str = "\
 5. 每個對話無論成功失敗 → 呼叫 mark_conversation_processed
 6. 全部完成後 → 呼叫 write_memory_log 記錄摘要（level: INFO）";
 
-pub async fn run_memory_agent_loop(app: &tauri::AppHandle) {
+pub async fn run_memory_agent_loop(app: &tauri::AppHandle, vault_uuid: String, vault_path: String) {
     use crate::commands::ai::{send_streaming_request, detect_tool_calls};
     use crate::runtime::sub_agent::run_sub_agent;
     use crate::runtime::types::LlmRound;
     use tauri::Manager;
 
-    let state = app.state::<AppState>();
-
-    let vault_path = state.get_vault_path().await;
-    let vault_id = match state.get_vault_id().await {
-        Ok(id) => id,
-        Err(_) => return,
-    };
-
-    // vault 未設定時跳過，並記 log
-    if vault_path.is_empty() {
+    if vault_path.is_empty() || vault_uuid.is_empty() {
         return;
     }
+
+    let state = app.state::<AppState>();
 
     // llama-server 必須在線
     let base_url = {
@@ -580,7 +602,7 @@ pub async fn run_memory_agent_loop(app: &tauri::AppHandle) {
 
     let registry = build_memory_registry(
         state.db.clone(),
-        vault_id,
+        vault_uuid,
         vault_path.clone(),
     );
 

@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use tauri::Manager;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::state::AppState;
+use crate::db::queries::get_or_create_vault_uuid;
 
 // ── Google OAuth 2.0 憑證（桌面應用程式類型）────────────────────────────────
 // 從 src-tauri/google-oauth.json 讀取（compile time embed，該檔案已 gitignore）
@@ -38,10 +39,6 @@ fn hash_password(password: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn session_path(app: &tauri::AppHandle) -> std::path::PathBuf {
-    app.path().app_data_dir().expect("app_data_dir").join("session.json")
-}
-
 #[derive(Deserialize)]
 struct UserRow {
     #[allow(dead_code)]
@@ -53,7 +50,6 @@ pub async fn login(
     username: String,
     password: String,
     state: tauri::State<'_, AppState>,
-    app: tauri::AppHandle,
 ) -> Result<SessionInfo, String> {
     let hash = hash_password(&password);
 
@@ -70,44 +66,89 @@ pub async fn login(
     }
 
     let token = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Local::now().timestamp();
+    let now = chrono::Utc::now().timestamp();
     let expires_at = now + 30 * 24 * 3600; // 30 days
 
-    let session = SessionInfo { token, username, expires_at, auth_provider: "local".to_string() };
+    // 清除舊 session
+    let _ = state.db
+        .query("DELETE FROM sessions WHERE username = $username")
+        .bind(("username", username.clone()))
+        .await;
 
-    let path = session_path(&app);
-    let json = serde_json::to_string(&session).map_err(|e| e.to_string())?;
-    tokio::fs::write(&path, json).await.map_err(|e| e.to_string())?;
+    // 寫入新 session
+    state.db
+        .query("INSERT INTO sessions (token, username, expires_at, auth_provider, created_at) VALUES ($token, $username, $expires_at, $provider, $created_at)")
+        .bind(("token", token.clone()))
+        .bind(("username", username.clone()))
+        .bind(("expires_at", expires_at))
+        .bind(("provider", "local".to_string()))
+        .bind(("created_at", now))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let session = SessionInfo { token, username: username.clone(), expires_at, auth_provider: "local".to_string() };
+
+    // 同步更新 state
+    state.set_username(username.clone()).await;
+
+    // 若 vault_path 非空，建立 vault UUID
+    let vp = state.get_vault_path().await;
+    if !vp.is_empty() {
+        let vault_uuid = get_or_create_vault_uuid(&state.db, &vp, &username).await;
+        state.set_vault_uuid(vault_uuid).await;
+    }
 
     Ok(session)
 }
 
 #[tauri::command]
-pub async fn logout(app: tauri::AppHandle) -> Result<(), String> {
-    let path = session_path(&app);
-    if path.exists() {
-        tokio::fs::remove_file(&path).await.map_err(|e| e.to_string())?;
+pub async fn logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let username = state.get_username().await;
+    if !username.is_empty() {
+        let _ = state.db
+            .query("DELETE FROM sessions WHERE username = $username")
+            .bind(("username", username))
+            .await;
     }
+    state.set_username(String::new()).await;
+    state.set_vault_uuid(String::new()).await;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn get_session(app: tauri::AppHandle) -> Result<Option<SessionInfo>, String> {
-    let path = session_path(&app);
-    if !path.exists() {
-        return Ok(None);
+pub async fn get_session(state: tauri::State<'_, AppState>) -> Result<Option<SessionInfo>, String> {
+    // 先嘗試從 state 取得 username
+    let cached_username = state.get_username().await;
+
+    #[derive(Deserialize)]
+    struct SessionRow {
+        token: String,
+        username: String,
+        expires_at: i64,
+        auth_provider: String,
     }
 
-    let json = tokio::fs::read_to_string(&path).await.map_err(|e| e.to_string())?;
-    let session: SessionInfo = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    let now_ts = chrono::Utc::now().timestamp();
+    let mut resp = state.db
+        .query("SELECT token, username, expires_at, auth_provider FROM sessions WHERE expires_at > $now ORDER BY expires_at DESC LIMIT 1")
+        .bind(("now", now_ts))
+        .await
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<SessionRow> = resp.take(0).map_err(|e| e.to_string())?;
 
-    let now = chrono::Local::now().timestamp();
-    if session.expires_at <= now {
-        let _ = tokio::fs::remove_file(&path).await;
-        return Ok(None);
+    if let Some(row) = rows.into_iter().next() {
+        if cached_username.is_empty() {
+            state.set_username(row.username.clone()).await;
+        }
+        Ok(Some(SessionInfo {
+            token: row.token,
+            username: row.username,
+            expires_at: row.expires_at,
+            auth_provider: row.auth_provider,
+        }))
+    } else {
+        Ok(None)
     }
-
-    Ok(Some(session))
 }
 
 #[tauri::command]
@@ -115,19 +156,16 @@ pub async fn change_password(
     current_password: String,
     new_password: String,
     state: tauri::State<'_, AppState>,
-    app: tauri::AppHandle,
 ) -> Result<(), String> {
-    let path = session_path(&app);
-    if !path.exists() {
+    let username = state.get_username().await;
+    if username.is_empty() {
         return Err("未登入".to_string());
     }
-    let json = tokio::fs::read_to_string(&path).await.map_err(|e| e.to_string())?;
-    let session: SessionInfo = serde_json::from_str(&json).map_err(|e| e.to_string())?;
 
     let current_hash = hash_password(&current_password);
     let mut resp = state.db
         .query("SELECT username FROM users WHERE username = $username AND password_hash = $hash LIMIT 1")
-        .bind(("username", session.username.clone()))
+        .bind(("username", username.clone()))
         .bind(("hash", current_hash.clone()))
         .await
         .map_err(|e| e.to_string())?;
@@ -141,7 +179,7 @@ pub async fn change_password(
     state.db
         .query("UPDATE users SET password_hash = $hash WHERE username = $username")
         .bind(("hash", new_hash.clone()))
-        .bind(("username", session.username.clone()))
+        .bind(("username", username.clone()))
         .await
         .map_err(|e| e.to_string())?;
 
@@ -163,7 +201,7 @@ fn generate_pkce() -> (String, String) {
 }
 
 #[tauri::command]
-pub async fn start_google_oauth(app: tauri::AppHandle) -> Result<SessionInfo, String> {
+pub async fn start_google_oauth(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<SessionInfo, String> {
     use tauri_plugin_shell::ShellExt;
 
     let (client_id, client_secret) = google_credentials();
@@ -286,14 +324,40 @@ pub async fn start_google_oauth(app: tauri::AppHandle) -> Result<SessionInfo, St
     let email = userinfo["email"].as_str().ok_or("無法取得 Email")?;
     let name  = userinfo["name"].as_str().unwrap_or(email);
 
-    // 建立 session 並寫入磁碟
+    // 建立 session 並寫入 DB
     let token      = uuid::Uuid::new_v4().to_string();
-    let expires_at = chrono::Local::now().timestamp() + 30 * 24 * 3600;
-    let session    = SessionInfo { token, username: name.to_string(), expires_at, auth_provider: "google".to_string() };
+    let now        = chrono::Utc::now().timestamp();
+    let expires_at = now + 30 * 24 * 3600;
+    let username   = name.to_string();
 
-    let path = session_path(&app);
-    let json = serde_json::to_string(&session).map_err(|e| e.to_string())?;
-    tokio::fs::write(&path, json).await.map_err(|e| e.to_string())?;
+    // 清除舊 session
+    let _ = state.db
+        .query("DELETE FROM sessions WHERE username = $username")
+        .bind(("username", username.clone()))
+        .await;
+
+    // 寫入新 session
+    state.db
+        .query("INSERT INTO sessions (token, username, expires_at, auth_provider, created_at) VALUES ($token, $username, $expires_at, $provider, $created_at)")
+        .bind(("token", token.clone()))
+        .bind(("username", username.clone()))
+        .bind(("expires_at", expires_at))
+        .bind(("provider", "google".to_string()))
+        .bind(("created_at", now))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let session = SessionInfo { token, username: username.clone(), expires_at, auth_provider: "google".to_string() };
+
+    // 同步更新 state
+    state.set_username(username.clone()).await;
+
+    // 若 vault_path 非空，建立 vault UUID
+    let vp = state.get_vault_path().await;
+    if !vp.is_empty() {
+        let vault_uuid = get_or_create_vault_uuid(&state.db, &vp, &username).await;
+        state.set_vault_uuid(vault_uuid).await;
+    }
 
     Ok(session)
 }
