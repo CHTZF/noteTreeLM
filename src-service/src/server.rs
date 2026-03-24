@@ -9,17 +9,84 @@ use serde_json::json;
 use std::net::SocketAddr;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
+use crate::api_state::ApiState;
 use crate::auth::{handlers, middleware::auth_middleware, store::AuthStore};
 use crate::db::SurrealDb;
 use crate::state::{DaemonState, ServerInfo};
 
-#[derive(Clone)]
-struct AppState {
-    auth: AuthStore,
-    daemon: DaemonState,
-    db: SurrealDb,
+/// Build the shared API router with all routes.
+/// Used by both HTTP :7787 and HTTPS :7788.
+pub fn build_api_router(app_state: ApiState) -> Router {
+    let auth_store = app_state.auth.clone();
+
+    // Public routes (no token required)
+    let public_routes = Router::new()
+        .route("/health", get(health_handler))
+        .route("/auth/pair", post(handlers::pair))
+        .route("/auth/refresh", post(handlers::refresh))
+        .route("/auth/revoke", post(handlers::revoke))
+        .with_state(auth_store.clone());
+
+    // Device management routes (token required)
+    let device_routes = Router::new()
+        .route("/auth/devices", get(handlers::list_devices))
+        .route("/auth/devices/:id", delete(handlers::revoke_device))
+        .layer(middleware::from_fn_with_state(auth_store.clone(), auth_middleware))
+        .with_state(auth_store);
+
+    // Server registry + admin routes
+    let admin_routes = Router::new()
+        .route("/servers/status", get(servers_status_handler))
+        .route("/servers/register", post(servers_register_handler))
+        .route("/db/repair", post(db_repair_handler))
+        .with_state(app_state.clone());
+
+    // API v1 routes (all the new domain routes)
+    let api_v1 = Router::new()
+        .merge(crate::routes::auth::router())
+        .merge(crate::routes::settings::router())
+        .merge(crate::routes::conversations::router())
+        .merge(crate::routes::vault::router())
+        .merge(crate::routes::notes::router())
+        .merge(crate::routes::search::router())
+        .merge(crate::routes::kb::router())
+        .merge(crate::routes::agents::router())
+        .merge(crate::routes::memory::router())
+        .merge(crate::routes::scheduled::router())
+        .with_state(app_state);
+
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    Router::new()
+        .nest("/api/v1", api_v1)
+        .merge(public_routes)
+        .merge(device_routes)
+        .merge(admin_routes)
+        .layer(cors)
+        .layer(TraceLayer::new_for_http())
 }
 
+/// Plain HTTP server on localhost :7787 (no TLS)
+pub async fn run_http_server(
+    port: u16,
+    app_state: ApiState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let app = build_api_router(app_state);
+
+    // Bind only to loopback — security: not accessible from outside
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    tracing::info!("HTTP server listening on http://127.0.0.1:{}", port);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app.into_make_service()).await?;
+
+    Ok(())
+}
+
+/// HTTPS server on all interfaces :7788 (TLS, for mobile/external)
 pub async fn run_https_server(
     cert_pem: String,
     key_pem: String,
@@ -33,45 +100,8 @@ pub async fn run_https_server(
         key_pem.into_bytes(),
     ).await?;
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
-    let app_state = AppState {
-        auth: auth_store.clone(),
-        daemon: daemon_state,
-        db,
-    };
-
-    // Public routes（不需要 token）
-    let public_routes = Router::new()
-        .route("/health", get(health_handler))
-        .route("/auth/pair", post(handlers::pair))
-        .route("/auth/refresh", post(handlers::refresh))
-        .route("/auth/revoke", post(handlers::revoke))
-        .with_state(auth_store.clone());
-
-    // Protected routes（需要 token）
-    let protected_routes = Router::new()
-        .route("/auth/devices", get(handlers::list_devices))
-        .route("/auth/devices/:id", delete(handlers::revoke_device))
-        .layer(middleware::from_fn_with_state(auth_store.clone(), auth_middleware))
-        .with_state(auth_store);
-
-    // Server registry + admin routes（loopback 免認證）
-    let admin_routes = Router::new()
-        .route("/servers/status", get(servers_status_handler))
-        .route("/servers/register", post(servers_register_handler))
-        .route("/db/repair", post(db_repair_handler))
-        .with_state(app_state.clone());
-
-    let app = Router::new()
-        .merge(public_routes)
-        .merge(protected_routes)
-        .merge(admin_routes)
-        .layer(cors)
-        .layer(TraceLayer::new_for_http());
+    let app_state = ApiState::new(auth_store, db, daemon_state);
+    let app = build_api_router(app_state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("HTTPS server listening on https://0.0.0.0:{}", port);
@@ -92,14 +122,14 @@ async fn health_handler() -> Json<serde_json::Value> {
 }
 
 async fn servers_status_handler(
-    State(state): State<AppState>,
+    State(state): State<ApiState>,
 ) -> Json<serde_json::Value> {
     let servers = state.daemon.servers.read().await;
     Json(json!({ "servers": *servers }))
 }
 
 async fn servers_register_handler(
-    State(state): State<AppState>,
+    State(state): State<ApiState>,
     Json(info): Json<ServerInfo>,
 ) -> Json<serde_json::Value> {
     let mut servers = state.daemon.servers.write().await;
@@ -112,9 +142,8 @@ async fn servers_register_handler(
 }
 
 async fn db_repair_handler(
-    State(state): State<AppState>,
+    State(state): State<ApiState>,
 ) -> Json<serde_json::Value> {
-    // Run a basic integrity check / re-run migrations
     match crate::db::run_migrations_pub(&state.db).await {
         Ok(_) => Json(json!({ "ok": true, "message": "Migrations re-applied successfully" })),
         Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),

@@ -45,6 +45,7 @@ import TitleBar from './components/TitleBar/TitleBar'
 import { useAuthStore } from './stores/authStore'
 import Toast, { toast } from './components/common/Toast'
 import ServerStatusBar from './components/common/ServerStatusBar'
+import DaemonGuard from './components/common/DaemonGuard'
 import { useTranslation } from 'react-i18next'
 import './styles/App.css'
 
@@ -162,24 +163,32 @@ export default function App() {
   // Auth + app loading splash
   if (authLoading || !appReady) {
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100vh', background: 'var(--color-bg-base)' }}>
-        <TitleBar />
-        <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--color-text-muted)', fontSize: '13px' }}>
-          {t('app.loading')}
+      <DaemonGuard>
+        <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100vh', background: 'var(--color-bg-base)' }}>
+          <TitleBar />
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--color-text-muted)', fontSize: '13px' }}>
+            {t('app.loading')}
+          </div>
         </div>
-      </div>
+      </DaemonGuard>
     )
   }
 
   // Not authenticated — show login
   if (!session) return (
-    <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100vh' }}>
-      <TitleBar />
-      <LoginScreen />
-    </div>
+    <DaemonGuard>
+      <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100vh' }}>
+        <TitleBar />
+        <LoginScreen />
+      </div>
+    </DaemonGuard>
   )
 
-  return <AppMain />
+  return (
+    <DaemonGuard>
+      <AppMain />
+    </DaemonGuard>
+  )
 }
 
 function AppMain() {
