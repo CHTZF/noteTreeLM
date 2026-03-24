@@ -1,3 +1,5 @@
+pub mod sqlite;
+
 use std::path::PathBuf;
 use surrealdb::{engine::any::Any, Surreal};
 

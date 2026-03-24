@@ -1,7 +1,9 @@
 mod api_state;
 mod auth;
+mod chunker;
 mod daemon;
 mod db;
+mod embedder;
 mod mdns;
 mod routes;
 mod server;

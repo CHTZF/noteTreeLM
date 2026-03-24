@@ -18,7 +18,7 @@ pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let _mdns = crate::mdns::start_mdns_broadcast(&tls.spki_pin)?;
 
     let auth_store = AuthStore::new();
-    let daemon_state = DaemonState::new();
+    let daemon_state = DaemonState::new_with_data_dir(&data_dir);
 
     // Spawn scheduler loop
     {

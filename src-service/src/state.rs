@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
@@ -14,12 +15,18 @@ pub struct ServerInfo {
 #[derive(Clone)]
 pub struct DaemonState {
     pub servers: Arc<RwLock<Vec<ServerInfo>>>,
+    pub sqlite: crate::db::sqlite::SqliteConn,
+    pub embedding_url: Arc<RwLock<Option<String>>>,
 }
 
 impl DaemonState {
-    pub fn new() -> Self {
+    pub fn new_with_data_dir(data_dir: &Path) -> Self {
+        let sqlite = crate::db::sqlite::init_sqlite(&data_dir.join("search.db"))
+            .expect("SQLite FTS5 init failed");
         Self {
             servers: Arc::new(RwLock::new(Vec::new())),
+            sqlite,
+            embedding_url: Arc::new(RwLock::new(None)),
         }
     }
 }

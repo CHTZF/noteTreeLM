@@ -132,6 +132,12 @@ async fn servers_register_handler(
     State(state): State<ApiState>,
     Json(info): Json<ServerInfo>,
 ) -> Json<serde_json::Value> {
+    // If an embedding server is registering, store its URL for vector search
+    if info.name == "embedding" {
+        let url = format!("http://127.0.0.1:{}", info.port);
+        *state.daemon.embedding_url.write().await = Some(url);
+    }
+
     let mut servers = state.daemon.servers.write().await;
     if let Some(existing) = servers.iter_mut().find(|s| s.name == info.name) {
         *existing = info;

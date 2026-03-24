@@ -10,6 +10,8 @@ use std::path::Path as FsPath;
 use uuid::Uuid;
 
 use crate::api_state::ApiState;
+use crate::chunker;
+use crate::embedder;
 
 pub fn router() -> Router<ApiState> {
     Router::new()
@@ -85,6 +87,10 @@ async fn scan_vault(
     let now = Utc::now().timestamp();
     let mut indexed = 0usize;
 
+    // Get embedding URL once for the whole scan
+    let emb_url = state.daemon.embedding_url.read().await.clone();
+    let http_client = reqwest::Client::new();
+
     for file_path in md_files {
         let rel_path = file_path
             .strip_prefix(root)
@@ -92,7 +98,7 @@ async fn scan_vault(
             .to_string_lossy()
             .to_string();
 
-        let content = match std::fs::read_to_string(&file_path) {
+        let content = match tokio::fs::read_to_string(&file_path).await {
             Ok(c) => c,
             Err(_) => continue,
         };
@@ -111,13 +117,103 @@ async fn scan_vault(
             .db
             .query("INSERT INTO notes (vault_id, path, title, content, word_count, created_at, modified_at) VALUES ($vid, $path, $title, $content, $wc, $now, $mod) ON DUPLICATE KEY UPDATE title = $title, content = $content, word_count = $wc, modified_at = $mod")
             .bind(("vid", vault_id.clone()))
-            .bind(("path", rel_path))
+            .bind(("path", rel_path.clone()))
             .bind(("title", title))
-            .bind(("content", content))
+            .bind(("content", content.clone()))
             .bind(("wc", word_count))
             .bind(("now", now))
             .bind(("mod", modified_at))
             .await;
+
+        // Chunk, embed, and index
+        let chunks = chunker::split_into_chunks(&content, &rel_path);
+        // Delete stale chunks for this file before inserting new ones
+        let _ = state
+            .db
+            .query("DELETE FROM chunks WHERE vault_id = $vid AND file_path = $fp")
+            .bind(("vid", vault_id.clone()))
+            .bind(("fp", rel_path.clone()))
+            .await;
+
+        // Best-effort: clear from SQLite FTS5
+        {
+            let sqlite = state.daemon.sqlite.clone();
+            let vid = vault_id.clone();
+            let fp = rel_path.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(conn) = sqlite.lock() {
+                    let _ = crate::db::sqlite::fts_delete_file(&conn, &vid, &fp);
+                }
+            })
+            .await
+            .ok();
+        }
+
+        for chunk in &chunks {
+            let embedding = embedder::embed_text(
+                &http_client,
+                &emb_url,
+                &chunker::clean_for_embedding(&chunk.content),
+            )
+            .await;
+
+            if let Some(ref vec) = embedding {
+                let _ = state
+                    .db
+                    .query(
+                        "INSERT INTO chunks (vault_id, chunk_id, file_path, section, content, \
+                         chunk_type, word_count, updated_at, embedding, status) \
+                         VALUES ($vid, $cid, $fp, $section, $content, \
+                         'text', $wc, time::now(), $emb, $status)",
+                    )
+                    .bind(("vid", vault_id.clone()))
+                    .bind(("cid", chunk.chunk_id.clone()))
+                    .bind(("fp", chunk.file_path.clone()))
+                    .bind(("section", chunk.section.clone()))
+                    .bind(("content", chunk.content.clone()))
+                    .bind(("wc", chunk.word_count as i64))
+                    .bind(("emb", vec.clone()))
+                    .bind(("status", chunk.status.clone()))
+                    .await;
+            } else {
+                let _ = state
+                    .db
+                    .query(
+                        "INSERT INTO chunks (vault_id, chunk_id, file_path, section, content, \
+                         chunk_type, word_count, updated_at, status) \
+                         VALUES ($vid, $cid, $fp, $section, $content, \
+                         'text', $wc, time::now(), $status)",
+                    )
+                    .bind(("vid", vault_id.clone()))
+                    .bind(("cid", chunk.chunk_id.clone()))
+                    .bind(("fp", chunk.file_path.clone()))
+                    .bind(("section", chunk.section.clone()))
+                    .bind(("content", chunk.content.clone()))
+                    .bind(("wc", chunk.word_count as i64))
+                    .bind(("status", chunk.status.clone()))
+                    .await;
+            }
+
+            // Best-effort: upsert into SQLite FTS5
+            {
+                let sqlite = state.daemon.sqlite.clone();
+                let vid = vault_id.clone();
+                let cid = chunk.chunk_id.clone();
+                let fp = chunk.file_path.clone();
+                let sec = chunk.section.clone();
+                let cont = chunk.content.clone();
+                let stat = chunk.status.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(conn) = sqlite.lock() {
+                        if let Err(e) =
+                            crate::db::sqlite::fts_upsert(&conn, &cid, &vid, &fp, &sec, &cont, &stat)
+                        {
+                            tracing::warn!("SQLite FTS upsert failed for {}: {}", cid, e);
+                        }
+                    }
+                });
+            }
+        }
 
         indexed += 1;
     }

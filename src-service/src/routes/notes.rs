@@ -97,14 +97,17 @@ async fn create_note(
     state
         .db
         .query("INSERT INTO notes (vault_id, path, title, content, word_count, created_at, modified_at) VALUES ($vid, $path, $title, $content, $wc, $now, $now) ON DUPLICATE KEY UPDATE title = $title, content = $content, word_count = $wc, modified_at = $now")
-        .bind(("vid", vault_id))
-        .bind(("path", rel_path))
+        .bind(("vid", vault_id.clone()))
+        .bind(("path", rel_path.clone()))
         .bind(("title", title))
-        .bind(("content", content))
+        .bind(("content", content.clone()))
         .bind(("wc", word_count))
         .bind(("now", now))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Best-effort: chunk, embed, and index
+    index_note_chunks(&state, &vault_id, &rel_path, &content).await;
 
     Ok(Json(json!({ "ok": true })))
 }
@@ -139,13 +142,16 @@ async fn update_note(
         .db
         .query("UPDATE notes SET title = $title, content = $content, word_count = $wc, modified_at = $now WHERE vault_id = $vid AND path = $path")
         .bind(("title", title))
-        .bind(("content", content))
+        .bind(("content", content.clone()))
         .bind(("wc", word_count))
         .bind(("now", now))
-        .bind(("vid", vault_id))
-        .bind(("path", rel_path))
+        .bind(("vid", vault_id.clone()))
+        .bind(("path", rel_path.clone()))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Best-effort: re-chunk, embed, and index (deletes stale chunks first)
+    index_note_chunks(&state, &vault_id, &rel_path, &content).await;
 
     Ok(Json(json!({ "ok": true })))
 }
@@ -170,12 +176,151 @@ async fn delete_note(
     state
         .db
         .query("DELETE FROM notes WHERE vault_id = $vid AND path = $path")
-        .bind(("vid", vault_id))
-        .bind(("path", rel_path))
+        .bind(("vid", vault_id.clone()))
+        .bind(("path", rel_path.clone()))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // Delete chunks from SurrealDB
+    let _ = state
+        .db
+        .query("DELETE FROM chunks WHERE vault_id = $vid AND file_path = $fp")
+        .bind(("vid", vault_id.clone()))
+        .bind(("fp", rel_path.clone()))
+        .await;
+
+    // Delete from SQLite FTS5 (best-effort)
+    {
+        let sqlite = state.daemon.sqlite.clone();
+        let vid = vault_id.clone();
+        let fp = rel_path.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(conn) = sqlite.lock() {
+                if let Err(e) = crate::db::sqlite::fts_delete_file(&conn, &vid, &fp) {
+                    tracing::warn!("SQLite FTS delete failed for {}: {}", fp, e);
+                }
+            }
+        });
+    }
+
     Ok(Json(json!({ "ok": true })))
+}
+
+// ── Index helpers ─────────────────────────────────────────────────────────
+
+/// Chunk, embed, and index a note into SurrealDB chunks + SQLite FTS5.
+/// This is best-effort: errors are logged but not returned to the caller.
+async fn index_note_chunks(state: &ApiState, vault_id: &str, rel_path: &str, content: &str) {
+    let chunks = crate::chunker::split_into_chunks(content, rel_path);
+    if chunks.is_empty() {
+        return;
+    }
+
+    // Collect current chunk IDs for this file
+    let current_ids: Vec<String> = chunks.iter().map(|c| c.chunk_id.clone()).collect();
+
+    // Delete stale chunks from SurrealDB (chunks no longer in the current set)
+    #[derive(serde::Deserialize)]
+    struct ChunkIdRow { chunk_id: String }
+
+    if let Ok(mut resp) = state
+        .db
+        .query("SELECT chunk_id FROM chunks WHERE vault_id = $vid AND file_path = $fp")
+        .bind(("vid", vault_id.to_owned()))
+        .bind(("fp", rel_path.to_owned()))
+        .await
+    {
+        let existing: Vec<ChunkIdRow> = resp.take(0).unwrap_or_default();
+        for row in existing {
+            if !current_ids.contains(&row.chunk_id) {
+                let _ = state
+                    .db
+                    .query("DELETE FROM chunks WHERE vault_id = $vid AND chunk_id = $cid")
+                    .bind(("vid", vault_id.to_owned()))
+                    .bind(("cid", row.chunk_id))
+                    .await;
+            }
+        }
+    }
+
+    // Get embedding URL
+    let emb_url = state.daemon.embedding_url.read().await.clone();
+    let http_client = reqwest::Client::new();
+
+    for chunk in &chunks {
+        // Try to get embedding
+        let embedding = crate::embedder::embed_text(
+            &http_client,
+            &emb_url,
+            &crate::chunker::clean_for_embedding(&chunk.content),
+        )
+        .await;
+
+        // Delete existing chunk record then insert fresh (avoids SurrealDB FTS B-tree bug)
+        let _ = state
+            .db
+            .query("DELETE FROM chunks WHERE vault_id = $vid AND chunk_id = $cid")
+            .bind(("vid", vault_id.to_owned()))
+            .bind(("cid", chunk.chunk_id.clone()))
+            .await;
+
+        if let Some(ref vec) = embedding {
+            let _ = state
+                .db
+                .query(
+                    "INSERT INTO chunks (vault_id, chunk_id, file_path, section, content, \
+                     chunk_type, word_count, updated_at, embedding, status) \
+                     VALUES ($vid, $cid, $fp, $section, $content, \
+                     'text', $wc, time::now(), $emb, $status)",
+                )
+                .bind(("vid", vault_id.to_owned()))
+                .bind(("cid", chunk.chunk_id.clone()))
+                .bind(("fp", chunk.file_path.clone()))
+                .bind(("section", chunk.section.clone()))
+                .bind(("content", chunk.content.clone()))
+                .bind(("wc", chunk.word_count as i64))
+                .bind(("emb", vec.clone()))
+                .bind(("status", chunk.status.clone()))
+                .await;
+        } else {
+            let _ = state
+                .db
+                .query(
+                    "INSERT INTO chunks (vault_id, chunk_id, file_path, section, content, \
+                     chunk_type, word_count, updated_at, status) \
+                     VALUES ($vid, $cid, $fp, $section, $content, \
+                     'text', $wc, time::now(), $status)",
+                )
+                .bind(("vid", vault_id.to_owned()))
+                .bind(("cid", chunk.chunk_id.clone()))
+                .bind(("fp", chunk.file_path.clone()))
+                .bind(("section", chunk.section.clone()))
+                .bind(("content", chunk.content.clone()))
+                .bind(("wc", chunk.word_count as i64))
+                .bind(("status", chunk.status.clone()))
+                .await;
+        }
+
+        // Best-effort: upsert into SQLite FTS5
+        {
+            let sqlite = state.daemon.sqlite.clone();
+            let vid = vault_id.to_owned();
+            let cid = chunk.chunk_id.clone();
+            let fp = chunk.file_path.clone();
+            let sec = chunk.section.clone();
+            let cont = chunk.content.clone();
+            let stat = chunk.status.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(conn) = sqlite.lock() {
+                    if let Err(e) = crate::db::sqlite::fts_upsert(
+                        &conn, &cid, &vid, &fp, &sec, &cont, &stat,
+                    ) {
+                        tracing::warn!("SQLite FTS upsert failed for {}: {}", cid, e);
+                    }
+                }
+            });
+        }
+    }
 }
 
 fn extract_title_from_content(content: &str, fallback_path: &str) -> String {

@@ -6,6 +6,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
 use crate::api_state::ApiState;
 
@@ -19,6 +20,16 @@ struct SearchQuery {
     q: Option<String>,
 }
 
+#[derive(Debug)]
+struct SearchResult {
+    chunk_id:  String,
+    file_path: String,
+    section:   String,
+    #[allow(dead_code)]
+    content:   String,
+    score:     f32,
+}
+
 async fn search_notes(
     State(state): State<ApiState>,
     Path(vault_id): Path<String>,
@@ -29,17 +40,170 @@ async fn search_notes(
         .filter(|s| !s.is_empty())
         .ok_or((StatusCode::BAD_REQUEST, "Missing query param q".to_string()))?;
 
-    let mut resp = state
-        .db
-        .query("SELECT path, title, search::score(1) AS score FROM notes WHERE vault_id = $vid AND (title @1@ $q OR content @1@ $q) ORDER BY score DESC LIMIT 20")
-        .bind(("vid", vault_id))
-        .bind(("q", query_str))
+    let mut results: Vec<SearchResult> = Vec::new();
+    let mut seen_chunk_ids: HashSet<String> = HashSet::new();
+
+    // 1. Try vector search if embedding server is available
+    let emb_url = state.daemon.embedding_url.read().await.clone();
+    if emb_url.is_some() {
+        let http_client = reqwest::Client::new();
+        if let Some(embedding) =
+            crate::embedder::embed_text(&http_client, &emb_url, &query_str).await
+        {
+            #[derive(serde::Deserialize)]
+            struct VecRow {
+                chunk_id:  String,
+                file_path: String,
+                section:   String,
+                content:   String,
+                score:     f64,
+            }
+
+            let vec_resp = state
+                .db
+                .query(
+                    "SELECT chunk_id, file_path, section, content, \
+                     vector::similarity::cosine(embedding, $vec) AS score \
+                     FROM chunks \
+                     WHERE vault_id = $vid AND embedding IS NOT NONE \
+                     ORDER BY score DESC LIMIT 20",
+                )
+                .bind(("vid", vault_id.clone()))
+                .bind(("vec", embedding))
+                .await;
+
+            if let Ok(mut resp) = vec_resp {
+                let rows: Vec<VecRow> = resp.take(0).unwrap_or_default();
+                for row in rows {
+                    if seen_chunk_ids.insert(row.chunk_id.clone()) {
+                        results.push(SearchResult {
+                            chunk_id:  row.chunk_id,
+                            file_path: row.file_path,
+                            section:   row.section,
+                            content:   row.content,
+                            score:     row.score as f32,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. FTS5 search (always run as fallback/supplement)
+    {
+        let sqlite = state.daemon.sqlite.clone();
+        let vid = vault_id.clone();
+        let query_clone = query_str.clone();
+        let fts_results = tokio::task::spawn_blocking(move || {
+            match sqlite.lock() {
+                Ok(conn) => {
+                    crate::db::sqlite::fts_search(&conn, &vid, &query_clone, false, 20)
+                        .unwrap_or_default()
+                }
+                Err(_) => Vec::new(),
+            }
+        })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .unwrap_or_default();
 
-    let rows: Vec<Value> = resp
-        .take(0)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        for row in fts_results {
+            if seen_chunk_ids.insert(row.chunk_id.clone()) {
+                results.push(SearchResult {
+                    chunk_id:  row.chunk_id,
+                    file_path: row.file_path,
+                    section:   row.section,
+                    content:   row.content,
+                    score:     0.5, // FTS results get a default score
+                });
+            }
+        }
+    }
 
-    Ok(Json(json!(rows)))
+    // 3. If results still empty, fallback to SurrealDB BM25
+    if results.is_empty() {
+        #[derive(serde::Deserialize)]
+        struct BM25Row {
+            path:  String,
+            title: String,
+            score: Option<f64>,
+        }
+
+        let bm25_resp = state
+            .db
+            .query(
+                "SELECT path, title, search::score(1) AS score \
+                 FROM notes \
+                 WHERE vault_id = $vid AND (title @1@ $q OR content @1@ $q) \
+                 ORDER BY score DESC LIMIT 20",
+            )
+            .bind(("vid", vault_id.clone()))
+            .bind(("q", query_str.clone()))
+            .await;
+
+        if let Ok(mut resp) = bm25_resp {
+            let rows: Vec<BM25Row> = resp.take(0).unwrap_or_default();
+            let out: Vec<Value> = rows
+                .into_iter()
+                .map(|r| {
+                    json!({
+                        "path": r.path,
+                        "title": r.title,
+                        "section": "",
+                        "score": r.score.unwrap_or(0.0),
+                    })
+                })
+                .collect();
+            return Ok(Json(json!(out)));
+        }
+    }
+
+    // 4. Collect unique file_paths and load note metadata
+    let unique_paths: Vec<String> = {
+        let mut seen = HashSet::new();
+        results
+            .iter()
+            .filter(|r| seen.insert(r.file_path.clone()))
+            .map(|r| r.file_path.clone())
+            .collect()
+    };
+
+    #[derive(serde::Deserialize)]
+    struct NoteRow {
+        path:  String,
+        title: String,
+    }
+
+    let mut title_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for path in &unique_paths {
+        if let Ok(mut resp) = state
+            .db
+            .query("SELECT path, title FROM notes WHERE vault_id = $vid AND path = $p LIMIT 1")
+            .bind(("vid", vault_id.clone()))
+            .bind(("p", path.clone()))
+            .await
+        {
+            let rows: Vec<NoteRow> = resp.take(0).unwrap_or_default();
+            if let Some(row) = rows.into_iter().next() {
+                title_map.insert(row.path, row.title);
+            }
+        }
+    }
+
+    let out: Vec<Value> = results
+        .into_iter()
+        .map(|r| {
+            let title = title_map
+                .get(&r.file_path)
+                .cloned()
+                .unwrap_or_else(|| r.file_path.clone());
+            json!({
+                "path": r.file_path,
+                "title": title,
+                "section": r.section,
+                "score": r.score,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!(out)))
 }
