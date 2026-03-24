@@ -70,6 +70,29 @@ fn is_app_ready(state: tauri::State<AppState>) -> bool {
     state.app_ready.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// POST server info to daemon's /servers/register (loopback, ignore errors)
+async fn register_server_with_daemon(name: &str, port: u16, status: &str, model: Option<&str>) {
+    let client = match reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(2))
+        .build() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+    let body = serde_json::json!({
+        "name": name,
+        "port": port,
+        "status": status,
+        "model": model,
+        "updated_at": chrono::Utc::now().timestamp(),
+    });
+    let _ = client
+        .post("https://127.0.0.1:7788/servers/register")
+        .json(&body)
+        .send()
+        .await;
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -264,6 +287,27 @@ pub fn run() {
                     warmup_llama_server(&state, &app_handle),
                     warmup_embedding_server(&state, &app_handle),
                 );
+
+                // 向 daemon 登記 AI server 狀態（daemon 未啟動時靜默忽略）
+                {
+                    let whisper_port = state.whisper_actual_port.lock().await;
+                    let llama_port = state.llama_actual_port.lock().await;
+                    let emb_port = *state.embedding_actual_port.lock().await;
+                    let wp = whisper_port.unwrap_or(8081);
+                    let lp = llama_port.unwrap_or(8080);
+                    drop(whisper_port);
+                    drop(llama_port);
+
+                    tokio::join!(
+                        register_server_with_daemon("whisper", wp, "running", None),
+                        register_server_with_daemon("llama", lp, "running", None),
+                        async {
+                            if let Some(p) = emb_port {
+                                register_server_with_daemon("embedding", p, "running", None).await;
+                            }
+                        },
+                    );
+                }
 
                 // Tool Registry 種子（確保 agent_tools 表有預設工具）
                 // 先用無 embedding 版本（快速），有 embedding server 時再補 embedding
@@ -554,6 +598,11 @@ pub fn run() {
             // DevTools (debug helper)
             open_devtools,
             is_app_ready,
+            // Daemon management
+            commands::daemon::install_daemon_service,
+            commands::daemon::uninstall_daemon_service,
+            commands::daemon::get_daemon_status,
+            commands::daemon::get_daemon_servers,
         ])
         .build(tauri::generate_context!())
         .expect("noteTreeLM 構建失敗")

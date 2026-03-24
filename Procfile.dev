@@ -1,0 +1,2 @@
+service: cargo watch --manifest-path src-service/Cargo.toml -x run
+app: npm run tauri dev
