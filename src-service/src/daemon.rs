@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use tokio::signal;
+use crate::api_state::ApiState;
 use crate::auth::store::AuthStore;
 use crate::db::SurrealDb;
 use crate::state::DaemonState;
@@ -27,20 +28,33 @@ pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let cert_pem = tls.cert_pem.clone();
-    let key_pem = tls.key_pem.clone();
-    let store_clone = auth_store.clone();
-    let db_clone = db.clone();
-    let daemon_state_clone = daemon_state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = crate::server::run_https_server(
-            cert_pem, key_pem, 7788, store_clone, db_clone, daemon_state_clone,
-        ).await {
-            tracing::error!("HTTPS server error: {}", e);
-        }
-    });
+    // HTTP localhost server (no TLS) on :7787
+    {
+        let api_state = ApiState::new(auth_store.clone(), db.clone(), daemon_state.clone());
+        tokio::spawn(async move {
+            if let Err(e) = crate::server::run_http_server(7787, api_state).await {
+                tracing::error!("HTTP server error: {}", e);
+            }
+        });
+    }
 
-    tracing::info!("Service ready on https://0.0.0.0:7788");
+    // HTTPS external server (TLS) on :7788
+    {
+        let cert_pem = tls.cert_pem.clone();
+        let key_pem = tls.key_pem.clone();
+        let store_clone = auth_store.clone();
+        let db_clone = db.clone();
+        let daemon_state_clone = daemon_state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::server::run_https_server(
+                cert_pem, key_pem, 7788, store_clone, db_clone, daemon_state_clone,
+            ).await {
+                tracing::error!("HTTPS server error: {}", e);
+            }
+        });
+    }
+
+    tracing::info!("Service ready — HTTP http://127.0.0.1:7787 | HTTPS https://0.0.0.0:7788");
     shutdown_signal().await;
     tracing::info!("Service shutting down...");
     Ok(())
@@ -84,7 +98,6 @@ async fn run_scheduler(db: SurrealDb) {
                 task.description, task.vault_id, task.agent_type
             );
 
-            // Update task state
             if task.repeat_interval_secs > 0 {
                 let next_ts = now_ts + task.repeat_interval_secs;
                 let _ = db.query(

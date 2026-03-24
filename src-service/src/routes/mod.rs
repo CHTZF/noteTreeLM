@@ -1,0 +1,10 @@
+pub mod auth;
+pub mod settings;
+pub mod conversations;
+pub mod notes;
+pub mod vault;
+pub mod kb;
+pub mod agents;
+pub mod search;
+pub mod memory;
+pub mod scheduled;

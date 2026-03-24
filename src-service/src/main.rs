@@ -1,7 +1,9 @@
+mod api_state;
 mod auth;
 mod daemon;
 mod db;
 mod mdns;
+mod routes;
 mod server;
 mod state;
 mod tls;
