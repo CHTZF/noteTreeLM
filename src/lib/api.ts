@@ -3,6 +3,16 @@ const BASE = 'http://127.0.0.1:7787/api/v1'
 // Auth token management
 let _token: string | null = localStorage.getItem('daemon_token')
 
+// Helper: resolve vaultId from settingsStore if not provided
+// Uses a lazy reference to avoid circular dependency (settingsStore imports api)
+let _getVaultId: (() => string) | null = null
+export function registerVaultIdResolver(fn: () => string) {
+  _getVaultId = fn
+}
+function getVaultId(): string {
+  return _getVaultId?.() ?? ''
+}
+
 export function setToken(t: string | null) {
   _token = t
   if (t) {
@@ -136,6 +146,134 @@ export const api = {
   createScheduledTask: (data: unknown) => request<{ task_id: string }>('POST', '/scheduled-tasks', data),
   deleteScheduledTask: (taskId: string) =>
     request<{ ok: boolean }>('DELETE', `/scheduled-tasks/${encodeURIComponent(taskId)}`),
+
+  // Auth alias
+  getSession: () => request<{ username: string; token: string; expires_at: number; auth_provider: string } | null>('GET', '/auth/session'),
+  changePassword: (currentPassword: string, newPassword: string) =>
+    request<{ ok: boolean }>('POST', '/auth/change-password', { current_password: currentPassword, new_password: newPassword }),
+
+  // Settings — conversation ID helpers
+  getLastChatConversationId: async (vaultPath: string) => {
+    try {
+      const s = await request<Record<string, string>>('GET', '/settings/user')
+      return s[`last_chat_conv_${vaultPath}`] ?? null
+    } catch { return null }
+  },
+  setLastChatConversationId: (vaultPath: string, conversationId: string | null) =>
+    request<{ ok: boolean }>('POST', '/settings/user', { [`last_chat_conv_${vaultPath}`]: conversationId ?? '' }),
+  getLastModeConversationId: async (vaultPath: string, mode: string) => {
+    try {
+      const s = await request<Record<string, string>>('GET', '/settings/user')
+      return s[`last_mode_conv_${mode}_${vaultPath}`] ?? null
+    } catch { return null }
+  },
+  setLastModeConversationId: (vaultPath: string, mode: string, conversationId: string | null) =>
+    request<{ ok: boolean }>('POST', '/settings/user', { [`last_mode_conv_${mode}_${vaultPath}`]: conversationId ?? '' }),
+
+  // API keys
+  getApiKey: (provider: string) => request<{ key: string | null }>('GET', `/settings/api-key/${encodeURIComponent(provider)}`),
+  setApiKey: (provider: string, key: string) => request<{ ok: boolean }>('POST', `/settings/api-key/${encodeURIComponent(provider)}`, { key }),
+  syncBraveKeyId: (keyId: string) => request<{ ok: boolean }>('POST', '/settings/brave-key-id', { key_id: keyId }),
+
+  // Conversations extras
+  getOrCreateLiveChatConv: (vaultId: string) => request<{ id: string }>('POST', '/conversations/live-chat', { vault_id: vaultId }),
+  markConversationProcessed: (id: string) => request<{ ok: boolean }>('PATCH', `/conversations/${encodeURIComponent(id)}/processed`, {}),
+  getUnprocessedConversations: (vaultId: string) => request<unknown[]>('GET', `/conversations?vault_id=${encodeURIComponent(vaultId)}&unprocessed=true`),
+  getConversationRatings: (conversationId: string) => request<Array<{ content_hash: string; rating: string }>>('GET', `/conversations/${encodeURIComponent(conversationId)}/ratings`),
+  rateResponse: (conversationId: string | undefined, contentHash: string, rating: string) =>
+    conversationId ? request<{ ok: boolean }>('POST', `/conversations/${encodeURIComponent(conversationId)}/rate`, { content_hash: contentHash, rating }) : Promise.resolve({ ok: false }),
+  saveKbChatMessages: (sessionId: string, messages: unknown) =>
+    request<{ ok: boolean }>('PUT', `/conversations/kb/${encodeURIComponent(sessionId)}/messages`, { messages }),
+  getKbChatMessages: (sessionId: string) =>
+    request<string | null>('GET', `/conversations/kb/${encodeURIComponent(sessionId)}/messages`),
+
+  // Notes extras
+  setNoteStatus: (path: string, status: string) => {
+    const vaultId = getVaultId()
+    return request<{ ok: boolean }>('PATCH', `/vaults/${encodeURIComponent(vaultId)}/notes/status`, { path, status })
+  },
+  trashNote: (path: string) => {
+    const vaultId = getVaultId()
+    return request<{ ok: boolean }>('DELETE', `/vaults/${encodeURIComponent(vaultId)}/notes/trash?path=${encodeURIComponent(path)}`)
+  },
+  deleteTrashItems: (itemIds: string[]) => {
+    const vaultId = getVaultId()
+    return request<{ ok: boolean }>('DELETE', `/vaults/${encodeURIComponent(vaultId)}/trash`, { item_ids: itemIds })
+  },
+  deleteAsset: (path: string) => {
+    const vaultId = getVaultId()
+    return request<{ ok: boolean }>('DELETE', `/vaults/${encodeURIComponent(vaultId)}/assets?path=${encodeURIComponent(path)}`)
+  },
+
+  // Memory
+  saveMemorySession: (messages: unknown[]) => {
+    const vaultId = getVaultId()
+    return request<{ ok: boolean }>('POST', `/vaults/${encodeURIComponent(vaultId)}/memory/session`, { messages })
+  },
+  queryMemory: (keywords: string[], limit: number) => {
+    const vaultId = getVaultId()
+    return request<unknown[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/memory/query?q=${encodeURIComponent(keywords.join(' '))}&limit=${limit}`)
+  },
+  updatePatternScore: (vaultId: string, signature: string, positive: boolean) =>
+    request<{ ok: boolean }>('POST', `/vaults/${encodeURIComponent(vaultId)}/activity-patterns/score`, { signature, delta: positive ? 0.2 : -0.1 }),
+  decayPatterns: (vaultId: string) =>
+    request<{ ok: boolean }>('POST', `/vaults/${encodeURIComponent(vaultId)}/activity-patterns/decay`, {}),
+  setPatternIntent: (vaultId: string, signature: string, intent: string) =>
+    request<{ ok: boolean }>('PATCH', `/vaults/${encodeURIComponent(vaultId)}/activity-patterns/intent`, { signature, intent }),
+
+  // KB extras
+  queryKb: (params: { queryId: string; question: string; sessionId?: string }) => {
+    const vaultId = getVaultId()
+    const qs = `query_id=${encodeURIComponent(params.queryId)}&q=${encodeURIComponent(params.question)}${params.sessionId ? `&session_id=${encodeURIComponent(params.sessionId)}` : ''}`
+    return request<unknown[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/kb/query?${qs}`)
+  },
+  queryKnowledge: (params: { queryId: string; question: string; sessionId?: string }) => {
+    const vaultId = getVaultId()
+    const qs = `query_id=${encodeURIComponent(params.queryId)}&q=${encodeURIComponent(params.question)}${params.sessionId ? `&session_id=${encodeURIComponent(params.sessionId)}` : ''}`
+    return request<unknown[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/kb/knowledge?${qs}`)
+  },
+  deleteKnowledgeItem: (itemId: string) => {
+    const vaultId = getVaultId()
+    return request<{ ok: boolean }>('DELETE', `/vaults/${encodeURIComponent(vaultId)}/kb/items/${encodeURIComponent(itemId)}`)
+  },
+  renameKnowledgeItem: (itemId: string, title: string) => {
+    const vaultId = getVaultId()
+    return request<{ ok: boolean }>('PATCH', `/vaults/${encodeURIComponent(vaultId)}/kb/items/${encodeURIComponent(itemId)}`, { title })
+  },
+  fetchSiteOutline: (sessionId: string) => {
+    const vaultId = getVaultId()
+    return request<{ ok: boolean }>('POST', `/vaults/${encodeURIComponent(vaultId)}/kb/sessions/${encodeURIComponent(sessionId)}/outline`, {})
+  },
+  importPage: (sessionId: string, pageId: string) => {
+    const vaultId = getVaultId()
+    return request<{ ok: boolean }>('POST', `/vaults/${encodeURIComponent(vaultId)}/kb/sessions/${encodeURIComponent(sessionId)}/pages/${encodeURIComponent(pageId)}/import`, {})
+  },
+  suggestNoteCards: (itemId: string) => {
+    const vaultId = getVaultId()
+    return request<unknown[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/kb/items/${encodeURIComponent(itemId)}/suggest-notes`)
+  },
+  suggestSkillCards: (itemId: string) => {
+    const vaultId = getVaultId()
+    return request<unknown[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/kb/items/${encodeURIComponent(itemId)}/suggest-skills`)
+  },
+
+  // Agents extras
+  wakeAgentDefinition: (vaultId: string, defId: string) =>
+    request<{ ok: boolean }>('POST', `/vaults/${encodeURIComponent(vaultId)}/agents/${encodeURIComponent(defId)}/wake`, {}),
+  addSkillTrigger: (vaultId: string, skillId: string, useAsk: boolean) =>
+    request<{ ok: boolean }>('POST', `/vaults/${encodeURIComponent(vaultId)}/skills/${encodeURIComponent(skillId)}/trigger`, { use_ask: useAsk }),
+  getSkillUsageStats: (vaultId: string) =>
+    request<unknown[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/skills/usage-stats`),
+
+  // Vault state (last open note)
+  getVaultLastNote: async (vaultPath: string) => {
+    try {
+      const s = await request<Record<string, string>>('GET', '/settings/user')
+      return s[`vault_last_note_${vaultPath}`] ?? null
+    } catch { return null }
+  },
+  setVaultLastNote: (vaultPath: string, notePath: string) =>
+    request<{ ok: boolean }>('POST', '/settings/user', { [`vault_last_note_${vaultPath}`]: notePath }),
 
   // Health
   health: () => fetch('http://127.0.0.1:7787/health').then(r => r.ok),

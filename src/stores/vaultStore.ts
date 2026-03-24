@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { Note, FileTreeNode, RenameResult, TrashItem } from '../types/models'
 import { useSettingsStore } from './settingsStore'
+import { api } from '../lib/api'
 
 interface VaultStore {
   notes: Note[]
@@ -54,8 +55,9 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
   scanVault: async () => {
     set({ isScanning: true, scanCount: 0 })
     try {
-      const count = await invoke<number>('scan_vault')
-      set({ scanCount: count })
+      const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+      const result = await api.scanVault(vaultId)
+      set({ scanCount: result.indexed })
       await get().loadNotes()
     } finally {
       set({ isScanning: false })
@@ -63,9 +65,12 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
   },
 
   createNote: async (title, folder, content) => {
-    const note = await invoke<Note>('create_note', { title, folder, content })
+    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+    await api.createNote(vaultId, { title, folder: folder ?? null, content })
     await get().loadNotes()
-    return note
+    // Return newly created note from store
+    const notes = get().notes
+    return notes.find(n => n.title === title) ?? notes[0]
   },
 
   readNote: async (path) => {
@@ -73,7 +78,8 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
   },
 
   updateNote: async (path, content) => {
-    await invoke('update_note', { path, content })
+    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+    await api.updateNote(vaultId, { path, content })
     set((state) => ({
       notes: state.notes.map((n) =>
         n.path === path ? { ...n, content, modified_at: Date.now() } : n
@@ -83,7 +89,7 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
 
   // 軟刪除：移至垃圾桶
   deleteNote: async (path) => {
-    await invoke('trash_note', { path })
+    await api.trashNote(path)
     await get().loadNotes()
   },
 
@@ -118,7 +124,7 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
   },
 
   deleteAsset: async (path) => {
-    await invoke('delete_asset', { path })
+    await api.deleteAsset(path)
     await get().loadNotes()
   },
 
@@ -132,7 +138,7 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
     await invoke('open_path_externally', { path })
   },
 
-  // ── Trash ──────────────────────────────────────────────────
+  // ── Trash ──────────────────────────────────────────────────────────────────
   listTrash: async () => {
     return invoke<TrashItem[]>('list_trash')
   },
@@ -150,7 +156,7 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
   },
 
   deleteTrashItems: async (ids) => {
-    await invoke('delete_trash_items', { ids })
+    await api.deleteTrashItems(ids)
   },
 
   buildFileTree: (notes, extraFolders = [], assets = [], sortOrders = {}) => {
@@ -249,7 +255,8 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
       if (scanTimer) clearTimeout(scanTimer)
       scanTimer = setTimeout(async () => {
         scanTimer = null
-        await invoke('scan_vault').catch(() => {})
+        const vid = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+        await api.scanVault(vid).catch(() => {})
         await get().loadNotes()
       }, 150)
     }

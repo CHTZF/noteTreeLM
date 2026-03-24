@@ -27,6 +27,7 @@
 import { useEffect, useRef, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { useActivityStore } from '../stores/activityStore'
+import { api } from '../lib/api'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -61,7 +62,7 @@ export function usePatternDetector() {
   // ── Daily Decay (run once per session) ────────────────────────────────────
   useEffect(() => {
     if (decayDoneToday || !vaultId.current) return
-    invoke('decay_patterns', { vaultId: vaultId.current }).catch(() => {})
+    api.decayPatterns(vaultId.current).catch(() => {})
     markDecayDone()
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [decayDoneToday])
@@ -80,11 +81,11 @@ export function usePatternDetector() {
     if (!vid) return
 
     // 1. Upsert (increments trigger_count)
-    await invoke('save_pattern', { vaultId: vid, signature }).catch(() => {})
+    await api.upsertActivityPattern(vid, { signature }).catch(() => {})
 
     // 2. Fetch current score
     type PatternRow = { signature: string; score: number; semantic_intent: string | null }
-    const patterns = await invoke<PatternRow[]>('list_patterns', { vaultId: vid, minScore: 0.0 }).catch(() => [] as PatternRow[])
+    const patterns = (await api.listActivityPatterns(vid).catch(() => [])) as PatternRow[]
     const matched = patterns.find(p => p.signature === signature)
     const score = matched?.score ?? 0.3
 
@@ -98,7 +99,7 @@ export function usePatternDetector() {
       silenceTimerRef.current = setTimeout(() => {
         silenceTimerRef.current = null
         if (activePatternSigRef.current === signature) {
-          invoke('update_pattern_score', { vaultId: vid, signature, spoke: false }).catch(() => {})
+          api.updatePatternScore(vid, signature, false).catch(() => {})
           clearPredictiveMode()
           activePatternSigRef.current = null
         }
@@ -113,7 +114,7 @@ export function usePatternDetector() {
         maxTokens: 20,
       }).then(intent => {
         if (intent?.trim()) {
-          invoke('set_pattern_intent', { vaultId: vid, signature, intent: intent.trim() }).catch(() => {})
+          api.setPatternIntent(vid, signature, intent.trim()).catch(() => {})
         }
       }).catch(() => {})
     }
@@ -126,7 +127,7 @@ export function usePatternDetector() {
     if (!sig || !vid) return
 
     clearSilenceTimer()
-    invoke('update_pattern_score', { vaultId: vid, signature: sig, spoke: true }).catch(() => {})
+    api.updatePatternScore(vid, sig, true).catch(() => {})
     clearPredictiveMode()
     activePatternSigRef.current = null
   }, [clearSilenceTimer, clearPredictiveMode])

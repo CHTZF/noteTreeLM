@@ -8,7 +8,11 @@ import { open as openPath } from '@tauri-apps/plugin-shell'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
 import { faGear, faBolt, faChevronLeft, faChevronRight, faSitemap, faFolderTree, faMagnifyingGlass, faBug, faComments, faMicrophone, faArrowRightArrowLeft, faTrash, faArrowRightFromBracket, faCircleQuestion, faUser, faFileImport, faShieldHalved, faSliders } from '@fortawesome/free-solid-svg-icons'
 import { useSettingsStore } from './stores/settingsStore'
+import { api, registerVaultIdResolver } from './lib/api'
 import { useVaultStore } from './stores/vaultStore'
+
+// Register vault ID resolver for api.ts methods that don't take an explicit vaultId
+registerVaultIdResolver(() => useSettingsStore.getState().settings.system_current_vault_path ?? '')
 import { useGraphStore } from './stores/graphStore'
 import { useEditorStore } from './stores/editorStore'
 import { useNavigationStore } from './stores/navigationStore'
@@ -363,7 +367,7 @@ function AppMain() {
     setFocusedPaneId(newLeafId)
     await scanVault()
     await loadGraph()
-    const lastNote = await invoke<string | null>('get_vault_last_note', { vaultPath: newVaultPath }).catch(() => null)
+    const lastNote = await api.getVaultLastNote(newVaultPath).catch(() => null)
     if (lastNote) {
       const tabId = crypto.randomUUID()
       setPaneRoot({ kind: 'leaf', id: newLeafId, tabs: [{ id: tabId, path: lastNote }], activeTabId: tabId })
@@ -377,7 +381,7 @@ function AppMain() {
   // ─── Save last open note ───────────────────────────────────────────────
   useEffect(() => {
     if (!currentPath || !settings.system_current_vault_path || currentPath === GRAPH_TAB) return
-    invoke('set_vault_last_note', { vaultPath: settings.system_current_vault_path, notePath: currentPath }).catch(() => {})
+    api.setVaultLastNote(settings.system_current_vault_path, currentPath).catch(() => {})
   }, [currentPath, settings.system_current_vault_path])
 
   // ─── whisper-server status toasts ─────────────────────────────────────

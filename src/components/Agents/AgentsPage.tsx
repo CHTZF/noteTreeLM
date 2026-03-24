@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type { AgentSkill } from '../../types/models'
+import { api } from '../../lib/api'
+import { useSettingsStore } from '../../stores/settingsStore'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -54,15 +56,17 @@ export default function AgentsPage() {
   const [showCreate, setShowCreate] = useState(false)
 
   const loadDefs = useCallback(() => {
-    invoke<AgentDefinition[]>('list_agent_definitions')
-      .then(setDefs)
+    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+    api.listAgentDefinitions(vaultId)
+      .then(defs => setDefs(defs as AgentDefinition[]))
       .catch(() => {})
       .finally(() => setLoading(false))
   }, [])
 
   const loadSkills = useCallback(() => {
-    invoke<AgentSkill[]>('list_agent_skills', { activeOnly: false })
-      .then(setSkills)
+    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+    api.listAgentSkills(vaultId)
+      .then(skills => setSkills(skills as AgentSkill[]))
       .catch(() => {})
   }, [])
 
@@ -96,17 +100,20 @@ export default function AgentsPage() {
   }, [loadDefs, loadSkills])
 
   const handleToggle = async (def_id: string, is_active: boolean) => {
-    await invoke('toggle_agent_definition', { defId: def_id, isActive: is_active })
+    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+    await api.updateAgentDefinition(vaultId, def_id, { isActive: is_active })
     setDefs(prev => prev.map(d => d.def_id === def_id ? { ...d, is_active } : d))
   }
 
   const handleDelete = async (def_id: string) => {
-    await invoke('delete_agent_definition', { defId: def_id })
+    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+    await api.deleteAgentDefinition(vaultId, def_id)
     setDefs(prev => prev.filter(d => d.def_id !== def_id))
   }
 
   const handleWake = async (def_id: string) => {
-    await invoke('wake_agent_definition', { defId: def_id })
+    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+    await api.wakeAgentDefinition(vaultId, def_id)
     setDefs(prev => prev.map(d => d.def_id === def_id ? { ...d, status: 'active' as const, slept_at: null } : d))
   }
 
@@ -248,8 +255,8 @@ function DefCard({
   const handleSave = async () => {
     setSaving(true)
     try {
-      await invoke('update_agent_definition', {
-        defId: def.def_id,
+      const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+      await api.updateAgentDefinition(vaultId, def.def_id, {
         name: editName,
         description: editDesc,
         skillIds: editSkills,
@@ -398,11 +405,12 @@ function CreateDefForm({ skills, onCreated, onCancel }: { skills: AgentSkill[], 
     if (!name.trim()) return
     setCreating(true)
     try {
-      const def = await invoke<AgentDefinition>('save_agent_definition', {
+      const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+      const def = await api.createAgentDefinition(vaultId, {
         name: name.trim(), description: desc.trim(),
         kind: 'sub', skillIds, toolNames: tools, maxRounds,
         trigger: trigger.trim() || null,
-      })
+      }) as AgentDefinition
       onCreated(def)
     } finally {
       setCreating(false)

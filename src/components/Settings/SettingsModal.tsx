@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { api } from '../../lib/api'
 import { open, ask, message } from '@tauri-apps/plugin-dialog'
 import { useTranslation } from 'react-i18next'
 import { useSettingsStore, SYSTEM_KEYS, SystemSettings } from '../../stores/settingsStore'
@@ -36,7 +37,7 @@ interface MemoryRuleEntry {
   created_at: number
 }
 
-type Tab = 'account' | 'general' | 'ai' | 'voice' | 'local' | 'advanced' | 'raw' | 'memory' | 'daemon'
+type Tab = 'account' | 'general' | 'ai' | 'voice' | 'local' | 'advanced' | 'raw' | 'memory'
 type ServerStatus = 'unknown' | 'running' | 'loading' | 'stopped'
 
 // Provider → 預設模型清單
@@ -66,100 +67,6 @@ interface RepairLog {
   result: string
   tables_restored: Record<string, number>
 }
-
-// ── DaemonTab ──────────────────────────────────────────────────────────────
-
-function DaemonTab() {
-  const [status, setStatus] = useState<null | { running: boolean; info?: Record<string, unknown> }>(null)
-  const [servers, setServers] = useState<{ name: string; port: number; status: string }[]>([])
-  const [msg, setMsg] = useState('')
-  const [loading, setLoading] = useState(false)
-
-  useEffect(() => {
-    invoke<{ running: boolean; info?: Record<string, unknown> }>('get_daemon_status').then(setStatus).catch(() => setStatus({ running: false }))
-    invoke<{ servers: { name: string; port: number; status: string }[] }>('get_daemon_servers').then(r => setServers(r.servers)).catch(() => {})
-  }, [])
-
-  const refresh = async () => {
-    const s = await invoke<{ running: boolean; info?: Record<string, unknown> }>('get_daemon_status').catch(() => ({ running: false }))
-    setStatus(s)
-    const r = await invoke<{ servers: { name: string; port: number; status: string }[] }>('get_daemon_servers').catch(() => ({ servers: [] }))
-    setServers(r.servers)
-  }
-
-  const handleInstall = async () => {
-    setLoading(true); setMsg('')
-    try {
-      const r = await invoke<string>('install_daemon_service')
-      setMsg(r)
-      await refresh()
-    } catch (e: unknown) {
-      setMsg(String(e))
-    } finally { setLoading(false) }
-  }
-
-  const handleUninstall = async () => {
-    setLoading(true); setMsg('')
-    try {
-      const r = await invoke<string>('uninstall_daemon_service')
-      setMsg(r)
-      await refresh()
-    } catch (e: unknown) {
-      setMsg(String(e))
-    } finally { setLoading(false) }
-  }
-
-  const dotColor = status?.running ? '#4ec9b0' : '#e06c75'
-  const statusLabel = status === null ? '檢測中…' : status.running ? '運行中' : '未啟動'
-
-  return (
-    <div>
-      {/* Status */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '20px', padding: '14px 16px', background: 'var(--color-bg-elevated)', borderRadius: '8px', border: '1px solid var(--color-border)' }}>
-        <span style={{ width: 10, height: 10, borderRadius: '50%', background: dotColor, display: 'inline-block', flexShrink: 0 }} />
-        <div>
-          <div style={{ fontSize: '13px', fontWeight: 500 }}>背景服務 (notetreetlm-service)</div>
-          <div style={{ fontSize: '11px', color: 'var(--color-text-muted)', marginTop: 2 }}>{statusLabel} · 端口 7788 (HTTPS)</div>
-        </div>
-        <button onClick={refresh} style={{ marginLeft: 'auto', padding: '4px 12px', fontSize: '12px', borderRadius: '6px', background: 'transparent', border: '1px solid var(--color-border)', cursor: 'pointer', color: 'var(--color-text-secondary)' }}>刷新</button>
-      </div>
-
-      {/* AI Servers */}
-      {servers.length > 0 && (
-        <div style={{ marginBottom: '20px' }}>
-          <div style={{ fontSize: '10.5px', fontWeight: 600, letterSpacing: '0.07em', color: 'var(--color-text-secondary)', textTransform: 'uppercase', marginBottom: '8px' }}>AI 服務狀態</div>
-          <div style={{ border: '1px solid var(--color-border)', borderRadius: '8px', overflow: 'hidden' }}>
-            {servers.map((s, i) => (
-              <div key={s.name} style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '10px 14px', borderBottom: i < servers.length - 1 ? '1px solid var(--color-border)' : undefined }}>
-                <span style={{ width: 8, height: 8, borderRadius: '50%', background: s.status === 'running' ? '#4ec9b0' : '#e06c75', display: 'inline-block' }} />
-                <span style={{ fontSize: '12px', flex: 1 }}>{s.name}</span>
-                <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>:{s.port}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Actions */}
-      <div style={{ fontSize: '10.5px', fontWeight: 600, letterSpacing: '0.07em', color: 'var(--color-text-secondary)', textTransform: 'uppercase', marginBottom: '10px' }}>LaunchAgent 管理</div>
-      <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', marginBottom: '14px', lineHeight: 1.6 }}>
-        安裝後服務會在登入時自動啟動，並在背景持續運行（即使 noteTreeLM 未開啟）。
-        手機 App 透過 mDNS 自動發現服務，使用 QR Code 配對授權。
-      </p>
-      <div style={{ display: 'flex', gap: '10px', marginBottom: '16px' }}>
-        <button onClick={handleInstall} disabled={loading} style={{ padding: '7px 16px', borderRadius: '6px', background: '#4ec9b022', border: '1px solid #4ec9b0', color: '#4ec9b0', fontSize: '12px', cursor: loading ? 'not-allowed' : 'pointer' }}>
-          {loading ? '處理中…' : '安裝 / 啟動服務'}
-        </button>
-        <button onClick={handleUninstall} disabled={loading} style={{ padding: '7px 16px', borderRadius: '6px', background: '#e06c7522', border: '1px solid #e06c75', color: '#e06c75', fontSize: '12px', cursor: loading ? 'not-allowed' : 'pointer' }}>
-          停止 / 移除服務
-        </button>
-      </div>
-      {msg && <p style={{ fontSize: '12px', color: 'var(--color-text-muted)', padding: '8px 12px', background: 'var(--color-bg-elevated)', borderRadius: '6px', border: '1px solid var(--color-border)' }}>{msg}</p>}
-    </div>
-  )
-}
-
-// ── SettingsModal ──────────────────────────────────────────────────────────
 
 export default function SettingsModal({ onClose, inline, mode = 'personal' }: SettingsModalProps) {
   const { t, i18n } = useTranslation()
@@ -430,8 +337,9 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
   useEffect(() => {
     if (tab !== 'memory') return
     setMemoryRulesLoading(true)
-    invoke<MemoryRuleEntry[]>('get_memory_rules')
-      .then(setMemoryRules)
+    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+    api.listMemoryRules(vaultId)
+      .then(rules => setMemoryRules(rules as MemoryRuleEntry[]))
       .catch(() => setMemoryRules([]))
       .finally(() => setMemoryRulesLoading(false))
   }, [tab])
@@ -444,16 +352,18 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
   }, [tab])
 
   const handleDeleteMemoryRule = async (id: number) => {
-    await invoke('delete_memory_rule', { id }).catch(() => {})
+    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+    await api.deleteMemoryRule(vaultId, String(id)).catch(() => {})
     setMemoryRules((prev) => prev.filter((r) => r.id !== id))
   }
 
   const handleAddMemoryRule = async () => {
     const pattern = newRulePattern.trim()
     if (!pattern) return
-    await invoke('add_memory_rule', { patternType: newRuleType, pattern, value: newRuleValue.trim() }).catch(() => {})
+    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+    await api.createMemoryRule(vaultId, { pattern_type: newRuleType, pattern, value: newRuleValue.trim() }).catch(() => {})
     // 重新載入以取得 server 產生的 id
-    const updated = await invoke<MemoryRuleEntry[]>('get_memory_rules').catch(() => memoryRules)
+    const updated = await api.listMemoryRules(vaultId).catch(() => memoryRules) as MemoryRuleEntry[]
     setMemoryRules(updated)
     setNewRulePattern('')
     setNewRuleValue('')
@@ -547,7 +457,7 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
   const handleSaveBraveApiKey = async () => {
     await setApiKey('brave_search', braveApiKey)
     // Persist key_id to DB — usage queries will use DB, never keychain directly
-    await invoke('sync_brave_key_id', { key: braveApiKey }).catch(() => {})
+    await api.syncBraveKeyId(braveApiKey).catch(() => {})
     setBraveApiKeySaved(true)
     setTimeout(() => setBraveApiKeySaved(false), 2000)
     invoke<{ used: number; limit: number; reset_label: string }>('get_brave_search_usage')
@@ -670,7 +580,7 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
 
 
   const tabs: [Tab, string][] = mode === 'system'
-    ? [['ai', t('settings.tab.ai')], ['voice', t('settings.tab.voice')], ['local', t('settings.tab.local')], ['advanced', t('settings.tab.advanced')], ['daemon', '背景服務'], ['raw', t('settings.tab.raw')]]
+    ? [['ai', t('settings.tab.ai')], ['voice', t('settings.tab.voice')], ['local', t('settings.tab.local')], ['advanced', t('settings.tab.advanced')], ['raw', t('settings.tab.raw')]]
     : [['account', t('settings.tab.account')], ['general', t('settings.tab.general')], ['advanced', t('settings.tab.advanced')], ['memory', t('settings.tab.memory')], ['raw', t('settings.tab.raw')]]
 
   const handleChangePassword = async () => {
@@ -680,7 +590,7 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
     }
     setPwSaving(true)
     try {
-      await invoke('change_password', { currentPassword, newPassword })
+      await api.changePassword(currentPassword, newPassword)
       toast.success('密碼已更新')
       setCurrentPassword('')
       setNewPassword('')
@@ -1866,8 +1776,6 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                 </div>
               </div>
             </>}
-
-            {tab === 'daemon' && <DaemonTab />}
 
             {tab === 'raw' && (() => {
               const rawEntries = mode === 'system'

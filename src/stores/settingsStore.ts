@@ -1,7 +1,6 @@
 import { create } from 'zustand'
-import { invoke } from '@tauri-apps/api/core'
 import { Settings, DEFAULT_SETTINGS } from '../types/settings'
-import { useAuthStore } from './authStore'
+import { api } from '../lib/api'
 
 export const SYSTEM_KEYS = ['system_current_vault_path', 'ai_provider', 'ai_model', 'ai_base_url',
   'ai_enable_topics', 'ai_enable_summary', 'ai_enable_vision',
@@ -30,8 +29,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   load: async () => {
     try {
-      const username = useAuthStore.getState().session?.username ?? ''
-      const raw = await invoke<any>('get_settings', { username })
+      const raw = await api.getSettings()
       const settings: Settings = {
         ...DEFAULT_SETTINGS,
         ...raw,
@@ -48,6 +46,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   loadSystem: async () => {
     try {
+      // get_system_settings returns only system keys
+      const { invoke } = await import('@tauri-apps/api/core')
       const raw = await invoke<SystemSettings>('get_system_settings')
       set({ systemSettings: raw })
     } catch (err) {
@@ -64,8 +64,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         ...updated,
         sort_orders: JSON.stringify(updated.sort_orders ?? {}),
       }
-      const username = useAuthStore.getState().session?.username ?? ''
-      await invoke('save_personal_settings', { username, settings: rustSettings })
+      await api.saveUserSettings(rustSettings)
     } catch (err) {
       console.error('儲存個人設定失敗：', err)
       throw err
@@ -79,7 +78,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         await get().loadSystem()
       }
       const merged = { ...(get().systemSettings ?? {} as SystemSettings), ...partial } as SystemSettings
-      await invoke('save_system_settings', { settings: merged })
+      await api.saveSettings(merged)
       set({ systemSettings: merged })
     } catch (err) {
       console.error('儲存系統設定失敗：', err)
@@ -89,13 +88,14 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   getApiKey: async (provider) => {
     try {
-      return await invoke<string | null>('get_api_key', { provider })
+      const result = await api.getApiKey(provider)
+      return result.key ?? null
     } catch {
       return null
     }
   },
 
   setApiKey: async (provider, key) => {
-    await invoke('set_api_key', { provider, key })
+    await api.setApiKey(provider, key)
   },
 }))

@@ -1,6 +1,6 @@
-import { invoke } from '@tauri-apps/api/core'
 import { useCallback, useEffect, useState } from 'react'
 import { useEditorStore } from '../../stores/editorStore'
+import { api } from '../../lib/api'
 
 type NoteStatus = 'draft' | 'verified' | 'deprecated'
 
@@ -40,7 +40,7 @@ export default function NoteStatusBadge() {
     if (!currentPath) return
     setLoading(true)
     try {
-      await invoke('set_note_status', { path: currentPath, status: newStatus })
+      await api.setNoteStatus(currentPath, newStatus)
       setLocalStatus(newStatus)
       // Sync updated frontmatter back to CM6 editor without triggering auto-save
       const store = useEditorStore.getState()

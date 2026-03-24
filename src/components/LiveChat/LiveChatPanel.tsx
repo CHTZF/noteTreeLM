@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { api } from '../../lib/api'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useVoiceRecorder } from '../../hooks/useVoiceRecorder'
 import { useDebugStore } from '../../stores/debugStore'
@@ -131,7 +132,7 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
   const loadConversationMessages = useCallback(async (id: string) => {
     console.log('[LiveChatPanel] loadConversationMessages id:', id)
     try {
-      const snap: { messages_json: string } = await invoke('get_conversation', { id })
+      const snap = await api.getConversation(id) as { messages_json: string }
       console.log('[LiveChatPanel] get_conversation raw messages_json:', snap.messages_json)
       const msgs: Array<{ role: string; content: string }> = JSON.parse(snap.messages_json)
       const filtered = msgs.filter(m => m.role === 'user' || m.role === 'assistant')
@@ -148,7 +149,7 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
     const saved = localStorage.getItem('live_chat_conversation_id')
     console.log('[LiveChatPanel] mount, saved conversation_id:', saved)
     if (saved) {
-      invoke('get_conversation', { id: saved })
+      api.getConversation(saved)
         .then(() => {
           console.log('[LiveChatPanel] verified conversation exists, loading messages for', saved)
           setConversationId(saved)

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { api } from '../../lib/api'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useVoiceRecorder } from '../../hooks/useVoiceRecorder'
 import { useEditorStore } from '../../stores/editorStore'
@@ -66,8 +67,8 @@ export default function LiveChatSheet({ open, onClose, onOpenNote, onOpenTab, on
 
   // ── Init conversation ────────────────────────────────────────────────────
   useEffect(() => {
-    invoke<string>('get_or_create_live_chat_conversation', { username: '__live_chat__' })
-      .then(id => setConversationId(id))
+    api.getOrCreateLiveChatConv('__live_chat__')
+      .then(result => setConversationId(result.id))
       .catch(console.error)
   }, [])
 
@@ -148,7 +149,7 @@ export default function LiveChatSheet({ open, onClose, onOpenNote, onOpenTab, on
       const vaultId = (await import('../../stores/settingsStore'))
         .useSettingsStore.getState().settings.system_current_vault_path ?? ''
       if (vaultId) {
-        invoke('update_pattern_score', { vaultId, signature, spoke: true }).catch(() => {})
+        api.updatePatternScore(vaultId, signature, true).catch(() => {})
       }
       clearPredictiveMode()
     }

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { api } from '../../lib/api'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
 import {
   faPlus, faTrash, faPaperPlane, faSpinner, faGlobe,
@@ -12,6 +13,7 @@ import SkillStatsPanel from './SkillStats'
 import { toast } from '../common/Toast'
 import { useKnowledgeChatStore, type KBMessage, type KnowledgeRef } from '../../stores/knowledgeChatStore'
 import { useAuthStore } from '../../stores/authStore'
+import { useSettingsStore } from '../../stores/settingsStore'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -98,7 +100,7 @@ export default function ImportPanel() {
   const loadItems = useCallback(async () => {
     setLoadingItems(true)
     try {
-      const result = await invoke<KnowledgeItem[]>('list_knowledge_items')
+      const result = await invoke<KnowledgeItem[]>('list_knowledge_items')  // keep as invoke — no api wrapper needed
       setItems(result)
     } catch { /* non-critical */ } finally {
       setLoadingItems(false)
@@ -117,7 +119,7 @@ export default function ImportPanel() {
       const existing = messagesBySession[id]
       if (!existing || existing.length === 0) {
         try {
-          const json = await invoke<string | null>('get_kb_chat_messages', { sessionId: id })
+          const json = await api.getKbChatMessages(id)
           if (json) {
             const msgs: KBMessage[] = JSON.parse(json)
             if (msgs.length > 0) setMessages(id, () => msgs)
@@ -129,7 +131,7 @@ export default function ImportPanel() {
       restoreSession(activeKbSessionId)
       return
     }
-    invoke<string | null>('get_last_mode_conversation_id', { username, mode: 'kb_session' })
+    api.getLastModeConversationId(username, 'kb_session')
       .then(id => { if (id) restoreSession(id) })
       .catch(() => {})
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -151,10 +153,7 @@ export default function ImportPanel() {
     if (!activeKbSessionId || messages.length === 0) return
     if (messages.some(m => m.isStreaming)) return
     const timer = setTimeout(() => {
-      invoke('save_kb_chat_messages', {
-        sessionId: activeKbSessionId,
-        messagesJson: JSON.stringify(messages),
-      }).catch(() => {})
+      api.saveKbChatMessages(activeKbSessionId, JSON.stringify(messages)).catch(() => {})
     }, 800)
     return () => clearTimeout(timer)
   }, [messages, activeKbSessionId])
@@ -176,17 +175,17 @@ export default function ImportPanel() {
       const session = await invoke<{ session_id: string }>('create_import_session', { seedUrl: url })
       const sessionId = session.session_id
       // Fetch sitemap + embed titles (backend handles this)
-      await invoke('fetch_site_outline', { sessionId })
+      await api.fetchSiteOutline(sessionId)
       // Import seed page (fast, no embedding)
       const pages = await invoke<Array<{ page_id: string; depth: number }>>('get_session_pages', { sessionId })
       const seed = pages.find(p => p.depth === 0) ?? pages[0]
       if (seed) {
-        await invoke('import_page', { sessionId, pageId: seed.page_id })
+        await api.importPage(sessionId, seed.page_id)
       }
       setUrlInput('')
       setActiveKbSessionId(sessionId)
       setView({ type: 'chat', sessionId })
-      invoke('set_last_mode_conversation_id', { username, mode: 'kb_session', conversationId: sessionId }).catch(() => {})
+      api.setLastModeConversationId(username, 'kb_session', sessionId).catch(() => {})
       toast.success('分析完成，可以開始提問了')
     } catch (e) {
       toast.error(`新增失敗：${fmtError(e)}`)
@@ -263,7 +262,7 @@ export default function ImportPanel() {
         unToken?.(); unRefs?.(); unImporting?.(); unDone?.()
       })
 
-      await invoke('query_knowledge', {
+      await api.queryKnowledge({
         queryId,
         question: q,
         sessionId,
@@ -283,7 +282,8 @@ export default function ImportPanel() {
     setSavingMsgId(msg.id)
     try {
       const title = msg.refs[0]?.title || '知識項目'
-      await invoke<KnowledgeItem>('save_knowledge_item', {
+      const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+      await api.createKnowledgeItem(vaultId, {
         sessionId: view.sessionId,
         title,
         aiSummary: msg.content,
@@ -311,7 +311,7 @@ export default function ImportPanel() {
       }
     )
     try {
-      await invoke('suggest_note_cards_for_item', { itemId: item.item_id })
+      await api.suggestNoteCards(item.item_id)
     } catch (e) {
       setLoadingNoteCards(false)
       setNoteCardError(fmtError(e))
@@ -333,7 +333,7 @@ export default function ImportPanel() {
       }
     )
     try {
-      await invoke('suggest_skill_cards_for_item', { itemId: item.item_id })
+      await api.suggestSkillCards(item.item_id)
     } catch (e) {
       setLoadingSkillCards(false)
       setSkillCardError(fmtError(e))
@@ -350,8 +350,9 @@ export default function ImportPanel() {
     setView({ type: 'detail', itemId: item.item_id })
 
     // 同步載入該知識項目已存在的 skills（前次產生的）
-    invoke<AgentSkill[]>('list_agent_skills', { knowledgeItemId: item.item_id, activeOnly: false })
-      .then(skills => setDetailSkills(skills))
+    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+    api.listAgentSkills(vaultId)
+      .then(skills => setDetailSkills(skills as AgentSkill[]))
       .catch(() => {})
   }, [])
 
@@ -359,10 +360,10 @@ export default function ImportPanel() {
   const handleEndSession = useCallback(() => {
     if (activeKbSessionId) {
       clearMessages(activeKbSessionId)
-      invoke('save_kb_chat_messages', { sessionId: activeKbSessionId, messagesJson: '[]' }).catch(() => {})
+      api.saveKbChatMessages(activeKbSessionId, '[]').catch(() => {})
     }
     setActiveKbSessionId(null)
-    invoke('set_last_mode_conversation_id', { username, mode: 'kb_session', conversationId: null }).catch(() => {})
+    api.setLastModeConversationId(username, 'kb_session', null).catch(() => {})
     setView({ type: 'empty' })
   }, [activeKbSessionId, clearMessages, setActiveKbSessionId, username])
 
@@ -380,7 +381,7 @@ export default function ImportPanel() {
   const handleDeleteItem = useCallback(async (item: KnowledgeItem, e: React.MouseEvent) => {
     e.stopPropagation()
     try {
-      await invoke('delete_knowledge_item', { itemId: item.item_id })
+      await api.deleteKnowledgeItem(item.item_id)
       await loadItems()
       if (view.type === 'detail' && view.itemId === item.item_id) {
         setView({ type: 'empty' })
@@ -402,7 +403,7 @@ export default function ImportPanel() {
     const title = renameValue.trim()
     if (!title || title === item.title) { setRenamingItemId(null); return }
     try {
-      await invoke('rename_knowledge_item', { itemId: item.item_id, title })
+      await api.renameKnowledgeItem(item.item_id, title)
       await loadItems()
       if (detailItem?.item_id === item.item_id) setDetailItem(d => d ? { ...d, title } : d)
     } catch (err) {
@@ -712,19 +713,22 @@ export default function ImportPanel() {
                   key={skill.skill_id}
                   skill={skill}
                   onToggle={async (id, active) => {
-                    await invoke('toggle_agent_skill', { skillId: id, isActive: active })
+                    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+                    await api.updateAgentSkill(vaultId, id, { isActive: active })
                     setDetailSkills(prev => prev.map(s =>
                       s.skill_id === id ? { ...s, is_active: active } : s
                     ))
                     window.dispatchEvent(new CustomEvent('skills-changed'))
                   }}
                   onDelete={async (id) => {
-                    await invoke('delete_agent_skill', { skillId: id })
+                    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+                    await api.deleteAgentSkill(vaultId, id)
                     setDetailSkills(prev => prev.filter(s => s.skill_id !== id))
                     window.dispatchEvent(new CustomEvent('skills-changed'))
                   }}
                   onUpdate={async (id, title, trigger, behavior, toolCalls, injectionMode, agentScope) => {
-                    await invoke('update_agent_skill', { skillId: id, title, trigger, behavior, toolCalls, injectionMode, agentScope })
+                    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+                    await api.updateAgentSkill(vaultId, id, { title, trigger, behavior, toolCalls, injectionMode, agentScope })
                     setDetailSkills(prev => prev.map(s =>
                       s.skill_id === id ? { ...s, title, trigger, behavior, tool_calls: toolCalls, injection_mode: injectionMode as 'passive' | 'active', agent_scope: agentScope } : s
                     ))
@@ -799,7 +803,8 @@ export function SkillsHub() {
   }
 
   const handleUpdate = async (id: string, title: string, trigger: string, behavior: string, toolCalls: string[], injectionMode: string, agentScope: AgentScope) => {
-    await invoke('update_agent_skill', { skillId: id, title, trigger, behavior, toolCalls, injectionMode, agentScope })
+    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+    await api.updateAgentSkill(vaultId, id, { title, trigger, behavior, toolCalls, injectionMode, agentScope })
     setSkills(prev => prev.map(s =>
       s.skill_id === id ? { ...s, title, trigger, behavior, tool_calls: toolCalls, injection_mode: injectionMode as 'passive' | 'active', agent_scope: agentScope } : s
     ))
@@ -910,11 +915,13 @@ export function SkillsHub() {
             key={skill.skill_id}
             skill={skill}
             onToggle={async (id, active) => {
-              await invoke('toggle_agent_skill', { skillId: id, isActive: active })
+              const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+              await api.updateAgentSkill(vaultId, id, { isActive: active })
               setSkills(prev => prev.map(s => s.skill_id === id ? { ...s, is_active: active } : s))
             }}
             onDelete={async (id) => {
-              await invoke('delete_agent_skill', { skillId: id })
+              const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+              await api.deleteAgentSkill(vaultId, id)
               setSkills(prev => prev.filter(s => s.skill_id !== id))
             }}
             onUpdate={handleUpdate}

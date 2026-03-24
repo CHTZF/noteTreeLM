@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { api } from '../../lib/api'
 import { useTranslation } from 'react-i18next'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useAuthStore } from '../../stores/authStore'
@@ -91,14 +92,14 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   useEffect(() => {
     const username = session?.username ?? ''
     if (!username) return
-    invoke<string | null>('get_last_chat_conversation_id', { username })
+    api.getLastChatConversationId(username)
       .then(saved => {
         if (saved) {
-          invoke('get_conversation', { id: saved })
+          api.getConversation(saved)
             .then(() => { setConversationId(saved); loadConversationMessages(saved) })
             .catch(() => {
               // Stale ID — clear it and stay on empty screen
-              invoke('set_last_chat_conversation_id', { username, conversationId: null }).catch(() => {})
+              api.setLastChatConversationId(username, null).catch(() => {})
             })
         }
       })
@@ -108,8 +109,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const loadConversationMessages = useCallback(async (id: string) => {
     try {
       const [snap, ratingEntries] = await Promise.all([
-        invoke<{ messages_json: string }>('get_conversation', { id }),
-        invoke<Array<{ content_hash: string; rating: string }>>('get_conversation_ratings', { conversationId: id }).catch(() => [] as Array<{ content_hash: string; rating: string }>),
+        api.getConversation(id) as Promise<{ messages_json: string }>,
+        api.getConversationRatings(id).catch(() => [] as Array<{ content_hash: string; rating: string }>),
       ])
       const msgs: Array<{ role: string; content: string }> = JSON.parse(snap.messages_json)
       const filtered = msgs.filter(m => m.role === 'user' || m.role === 'assistant')
@@ -130,7 +131,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       console.error('[ChatPanel] loadConversationMessages error:', e)
       // Stale conversation ID — clear it and show empty screen
       const username = useAuthStore.getState().session?.username ?? ''
-      invoke('set_last_chat_conversation_id', { username, conversationId: null }).catch(() => {})
+      api.setLastChatConversationId(username, null).catch(() => {})
       setConversationId(null)
       setMessages([])
       setRatings({})
@@ -162,7 +163,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     switchConversation(conversationId, id)
     setConversationId(id)
     const username = useAuthStore.getState().session?.username ?? ''
-    invoke('set_last_chat_conversation_id', { username, conversationId: id }).catch(() => {})
+    api.setLastChatConversationId(username, id).catch(() => {})
     loadConversationMessages(id)
   }, [isStreaming, conversationId, loadConversationMessages, switchConversation])
 
@@ -172,14 +173,14 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       // Current conversation was deleted — reset to empty screen
       switchConversation(conversationId, null)
       setConversationId(null)
-      invoke('set_last_chat_conversation_id', { username, conversationId: null }).catch(() => {})
+      api.setLastChatConversationId(username, null).catch(() => {})
       setMessages([])
       setRatings({})
       return
     }
     switchConversation(conversationId, id)
     setConversationId(id)
-    invoke('set_last_chat_conversation_id', { username, conversationId: id }).catch(() => {})
+    api.setLastChatConversationId(username, id).catch(() => {})
     setMessages([])
     setRatings({})
   }, [conversationId, switchConversation])
@@ -243,7 +244,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     if (!path) { toast.error('請先開啟一個筆記'); return }
     const newContent = existing ? existing + '\n\n' + processedText : processedText
     try {
-      await invoke('update_note', { path, content: newContent })
+      const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+      await api.updateNote(vaultId, { path, content: newContent })
       // 同步 Editor CM6 視圖，防止 auto-save 用舊內容覆蓋
       useEditorStore.getState().applyExternalWrite(newContent)
       toast.success('已追加寫入當前筆記')
@@ -256,7 +258,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const doSaveToNewNote = useCallback(async (text: string, title: string, folder: string) => {
     const processedText = await applyVoicePostProcess(text)
     try {
-      await invoke('create_note', { title, folder: folder || null, content: processedText })
+      const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+      await api.createNote(vaultId, { title, folder: folder || null, content: processedText })
       toast.success(`已建立筆記「${title}」`)
     } catch (e) {
       toast.error('建立失敗：' + String(e))
@@ -367,8 +370,9 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   useEffect(() => {
     if (!pendingSkillNotFound) return
     setSkillsPickerLoaded(false)
-    invoke<AgentSkill[]>('list_agent_skills', { knowledgeItemId: null, activeOnly: true })
-      .then(skills => { setSkillsForPicker(skills); setSkillsPickerLoaded(true) })
+    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+    api.listAgentSkills(vaultId)
+      .then(skills => { setSkillsForPicker(skills as AgentSkill[]); setSkillsPickerLoaded(true) })
       .catch(() => { setSkillsForPicker([]); setSkillsPickerLoaded(true) })
   }, [pendingSkillNotFound])
 
@@ -615,7 +619,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
           .filter(m => m.role === 'user' || m.role === 'assistant')
           .map(m => ({ role: m.role, content: m.content }))
         if (snapshotMsgs.length >= 2) {
-          invoke('save_memory_session', { messages: snapshotMsgs }).catch(() => {})
+          api.saveMemorySession(snapshotMsgs).catch(() => {})
           lastExtractedMsgCountRef.current = snapshotMsgs.length
           invoke('extract_memory_facts', { messages: snapshotMsgs }).catch(() => {})
         }
@@ -670,7 +674,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         ? invoke('extract_memory_facts', { messages: chatMessages }).catch(() => {})
         : Promise.resolve()
       Promise.all([
-        invoke('save_memory_session', { messages: chatMessages }).catch(() => {}),
+        api.saveMemorySession(chatMessages).catch(() => {}),
         extractOp,
         invoke('distill_preferences').catch(() => {}),
         invoke('analyze_tool_patterns').catch(() => {}),
@@ -732,7 +736,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     setSavingWebMsgIdx(msgIndex)
     try {
       const title = msg.webRefs[0]?.title || '知識項目'
-      await invoke('save_knowledge_item', {
+      const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+      await api.createKnowledgeItem(vaultId, {
         sessionId: 'chat',
         title,
         aiSummary: msg.content,
@@ -840,7 +845,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     if (!skillPreview || skillPreview.loading) return
     setSavingSkill(true)
     try {
-      await invoke('save_agent_skill', {
+      const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+      await api.createAgentSkill(vaultId, {
         knowledgeItemId: 'conversation',
         title: skillPreview.title,
         trigger: skillPreview.trigger,
@@ -1072,11 +1078,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
                     ? (r: 'good' | 'bad') => {
                         setRatings(prev => ({ ...prev, [i]: r }))
                         const hash = msg.content.slice(0, 150)
-                        invoke('rate_response', {
-                          conversationId: conversationId ?? undefined,
-                          contentHash: hash,
-                          rating: r,
-                        }).catch(() => {})
+                        api.rateResponse(conversationId ?? undefined, hash, r).catch(() => {})
                       }
                     : undefined}
                 />
@@ -1168,7 +1170,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
             <div style={{ display: 'flex', gap: '6px' }}>
               <button
                 onClick={async () => {
-                  await invoke('add_skill_trigger', { skillId: pendingSkillFound.skill_id, useAsk: pendingSkillFound.use_ask })
+                  const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+                  await api.addSkillTrigger(vaultId, pendingSkillFound.skill_id, false)
                   setPendingSkillFound(null)
                 }}
                 style={{ padding: '4px 12px', borderRadius: '4px', background: 'var(--color-accent)', color: '#fff', border: 'none', cursor: 'pointer', fontSize: '12px' }}
@@ -1200,7 +1203,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
                   <button
                     key={skill.skill_id}
                     onClick={async () => {
-                      await invoke('add_skill_trigger', { skillId: skill.skill_id, useAsk: pendingSkillNotFound.use_ask })
+                      const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+                      await api.addSkillTrigger(vaultId, skill.skill_id, false)
                       setPendingSkillNotFound(null)
                       setSkillsForPicker([])
                       setSkillsPickerLoaded(false)

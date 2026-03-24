@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { invoke } from '@tauri-apps/api/core'
+import { api, setToken } from '../lib/api'
 
 export interface SessionInfo {
   token: string
@@ -28,7 +29,13 @@ export const useAuthStore = create<AuthStore>((set) => ({
   checkSession: async () => {
     set({ isLoading: true })
     try {
-      const session = await invoke<SessionInfo | null>('get_session')
+      const raw = await api.getSession()
+      const session: SessionInfo | null = raw ? {
+        token: raw.token,
+        username: raw.username,
+        expires_at: raw.expires_at,
+        auth_provider: (raw as SessionInfo).auth_provider ?? 'local',
+      } : null
       set({ session, isLoading: false })
     } catch {
       set({ session: null, isLoading: false })
@@ -38,7 +45,14 @@ export const useAuthStore = create<AuthStore>((set) => ({
   login: async (username: string, password: string) => {
     set({ isLoading: true, error: null })
     try {
-      const session = await invoke<SessionInfo>('login', { username, password })
+      const raw = await api.login(username, password)
+      if (raw.token) setToken(raw.token)
+      const session: SessionInfo = {
+        token: raw.token,
+        username: raw.username,
+        expires_at: raw.expires_at,
+        auth_provider: (raw as unknown as SessionInfo).auth_provider ?? 'local',
+      }
       set({ session, isLoading: false })
     } catch (e: any) {
       set({ isLoading: false, error: typeof e === 'string' ? e : '登入失敗' })
@@ -49,7 +63,9 @@ export const useAuthStore = create<AuthStore>((set) => ({
   loginWithGoogle: async () => {
     set({ isLoading: true, error: null })
     try {
+      // Keep as invoke — OAuth flow is native
       const session = await invoke<SessionInfo>('start_google_oauth')
+      if (session.token) setToken(session.token)
       set({ session, isLoading: false })
     } catch (e: any) {
       set({ isLoading: false, error: typeof e === 'string' ? e : 'Google 登入失敗' })
@@ -58,7 +74,9 @@ export const useAuthStore = create<AuthStore>((set) => ({
   },
 
   logout: async () => {
-    await invoke('logout')
+    await api.logout()
+    setToken(null)
+    localStorage.removeItem('auth_token')
     set({ session: null })
   },
 

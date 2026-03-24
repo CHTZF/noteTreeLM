@@ -1,9 +1,9 @@
-import { invoke } from '@tauri-apps/api/core'
 import { useEffect, useRef, useState } from 'react'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
 import { faPlus, faTrash, faClock } from '@fortawesome/free-solid-svg-icons'
 import { toast } from '../common/Toast'
 import { useAuthStore } from '../../stores/authStore'
+import { api } from '../../lib/api'
 
 export interface ConversationSummary {
   id: string
@@ -54,14 +54,7 @@ export default function ConversationList({ mode, selectedId, onSelect, onNew }: 
     loadingRef.current = true
     setLoading(true)
     try {
-      const newOffset = reset ? 0 : convs.length
-      const username = useAuthStore.getState().session?.username ?? ''
-      const list: ConversationSummary[] = await invoke('list_conversations', {
-        username,
-        mode,
-        limit: PAGE_SIZE,
-        offset: newOffset,
-      })
+      const list = await api.listConversations(undefined, mode) as ConversationSummary[]
       setConvs(prev => reset ? list : [...prev, ...list])
       setHasMore(list.length === PAGE_SIZE)
       console.log(`[ConversationList][${mode}] loaded ${list.length} conversations:`, list.map(c => ({ id: c.id, title: c.title, updated_at: new Date(c.updated_at * 1000).toLocaleString() })))
@@ -82,7 +75,8 @@ export default function ConversationList({ mode, selectedId, onSelect, onNew }: 
   const handleNew = async () => {
     try {
       const username = useAuthStore.getState().session?.username ?? ''
-      const id: string = await invoke('create_conversation', { username, mode })
+      const result = await api.createConversation({ username, mode })
+      const id: string = result.id
       setConvs(prev => [{ id, mode, title: '新對話', updated_at: Date.now() / 1000, has_pending_plan: false }, ...prev])
       onNew(id)
     } catch {
@@ -93,7 +87,7 @@ export default function ConversationList({ mode, selectedId, onSelect, onNew }: 
   const handleDelete = async (e: React.MouseEvent, id: string) => {
     e.stopPropagation()
     try {
-      await invoke('delete_conversation', { id })
+      await api.deleteConversation(id)
       setConvs(prev => prev.filter(c => c.id !== id))
       if (selectedId === id) onNew('')
     } catch {

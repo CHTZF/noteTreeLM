@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { api } from '../../lib/api'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
 import { faSpinner, faPaperPlane, faBook, faFileLines, faShieldHalved, faChevronLeft, faChevronRight } from '@fortawesome/free-solid-svg-icons'
 import { type KnowledgeRef } from '../../stores/knowledgeChatStore'
@@ -63,16 +64,13 @@ export default function KnowledgeAssistant({ onOpenNote }: Props) {
       .map(m => ({ role: m.role, content: m.content, refs: m.refs }))
     if (saveable.length === 0) return
     try {
-      await invoke('save_conversation_messages', {
-        conversationId: convId,
-        messagesJson: JSON.stringify(saveable),
-      })
+      await api.saveConversationMessages(convId, saveable)
     } catch { /* non-fatal */ }
   }, [])
 
   const loadConversationMessages = useCallback(async (id: string): Promise<KBAssistMessage[]> => {
     try {
-      const snap = await invoke<{ messages_json: string }>('get_conversation', { id })
+      const snap = await api.getConversation(id) as { messages_json: string }
       const raw = JSON.parse(snap.messages_json) as Array<{ role: string; content: string; refs?: KnowledgeRef[] }>
       return raw.map(m => ({
         id: crypto.randomUUID(),
@@ -87,8 +85,8 @@ export default function KnowledgeAssistant({ onOpenNote }: Props) {
 
   const createNewConversation = useCallback(async (): Promise<string> => {
     const username = useAuthStore.getState().session?.username ?? ''
-    const id: string = await invoke('create_conversation', { username, mode: KB_MODE })
-    return id
+    const result = await api.createConversation({ username, mode: KB_MODE })
+    return result.id
   }, [])
 
   // ── Mount: restore last KB conversation ───────────────────────────────────
@@ -97,7 +95,7 @@ export default function KnowledgeAssistant({ onOpenNote }: Props) {
     (async () => {
       try {
         const username = useAuthStore.getState().session?.username ?? ''
-        const lastId = await invoke<string | null>('get_last_mode_conversation_id', { username, mode: KB_MODE }).catch(() => null)
+        const lastId = await api.getLastModeConversationId(username, KB_MODE as string).catch(() => null)
         if (lastId) {
           const msgs = await loadConversationMessages(lastId)
           if (msgs.length > 0) {
@@ -124,7 +122,7 @@ export default function KnowledgeAssistant({ onOpenNote }: Props) {
     setConversationId(id)
     setMessages(msgs)
     const username = useAuthStore.getState().session?.username ?? ''
-    invoke('set_last_mode_conversation_id', { username, mode: KB_MODE, conversationId: id }).catch(() => {})
+    api.setLastModeConversationId(username, KB_MODE as string, id).catch(() => {})
   }, [conversationId, saveCurrentConversation, loadConversationMessages])
 
   const handleNewConversation = useCallback(async (id: string) => {
@@ -136,7 +134,7 @@ export default function KnowledgeAssistant({ onOpenNote }: Props) {
     setConversationId(id)
     setMessages([])
     const username = useAuthStore.getState().session?.username ?? ''
-    invoke('set_last_mode_conversation_id', { username, mode: KB_MODE, conversationId: id }).catch(() => {})
+    api.setLastModeConversationId(username, KB_MODE as string, id).catch(() => {})
   }, [conversationId, saveCurrentConversation, createNewConversation])
 
   // ── Query ─────────────────────────────────────────────────────────────────
@@ -192,10 +190,7 @@ export default function KnowledgeAssistant({ onOpenNote }: Props) {
           const saveable = updated
             .filter(m => !m.isStreaming)
             .map(m => ({ role: m.role, content: m.content, refs: m.refs }))
-          invoke('save_conversation_messages', {
-            conversationId: convId,
-            messagesJson: JSON.stringify(saveable),
-          }).catch(() => {})
+          api.saveConversationMessages(convId, saveable).catch(() => {})
         }
         return updated
       })
@@ -204,7 +199,7 @@ export default function KnowledgeAssistant({ onOpenNote }: Props) {
     })
 
     try {
-      await invoke('query_kb', { queryId, question: q })
+      await api.queryKb({ queryId, question: q })
     } catch (e: unknown) {
       const msg = fmtError(e)
       setMessages(prev => prev.map(m =>
