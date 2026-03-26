@@ -469,7 +469,7 @@ async fn delete_trash_items_handler(
                 if fname.ends_with(".meta.json") {
                     if let Ok(content) = std::fs::read_to_string(entry.path()) {
                         if let Ok(meta) = serde_json::from_str::<Value>(&content) {
-                            if meta["id"].as_str() == Some(id.as_str()) {
+                            if meta["item_id"].as_str() == Some(id.as_str()) {
                                 let trash_filename = meta["trash_filename"].as_str().unwrap_or("");
                                 let _ = std::fs::remove_file(trash_dir.join(trash_filename));
                                 let _ = std::fs::remove_file(entry.path());
