@@ -86,11 +86,19 @@ async fn create_note(
     Path(vault_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let rel_path = body
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or((StatusCode::BAD_REQUEST, "Missing path".to_string()))?
-        .to_string();
+    // Accept either { path, content } or { title, folder?, content }
+    let rel_path = if let Some(p) = body.get("path").and_then(|v| v.as_str()) {
+        p.to_string()
+    } else if let Some(title) = body.get("title").and_then(|v| v.as_str()) {
+        let safe_title: String = title.chars()
+            .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' || c == '.' { c } else { '_' })
+            .collect();
+        let filename = format!("{}.md", safe_title.trim());
+        let folder = body.get("folder").and_then(|v| v.as_str()).unwrap_or("").trim_end_matches('/').to_string();
+        if folder.is_empty() { filename } else { format!("{}/{}", folder, filename) }
+    } else {
+        return Err((StatusCode::BAD_REQUEST, "Missing path or title".to_string()));
+    };
     let content = body
         .get("content")
         .and_then(|v| v.as_str())
