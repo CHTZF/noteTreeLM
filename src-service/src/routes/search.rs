@@ -142,17 +142,28 @@ async fn search_notes(
 
         if let Ok(mut resp) = bm25_resp {
             let rows: Vec<BM25Row> = resp.take(0).unwrap_or_default();
-            let out: Vec<Value> = rows
-                .into_iter()
-                .map(|r| {
-                    json!({
-                        "path": r.path,
-                        "title": r.title,
-                        "section": "",
-                        "score": r.score.unwrap_or(0.0),
-                    })
-                })
-                .collect();
+            let mut out: Vec<Value> = Vec::new();
+            for r in rows {
+                let source_url: Option<String> = if r.path.starts_with("imports/") {
+                    #[derive(serde::Deserialize)]
+                    struct UrlRow { url: String }
+                    state.db
+                        .query("SELECT url FROM import_pages WHERE vault_id = $vid AND note_path = $p LIMIT 1")
+                        .bind(("vid", vault_id.clone()))
+                        .bind(("p", r.path.clone()))
+                        .await
+                        .ok()
+                        .and_then(|mut rr| rr.take::<Vec<UrlRow>>(0).ok())
+                        .and_then(|v| v.into_iter().next().map(|row| row.url))
+                } else { None };
+                out.push(json!({
+                    "path": r.path,
+                    "title": r.title,
+                    "section": "",
+                    "score": r.score.unwrap_or(0.0),
+                    "source_url": source_url,
+                }));
+            }
             return Ok(Json(json!(out)));
         }
     }
@@ -174,6 +185,7 @@ async fn search_notes(
     }
 
     let mut title_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut source_url_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for path in &unique_paths {
         if let Ok(mut resp) = state
             .db
@@ -187,6 +199,23 @@ async fn search_notes(
                 title_map.insert(row.path, row.title);
             }
         }
+        // Enrich import pages with their original source URL
+        if path.starts_with("imports/") {
+            #[derive(serde::Deserialize)]
+            struct UrlRow { url: String }
+            if let Ok(mut resp) = state
+                .db
+                .query("SELECT url FROM import_pages WHERE vault_id = $vid AND note_path = $p LIMIT 1")
+                .bind(("vid", vault_id.clone()))
+                .bind(("p", path.clone()))
+                .await
+            {
+                let rows: Vec<UrlRow> = resp.take(0).unwrap_or_default();
+                if let Some(row) = rows.into_iter().next() {
+                    source_url_map.insert(path.clone(), row.url);
+                }
+            }
+        }
     }
 
     let out: Vec<Value> = results
@@ -196,11 +225,13 @@ async fn search_notes(
                 .get(&r.file_path)
                 .cloned()
                 .unwrap_or_else(|| r.file_path.clone());
+            let source_url = source_url_map.get(&r.file_path);
             json!({
                 "path": r.file_path,
                 "title": title,
                 "section": r.section,
                 "score": r.score,
+                "source_url": source_url,
             })
         })
         .collect();
