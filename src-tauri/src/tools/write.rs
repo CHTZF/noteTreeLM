@@ -7,19 +7,60 @@ use tauri::Emitter;
 use tokio::sync::Mutex;
 
 use crate::commands::ai::{resolve_vault_path, tool_create_note, tool_update_note, tool_create_folder};
-use crate::runtime::memory_agent::add_memory_rule_to_db;
 use crate::runtime::tool_registry::ToolRegistry;
 use crate::runtime::types::Tool;
 
 use super::BuildCtx;
+
+// ── Daemon sync helpers ─────────────────────────────────────────────────────
+
+/// 讀取磁碟上的筆記並同步到 daemon DB（create or update）
+async fn daemon_index_note(
+    client: &reqwest::Client,
+    tok: Option<&str>,
+    vault_id: &str,
+    vault_path: &str,
+    rel_path: &str,
+) {
+    let abs = std::path::PathBuf::from(vault_path).join(rel_path);
+    let content = match tokio::fs::read_to_string(&abs).await {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
+        client,
+        &format!("/vaults/{}/notes", urlencoding::encode(vault_id)),
+        &serde_json::json!({ "path": rel_path, "content": content }),
+        tok,
+    ).await;
+}
+
+/// 從 daemon DB 刪除指定筆記記錄
+async fn daemon_delete_note(
+    client: &reqwest::Client,
+    tok: Option<&str>,
+    vault_id: &str,
+    rel_path: &str,
+) {
+    let url = format!(
+        "/vaults/{}/notes?path={}",
+        urlencoding::encode(vault_id),
+        urlencoding::encode(rel_path),
+    );
+    let _ = crate::api_client::daemon_delete::<serde_json::Value>(client, &url, tok).await;
+}
 
 pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
     // create_note — rollback: 刪除剛建立的檔案
     {
         let vp_exec = ctx.vault_path.clone();
         let vp_rb = ctx.vault_path.clone();
-        let db_cn = ctx.vault_db.clone();
+        let client_cn = ctx.http_client.clone();
+        let tok_cn = ctx.auth_token.clone();
         let vid_cn = ctx.vault_id.clone();
+        let client_rb = ctx.http_client.clone();
+        let tok_rb = ctx.auth_token.clone();
+        let vid_rb = ctx.vault_id.clone();
         registry.register(
             "create_note".into(),
             Tool {
@@ -27,13 +68,16 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                     let path = args["path"].as_str().unwrap_or("").to_string();
                     let content = args["content"].as_str().unwrap_or("").to_string();
                     let vp = vp_exec.clone();
-                    let db = db_cn.clone();
+                    let client = client_cn.clone();
+                    let tok = tok_cn.clone();
                     let vid = vid_cn.clone();
                     Box::pin(async move {
-                        let result = tool_create_note(&path, &content, &vp, Some((db, vid))).await;
+                        let result = tool_create_note(&path, &content, &vp, None).await;
                         if result.contains("失敗") {
                             Err(result)
                         } else {
+                            let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                            daemon_index_note(&client, tok_ref, &vid, &vp, &path).await;
                             Ok(Value::String(result))
                         }
                     })
@@ -41,10 +85,16 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                 rollback: Some(Arc::new(move |args: Value| {
                     let path = args["path"].as_str().unwrap_or("").to_string();
                     let vp = vp_rb.clone();
+                    let client = client_rb.clone();
+                    let tok = tok_rb.clone();
+                    let vid = vid_rb.clone();
                     Box::pin(async move {
                         if let Ok(abs_path) = resolve_vault_path(&path, &vp) {
                             let _ = tokio::fs::remove_file(&abs_path).await;
                         }
+                        // Remove from daemon index
+                        let tok_ref: Option<&str> = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        daemon_delete_note(&client, tok_ref, &vid, &path).await;
                         Ok(Value::Null)
                     })
                 })),
@@ -56,8 +106,12 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
     {
         let vp_exec = ctx.vault_path.clone();
         let vp_rb = ctx.vault_path.clone();
-        let db_un = ctx.vault_db.clone();
+        let client_un = ctx.http_client.clone();
+        let tok_un = ctx.auth_token.clone();
         let vid_un = ctx.vault_id.clone();
+        let client_rb = ctx.http_client.clone();
+        let tok_rb = ctx.auth_token.clone();
+        let vid_rb = ctx.vault_id.clone();
         let backups: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
         let backups_rb = Arc::clone(&backups);
 
@@ -68,30 +122,39 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                     let path = args["path"].as_str().unwrap_or("").to_string();
                     let content = args["content"].as_str().unwrap_or("").to_string();
                     let vp = vp_exec.clone();
-                    let db = db_un.clone();
+                    let client = client_un.clone();
+                    let tok = tok_un.clone();
                     let vid = vid_un.clone();
                     let backups = Arc::clone(&backups);
                     Box::pin(async move {
                         let abs_path = resolve_vault_path(&path, &vp).map_err(|e| e)?;
                         let original = tokio::fs::read_to_string(&abs_path).await.unwrap_or_default();
                         backups.lock().await.insert(path.clone(), original);
-                        let result = tool_update_note(&path, &content, &vp, Some((db, vid))).await;
+                        let result = tool_update_note(&path, &content, &vp, None).await;
                         if result.contains("失敗") {
                             return Err(result);
                         }
+                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        daemon_index_note(&client, tok_ref, &vid, &vp, &path).await;
                         Ok(Value::String(result))
                     })
                 }),
                 rollback: Some(Arc::new(move |args: Value| {
                     let path = args["path"].as_str().unwrap_or("").to_string();
                     let vp = vp_rb.clone();
+                    let client = client_rb.clone();
+                    let tok = tok_rb.clone();
+                    let vid = vid_rb.clone();
                     let backups = Arc::clone(&backups_rb);
                     Box::pin(async move {
                         let abs_path = resolve_vault_path(&path, &vp).map_err(|e| e)?;
                         if let Some(original) = backups.lock().await.remove(&path) {
-                            tokio::fs::write(&abs_path, original)
+                            tokio::fs::write(&abs_path, original.as_bytes())
                                 .await
                                 .map_err(|e| format!("還原失敗：{}", e))?;
+                            // Re-sync restored content to daemon
+                            let tok_ref: Option<&str> = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                            daemon_index_note(&client, tok_ref, &vid, &vp, &path).await;
                         }
                         Ok(Value::Null)
                     })
@@ -135,7 +198,8 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
 
     // add_memory_rule — 讓 LLM 學習新的時間表達式規則
     {
-        let db = ctx.vault_db.clone();
+        let client = ctx.http_client.clone();
+        let tok = ctx.auth_token.clone();
         let vid = ctx.vault_id.clone();
         registry.register(
             "add_memory_rule".into(),
@@ -144,10 +208,12 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                     let ptype   = args["pattern_type"].as_str().unwrap_or("").to_string();
                     let pattern = args["pattern"].as_str().unwrap_or("").to_string();
                     let value   = args["value"].as_str().unwrap_or("").to_string();
-                    let db = db.clone();
+                    let client = client.clone();
+                    let tok = tok.clone();
                     let vid = vid.clone();
                     Box::pin(async move {
-                        Ok(Value::String(add_memory_rule_to_db(&db, &vid, &ptype, &pattern, &value).await))
+                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        Ok(Value::String(crate::runtime::memory_agent::add_memory_rule_to_db(&client, tok_ref, &vid, &ptype, &pattern, &value).await))
                     })
                 }),
                 rollback: None,
@@ -159,6 +225,9 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
     {
         let vp = ctx.vault_path.clone();
         let app_an = ctx.app.clone();
+        let client_an = ctx.http_client.clone();
+        let tok_an = ctx.auth_token.clone();
+        let vid_an = ctx.vault_id.clone();
         registry.register(
             "append_to_note".into(),
             Tool {
@@ -167,6 +236,9 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                     let content = args["content"].as_str().unwrap_or("").to_string();
                     let vp = vp.clone();
                     let app = app_an.clone();
+                    let client = client_an.clone();
+                    let tok = tok_an.clone();
+                    let vid = vid_an.clone();
                     Box::pin(async move {
                         if path.is_empty() {
                             return Err("請提供筆記路徑".to_string());
@@ -183,6 +255,13 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                             .map_err(|e| format!("寫入失敗：{}", e))?;
                         let abs_str = abs.to_string_lossy().to_string();
                         let _ = app.emit("ui:open_note", &abs_str);
+                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
+                            &client,
+                            &format!("/vaults/{}/notes", urlencoding::encode(&vid)),
+                            &serde_json::json!({ "path": rel, "content": new_content }),
+                            tok_ref,
+                        ).await;
                         Ok(Value::String(format!("已追加內容至 {}", rel)))
                     })
                 }),
@@ -191,19 +270,21 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // delete_note — 刪除筆記並清除 DB 記錄
+    // delete_note — 刪除筆記並同步更新 daemon DB
     {
         let vp = ctx.vault_path.clone();
-        let db = ctx.vault_db.clone();
-        let vid = ctx.vault_id.clone();
+        let client_dn = ctx.http_client.clone();
+        let tok_dn = ctx.auth_token.clone();
+        let vid_dn = ctx.vault_id.clone();
         registry.register(
             "delete_note".into(),
             Tool {
                 execute: Arc::new(move |args: Value| {
                     let path = args["path"].as_str().unwrap_or("").to_string();
                     let vp = vp.clone();
-                    let db = db.clone();
-                    let vid = vid.clone();
+                    let client = client_dn.clone();
+                    let tok = tok_dn.clone();
+                    let vid = vid_dn.clone();
                     Box::pin(async move {
                         if path.is_empty() {
                             return Err("請提供筆記路徑".to_string());
@@ -260,13 +341,8 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                         std::fs::remove_file(&abs_path)
                             .map_err(|e| format!("刪除檔案失敗：{}", e))?;
 
-                        let _ = db.query(
-                            "DELETE FROM notes WHERE vault_id = $vid AND path = $path"
-                        )
-                        .bind(("vid", vid.clone()))
-                        .bind(("path", rel_for_db.clone()))
-                        .await;
-
+                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        daemon_delete_note(&client, tok_ref, &vid, &rel_for_db).await;
                         Ok(Value::String(format!("已刪除筆記：{}", rel_for_db)))
                     })
                 }),
@@ -278,16 +354,12 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
     // delete_folder — 刪除資料夾及其所有內容
     {
         let vp = ctx.vault_path.clone();
-        let db = ctx.vault_db.clone();
-        let vid = ctx.vault_id.clone();
         registry.register(
             "delete_folder".into(),
             Tool {
                 execute: Arc::new(move |args: Value| {
                     let path = args["path"].as_str().unwrap_or("").to_string();
                     let vp = vp.clone();
-                    let db = db.clone();
-                    let vid = vid.clone();
                     Box::pin(async move {
                         if path.is_empty() {
                             return Err("請提供資料夾路徑".to_string());
@@ -299,14 +371,6 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                         std::fs::remove_dir_all(&abs)
                             .map_err(|e| format!("刪除資料夾失敗：{}", e))?;
 
-                        let prefix = if path.ends_with('/') { path.clone() } else { format!("{}/", path) };
-                        let _ = db.query(
-                            "DELETE FROM notes WHERE vault_id = $vid AND string::starts_with(path, $prefix)"
-                        )
-                        .bind(("vid", vid.clone()))
-                        .bind(("prefix", prefix))
-                        .await;
-
                         Ok(Value::String(format!("已刪除資料夾：{}", path)))
                     })
                 }),
@@ -315,11 +379,12 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // move_note — 移動筆記並更新 DB 路徑
+    // move_note — 移動筆記
     {
         let vp = ctx.vault_path.clone();
-        let db = ctx.vault_db.clone();
-        let vid = ctx.vault_id.clone();
+        let client_mn = ctx.http_client.clone();
+        let tok_mn = ctx.auth_token.clone();
+        let vid_mn = ctx.vault_id.clone();
         registry.register(
             "move_note".into(),
             Tool {
@@ -327,8 +392,9 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                     let from = args["from"].as_str().unwrap_or("").to_string();
                     let to = args["to"].as_str().unwrap_or("").to_string();
                     let vp = vp.clone();
-                    let db = db.clone();
-                    let vid = vid.clone();
+                    let client = client_mn.clone();
+                    let tok = tok_mn.clone();
+                    let vid = vid_mn.clone();
                     Box::pin(async move {
                         if from.is_empty() || to.is_empty() {
                             return Err("from 和 to 為必填".to_string());
@@ -349,14 +415,9 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                         std::fs::rename(&from_abs, &to_abs)
                             .map_err(|e| format!("移動失敗：{}", e))?;
 
-                        let _ = db.query(
-                            "UPDATE notes SET path = $to WHERE vault_id = $vid AND path = $from"
-                        )
-                        .bind(("vid", vid.clone()))
-                        .bind(("from", from_rel.clone()))
-                        .bind(("to", to_rel.clone()))
-                        .await;
-
+                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        daemon_delete_note(&client, tok_ref, &vid, &from_rel).await;
+                        daemon_index_note(&client, tok_ref, &vid, &vp, &to_rel).await;
                         Ok(Value::String(format!("已移動 {} → {}", from_rel, to_rel)))
                     })
                 }),
@@ -419,8 +480,9 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
     // compress_to_knowledge — 儲存重要知識/洞見到 knowledge/ 資料夾
     {
         let vp = ctx.vault_path.clone();
-        let db = ctx.vault_db.clone();
-        let vid = ctx.vault_id.clone();
+        let client_ck = ctx.http_client.clone();
+        let tok_ck = ctx.auth_token.clone();
+        let vid_ck = ctx.vault_id.clone();
         registry.register(
             "compress_to_knowledge".into(),
             Tool {
@@ -431,8 +493,9 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                         .unwrap_or_default();
                     let vp = vp.clone();
-                    let db = db.clone();
-                    let vid = vid.clone();
+                    let client = client_ck.clone();
+                    let tok = tok_ck.clone();
+                    let vid = vid_ck.clone();
                     Box::pin(async move {
                         if title.is_empty() { return Err("title 為必填".to_string()); }
                         if content.is_empty() { return Err("content 為必填".to_string()); }
@@ -451,8 +514,12 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                             .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
                             .collect();
                         let path = format!("knowledge/{}_{}.md", date_str, safe_title);
-                        let result = crate::commands::ai::tool_create_note(&path, &full_content, &vp, Some((db, vid))).await;
-                        if result.contains("失敗") { Err(result) } else { Ok(Value::String(format!("✅ 已儲存知識至 {}", path))) }
+                        let result = crate::commands::ai::tool_create_note(&path, &full_content, &vp, None).await;
+                        if result.contains("失敗") { Err(result) } else {
+                            let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                            daemon_index_note(&client, tok_ref, &vid, &vp, &path).await;
+                            Ok(Value::String(format!("✅ 已儲存知識至 {}", path)))
+                        }
                     })
                 }),
                 rollback: None,
@@ -463,6 +530,9 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
     // update_note_frontmatter — 局部更新 YAML frontmatter 欄位（不覆蓋正文）
     {
         let vp = ctx.vault_path.clone();
+        let client_uf = ctx.http_client.clone();
+        let tok_uf = ctx.auth_token.clone();
+        let vid_uf = ctx.vault_id.clone();
         registry.register(
             "update_note_frontmatter".into(),
             Tool {
@@ -470,6 +540,9 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                     let path = args["path"].as_str().unwrap_or("").to_string();
                     let fields = args["fields"].clone();
                     let vp = vp.clone();
+                    let client = client_uf.clone();
+                    let tok = tok_uf.clone();
+                    let vid = vid_uf.clone();
                     Box::pin(async move {
                         if path.is_empty() { return Err("path 為必填".to_string()); }
                         if !fields.is_object() { return Err("fields 必須為物件（鍵值對）".to_string()); }
@@ -524,6 +597,13 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                         };
                         tokio::fs::write(&abs, &new_content).await
                             .map_err(|e| format!("寫入失敗：{}", e))?;
+                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
+                            &client,
+                            &format!("/vaults/{}/notes", urlencoding::encode(&vid)),
+                            &serde_json::json!({ "path": rel, "content": new_content }),
+                            tok_ref,
+                        ).await;
                         Ok(Value::String(format!("✅ 已更新 {} 的 frontmatter 欄位", rel)))
                     })
                 }),
@@ -535,6 +615,9 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
     // link_notes — 在筆記 A 中插入 [[筆記B]] 反向連結
     {
         let vp = ctx.vault_path.clone();
+        let client_ln = ctx.http_client.clone();
+        let tok_ln = ctx.auth_token.clone();
+        let vid_ln = ctx.vault_id.clone();
         registry.register(
             "link_notes".into(),
             Tool {
@@ -543,6 +626,9 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                     let to_path = args["to_path"].as_str().unwrap_or("").to_string();
                     let section = args["section"].as_str().unwrap_or("").to_string();
                     let vp = vp.clone();
+                    let client = client_ln.clone();
+                    let tok = tok_ln.clone();
+                    let vid = vid_ln.clone();
                     Box::pin(async move {
                         if from_path.is_empty() || to_path.is_empty() {
                             return Err("from_path 和 to_path 為必填".to_string());
@@ -599,6 +685,13 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                         };
                         tokio::fs::write(&abs, &new_content).await
                             .map_err(|e| format!("寫入失敗：{}", e))?;
+                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
+                            &client,
+                            &format!("/vaults/{}/notes", urlencoding::encode(&vid)),
+                            &serde_json::json!({ "path": from_rel, "content": new_content }),
+                            tok_ref,
+                        ).await;
                         Ok(Value::String(format!("✅ 已在「{}」加入連結 {}", from_rel, link)))
                     })
                 }),
@@ -610,7 +703,8 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
     // generate_moc — 為資料夾生成 Map of Contents（索引筆記）
     {
         let vp = ctx.vault_path.clone();
-        let db = ctx.vault_db.clone();
+        let client = ctx.http_client.clone();
+        let tok = ctx.auth_token.clone();
         let vid = ctx.vault_id.clone();
         registry.register(
             "generate_moc".into(),
@@ -619,64 +713,54 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                     let folder = args["folder"].as_str().unwrap_or("").to_string();
                     let output_path = args["output_path"].as_str().unwrap_or("").to_string();
                     let vp = vp.clone();
-                    let db = db.clone();
+                    let client = client.clone();
+                    let tok = tok.clone();
                     let vid = vid.clone();
                     Box::pin(async move {
                         if folder.is_empty() { return Err("請提供資料夾路徑".to_string()); }
                         let prefix = if folder.ends_with('/') { folder.clone() } else { format!("{}/", folder) };
-                        #[derive(serde::Deserialize)]
-                        struct NoteRow { path: String, title: Option<String> }
-                        let mut resp = db.query(
-                            "SELECT path, title FROM notes \
-                             WHERE vault_id = $vid AND string::starts_with(path, $prefix) \
-                             ORDER BY path ASC LIMIT 200"
-                        )
-                        .bind(("vid", vid.clone()))
-                        .bind(("prefix", prefix.clone()))
-                        .await
-                        .map_err(|e| e.to_string())?;
-                        let rows: Vec<NoteRow> = resp.take(0).unwrap_or_default();
-                        if rows.is_empty() {
+                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        let result_val: serde_json::Value = crate::api_client::daemon_get(
+                            &client,
+                            &format!("/vaults/{}/notes?path_prefix={}", urlencoding::encode(&vid), urlencoding::encode(&prefix)),
+                            tok_ref,
+                        ).await.unwrap_or_else(|_| serde_json::json!([]));
+                        let notes = result_val.as_array().cloned().unwrap_or_default();
+                        if notes.is_empty() {
                             return Ok(Value::String(format!("資料夾「{}」中沒有筆記，無法生成 MOC", folder)));
                         }
-                        // Group by sub-folder
                         let folder_name = folder.split('/').last().unwrap_or(&folder);
                         let now = chrono::Local::now();
                         let mut moc = format!(
                             "---\ntitle: {folder_name} Index\ncreated: {}\ntags:\n  - moc\n  - index\n---\n\n# {folder_name}\n\n> 自動生成的目錄筆記（{}）\n\n",
                             now.to_rfc3339(), now.format("%Y-%m-%d %H:%M")
                         );
-                        // Group notes by immediate sub-folder
-                        let mut groups: std::collections::BTreeMap<String, Vec<&NoteRow>> = std::collections::BTreeMap::new();
-                        for row in &rows {
-                            let rel = row.path.strip_prefix(&prefix).unwrap_or(&row.path);
+                        let mut groups: std::collections::BTreeMap<String, Vec<(String, String)>> = std::collections::BTreeMap::new();
+                        for note in &notes {
+                            let path = note["path"].as_str().unwrap_or("").to_string();
+                            let title = note["title"].as_str().unwrap_or("(無標題)").to_string();
+                            let rel = path.strip_prefix(&prefix).unwrap_or(&path).to_string();
                             let sub = if rel.contains('/') {
                                 rel.split('/').next().unwrap_or("").to_string()
-                            } else {
-                                String::new() // top-level
-                            };
-                            groups.entry(sub).or_default().push(row);
+                            } else { String::new() };
+                            groups.entry(sub).or_default().push((path, title));
                         }
-                        // Top-level notes first
                         if let Some(top) = groups.remove("") {
                             moc.push_str("## 筆記\n\n");
-                            for row in top {
-                                let stem = std::path::Path::new(&row.path)
+                            for (path, title) in top {
+                                let stem = std::path::Path::new(&path)
                                     .file_stem().map(|s| s.to_string_lossy().to_string())
                                     .unwrap_or_default();
-                                let title = row.title.as_deref().unwrap_or(&stem);
                                 moc.push_str(&format!("- [[{}]] — {}\n", stem, title));
                             }
                             moc.push('\n');
                         }
-                        // Sub-folders
-                        for (sub, notes) in &groups {
+                        for (sub, notes_in_sub) in &groups {
                             moc.push_str(&format!("## {}\n\n", sub));
-                            for row in notes {
-                                let stem = std::path::Path::new(&row.path)
+                            for (path, title) in notes_in_sub {
+                                let stem = std::path::Path::new(&path)
                                     .file_stem().map(|s| s.to_string_lossy().to_string())
                                     .unwrap_or_default();
-                                let title = row.title.as_deref().unwrap_or(&stem);
                                 moc.push_str(&format!("- [[{}]] — {}\n", stem, title));
                             }
                             moc.push('\n');
@@ -686,9 +770,11 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                         } else {
                             if output_path.ends_with(".md") { output_path.clone() } else { format!("{}.md", output_path) }
                         };
-                        let result = crate::commands::ai::tool_create_note(&out_path, &moc, &vp, Some((db, vid))).await;
+                        let result = crate::commands::ai::tool_create_note(&out_path, &moc, &vp, None).await;
                         if result.contains("失敗") { Err(result) } else {
-                            Ok(Value::String(format!("✅ 已生成 MOC：{} （共 {} 篇筆記）", out_path, rows.len())))
+                            let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                            daemon_index_note(&client, tok_ref, &vid, &vp, &out_path).await;
+                            Ok(Value::String(format!("✅ 已生成 MOC：{} （共 {} 篇筆記）", out_path, notes.len())))
                         }
                     })
                 }),
@@ -697,9 +783,10 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // schedule_task — 插入 scheduled_tasks 表
+    // schedule_task — 排程任務（daemon POST /vaults/:vid/schedules）
     {
-        let db = ctx.vault_db.clone();
+        let client = ctx.http_client.clone();
+        let tok = ctx.auth_token.clone();
         let vid = ctx.vault_id.clone();
         registry.register(
             "schedule_task".into(),
@@ -710,7 +797,8 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                     let repeat_interval_secs = args["repeat_interval_seconds"].as_i64().unwrap_or(0);
                     let agent_type = args["agent_type"].as_str().map(String::from);
                     let agent_prompt = args["agent_prompt"].as_str().map(String::from);
-                    let db = db.clone();
+                    let client = client.clone();
+                    let tok = tok.clone();
                     let vid = vid.clone();
                     Box::pin(async move {
                         if description.is_empty() {
@@ -723,23 +811,20 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                             .map_err(|e| format!("run_at 格式錯誤（需 ISO 8601）：{}", e))?;
                         let run_at_ts = run_at_dt.timestamp();
                         let task_id = uuid::Uuid::new_v4().to_string();
-                        let now_ts = chrono::Utc::now().timestamp();
-
-                        let _ = db.query(
-                            "INSERT INTO scheduled_tasks \
-                             (task_id, vault_id, description, agent_type, agent_prompt, run_at_ts, repeat_interval_secs, status, created_at) \
-                             VALUES ($tid, $vid, $desc, $atype, $aprompt, $ts, $interval, 'pending', $now)"
-                        )
-                        .bind(("tid", task_id.clone()))
-                        .bind(("vid", vid.clone()))
-                        .bind(("desc", description.clone()))
-                        .bind(("atype", agent_type.clone()))
-                        .bind(("aprompt", agent_prompt.clone()))
-                        .bind(("ts", run_at_ts))
-                        .bind(("interval", repeat_interval_secs))
-                        .bind(("now", now_ts))
-                        .await
-                        .map_err(|e| format!("排程失敗：{}", e))?;
+                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
+                            &client,
+                            &format!("/vaults/{}/schedules", urlencoding::encode(&vid)),
+                            &serde_json::json!({
+                                "task_id": task_id,
+                                "description": description,
+                                "agent_type": agent_type,
+                                "agent_prompt": agent_prompt,
+                                "run_at_ts": run_at_ts,
+                                "repeat_interval_secs": repeat_interval_secs,
+                            }),
+                            tok_ref,
+                        ).await;
 
                         let repeat_info = if repeat_interval_secs > 0 {
                             format!("，每 {} 秒重複", repeat_interval_secs)

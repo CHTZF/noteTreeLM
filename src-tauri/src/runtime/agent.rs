@@ -6,8 +6,6 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::db::surreal::SurrealDb;
-
 use super::dispatcher::Dispatcher;
 use super::intent_classifier::{Intent, IntentClassifier};
 use super::planner::Planner;
@@ -35,8 +33,10 @@ pub struct Agent {
     prefetch_memory: Option<PrefetchFn>,
     /// Embedding 回呼（用於 plan_announce centroid 計算）
     embed_fn: EmbedFn,
-    /// DB（用於 pending_plans CRUD）
-    db: SurrealDb,
+    /// HTTP client（用於 pending_plans CRUD via daemon API）
+    http_client: reqwest::Client,
+    /// Daemon auth token
+    auth_token: String,
     /// 目前對話的 conversation_id（None = 無 DB 模式）
     conversation_id: Option<String>,
 }
@@ -54,7 +54,8 @@ impl Agent {
         vault_tools: Option<Value>,
         prefetch_memory: Option<PrefetchFn>,
         embed_fn: EmbedFn,
-        db: SurrealDb,
+        http_client: reqwest::Client,
+        auth_token: String,
         conversation_id: Option<String>,
     ) -> Self {
         Self {
@@ -69,7 +70,8 @@ impl Agent {
             vault_tools,
             prefetch_memory,
             embed_fn,
-            db,
+            http_client,
+            auth_token,
             conversation_id,
         }
     }
@@ -90,15 +92,16 @@ impl Agent {
         };
 
         // ── 檢查是否有 pending plan（conversation_id 模式）─────────────
+        let tok = if self.auth_token.is_empty() { None } else { Some(self.auth_token.as_str()) };
         if let Some(ref conv_id) = self.conversation_id {
-            let plan = load_pending_plan(&self.db, conv_id).await
+            let plan = load_pending_plan(&self.http_client, tok, conv_id).await
                 .unwrap_or(None);
 
             if let Some(pending) = plan {
                 // TTL 檢查：超過 24h 自動取消
                 let age = chrono::Utc::now().timestamp() - pending.created_at;
                 if age > 86400 {
-                    let _ = delete_pending_plan(&self.db, conv_id).await;
+                    let _ = delete_pending_plan(&self.http_client, tok, conv_id).await;
                     // 通知 LLM 計畫已過期，繼續正常處理
                     messages.push(serde_json::json!({
                         "role": "user",
@@ -112,7 +115,7 @@ impl Agent {
                     ).await;
 
                     // 無論任何 intent 都清除 pending plan
-                    let _ = delete_pending_plan(&self.db, conv_id).await;
+                    let _ = delete_pending_plan(&self.http_client, tok, conv_id).await;
 
                     match intent {
                         Intent::Confirm => {
@@ -210,6 +213,7 @@ impl Agent {
         session_id: String,
     ) -> Result<String, String> {
         use crate::commands::conversation::{save_pending_plan, DeferredTool};
+        let tok = if self.auth_token.is_empty() { None } else { Some(self.auth_token.as_str()) };
 
         // 建立 Transaction → prepare → emit
         let tx = Arc::new(Transaction::new());
@@ -331,7 +335,7 @@ impl Agent {
                             .collect();
                         if !deferred.is_empty() {
                             let _ = save_pending_plan(
-                                &self.db, conv_id, &deferred,
+                                &self.http_client, tok, conv_id, &deferred,
                             ).await;
                             // 通知 LLM 計畫已記錄
                             messages.push(serde_json::json!({
@@ -365,7 +369,7 @@ impl Agent {
 
                         if !deferred.is_empty() {
                             let _ = save_pending_plan(
-                                &self.db, conv_id, &deferred,
+                                &self.http_client, tok, conv_id, &deferred,
                             ).await;
                         }
 
@@ -494,7 +498,7 @@ impl Agent {
                     name: "__open_note__".into(),
                     args: serde_json::json!({ "paths": all_note_refs }),
                 }];
-                let _ = save_pending_plan(&self.db, conv_id, &deferred).await;
+                let _ = save_pending_plan(&self.http_client, tok, conv_id, &deferred).await;
             }
         }
 

@@ -1,7 +1,7 @@
 #![recursion_limit = "512"]
+mod api_client;
 mod commands;
 pub mod crypto;
-mod db;
 mod error;
 pub mod runtime;
 mod state;
@@ -18,7 +18,7 @@ use commands::{
          get_memory_rules, delete_memory_rule, confirm_write_tool,
          test_vault_tool, run_tool_pipeline, cancel_tool_test, cancel_agent, invoke_agent, invoke_live_chat,
          set_note_status, confirm_search_method,
-         seed_agent_tools, seed_agent_skills, add_skill_trigger},
+         add_skill_trigger},
     conversation::{create_conversation, list_conversations, get_conversation,
                    delete_conversation, update_conversation_title, save_conversation_messages,
                    get_or_create_live_chat_conversation},
@@ -39,7 +39,7 @@ use commands::{
     knowledge_import::auto_check_all_sessions,
     agent_def::{list_agent_definitions, save_agent_definition, update_agent_definition,
                 delete_agent_definition, toggle_agent_definition, wake_agent_definition,
-                list_ephemeral_agents, clear_ephemeral_agents, seed_agent_definitions},
+                list_ephemeral_agents, clear_ephemeral_agents},
     settings::{get_settings, save_personal_settings, get_system_settings, save_system_settings, get_api_key, set_api_key,
                get_vault_last_note, set_vault_last_note, check_vcredist,
                get_last_chat_conversation_id, set_last_chat_conversation_id,
@@ -154,14 +154,7 @@ pub fn run() {
                     None
                 };
 
-                let surreal_db = db::surreal::init_db(&app_data_dir)
-                    .await
-                    .expect("SurrealDB 初始化失敗");
-
-                let sqlite = db::sqlite::init_sqlite(&app_data_dir.join("search.db"))
-                    .expect("SQLite FTS5 初始化失敗");
-
-                (AppState::new(surreal_db, sqlite), corruption)
+                (AppState::new(), corruption)
             });
 
             app_handle.manage(state);
@@ -206,79 +199,65 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 let state = app_handle.state::<AppState>();
 
-                // 載入已設定的 vault 路徑
-                if let Ok(Some(vp)) = db::queries::get_setting(&state.db, "system_current_vault_path").await {
+                // 載入已設定的 vault 路徑（via daemon API）
+                let auth_tok = state.get_auth_token().await;
+                let tok_ref: Option<&str> = if auth_tok.is_empty() { None } else { Some(&auth_tok) };
+                if let Some(vp) = crate::api_client::daemon_get_setting(&state.http_client, tok_ref, "system_current_vault_path").await {
                     if !vp.is_empty() {
                         state.set_vault_path_with_agent(vp.clone()).await;
 
-                        // 從 sessions DB 取得目前登入的 username
-                        let username = {
-                            #[derive(serde::Deserialize)]
-                            struct SessionRow { username: String }
-                            let now_ts = chrono::Utc::now().timestamp();
-                            if let Ok(mut resp) = state.db.query(
-                                "SELECT username FROM sessions WHERE expires_at > $now ORDER BY expires_at DESC LIMIT 1"
-                            ).bind(("now", now_ts)).await {
-                                let rows: Vec<SessionRow> = resp.take(0).unwrap_or_default();
-                                rows.into_iter().next().map(|r| r.username).unwrap_or_default()
-                            } else {
-                                String::new()
-                            }
-                        };
+                        // daemon 負責 session 管理，直接使用預設 username
+                        let username = String::from("user"); // daemon handles sessions
                         state.set_username(username.clone()).await;
 
-                        // 查詢或建立 vault UUID
-                        let vault_uuid = db::queries::get_or_create_vault_uuid(&state.db, &vp, &username).await;
-                        state.set_vault_uuid(vault_uuid.clone()).await;
+                        // 向 daemon 取得（或建立）vault UUID
+                        if let Ok(v) = crate::api_client::daemon_post::<_, serde_json::Value>(
+                            &state.http_client,
+                            "/vaults",
+                            &serde_json::json!({"path": vp, "account": username}),
+                            tok_ref,
+                        ).await {
+                            if let Some(uuid) = v["vault_id"].as_str() {
+                                state.set_vault_uuid(uuid.to_string()).await;
+                            }
+                        }
 
-                        // Agent 生命週期管理（sleep/delete）
-                        commands::agent_def::check_agent_lifecycle(&state.db, &vp).await;
-                        // 確保 memory_agent 系統排程存在（8 小時重複，agent_type 唯一）
-                        let run_at_ts = chrono::Utc::now().timestamp() + 8 * 3600;
-                        let task_id = uuid::Uuid::new_v4().to_string();
-                        let now_ts = chrono::Utc::now().timestamp();
-                        let _ = state.db.query(
-                            "INSERT INTO scheduled_tasks \
-                             (task_id, vault_id, description, agent_type, agent_prompt, run_at_ts, repeat_interval_secs, status, created_at) \
-                             VALUES ($tid, $vid, 'Memory Agent', 'memory_agent', '請開始分析並提取記憶。', $ts, 28800, 'pending', $now) \
-                             ON DUPLICATE KEY UPDATE task_id = task_id"
-                        )
-                        .bind(("tid", task_id))
-                        .bind(("vid", vault_uuid.clone()))
-                        .bind(("ts", run_at_ts))
-                        .bind(("now", now_ts))
-                        .await;
+                        // Agent 生命週期管理（daemon 負責，跳過）
+                        // scheduled_tasks INSERT 已由 daemon 管理，跳過
                         let path = std::path::PathBuf::from(&vp);
                         if path.exists() {
-                            // 背景補齊 chunk 索引（不阻塞啟動）
-                            {
-                                let db = state.db.clone();
-                                let vid = vp.clone();
-                                tokio::spawn(async move {
-                                    let _ = vault::chunker::reindex_all(&db, &vid, None).await;
-                                });
-                            }
+                            // file watcher syncs external edits to daemon; startup scan skipped (daemon DB persists)
                             let stop_tx = vault::watcher::start_watcher(app_handle.clone(), path);
                             *state.watcher_stop.lock().await = Some(stop_tx);
                         }
                     }
                 }
 
-                // 初始化加密金鑰（讀取/生成 DB salt → HKDF → OnceLock）
+                // 初始化加密金鑰（daemon API 版本）
                 // 必須在所有 encrypt/decrypt 呼叫之前執行
-                crate::crypto::init_encryption_key(&state.db).await;
+                let auth_tok2 = state.get_auth_token().await;
+                let tok_ref2: Option<&str> = if auth_tok2.is_empty() { None } else { Some(&auth_tok2) };
+                crate::crypto::init_encryption_key_daemon(&state.http_client, tok_ref2).await;
 
-                // 預載 API key 進記憶體快取（從 DB 讀取並解密）
-                if let Ok(Some(provider)) = db::queries::get_setting(&state.db, "ai_provider").await {
+                // 預載 API key 進記憶體快取（via daemon API）
+                let auth_tok3 = state.get_auth_token().await;
+                let tok_ref3: Option<&str> = if auth_tok3.is_empty() { None } else { Some(&auth_tok3) };
+                if let Some(provider) = crate::api_client::daemon_get_setting(&state.http_client, tok_ref3, "ai_provider").await {
                     if !provider.is_empty() {
                         let db_key = format!("api_key_{}", provider);
-                        let plain = db::queries::get_setting(&state.db, &db_key)
-                            .await.unwrap_or_default()
+                        let plain = crate::api_client::daemon_get_setting(&state.http_client, tok_ref3, &db_key)
+                            .await
                             .map(|enc| crate::crypto::decrypt_api_key(&enc))
                             .unwrap_or_default();
                         state.api_key_cache.lock().await.insert(provider, plain);
                     }
                 }
+
+                // 標記 app 初始化完成，通知前端（不等 server warmup）
+                state.app_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = app_handle.emit("app:ready", serde_json::json!({}));
+
+                // 以下為背景任務，不阻塞 app 載入
 
                 // 預熱 whisper-server 與 llama-server（延遲 2 秒等前端 register 監聽器）
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -309,102 +288,30 @@ pub fn run() {
                     );
                 }
 
-                // Tool Registry 種子（確保 agent_tools 表有預設工具）
-                // 先用無 embedding 版本（快速），有 embedding server 時再補 embedding
+                // 呼叫 daemon seed-builtins：幂等重建此 vault 的內建 skills 與 agents
                 {
-                    let db_seed = state.db.clone();
-                    let emb_url: Option<String> = {
-                        let port = *state.embedding_actual_port.lock().await;
-                        port.map(|p| format!("http://127.0.0.1:{}", p))
-                    };
-                    seed_agent_tools(&db_seed, emb_url.as_deref()).await;
-
-                    // 內建 skill / agent definitions 種子（per-vault，幂等）
-                    if let Ok(Some(vp)) = db::queries::get_setting(&db_seed, "system_current_vault_path").await {
-                        if !vp.is_empty() {
-                            seed_agent_skills(&db_seed, &vp, emb_url.as_deref()).await;
-                            seed_agent_definitions(&db_seed, &vp, emb_url.as_deref()).await;
-                            // 通知前端重新載入 agents / skills（解決 race condition）
-                            let _ = app_handle.emit("agent:seeded", serde_json::json!({}));
-                        }
+                    let vault_uuid_for_seed = state.get_vault_id().await.unwrap_or_default();
+                    if !vault_uuid_for_seed.is_empty() {
+                        let seed_tok = state.get_auth_token().await;
+                        let seed_tok_ref = if seed_tok.is_empty() { None } else { Some(seed_tok.as_str()) };
+                        let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
+                            &state.http_client,
+                            &format!("/vaults/{}/seed-builtins", urlencoding::encode(&vault_uuid_for_seed)),
+                            &serde_json::json!({}),
+                            seed_tok_ref,
+                        ).await;
                     }
+                    // 通知前端 agent:seeded（觸發 UI 刷新）
+                    let _ = app_handle.emit("agent:seeded", serde_json::json!({}));
                 }
 
                 // 自動更新：掃描開啟 auto_update 的 import sessions
                 auto_check_all_sessions(&app_handle, &state).await;
-
-                // 標記 app 初始化完成，通知前端
-                state.app_ready.store(true, std::sync::atomic::Ordering::Relaxed);
-                let _ = app_handle.emit("app:ready", serde_json::json!({}));
             });
 
-            // 排程器：每分鐘檢查到期的 scheduled_tasks
-            {
-                let ah_sched = app_handle_sched;
-                tauri::async_runtime::spawn(async move {
-                    loop {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-                        let state = ah_sched.state::<AppState>();
-                        let now_ts = chrono::Utc::now().timestamp();
-
-                        #[derive(serde::Deserialize)]
-                        struct TaskRow {
-                            task_id: String,
-                            vault_id: String,
-                            description: String,
-                            agent_type: Option<String>,
-                            agent_prompt: Option<String>,
-                            repeat_interval_secs: i64,
-                        }
-
-                        // 查所有到期的任務，不限 active vault（每個任務已記錄自己的 vault_id）
-                        let mut resp = match state.db.query(
-                            "SELECT task_id, vault_id, description, agent_type, agent_prompt, repeat_interval_secs \
-                             FROM scheduled_tasks \
-                             WHERE status = 'pending' AND run_at_ts <= $now"
-                        )
-                        .bind(("now", now_ts))
-                        .await {
-                            Ok(r) => r,
-                            Err(_) => continue,
-                        };
-
-                        let due: Vec<TaskRow> = resp.take(0).unwrap_or_default();
-                        for task in due {
-                            // 所有任務統一走 run_scheduled_agent，由 agent 決定執行內容
-                            {
-                                let ah2          = ah_sched.clone();
-                                let vault_id     = task.vault_id.clone();
-                                let agent_type   = task.agent_type.clone();
-                                let agent_prompt = task.agent_prompt.clone();
-                                let description  = task.description.clone();
-                                tokio::spawn(async move {
-                                    commands::memory_agent::run_scheduled_agent(
-                                        &ah2, vault_id, agent_type, agent_prompt, description,
-                                    ).await;
-                                });
-                            }
-
-                            if task.repeat_interval_secs > 0 {
-                                let next_ts = now_ts + task.repeat_interval_secs;
-                                let _ = state.db.query(
-                                    "UPDATE scheduled_tasks SET run_at_ts = $next \
-                                     WHERE task_id = $tid"
-                                )
-                                .bind(("next", next_ts))
-                                .bind(("tid", task.task_id.clone()))
-                                .await;
-                            } else {
-                                let _ = state.db.query(
-                                    "UPDATE scheduled_tasks SET status = 'done' WHERE task_id = $tid"
-                                )
-                                .bind(("tid", task.task_id.clone()))
-                                .await;
-                            }
-                        }
-                    }
-                });
-            }
+            // 排程器：已由 daemon 負責管理，Tauri 端不再輪詢 scheduled_tasks
+            // （移除 state.db 依賴，daemon service 層處理所有排程邏輯）
+            let _ = app_handle_sched; // suppress unused variable warning
 
             Ok(())
         })
@@ -470,6 +377,7 @@ pub fn run() {
             prepare_db_repair,
             list_repair_logs,
             search_vault_chunks,
+            get_vault_uuid,
             // Graph
             get_graph,
             // Import

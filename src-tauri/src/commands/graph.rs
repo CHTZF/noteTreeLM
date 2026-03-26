@@ -1,4 +1,4 @@
-use crate::{error::AppError, state::AppState};
+use crate::{api_client::daemon_get, error::AppError, state::AppState};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -28,85 +28,50 @@ pub struct GraphData {
 
 #[tauri::command]
 pub async fn get_graph(state: State<'_, AppState>) -> Result<GraphData, AppError> {
-    let db = state.db.clone();
-    let vault_id = state.get_vault_id().await?;
-
-    #[derive(Deserialize)]
-    struct NodeRow {
-        node_id: String,
-        node_type: String,
-        label: String,
-        url: Option<String>,
-        file_path: Option<String>,
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() {
+        return Ok(GraphData { nodes: vec![], edges: vec![] });
     }
-
-    let mut resp = db
-        .query(
-            "SELECT node_id, node_type, label, url, file_path FROM graph_nodes WHERE vault_id = $vid ORDER BY node_type, label",
-        )
-        .bind(("vid", vault_id.clone()))
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    let path = format!("/vaults/{}/graph", urlencoding::encode(&vault_id));
+    let result: serde_json::Value = daemon_get(&state.http_client, &path, tok)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-    let node_rows: Vec<NodeRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
+        .unwrap_or(serde_json::json!({ "nodes": [], "edges": [] }));
 
-    // 計算每個節點的連結數量
-    let mut graph_nodes = Vec::new();
-    for row in node_rows {
-        #[derive(Deserialize)]
-        struct CountRow {
-            count: i64,
-        }
-
-        let mut resp2 = db
-            .query(
-                "SELECT count() AS count FROM graph_edges WHERE vault_id = $vid AND (source_id = $nid OR target_id = $nid) GROUP ALL",
-            )
-            .bind(("vid", vault_id.clone()))
-            .bind(("nid", row.node_id.clone()))
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-        let counts: Vec<CountRow> = resp2.take(0).unwrap_or_default();
-        let link_count = counts.first().map(|r| r.count).unwrap_or(0);
-
-        graph_nodes.push(GraphNode {
-            id: row.node_id,
-            node_type: row.node_type,
-            label: row.label,
-            url: row.url,
-            file_path: row.file_path,
-            link_count,
-        });
-    }
-
-    #[derive(Deserialize)]
-    struct EdgeRow {
-        source_id: String,
-        target_id: String,
-        edge_type: String,
-        weight: f64,
-    }
-
-    let mut resp3 = db
-        .query(
-            "SELECT source_id, target_id, edge_type, weight FROM graph_edges WHERE vault_id = $vid",
-        )
-        .bind(("vid", vault_id.clone()))
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-    let edge_rows: Vec<EdgeRow> = resp3.take(0).map_err(|e| AppError::Database(e.to_string()))?;
-
-    let graph_edges = edge_rows
-        .into_iter()
-        .map(|r| GraphEdge {
-            source_id: r.source_id,
-            target_id: r.target_id,
-            edge_type: r.edge_type,
-            weight: r.weight,
+    let nodes = result["nodes"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|n| {
+                    Some(GraphNode {
+                        id: n["id"].as_str()?.to_string(),
+                        node_type: n["node_type"].as_str().unwrap_or("note").to_string(),
+                        label: n["label"].as_str().unwrap_or("").to_string(),
+                        url: n["url"].as_str().map(|s| s.to_string()),
+                        file_path: n["file_path"].as_str().map(|s| s.to_string()),
+                        link_count: n["link_count"].as_i64().unwrap_or(0),
+                    })
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
 
-    Ok(GraphData {
-        nodes: graph_nodes,
-        edges: graph_edges,
-    })
+    let edges = result["edges"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    Some(GraphEdge {
+                        source_id: e["source_id"].as_str()?.to_string(),
+                        target_id: e["target_id"].as_str()?.to_string(),
+                        edge_type: e["edge_type"].as_str().unwrap_or("link").to_string(),
+                        weight: e["weight"].as_f64().unwrap_or(1.0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(GraphData { nodes, edges })
 }

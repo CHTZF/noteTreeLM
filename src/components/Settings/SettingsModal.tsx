@@ -30,7 +30,7 @@ interface SettingsModalProps {
 }
 
 interface MemoryRuleEntry {
-  id: number
+  rule_id: string
   pattern_type: string
   pattern: string
   value: string
@@ -337,8 +337,8 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
   useEffect(() => {
     if (tab !== 'memory') return
     setMemoryRulesLoading(true)
-    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
-    api.listMemoryRules(vaultId)
+    invoke<string>('get_vault_uuid')
+      .then(vaultId => api.listMemoryRules(vaultId))
       .then(rules => setMemoryRules(rules as MemoryRuleEntry[]))
       .catch(() => setMemoryRules([]))
       .finally(() => setMemoryRulesLoading(false))
@@ -351,16 +351,16 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
       .catch(() => setRepairLogs([]))
   }, [tab])
 
-  const handleDeleteMemoryRule = async (id: number) => {
-    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
-    await api.deleteMemoryRule(vaultId, String(id)).catch(() => {})
-    setMemoryRules((prev) => prev.filter((r) => r.id !== id))
+  const handleDeleteMemoryRule = async (ruleId: string) => {
+    const vaultId = await invoke<string>('get_vault_uuid')
+    await api.deleteMemoryRule(vaultId, ruleId).catch(() => {})
+    setMemoryRules((prev) => prev.filter((r) => r.rule_id !== ruleId))
   }
 
   const handleAddMemoryRule = async () => {
     const pattern = newRulePattern.trim()
     if (!pattern) return
-    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+    const vaultId = await invoke<string>('get_vault_uuid')
     await api.createMemoryRule(vaultId, { pattern_type: newRuleType, pattern, value: newRuleValue.trim() }).catch(() => {})
     // 重新載入以取得 server 產生的 id
     const updated = await api.listMemoryRules(vaultId).catch(() => memoryRules) as MemoryRuleEntry[]
@@ -1683,16 +1683,16 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                     </thead>
                     <tbody>
                       {memoryRules.map((rule, i) => (
-                        <tr key={rule.id} style={{ background: i % 2 === 0 ? 'transparent' : 'var(--color-bg-elevated)' }}>
+                        <tr key={rule.rule_id} style={{ background: i % 2 === 0 ? 'transparent' : 'var(--color-bg-elevated)' }}>
                           <td style={{ padding: '6px 10px', color: 'var(--color-text-secondary)' }}>{patternTypeLabel(rule.pattern_type)}</td>
                           <td style={{ padding: '6px 10px', color: 'var(--color-text-primary)', fontFamily: 'monospace' }}>{rule.pattern}</td>
                           <td style={{ padding: '6px 10px', color: 'var(--color-text-secondary)', fontFamily: 'monospace' }}>{rule.value || '—'}</td>
                           <td style={{ padding: '6px 10px', color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }}>
-                            {new Date(rule.created_at).toLocaleDateString('zh-TW')}
+                            {new Date(rule.created_at * 1000).toLocaleDateString('zh-TW')}
                           </td>
                           <td style={{ padding: '6px 8px', textAlign: 'right' }}>
                             <button
-                              onClick={() => handleDeleteMemoryRule(rule.id)}
+                              onClick={() => handleDeleteMemoryRule(rule.rule_id)}
                               style={{ padding: '2px 8px', borderRadius: '4px', fontSize: '11px', background: 'transparent', border: '1px solid var(--color-border)', color: 'var(--color-text-muted)', cursor: 'pointer' }}
                               onMouseEnter={e => { e.currentTarget.style.borderColor = '#e06c75'; e.currentTarget.style.color = '#e06c75' }}
                               onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--color-border)'; e.currentTarget.style.color = 'var(--color-text-muted)' }}

@@ -12,10 +12,7 @@
 //   parse_text_tool_calls              — 解析 <tool_call>...</tool_call> 格式
 
 use chrono::{Datelike, Local};
-use serde::Deserialize;
 use serde_json::Value;
-
-use crate::db::surreal::SurrealDb;
 
 // ── MemoryAgent ───────────────────────────────────────────────────────────────
 
@@ -194,226 +191,80 @@ fn extract_number_before(query: &str, suffix: &str) -> Option<i64> {
 // ── 記憶 DB 工具 ──────────────────────────────────────────────────────────────
 
 /// 將規則寫入 memory_rules 表（供 add_memory_rule command 共用）
-pub(crate) async fn add_memory_rule_to_db(db: &SurrealDb, vault_id: &str, pattern_type: &str, pattern: &str, value: &str) -> String {
-    let vid = vault_id.to_owned();
-    let pt = pattern_type.to_owned();
-    let p = pattern.to_owned();
-    let v = value.to_owned();
+pub(crate) async fn add_memory_rule_to_db(http_client: &reqwest::Client, tok: Option<&str>, vault_id: &str, pattern_type: &str, pattern: &str, value: &str) -> String {
+    use crate::api_client::daemon_post;
     let result_msg = format!("已記住規則：{} = {}", pattern, value);
-    match db.query("INSERT INTO memory_rules (vault_id, pattern_type, pattern, value) VALUES ($vid, $pt, $p, $v) ON DUPLICATE KEY UPDATE value = $v, pattern_type = $pt")
-        .bind(("vid", vid))
-        .bind(("pt", pt))
-        .bind(("p", p))
-        .bind(("v", v))
-        .await {
+    let body = serde_json::json!({
+        "vault_id": vault_id,
+        "pattern_type": pattern_type,
+        "pattern": pattern,
+        "value": value,
+    });
+    match daemon_post::<_, serde_json::Value>(http_client, "/memory-rules", &body, tok).await {
         Ok(_) => result_msg,
         Err(e) => format!("儲存規則失敗：{}", e),
     }
 }
 
 /// 格式化記憶筆記列表為純文字（供 LLM context 使用）
-pub(crate) async fn format_memory_rows(rows: &[(String, String, i64)], prefix: &str, vault_db: &SurrealDb, vault_id: &str) -> String {
+pub(crate) fn format_memory_rows(rows: &[(String, String, i64)], prefix: &str) -> String {
     let mut output = if prefix.is_empty() {
         format!("找到 {} 筆記憶筆記：\n\n", rows.len())
     } else {
         format!("{}\n找到 {} 筆記憶筆記：\n\n", prefix, rows.len())
     };
-
-    #[derive(Deserialize)]
-    struct ContentRow { content: String }
-
-    let vid = vault_id.to_owned();
-
     for (path, title, created_ms) in rows {
         let dt = chrono::DateTime::from_timestamp_millis(*created_ms)
             .map(|dt| dt.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_else(|| "未知時間".to_string());
-
-        // 取前 600 字元的摘要（跳過 frontmatter 分隔符）
-        let path_owned = path.clone();
-        let vid_owned = vid.clone();
-        let mut resp = vault_db.query("SELECT content FROM notes WHERE vault_id = $vid AND path = $path LIMIT 1")
-            .bind(("vid", vid_owned))
-            .bind(("path", path_owned))
-            .await.ok();
-        let content = resp.as_mut()
-            .and_then(|r| r.take::<Vec<ContentRow>>(0).ok())
-            .and_then(|rows| rows.into_iter().next())
-            .map(|r| r.content)
-            .unwrap_or_default();
-
-        let snippet: String = content
-            .chars()
-            .skip_while(|c| *c == '-' || *c == '\n')
-            .take(600)
-            .collect();
-
-        output.push_str(&format!("【{}】{}\n路徑：{}\n內容：\n{}…\n\n", dt, title, path, snippet.trim()));
+        output.push_str(&format!("【{}】{}\n路徑：{}\n\n", dt, title, path));
     }
     output
 }
 
 /// Agent 工具：查詢記憶筆記（回傳格式化純文字，供 LLM 直接使用）
-/// 若提供 `emb_url`，優先使用向量相似度搜尋；無 embedding 時 fallback 至 FTS。
+/// 使用 daemon search API 搜尋 memories/ 路徑下的筆記。
 pub(crate) async fn tool_query_memory(
     keywords: Vec<String>,
     since: Option<String>,
     limit: Option<usize>,
-    vault_db: &SurrealDb,
+    client: &reqwest::Client,
+    tok: Option<&str>,
     vault_id: &str,
-    emb_url: Option<&str>,
+    _emb_url: Option<&str>,
 ) -> String {
-    let limit = limit.unwrap_or(3).min(10) as i64;
-
-    // 可選：時間篩選（since 格式 YYYY-MM-DD）
-    let since_ts: Option<i64> = since.and_then(|s| {
-        chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok().map(|d| {
-            d.and_hms_opt(0, 0, 0)
-                .and_then(|dt| dt.and_local_timezone(Local).earliest())
-                .map(|dt| dt.timestamp_millis())
-                .unwrap_or(0)
-        })
-    });
-
-    // ── Vector search path (when keywords given + embedding server available) ──
-    if !keywords.is_empty() {
-        if let Some(emb_url) = emb_url {
-            let query_text = keywords.join(" ");
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .ok();
-            if let Some(client) = client {
-                let query_vec = crate::commands::ai::get_embedding(&client, emb_url, &query_text).await;
-                if !query_vec.is_empty() {
-                    #[derive(Deserialize)]
-                    struct VecRow { file_path: String, content: String, score: f64 }
-                    let min_ts = since_ts.unwrap_or(0);
-                    let mut resp = vault_db.query(
-                        "SELECT file_path, content, vector::similarity::cosine(embedding, $vec) AS score \
-                         FROM chunks WHERE vault_id = $vid \
-                         AND string::starts_with(file_path, 'memories/') \
-                         AND embedding IS NOT NONE \
-                         AND updated_at >= $min_ts \
-                         ORDER BY score DESC LIMIT $lim"
-                    )
-                    .bind(("vid", vault_id.to_owned()))
-                    .bind(("vec", query_vec))
-                    .bind(("min_ts", min_ts))
-                    .bind(("lim", limit))
-                    .await.ok();
-
-                    let vec_rows: Vec<VecRow> = resp.as_mut()
-                        .and_then(|r| r.take::<Vec<VecRow>>(0).ok())
-                        .unwrap_or_default();
-
-                    if !vec_rows.is_empty() {
-                        // Deduplicate by file_path, keep top chunk per file
-                        let mut seen = std::collections::HashSet::new();
-                        let mut deduped: Vec<(String, String, i64)> = Vec::new();
-                        for row in vec_rows {
-                            if seen.insert(row.file_path.clone()) {
-                                // Use score * 1e12 as pseudo-timestamp for ordering
-                                deduped.push((row.file_path, row.content, (row.score * 1e12) as i64));
-                            }
-                        }
-                        if !deduped.is_empty() {
-                            return format_memory_rows(&deduped, "", vault_db, vault_id).await;
-                        }
-                    }
-                }
-            }
-        }
+    let limit = limit.unwrap_or(3).min(10);
+    let kw_param = urlencoding::encode(&keywords.join(",")).to_string();
+    let mut url = format!(
+        "/vaults/{}/memory/query?keywords={}&limit={}",
+        urlencoding::encode(vault_id),
+        kw_param,
+        limit,
+    );
+    if let Some(s) = since {
+        url.push_str(&format!("&since={}", urlencoding::encode(&s)));
     }
 
-    #[derive(Deserialize)]
-    struct NoteRow { path: String, title: String, modified_at: i64 }
-
-    let rows: Vec<(String, String, i64)> = if keywords.is_empty() {
-        // 無關鍵字：按時間降序回傳最新記憶
-        let mut resp = vault_db.query(
-            "SELECT path, title, modified_at FROM notes WHERE vault_id = $vid AND string::starts_with(path, 'memories/') ORDER BY modified_at DESC LIMIT $lim"
-        )
-        .bind(("vid", vault_id.to_owned()))
-        .bind(("lim", limit))
-        .await;
-
-        let mut rows: Vec<(String, String, i64)> = resp
-            .as_mut()
-            .ok()
-            .and_then(|r| r.take::<Vec<NoteRow>>(0).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| (r.path, r.title, r.modified_at))
-            .collect();
-
-        if let Some(min_ts) = since_ts {
-            rows.retain(|(_, _, ts)| *ts >= min_ts);
-        }
-        rows
-    } else {
-        // 有關鍵字：對每個關鍵字使用 FTS 搜尋，合併去重
-        let mut seen = std::collections::HashSet::new();
-        let mut collected: Vec<(String, String, i64)> = Vec::new();
-
-        for kw in &keywords {
-            let mut resp = vault_db.query(
-                "SELECT path, title, modified_at FROM notes WHERE vault_id = $vid AND string::starts_with(path, 'memories/') AND content ~ $kw ORDER BY modified_at DESC LIMIT $lim"
-            )
-            .bind(("vid", vault_id.to_owned()))
-            .bind(("kw", kw.to_owned()))
-            .bind(("lim", limit))
-            .await;
-
-            let kw_rows: Vec<(String, String, i64)> = resp
-                .as_mut()
-                .ok()
-                .and_then(|r| r.take::<Vec<NoteRow>>(0).ok())
-                .unwrap_or_default()
-                .into_iter()
-                .map(|r| (r.path, r.title, r.modified_at))
-                .collect();
-
-            for row in kw_rows {
-                if seen.insert(row.0.clone()) {
-                    collected.push(row);
-                }
-            }
-        }
-
-        collected.into_iter()
-            .filter(|(_, _, ts)| since_ts.map_or(true, |min_ts| *ts >= min_ts))
-            .take(limit as usize)
-            .collect()
-    };
+    let rows: Vec<serde_json::Value> = crate::api_client::daemon_get(
+        client,
+        &url,
+        tok,
+    ).await.unwrap_or_default();
 
     if rows.is_empty() {
         if keywords.is_empty() {
             return "目前沒有任何已儲存的記憶筆記".to_string();
         }
-        // FTS 找不到時，降級到最新 1 筆，避免空手而回
-        let mut resp = vault_db.query(
-            "SELECT path, title, modified_at FROM notes WHERE vault_id = $vid AND string::starts_with(path, 'memories/') ORDER BY modified_at DESC LIMIT 1"
-        )
-        .bind(("vid", vault_id.to_owned()))
-        .await;
-
-        let fallback: Vec<(String, String, i64)> = resp
-            .as_mut()
-            .ok()
-            .and_then(|r| r.take::<Vec<NoteRow>>(0).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| (r.path, r.title, r.modified_at))
-            .collect();
-
-        if fallback.is_empty() {
-            return format!("未找到關鍵字「{}」相關的記憶筆記，且目前無任何記憶存檔", keywords.join("、"));
-        }
-        return format_memory_rows(&fallback, &format!("（關鍵字「{}」無精確匹配，以下為最新記憶）", keywords.join("、")), vault_db, vault_id).await;
+        return format!("未找到關鍵字「{}」相關的記憶筆記", keywords.join("、"));
     }
 
-    format_memory_rows(&rows, "", vault_db, vault_id).await
+    let mut output = format!("找到 {} 筆記憶：\n\n", rows.len());
+    for r in &rows {
+        let path = r["path"].as_str().unwrap_or("");
+        let snippet = r["snippet"].as_str().unwrap_or("").chars().take(600).collect::<String>();
+        output.push_str(&format!("路徑：{}\n內容：\n{}…\n\n", path, snippet));
+    }
+    output
 }
 
 /// 解析 LLM 以文字格式輸出的工具調用

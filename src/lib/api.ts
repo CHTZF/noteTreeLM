@@ -3,14 +3,15 @@ const BASE = 'http://127.0.0.1:7787/api/v1'
 // Auth token management
 let _token: string | null = localStorage.getItem('daemon_token')
 
-// Helper: resolve vaultId from settingsStore if not provided
-// Uses a lazy reference to avoid circular dependency (settingsStore imports api)
-let _getVaultId: (() => string) | null = null
-export function registerVaultIdResolver(fn: () => string) {
-  _getVaultId = fn
-}
-function getVaultId(): string {
-  return _getVaultId?.() ?? ''
+// Helper: resolve vault UUID from Tauri AppState (daemon-generated)
+// invoke is imported lazily to avoid bundler issues
+async function getVaultId(): Promise<string> {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    return await invoke<string>('get_vault_uuid')
+  } catch {
+    return ''
+  }
 }
 
 export function setToken(t: string | null) {
@@ -57,8 +58,14 @@ export const api = {
   saveUserSettings: (data: Record<string, unknown>) => request<{ ok: boolean }>('POST', '/settings/user', data),
 
   // Conversations
-  listConversations: (vaultId?: string, mode?: string) =>
-    request<unknown[]>('GET', `/conversations${vaultId ? `?vault_id=${encodeURIComponent(vaultId)}&mode=${encodeURIComponent(mode ?? 'chat')}` : ''}`),
+  listConversations: (vaultId?: string, mode?: string, accountId?: string) => {
+    const params = new URLSearchParams()
+    if (vaultId) params.set('vault_id', vaultId)
+    if (mode) params.set('mode', mode)
+    if (accountId) params.set('account_id', accountId)
+    const qs = params.toString()
+    return request<unknown[]>('GET', `/conversations${qs ? `?${qs}` : ''}`)
+  },
   createConversation: (data: unknown) => request<{ id: string }>('POST', '/conversations', data),
   getConversation: (id: string) => request<unknown>('GET', `/conversations/${encodeURIComponent(id)}`),
   deleteConversation: (id: string) => request<{ ok: boolean }>('DELETE', `/conversations/${encodeURIComponent(id)}`),
@@ -176,7 +183,7 @@ export const api = {
   syncBraveKeyId: (keyId: string) => request<{ ok: boolean }>('POST', '/settings/brave-key-id', { key_id: keyId }),
 
   // Conversations extras
-  getOrCreateLiveChatConv: (vaultId: string) => request<{ id: string }>('POST', '/conversations/live-chat', { vault_id: vaultId }),
+  getOrCreateLiveChatConv: (vaultId: string, accountId: string) => request<{ id: string }>('POST', '/conversations/live-chat', { vault_id: vaultId, account_id: accountId }),
   markConversationProcessed: (id: string) => request<{ ok: boolean }>('PATCH', `/conversations/${encodeURIComponent(id)}/processed`, {}),
   getUnprocessedConversations: (vaultId: string) => request<unknown[]>('GET', `/conversations?vault_id=${encodeURIComponent(vaultId)}&unprocessed=true`),
   getConversationRatings: (conversationId: string) => request<Array<{ content_hash: string; rating: string }>>('GET', `/conversations/${encodeURIComponent(conversationId)}/ratings`),
@@ -188,72 +195,72 @@ export const api = {
     request<string | null>('GET', `/conversations/kb/${encodeURIComponent(sessionId)}/messages`),
 
   // Notes extras
-  setNoteStatus: (path: string, status: string) => {
-    const vaultId = getVaultId()
+  setNoteStatus: async (path: string, status: string) => {
+    const vaultId = await getVaultId()
     return request<{ ok: boolean }>('PATCH', `/vaults/${encodeURIComponent(vaultId)}/notes/status`, { path, status })
   },
-  trashNote: (path: string) => {
-    const vaultId = getVaultId()
+  trashNote: async (path: string) => {
+    const vaultId = await getVaultId()
     return request<{ ok: boolean }>('DELETE', `/vaults/${encodeURIComponent(vaultId)}/notes/trash?path=${encodeURIComponent(path)}`)
   },
-  deleteTrashItems: (itemIds: string[]) => {
-    const vaultId = getVaultId()
+  deleteTrashItems: async (itemIds: string[]) => {
+    const vaultId = await getVaultId()
     return request<{ ok: boolean }>('DELETE', `/vaults/${encodeURIComponent(vaultId)}/trash`, { item_ids: itemIds })
   },
-  deleteAsset: (path: string) => {
-    const vaultId = getVaultId()
+  deleteAsset: async (path: string) => {
+    const vaultId = await getVaultId()
     return request<{ ok: boolean }>('DELETE', `/vaults/${encodeURIComponent(vaultId)}/assets?path=${encodeURIComponent(path)}`)
   },
 
   // Memory
-  saveMemorySession: (messages: unknown[]) => {
-    const vaultId = getVaultId()
+  saveMemorySession: async (messages: unknown[]) => {
+    const vaultId = await getVaultId()
     return request<{ ok: boolean }>('POST', `/vaults/${encodeURIComponent(vaultId)}/memory/session`, { messages })
   },
-  queryMemory: (keywords: string[], limit: number) => {
-    const vaultId = getVaultId()
-    return request<unknown[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/memory/query?q=${encodeURIComponent(keywords.join(' '))}&limit=${limit}`)
+  queryMemory: async (keywords: string[], limit: number) => {
+    const vaultId = await getVaultId()
+    return request<unknown[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/memory/query?keywords=${encodeURIComponent(keywords.join(','))}&limit=${limit}`)
   },
   updatePatternScore: (vaultId: string, signature: string, positive: boolean) =>
-    request<{ ok: boolean }>('POST', `/vaults/${encodeURIComponent(vaultId)}/activity-patterns/score`, { signature, delta: positive ? 0.2 : -0.1 }),
+    request<{ ok: boolean }>('POST', `/vaults/${encodeURIComponent(vaultId)}/activity-patterns/score`, { signature, spoke: positive }),
   decayPatterns: (vaultId: string) =>
     request<{ ok: boolean }>('POST', `/vaults/${encodeURIComponent(vaultId)}/activity-patterns/decay`, {}),
   setPatternIntent: (vaultId: string, signature: string, intent: string) =>
-    request<{ ok: boolean }>('PATCH', `/vaults/${encodeURIComponent(vaultId)}/activity-patterns/intent`, { signature, intent }),
+    request<{ ok: boolean }>('PATCH', `/vaults/${encodeURIComponent(vaultId)}/activity-patterns/intent`, { signature, semantic_intent: intent }),
 
   // KB extras
-  queryKb: (params: { queryId: string; question: string; sessionId?: string }) => {
-    const vaultId = getVaultId()
+  queryKb: async (params: { queryId: string; question: string; sessionId?: string }) => {
+    const vaultId = await getVaultId()
     const qs = `query_id=${encodeURIComponent(params.queryId)}&q=${encodeURIComponent(params.question)}${params.sessionId ? `&session_id=${encodeURIComponent(params.sessionId)}` : ''}`
     return request<unknown[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/kb/query?${qs}`)
   },
-  queryKnowledge: (params: { queryId: string; question: string; sessionId?: string }) => {
-    const vaultId = getVaultId()
+  queryKnowledge: async (params: { queryId: string; question: string; sessionId?: string }) => {
+    const vaultId = await getVaultId()
     const qs = `query_id=${encodeURIComponent(params.queryId)}&q=${encodeURIComponent(params.question)}${params.sessionId ? `&session_id=${encodeURIComponent(params.sessionId)}` : ''}`
     return request<unknown[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/kb/knowledge?${qs}`)
   },
-  deleteKnowledgeItem: (itemId: string) => {
-    const vaultId = getVaultId()
+  deleteKnowledgeItem: async (itemId: string) => {
+    const vaultId = await getVaultId()
     return request<{ ok: boolean }>('DELETE', `/vaults/${encodeURIComponent(vaultId)}/kb/items/${encodeURIComponent(itemId)}`)
   },
-  renameKnowledgeItem: (itemId: string, title: string) => {
-    const vaultId = getVaultId()
+  renameKnowledgeItem: async (itemId: string, title: string) => {
+    const vaultId = await getVaultId()
     return request<{ ok: boolean }>('PATCH', `/vaults/${encodeURIComponent(vaultId)}/kb/items/${encodeURIComponent(itemId)}`, { title })
   },
-  fetchSiteOutline: (sessionId: string) => {
-    const vaultId = getVaultId()
+  fetchSiteOutline: async (sessionId: string) => {
+    const vaultId = await getVaultId()
     return request<{ ok: boolean }>('POST', `/vaults/${encodeURIComponent(vaultId)}/kb/sessions/${encodeURIComponent(sessionId)}/outline`, {})
   },
-  importPage: (sessionId: string, pageId: string) => {
-    const vaultId = getVaultId()
+  importPage: async (sessionId: string, pageId: string) => {
+    const vaultId = await getVaultId()
     return request<{ ok: boolean }>('POST', `/vaults/${encodeURIComponent(vaultId)}/kb/sessions/${encodeURIComponent(sessionId)}/pages/${encodeURIComponent(pageId)}/import`, {})
   },
-  suggestNoteCards: (itemId: string) => {
-    const vaultId = getVaultId()
+  suggestNoteCards: async (itemId: string) => {
+    const vaultId = await getVaultId()
     return request<unknown[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/kb/items/${encodeURIComponent(itemId)}/suggest-notes`)
   },
-  suggestSkillCards: (itemId: string) => {
-    const vaultId = getVaultId()
+  suggestSkillCards: async (itemId: string) => {
+    const vaultId = await getVaultId()
     return request<unknown[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/kb/items/${encodeURIComponent(itemId)}/suggest-skills`)
   },
 

@@ -18,7 +18,7 @@ import type { AgentSkill } from '../../types/models'
 
 export default function ChatPanel({ liveChatActive = false, onActiveChange, onOpenNote }: { liveChatActive?: boolean; onActiveChange?: (active: boolean) => void; onOpenNote?: (path: string) => void }) {
   const { t } = useTranslation()
-  const { settings } = useSettingsStore()
+  const { settings, currentVaultId } = useSettingsStore()
   const { session } = useAuthStore()
   const { content: noteContent, currentPath } = useEditorStore()
   const { addLog } = useDebugStore()
@@ -88,23 +88,29 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const log = useCallback((msg: string) => addLog('chat', 'info', msg), [addLog])
   const err = useCallback((msg: string) => addLog('chat', 'error', msg), [addLog])
 
-  // 初始化：從 DB 恢復上次對話（不自動建立新對話）
+  // 初始化：從 DB 恢復上次對話（不自動建立新對話）；vault 切換時重新執行
   useEffect(() => {
     const username = session?.username ?? ''
-    if (!username) return
-    api.getLastChatConversationId(username)
+    if (!username || !currentVaultId) return
+    const key = `${username}_${currentVaultId}`
+    api.getLastChatConversationId(key)
       .then(saved => {
         if (saved) {
           api.getConversation(saved)
             .then(() => { setConversationId(saved); loadConversationMessages(saved) })
             .catch(() => {
               // Stale ID — clear it and stay on empty screen
-              api.setLastChatConversationId(username, null).catch(() => {})
+              api.setLastChatConversationId(key, null).catch(() => {})
             })
+        } else {
+          // Different vault — reset to empty screen
+          setConversationId(null)
+          setMessages([])
+          setRatings({})
         }
       })
       .catch(() => {})
-  }, [session?.username])
+  }, [session?.username, currentVaultId])
 
   const loadConversationMessages = useCallback(async (id: string) => {
     try {
@@ -131,7 +137,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       console.error('[ChatPanel] loadConversationMessages error:', e)
       // Stale conversation ID — clear it and show empty screen
       const username = useAuthStore.getState().session?.username ?? ''
-      api.setLastChatConversationId(username, null).catch(() => {})
+      invoke<string>('get_vault_uuid').then(vaultId => api.setLastChatConversationId(`${username}_${vaultId}`, null).catch(() => {})).catch(() => {})
       setConversationId(null)
       setMessages([])
       setRatings({})
@@ -162,25 +168,32 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     if (isStreaming) return
     switchConversation(conversationId, id)
     setConversationId(id)
-    const username = useAuthStore.getState().session?.username ?? ''
-    api.setLastChatConversationId(username, id).catch(() => {})
+    invoke<string>('get_vault_uuid').then(vaultId => {
+      const username = useAuthStore.getState().session?.username ?? ''
+      api.setLastChatConversationId(`${username}_${vaultId}`, id).catch(() => {})
+    }).catch(() => {})
     loadConversationMessages(id)
   }, [isStreaming, conversationId, loadConversationMessages, switchConversation])
 
   const handleNewConversation = useCallback((id: string) => {
-    const username = useAuthStore.getState().session?.username ?? ''
     if (!id) {
       // Current conversation was deleted — reset to empty screen
       switchConversation(conversationId, null)
       setConversationId(null)
-      api.setLastChatConversationId(username, null).catch(() => {})
+      invoke<string>('get_vault_uuid').then(vaultId => {
+        const username = useAuthStore.getState().session?.username ?? ''
+        api.setLastChatConversationId(`${username}_${vaultId}`, null).catch(() => {})
+      }).catch(() => {})
       setMessages([])
       setRatings({})
       return
     }
     switchConversation(conversationId, id)
     setConversationId(id)
-    api.setLastChatConversationId(username, id).catch(() => {})
+    invoke<string>('get_vault_uuid').then(vaultId => {
+      const username = useAuthStore.getState().session?.username ?? ''
+      api.setLastChatConversationId(`${username}_${vaultId}`, id).catch(() => {})
+    }).catch(() => {})
     setMessages([])
     setRatings({})
   }, [conversationId, switchConversation])
@@ -244,7 +257,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     if (!path) { toast.error('請先開啟一個筆記'); return }
     const newContent = existing ? existing + '\n\n' + processedText : processedText
     try {
-      const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+      const vaultId = await invoke<string>('get_vault_uuid')
       await api.updateNote(vaultId, { path, content: newContent })
       // 同步 Editor CM6 視圖，防止 auto-save 用舊內容覆蓋
       useEditorStore.getState().applyExternalWrite(newContent)
@@ -258,7 +271,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const doSaveToNewNote = useCallback(async (text: string, title: string, folder: string) => {
     const processedText = await applyVoicePostProcess(text)
     try {
-      const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+      const vaultId = await invoke<string>('get_vault_uuid')
       await api.createNote(vaultId, { title, folder: folder || null, content: processedText })
       toast.success(`已建立筆記「${title}」`)
     } catch (e) {
@@ -370,8 +383,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   useEffect(() => {
     if (!pendingSkillNotFound) return
     setSkillsPickerLoaded(false)
-    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
-    api.listAgentSkills(vaultId)
+    invoke<string>('get_vault_uuid')
+      .then(vaultId => api.listAgentSkills(vaultId))
       .then(skills => { setSkillsForPicker(skills as AgentSkill[]); setSkillsPickerLoaded(true) })
       .catch(() => { setSkillsForPicker([]); setSkillsPickerLoaded(true) })
   }, [pendingSkillNotFound])
@@ -736,7 +749,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     setSavingWebMsgIdx(msgIndex)
     try {
       const title = msg.webRefs[0]?.title || '知識項目'
-      const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+      const vaultId = await invoke<string>('get_vault_uuid')
       await api.createKnowledgeItem(vaultId, {
         sessionId: 'chat',
         title,
@@ -845,7 +858,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     if (!skillPreview || skillPreview.loading) return
     setSavingSkill(true)
     try {
-      const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+      const vaultId = await invoke<string>('get_vault_uuid')
       await api.createAgentSkill(vaultId, {
         knowledgeItemId: 'conversation',
         title: skillPreview.title,
@@ -1170,7 +1183,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
             <div style={{ display: 'flex', gap: '6px' }}>
               <button
                 onClick={async () => {
-                  const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+                  const vaultId = await invoke<string>('get_vault_uuid')
                   await api.addSkillTrigger(vaultId, pendingSkillFound.skill_id, false)
                   setPendingSkillFound(null)
                 }}
@@ -1203,7 +1216,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
                   <button
                     key={skill.skill_id}
                     onClick={async () => {
-                      const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+                      const vaultId = await invoke<string>('get_vault_uuid')
                       await api.addSkillTrigger(vaultId, skill.skill_id, false)
                       setPendingSkillNotFound(null)
                       setSkillsForPicker([])

@@ -5,8 +5,9 @@ use serde_json::Value;
 use tauri::{Emitter, Manager};
 
 use crate::commands::ai::{
-    tool_list_recent_conversations, call_external_ai_via_db, vault_tools,
+    tool_list_recent_conversations, vault_tools,
 };
+use crate::commands::external_ai::call_external_ai_via_client;
 use crate::commands::knowledge_import::tool_web_search;
 use crate::runtime::system_agent::{AgentRequest, NewSkillSpec};
 use crate::runtime::tool_registry::ToolRegistry;
@@ -35,21 +36,9 @@ fn make_confirm_write(app: &tauri::AppHandle) -> ConfirmWriteFn {
     })
 }
 
-/// 建立子 agent 共用的 summarize_fn 閉包
-async fn make_summarize_fn(app: &tauri::AppHandle, emb: &Option<String>) -> Option<SummarizeFn> {
-    let Some(ref base_url) = emb else { return None; };
-    let app_state = app.state::<crate::state::AppState>();
-    let db = app_state.db.clone();
-    let client = app_state.http_client.clone();
-    let vid = app_state.get_vault_id().await.unwrap_or_default();
-    let base = base_url.clone();
-    Some(Arc::new(move |fp: String, uq: String| {
-        let db = db.clone(); let client = client.clone();
-        let vid = vid.clone(); let base = base.clone();
-        Box::pin(async move {
-            crate::commands::ai::parallel_chunk_summarize(&db, &vid, &fp, &uq, &client, &base).await
-        }) as std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
-    }) as SummarizeFn)
+/// 建立子 agent 共用的 summarize_fn 閉包（no-op without DB）
+async fn make_summarize_fn(_app: &tauri::AppHandle, _emb: &Option<String>) -> Option<SummarizeFn> {
+    None
 }
 
 pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
@@ -128,7 +117,8 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
 
     // call_external_ai — 呼叫前暫停，等待前端選擇搜尋方式
     {
-        let db = ctx.vault_db.clone();
+        let http_client = ctx.http_client.clone();
+        let auth_token = ctx.auth_token.clone();
         let vid = ctx.vault_id.clone();
         let app = ctx.app.clone();
         let emb = ctx.emb_url.clone();
@@ -140,7 +130,8 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
             Tool {
                 execute: Arc::new(move |args: Value| {
                     let query = args["query"].as_str().unwrap_or("").to_string();
-                    let db = db.clone();
+                    let http_client = http_client.clone();
+                    let auth_token = auth_token.clone();
                     let vid = vid.clone();
                     let app = app.clone();
                     let emb = emb.clone();
@@ -157,13 +148,14 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                                 .unwrap_or(Ok("call_external_ai".to_string()))
                                 .unwrap_or_else(|_| "call_external_ai".to_string())
                         };
+                        let tok = if auth_token.is_empty() { None } else { Some(auth_token.as_str()) };
                         let result = if method == "web_search" {
-                            tool_web_search(&db, &vid, &query, &app, emb.as_deref()).await
+                            tool_web_search(&http_client, &auth_token, &vid, &query, &app, emb.as_deref()).await
                         } else {
                             let _ = app.emit("agent:web_refs", serde_json::json!([
                                 {"path": "", "title": query, "excerpt": ""}
                             ]));
-                            call_external_ai_via_db(&query, &db, &app, &cache, &scache).await
+                            call_external_ai_via_client(&query, &http_client, tok, &app, &cache, &scache).await
                         };
                         Ok(Value::String(result))
                     })
@@ -173,9 +165,10 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // web_search — 搜尋 DuckDuckGo Lite
+    // web_search — 搜尋網路（Brave Search）
     {
-        let db = ctx.vault_db.clone();
+        let http_client = ctx.http_client.clone();
+        let auth_token = ctx.auth_token.clone();
         let vid = ctx.vault_id.clone();
         let app = ctx.app.clone();
         let emb = ctx.emb_url.clone();
@@ -184,12 +177,13 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
             Tool {
                 execute: Arc::new(move |args: Value| {
                     let query = args["query"].as_str().unwrap_or("").to_string();
-                    let db = db.clone();
+                    let http_client = http_client.clone();
+                    let auth_token = auth_token.clone();
                     let vid = vid.clone();
                     let app = app.clone();
                     let emb = emb.clone();
                     Box::pin(async move {
-                        Ok(Value::String(tool_web_search(&db, &vid, &query, &app, emb.as_deref()).await))
+                        Ok(Value::String(tool_web_search(&http_client, &auth_token, &vid, &query, &app, emb.as_deref()).await))
                     })
                 }),
                 rollback: None,
@@ -199,17 +193,17 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
 
     // list_recent_conversations — 讀取最近對話記錄
     {
-        let db = ctx.vault_db.clone();
-        let vid = ctx.vault_id.clone();
+        let http_client = ctx.http_client.clone();
+        let auth_token = ctx.auth_token.clone();
         registry.register(
             "list_recent_conversations".into(),
             Tool {
                 execute: Arc::new(move |args: Value| {
                     let limit = args["limit"].as_u64().unwrap_or(10) as usize;
-                    let db = db.clone();
-                    let vid = vid.clone();
+                    let http_client = http_client.clone();
+                    let auth_token = auth_token.clone();
                     Box::pin(async move {
-                        Ok(Value::String(tool_list_recent_conversations(&db, &vid, limit).await))
+                        Ok(Value::String(tool_list_recent_conversations(&http_client, &auth_token, limit).await))
                     })
                 }),
                 rollback: None,
@@ -219,7 +213,6 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
 
     // create_agent_skill — 透過 generate_skills_via_tool_call 建立技能規範（LLM 知悉所有工具）
     {
-        let db  = ctx.vault_db.clone();
         let vid = ctx.vault_id.clone();
         let emb = ctx.emb_url.clone();
         let app = ctx.app.clone();
@@ -231,7 +224,6 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                     let trigger_hint   = args["trigger"].as_str().unwrap_or("").to_string();
                     let behavior       = args["behavior"].as_str().unwrap_or("").to_string();
                     let injection_mode = args["injection_mode"].as_str().unwrap_or("passive").to_string();
-                    let db  = db.clone();
                     let vid = vid.clone();
                     let emb = emb.clone();
                     let app = app.clone();
@@ -244,13 +236,12 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                         };
                         let client = reqwest::Client::new();
                         let now_ms = chrono::Utc::now().timestamp_millis();
-                        // 以 title + trigger + behavior 組成知識上下文
                         let context = format!(
                             "技能標題：{}\n觸發語境：{}\n行為描述：{}\n注入模式：{}",
                             title, trigger_hint, behavior, injection_mode
                         );
                         let skills = crate::commands::knowledge_import::generate_skills_via_tool_call(
-                            &client, &base_url, &db, &vid, "", &context, emb.as_deref(), now_ms,
+                            &client, &base_url, None, &vid, "", &context, emb.as_deref(), now_ms,
                         ).await;
                         if skills.is_empty() {
                             Ok(Value::String("技能建立失敗：LLM 未能生成有效技能規範".to_string()))
@@ -500,48 +491,37 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // list_available_agents — 查詢 DB 中所有 active agent definitions
+    // list_available_agents — daemon GET /vaults/:vid/agents
     {
-        let db_la  = ctx.vault_db.clone();
+        let http_client = ctx.http_client.clone();
+        let auth_token = ctx.auth_token.clone();
         let vid_la = ctx.vault_id.clone();
 
         registry.register(
             "list_available_agents".into(),
             Tool {
                 execute: Arc::new(move |_args: Value| {
-                    let db  = db_la.clone();
+                    let http_client = http_client.clone();
+                    let auth_token = auth_token.clone();
                     let vid = vid_la.clone();
                     Box::pin(async move {
-                        #[derive(serde::Deserialize)]
-                        struct DefSummary {
-                            def_id: String,
-                            name: String,
-                            description: String,
-                            kind: String,
-                            tool_names: Vec<String>,
-                            #[allow(dead_code)]
-                            created_at: surrealdb::sql::Datetime,
-                        }
-                        let mut resp = db.query(
-                            "SELECT def_id, name, description, kind, tool_names, created_at \
-                             FROM agent_definitions \
-                             WHERE vault_id = $vid AND is_active = true \
-                             ORDER BY created_at ASC"
-                        )
-                        .bind(("vid", vid.clone()))
-                        .await
-                        .map_err(|e| e.to_string())?;
-
-                        let rows: Vec<DefSummary> = resp.take(0).unwrap_or_default();
-
-                        let lines: Vec<String> = rows.iter().map(|d| {
-                            format!(
-                                "- **{}** (id: `{}`, kind: {}) — {} [tools: {}]",
-                                d.name, d.def_id, d.kind, d.description,
-                                d.tool_names.join(", ")
-                            )
+                        let tok = if auth_token.is_empty() { None } else { Some(auth_token.as_str()) };
+                        let result: serde_json::Value = crate::api_client::daemon_get(
+                            &http_client,
+                            &format!("/vaults/{}/agents", urlencoding::encode(&vid)),
+                            tok,
+                        ).await.unwrap_or_else(|_| serde_json::json!([]));
+                        let agents = result.as_array().cloned().unwrap_or_default();
+                        let lines: Vec<String> = agents.iter().map(|d| {
+                            let name = d["name"].as_str().unwrap_or("(無名稱)");
+                            let def_id = d["def_id"].as_str().unwrap_or("");
+                            let kind = d["kind"].as_str().unwrap_or("custom");
+                            let desc = d["description"].as_str().unwrap_or("");
+                            let tools = d["tool_names"].as_array()
+                                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+                                .unwrap_or_default();
+                            format!("- **{}** (id: `{}`, kind: {}) — {} [tools: {}]", name, def_id, kind, desc, tools)
                         }).collect();
-
                         if lines.is_empty() {
                             Ok(Value::String("目前沒有可用的 agent definitions。".to_string()))
                         } else {

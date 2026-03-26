@@ -6,6 +6,7 @@ mod db;
 mod embedder;
 mod mdns;
 mod routes;
+pub mod seeds;
 mod server;
 mod state;
 mod tls;

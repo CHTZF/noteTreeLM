@@ -1,4 +1,5 @@
-use crate::{db::queries, error::AppError, state::AppState};
+use crate::{error::AppError, state::AppState};
+use crate::api_client::{daemon_get_setting, daemon_set_setting};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::Write;
@@ -235,8 +236,9 @@ pub async fn get_external_model_paths(
     kind: String,
 ) -> Result<Vec<String>, AppError> {
     let key = format!("external_models_{}", kind);
-    let json = queries::get_setting(&state.db, &key)
-        .await?
+    let tok = { let t = state.get_auth_token().await; if t.is_empty() { None } else { Some(t) } };
+    let json = daemon_get_setting(&state.http_client, tok.as_deref(), &key)
+        .await
         .unwrap_or_else(|| "[]".to_string());
     Ok(serde_json::from_str(&json).unwrap_or_default())
 }
@@ -250,7 +252,8 @@ pub async fn set_external_model_paths(
 ) -> Result<(), AppError> {
     let key = format!("external_models_{}", kind);
     let json = serde_json::to_string(&paths).map_err(|e| AppError::Io(e.to_string()))?;
-    queries::set_setting(&state.db, &key, &json).await?;
+    let tok = { let t = state.get_auth_token().await; if t.is_empty() { None } else { Some(t) } };
+    daemon_set_setting(&state.http_client, tok.as_deref(), &key, &json).await;
     Ok(())
 }
 

@@ -27,82 +27,76 @@ pub struct ConversationPreview {
 // ─── 內部工具函式（ToolHandler 閉包呼叫，也可被 Tauri command 呼叫） ──────────
 
 pub(crate) async fn internal_get_unprocessed(
-    db: &crate::db::surreal::SurrealDb,
     vault_id: &str,
     limit: i64,
+    client: &reqwest::Client,
+    auth_token: Option<&str>,
 ) -> Vec<ConversationPreview> {
-    #[derive(Deserialize)]
-    struct Row {
-        id: String,
-        title: String,
-        messages_json: String,
-        updated_at: surrealdb::sql::Datetime,
-    }
-
-    let mut resp = match db.query(
-        "SELECT record::id(id) AS id, title, messages_json, updated_at
-         FROM conversations
-         WHERE vault_id = $vid AND (memory_processed = false OR memory_processed IS NONE)
-         ORDER BY updated_at DESC
-         LIMIT $limit"
-    )
-    .bind(("vid", vault_id.to_owned()))
-    .bind(("limit", limit))
-    .await { Ok(r) => r, Err(_) => return vec![] };
-
-    let rows: Vec<Row> = resp.take(0).unwrap_or_default();
-
-    rows.into_iter().map(|row| {
-        let msgs: serde_json::Value = serde_json::from_str(&row.messages_json)
-            .unwrap_or(serde_json::json!([]));
-        let arr = msgs.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
-        let message_count = arr.iter()
-            .filter(|m| matches!(m["role"].as_str(), Some("user") | Some("assistant")))
-            .count() as i64;
-        let preview: String = arr.iter()
-            .filter(|m| m["role"].as_str() == Some("user"))
-            .take(2)
-            .filter_map(|m| m["content"].as_str())
-            .map(|s| s.chars().take(100).collect::<String>())
-            .collect::<Vec<_>>()
-            .join(" / ");
-        ConversationPreview {
-            id: row.id,
-            title: row.title,
-            message_count,
-            preview,
-            updated_at: row.updated_at.timestamp(),
-        }
-    }).collect()
+    use crate::api_client::daemon_get;
+    let path = format!("/conversations?vault_id={}", urlencoding::encode(vault_id));
+    let result: serde_json::Value = match daemon_get(client, &path, auth_token).await {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    let arr = match result.as_array() {
+        Some(a) => a.clone(),
+        None => return vec![],
+    };
+    arr.iter()
+        .filter(|c| c["memory_processed"].as_bool() != Some(true))
+        .take(limit as usize)
+        .filter_map(|c| {
+            let raw_id = c["id"].as_str().unwrap_or("").to_string();
+            let id = raw_id
+                .strip_prefix("conversations:")
+                .unwrap_or(&raw_id)
+                .to_string();
+            if id.is_empty() { return None; }
+            let title = c["title"].as_str().unwrap_or("未知對話").to_string();
+            let updated_at = c["updated_at"].as_i64().unwrap_or(0);
+            let messages_str = c["messages_json"].as_str().unwrap_or("[]");
+            let msgs: serde_json::Value =
+                serde_json::from_str(messages_str).unwrap_or_default();
+            let message_count =
+                msgs.as_array().map(|a| a.len() as i64).unwrap_or(0);
+            let preview = msgs
+                .as_array()
+                .and_then(|a| a.iter().rev().find(|m| m["role"].as_str() == Some("user")))
+                .and_then(|m| m["content"].as_str())
+                .map(|s| s.chars().take(100).collect::<String>())
+                .unwrap_or_default();
+            Some(ConversationPreview { id, title, message_count, preview, updated_at })
+        })
+        .collect()
 }
 
 pub(crate) async fn internal_get_content(
-    db: &crate::db::surreal::SurrealDb,
     conversation_id: &str,
+    client: &reqwest::Client,
+    auth_token: Option<&str>,
 ) -> String {
-    #[derive(Deserialize)]
-    struct Row { messages_json: String }
-    let mut resp = match db.query(
-        "SELECT messages_json FROM type::thing('conversations', $id)"
-    ).bind(("id", conversation_id.to_owned())).await {
-        Ok(r) => r, Err(_) => return String::new(),
+    use crate::api_client::daemon_get;
+    let path = format!("/conversations/{}/messages", urlencoding::encode(conversation_id));
+    let result: serde_json::Value = match daemon_get(client, &path, auth_token).await {
+        Ok(v) => v,
+        Err(_) => return String::new(),
     };
-    let row: Option<Row> = resp.take(0).unwrap_or_default();
-    let row = match row { Some(r) => r, None => return String::new() };
-    let msgs: serde_json::Value = serde_json::from_str(&row.messages_json)
-        .unwrap_or(serde_json::json!([]));
-    msgs.as_array().unwrap_or(&vec![]).iter()
-        .filter_map(|m| {
-            let role = m["role"].as_str()?;
-            let content = m["content"].as_str()?;
-            match role {
-                "user"      => Some(format!("使用者：{}", content.chars().take(500).collect::<String>())),
-                "assistant" => Some(format!("助理：{}", content.chars().take(800).collect::<String>())),
-                _ => None,
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let messages_str = result["messages_json"].as_str().unwrap_or("[]");
+    let msgs: serde_json::Value =
+        serde_json::from_str(messages_str).unwrap_or_default();
+    let arr = match msgs.as_array() {
+        Some(a) => a,
+        None => return String::new(),
+    };
+    let mut lines = Vec::new();
+    for msg in arr {
+        let role = msg["role"].as_str().unwrap_or("unknown");
+        let content = msg["content"].as_str().unwrap_or("");
+        if !content.is_empty() && (role == "user" || role == "assistant") {
+            lines.push(format!("[{}]: {}", role, content));
+        }
+    }
+    lines.join("\n\n")
 }
 
 pub(crate) async fn internal_call_claude(vault_path: &str, prompt: &str) -> Result<String, String> {
@@ -150,12 +144,19 @@ pub(crate) async fn internal_write_log(vault_path: &str, level: &str, message: &
 }
 
 pub(crate) async fn internal_mark_processed(
-    db: &crate::db::surreal::SurrealDb,
     conversation_id: &str,
+    client: &reqwest::Client,
+    auth_token: Option<&str>,
 ) {
-    let _ = db.query(
-        "UPDATE type::thing('conversations', $id) SET memory_processed = true, updated_at = time::now()"
-    ).bind(("id", conversation_id.to_owned())).await;
+    use crate::api_client::daemon_patch;
+    let path = format!("/conversations/{}/processed", urlencoding::encode(conversation_id));
+    let _ = daemon_patch::<_, serde_json::Value>(
+        client,
+        &path,
+        &serde_json::json!({}),
+        auth_token,
+    )
+    .await;
 }
 
 // ─── Tauri Commands（前端手動呼叫） ──────────────────────────────────────────
@@ -165,9 +166,16 @@ pub async fn get_unprocessed_conversations(
     state: State<'_, AppState>,
     limit: Option<u32>,
 ) -> Result<Vec<ConversationPreview>, AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-    Ok(internal_get_unprocessed(db, &vault_id, limit.unwrap_or(20) as i64).await)
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() { return Ok(vec![]); }
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    Ok(internal_get_unprocessed(
+        &vault_id,
+        limit.unwrap_or(20) as i64,
+        &state.http_client,
+        tok,
+    ).await)
 }
 
 #[tauri::command]
@@ -175,7 +183,9 @@ pub async fn get_conversation_content(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<String, AppError> {
-    Ok(internal_get_content(&state.db, &conversation_id).await)
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    Ok(internal_get_content(&conversation_id, &state.http_client, tok).await)
 }
 
 #[tauri::command]
@@ -204,7 +214,9 @@ pub async fn mark_conversation_processed(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<(), AppError> {
-    internal_mark_processed(&state.db, &conversation_id).await;
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    internal_mark_processed(&conversation_id, &state.http_client, tok).await;
     Ok(())
 }
 
@@ -303,9 +315,10 @@ pub fn memory_agent_tools() -> Vec<serde_json::Value> {
 // ─── 建立 ToolRegistry（僅包含記憶提取工具） ─────────────────────────────────
 
 fn build_memory_registry(
-    db: crate::db::surreal::SurrealDb,
     vault_id: String,
     vault_path: String,
+    client: reqwest::Client,
+    auth_token: String,
 ) -> Arc<crate::runtime::tool_registry::ToolRegistry> {
     use crate::runtime::tool_registry::ToolRegistry;
     use crate::runtime::types::Tool;
@@ -314,14 +327,19 @@ fn build_memory_registry(
 
     // get_unprocessed_conversations
     {
-        let db = db.clone(); let vid = vault_id.clone();
+        let vid = vault_id.clone();
+        let c = client.clone();
+        let tok = auth_token.clone();
         registry.register("get_unprocessed_conversations".into(), Tool {
             execute: Arc::new(move |args| {
-                let db = db.clone(); let vid = vid.clone();
+                let vid = vid.clone();
+                let c = c.clone();
+                let tok = tok.clone();
                 let limit = args["limit"].as_i64().unwrap_or(20);
                 Box::pin(async move {
-                    let previews = internal_get_unprocessed(&db, &vid, limit).await;
-                    Ok(serde_json::to_value(previews).unwrap_or(serde_json::json!([])))
+                    let tok_ref: Option<&str> = if tok.is_empty() { None } else { Some(&tok) };
+                    let list = internal_get_unprocessed(&vid, limit, &c, tok_ref).await;
+                    Ok(serde_json::to_value(list).unwrap_or(serde_json::json!([])))
                 })
             }),
             rollback: None,
@@ -330,13 +348,17 @@ fn build_memory_registry(
 
     // get_conversation_content
     {
-        let db = db.clone();
+        let c = client.clone();
+        let tok = auth_token.clone();
         registry.register("get_conversation_content".into(), Tool {
             execute: Arc::new(move |args| {
-                let db = db.clone();
+                let c = c.clone();
+                let tok = tok.clone();
                 let cid = args["conversation_id"].as_str().unwrap_or("").to_string();
                 Box::pin(async move {
-                    Ok(serde_json::Value::String(internal_get_content(&db, &cid).await))
+                    let tok_ref: Option<&str> = if tok.is_empty() { None } else { Some(&tok) };
+                    let text = internal_get_content(&cid, &c, tok_ref).await;
+                    Ok(serde_json::Value::String(text))
                 })
             }),
             rollback: None,
@@ -380,13 +402,16 @@ fn build_memory_registry(
 
     // mark_conversation_processed
     {
-        let db = db.clone();
+        let c = client.clone();
+        let tok = auth_token.clone();
         registry.register("mark_conversation_processed".into(), Tool {
             execute: Arc::new(move |args| {
-                let db = db.clone();
+                let c = c.clone();
+                let tok = tok.clone();
                 let cid = args["conversation_id"].as_str().unwrap_or("").to_string();
                 Box::pin(async move {
-                    internal_mark_processed(&db, &cid).await;
+                    let tok_ref: Option<&str> = if tok.is_empty() { None } else { Some(&tok) };
+                    internal_mark_processed(&cid, &c, tok_ref).await;
                     Ok(serde_json::Value::String("ok".into()))
                 })
             }),
@@ -410,24 +435,10 @@ pub async fn run_scheduled_agent(
     use tauri::Manager;
     match agent_type.as_deref() {
         Some("memory_agent") => {
-            // 從 vaults table 用 vault_id (UUID) 取得 vault_path
+            // vault_path: use the state's current vault path (DB migrated to daemon)
             let vault_path = {
-                #[derive(serde::Deserialize)]
-                struct VaultRow { path: String }
                 let state = app.state::<AppState>();
-                let mut resp = match state.db.query(
-                    "SELECT path FROM vaults WHERE vault_id = $vid LIMIT 1"
-                )
-                .bind(("vid", vault_id.clone()))
-                .await {
-                    Ok(r) => r,
-                    Err(_) => {
-                        eprintln!("[scheduler] DB error querying vaults for vault_id={}", vault_id);
-                        return;
-                    }
-                };
-                let rows: Vec<VaultRow> = resp.take(0).unwrap_or_default();
-                rows.into_iter().next().map(|r| r.path).unwrap_or_default()
+                state.get_vault_path().await
             };
             if vault_path.is_empty() {
                 eprintln!("[scheduler] vault not found for vault_id={}", vault_id);
@@ -485,11 +496,12 @@ pub async fn run_scheduled_agent(
                 })
             };
 
+            let ma_auth_token = state.get_auth_token().await;
             let registry = crate::tools::build_vault_registry(
                 vault_path.clone(),
-                state.db.clone(),
                 vault_id.clone(),
-                state.sqlite.clone(),
+                state.http_client.clone(),
+                ma_auth_token,
                 app.clone(),
                 Some(base_url_for_registry),
                 Arc::clone(&state.search_method_tx),
@@ -600,10 +612,12 @@ pub async fn run_memory_agent_loop(app: &tauri::AppHandle, vault_uuid: String, v
         })
     });
 
+    let auth_token = state.get_auth_token().await;
     let registry = build_memory_registry(
-        state.db.clone(),
         vault_uuid,
         vault_path.clone(),
+        state.http_client.clone(),
+        auth_token,
     );
 
     let emit: crate::runtime::types::EmitEventFn = Arc::new(|_, _| {});  // 靜默，不 emit 前端事件

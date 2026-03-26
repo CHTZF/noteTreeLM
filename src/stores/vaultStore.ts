@@ -55,7 +55,7 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
   scanVault: async () => {
     set({ isScanning: true, scanCount: 0 })
     try {
-      const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+      const vaultId = await invoke<string>('get_vault_uuid')
       const result = await api.scanVault(vaultId)
       set({ scanCount: result.indexed })
       await get().loadNotes()
@@ -65,7 +65,7 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
   },
 
   createNote: async (title, folder, content) => {
-    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+    const vaultId = await invoke<string>('get_vault_uuid')
     await api.createNote(vaultId, { title, folder: folder ?? null, content })
     await get().loadNotes()
     // Return newly created note from store
@@ -78,7 +78,7 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
   },
 
   updateNote: async (path, content) => {
-    const vaultId = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+    const vaultId = await invoke<string>('get_vault_uuid')
     await api.updateNote(vaultId, { path, content })
     set((state) => ({
       notes: state.notes.map((n) =>
@@ -255,7 +255,7 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
       if (scanTimer) clearTimeout(scanTimer)
       scanTimer = setTimeout(async () => {
         scanTimer = null
-        const vid = useSettingsStore.getState().settings.system_current_vault_path ?? ''
+        const vid = await invoke<string>('get_vault_uuid').catch(() => '')
         await api.scanVault(vid).catch(() => {})
         await get().loadNotes()
       }, 150)

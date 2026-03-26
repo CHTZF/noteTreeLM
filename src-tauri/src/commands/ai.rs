@@ -1,5 +1,4 @@
 use crate::{error::AppError, state::AppState};
-use crate::db::surreal::SurrealDb;
 use crate::runtime::memory_agent::{
     parse_text_tool_calls, tool_query_memory,
 };
@@ -11,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 // ─── Re-exports from sub-modules ──────────────────────────────────────────────
 pub use super::server::{
@@ -26,7 +25,7 @@ pub use super::external_ai::{
     call_external_ai_tool, ExtAiConfig,
 };
 pub(crate) use super::external_ai::{
-    call_external_ai_via_db, read_api_key, get_cached_setting,
+    read_api_key, get_cached_setting,
 };
 pub use super::memory::{
     add_memory_rule, get_memory_rules, delete_memory_rule,
@@ -168,113 +167,6 @@ pub fn compute_centroid(vecs: &[Vec<f32>]) -> Vec<f32> {
         for f in &mut centroid { *f /= norm; }
     }
     centroid
-}
-
-/// 大型 read_note 結果的並行分段摘要。
-/// 從 chunks 表取出該筆記的 heading-level 切段，分批並行呼叫非串流 LLM，
-/// 依使用者查詢提取要點後合併回傳。
-/// chunks 不存在時回傳 None（呼叫方 fallback 至截斷）。
-pub(crate) async fn parallel_chunk_summarize(
-    db: &SurrealDb,
-    vault_id: &str,
-    file_path: &str,
-    user_query: &str,
-    client: &reqwest::Client,
-    base_url: &str,
-) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct ChunkRow { section: String, content: String }
-
-    let mut res = db
-        .query("SELECT section, content FROM chunks WHERE vault_id = $vid AND file_path = $fp ORDER BY id")
-        .bind(("vid", vault_id.to_string()))
-        .bind(("fp", file_path.to_string()))
-        .await.ok()?;
-    let rows: Vec<ChunkRow> = res.take(0).ok()?;
-    if rows.is_empty() {
-        return None;
-    }
-
-    // 批次分組：每批最多 2500 chars
-    const BATCH_CHARS: usize = 2500;
-    let mut batches: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for row in rows {
-        let chunk_text = if row.section.is_empty() {
-            row.content.clone()
-        } else {
-            format!("## {}\n{}", row.section, row.content)
-        };
-        if !current.is_empty() && current.chars().count() + chunk_text.chars().count() > BATCH_CHARS {
-            batches.push(std::mem::take(&mut current));
-        }
-        if !current.is_empty() { current.push('\n'); }
-        current.push_str(&chunk_text);
-    }
-    if !current.is_empty() { batches.push(current); }
-
-    let file_label = file_path.split('/').last().unwrap_or(file_path).trim_end_matches(".md").to_string();
-
-    // 並行呼叫非串流 LLM 摘要各批次
-    let futs: Vec<_> = batches.into_iter().enumerate().map(|(i, chunk)| {
-        let client = client.clone();
-        let base_url = base_url.to_string();
-        let query = user_query.to_string();
-        let label = file_label.clone();
-        async move {
-            #[derive(serde::Deserialize)]
-            struct Resp { choices: Vec<Choice> }
-            #[derive(serde::Deserialize)]
-            struct Choice { message: Msg }
-            #[derive(serde::Deserialize)]
-            struct Msg { content: String }
-
-            let body = serde_json::json!({
-                "model": "local",
-                "stream": false,
-                "max_tokens": 512,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": format!(
-                            "你是筆記摘要助手。以下是「{}」第 {} 段，請根據查詢提取相關要點，\
-                            輸出 3-6 個條目，每點不超過 40 字。與查詢無關時回覆「本段無相關內容」。",
-                            label, i + 1
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": format!("查詢：{}\n\n內容：\n{}", query, chunk)
-                    }
-                ]
-            });
-            let resp = client
-                .post(format!("{}/v1/chat/completions", base_url))
-                .json(&body)
-                .timeout(Duration::from_secs(60))
-                .send().await.ok()?;
-            let parsed: Resp = resp.json().await.ok()?;
-            parsed.choices.into_iter().next().map(|c| c.message.content)
-        }
-    }).collect();
-
-    let summaries: Vec<String> = futures::future::join_all(futs)
-        .await
-        .into_iter()
-        .flatten()
-        .filter(|s| s.trim() != "本段無相關內容")
-        .collect();
-
-    if summaries.is_empty() {
-        return None;
-    }
-
-    Some(format!(
-        "[「{}」摘要，共 {} 段相關內容]\n{}",
-        file_label,
-        summaries.len(),
-        summaries.join("\n---\n")
-    ))
 }
 
 /// 封裝 OpenAI-compatible SSE 串流請求，返回 StreamResult
@@ -460,13 +352,14 @@ pub async fn invoke_agent(
     // 2. Vault 資訊
     let vault_path = state.get_vault_path().await;
     let vault_id_opt = state.get_vault_id().await.ok();
-    let vault_db = state.db.clone();
+    let auth_token = state.get_auth_token().await;
+    let tok = if auth_token.is_empty() { None } else { Some(auth_token.as_str()) };
 
     // 3. 組裝 messages_json
     //    - conversation_id 存在：從 DB 載入歷史，追加當前 user 訊息
     //    - 否則：使用前端傳入的 messages（向下相容）
     let mut messages_json: Vec<serde_json::Value> = if let Some(ref conv_id) = conversation_id {
-        let mut db_msgs = load_messages(&state.db, conv_id).await?;
+        let mut db_msgs = load_messages(&state.http_client, tok, conv_id).await?;
         let arr = db_msgs.as_array_mut()
             .ok_or_else(|| AppError::AI("messages_json 格式錯誤".into()))?;
         // 追加當前 user 訊息（input）
@@ -509,9 +402,9 @@ pub async fn invoke_agent(
     let registry = if !vault_path.is_empty() && vault_id_opt.is_some() {
         crate::tools::build_vault_registry(
             vault_path.clone(),
-            vault_db.clone(),
             vault_id_opt.clone().unwrap_or_default(),
-            state.sqlite.clone(),
+            state.http_client.clone(),
+            auth_token.clone(),
             app.clone(),
             reg_emb_url.clone(),
             search_method_tx,
@@ -600,9 +493,9 @@ pub async fn invoke_agent(
     // 9. Pending plan check（原 Agent::run 邏輯，移至此處統一處理）
     if let Some(ref conv_id) = conversation_id {
         use crate::commands::conversation::{load_pending_plan, delete_pending_plan};
-        if let Ok(Some(pending)) = load_pending_plan(&state.db, conv_id).await {
+        if let Ok(Some(pending)) = load_pending_plan(&state.http_client, tok, conv_id).await {
             let age = chrono::Utc::now().timestamp() - pending.created_at;
-            let _ = delete_pending_plan(&state.db, conv_id).await;
+            let _ = delete_pending_plan(&state.http_client, tok, conv_id).await;
             if age <= 86400 {
                 let intent = match IntentClassifier::compute_centroids_cached(
                     &state.intent_centroids, &embed_fn,
@@ -652,13 +545,11 @@ pub async fn invoke_agent(
         }
     }
 
-    // 10. 記憶事實語意搜尋（embedding 相似度優先，fallback 最新事實）
-    // query_vec 提升到此 scope，供後續 skill pre-pass 共用，避免重複呼叫 /embedding
-    let (memory_context, query_vec_opt) = if let Some(ref vid) = vault_id_opt {
+    // 10. 記憶事實語意搜尋（daemon 架構下已移除本地 DB 依賴，回傳空字串）
+    let (memory_context, query_vec_opt) = if let Some(_vid) = vault_id_opt.as_ref() {
         let query_vec = get_embedding(&client, &base_url, &input).await;
-        let mem = retrieve_relevant_facts(&vault_db, vid, &input, &query_vec, 10).await;
         let vec_opt = if query_vec.is_empty() { None } else { Some(query_vec) };
-        (mem, vec_opt)
+        (String::new(), vec_opt)
     } else {
         (String::new(), None)
     };
@@ -716,11 +607,59 @@ pub async fn invoke_agent(
             "plan_announce".to_string(),
         ]);
 
-        let tools = if let Some(ref vid) = vault_id_opt {
-            if let Some((skill_text, skill_titles, required_tools)) = run_skill_pre_pass(
-                &vault_db, vid, &input, skill_emb_url.as_deref(), &client, "main",
-                query_vec_opt.clone(),  // 共用 memory 步驟已算好的向量
-            ).await {
+        let tools = if let Some(ref _vid) = vault_id_opt {
+            if let Some((skill_text, skill_titles, required_tools)) = {
+                // Skill pre-pass：透過 daemon API 搜尋匹配的 skills
+                let vid = vault_id_opt.as_deref().unwrap_or("");
+                let matched = search_skills_for_tool(
+                    &client,
+                    &auth_token,
+                    vid,
+                    &input,
+                    skill_emb_url.as_deref(),
+                    &client,
+                ).await;
+                if matched.is_empty() {
+                    None
+                } else {
+                    // 收集 behavior 文字（注入 system prompt）
+                    let skill_text = matched.iter()
+                        .filter(|(_, _, beh, _)| !beh.is_empty())
+                        .map(|(_, title, beh, _)| format!("[技能：{}]\n{}", title, beh))
+                        .collect::<Vec<_>>().join("\n\n");
+                    let skill_titles: Vec<String> = matched.iter()
+                        .map(|(_, t, _, _)| t.clone())
+                        .collect();
+                    // 合併所有 skill 的 tool_calls，去重
+                    let mut required_tools: Vec<String> = matched.iter()
+                        .flat_map(|(_, _, _, tc)| tc.clone())
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
+                        .collect();
+                    required_tools.sort();
+                    // 非同步 bump trigger_count（不阻塞主流程）
+                    for (skill_id, _, _, _) in &matched {
+                        let sid = skill_id.clone();
+                        let hc = client.clone();
+                        let at = auth_token.clone();
+                        let v = vid.to_string();
+                        tokio::spawn(async move {
+                            let tok = if at.is_empty() { None } else { Some(at.as_str()) };
+                            let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
+                                &hc,
+                                &format!("/vaults/{}/skills/{}/trigger", urlencoding::encode(&v), urlencoding::encode(&sid)),
+                                &serde_json::json!({}),
+                                tok,
+                            ).await;
+                        });
+                    }
+                    if skill_text.is_empty() && required_tools.is_empty() {
+                        None
+                    } else {
+                        Some((skill_text, skill_titles, required_tools))
+                    }
+                }
+            } {
                 if let Some(sys) = msgs.first_mut() {
                     if sys["role"].as_str() == Some("system") {
                         let existing = sys["content"].as_str().unwrap_or("").to_string();
@@ -900,10 +839,9 @@ pub async fn invoke_agent(
                 let res_str = if raw.chars().count() > MAX_TOOL_RESULT {
                     // read_note：嘗試從 chunks 表並行摘要；其他工具截斷
                     if name == "read_note" {
-                        if let (Some(vid), Some(fp)) = (vault_id_opt.as_deref(), args["path"].as_str()) {
-                            if let Some(summary) = parallel_chunk_summarize(&vault_db, vid, fp, &input, &client, &base_url).await {
-                                summary
-                            } else {
+                        if let (Some(_vid), Some(_fp)) = (vault_id_opt.as_deref(), args["path"].as_str()) {
+                            // parallel_chunk_summarize 已移除本地 DB 依賴，直接截斷（daemon 架構）
+                            {
                                 let truncated: String = raw.chars().take(MAX_TOOL_RESULT).collect();
                                 format!("{}…（內容已截斷）", truncated)
                             }
@@ -983,12 +921,12 @@ pub async fn invoke_agent(
         }
 
         let arr = serde_json::Value::Array(to_save);
-        let _ = save_messages(&state.db, conv_id, &arr).await;
+        let _ = save_messages(&state.http_client, tok, conv_id, &arr).await;
 
         // maybe_set_title：只有首次（標題尚未設定）才需呼叫；之後用 in-memory set 跳過
         let already_titled = state.titled_convs.lock().await.contains(conv_id.as_str());
         if !already_titled {
-            let _ = maybe_set_title(&state.db, conv_id, &arr).await;
+            let _ = maybe_set_title(&state.http_client, tok, conv_id, &arr).await;
             state.titled_convs.lock().await.insert(conv_id.clone());
         }
     }
@@ -1025,11 +963,12 @@ pub async fn invoke_live_chat(
     // 2. Vault 資訊
     let vault_path = state.get_vault_path().await;
     let vault_id_opt = state.get_vault_id().await.ok();
-    let vault_db = state.db.clone();
+    let auth_token_lc = state.get_auth_token().await;
+    let tok_lc = if auth_token_lc.is_empty() { None } else { Some(auth_token_lc.as_str()) };
 
     // 3. 從 DB 載入對話歷史
     let mut messages_json: Vec<serde_json::Value> = {
-        let db_msgs = load_messages(&state.db, &conversation_id).await?;
+        let db_msgs = load_messages(&state.http_client, tok_lc, &conversation_id).await?;
         let mut arr = db_msgs.as_array().cloned().unwrap_or_default();
         arr.push(serde_json::json!({"role": "user", "content": input}));
         arr
@@ -1072,9 +1011,9 @@ live_respond 規則：\
     let registry = if !vault_path.is_empty() && vault_id_opt.is_some() {
         crate::tools::build_vault_registry(
             vault_path.clone(),
-            vault_db.clone(),
             vault_id_opt.clone().unwrap_or_default(),
-            state.sqlite.clone(),
+            state.http_client.clone(),
+            auth_token_lc.clone(),
             app.clone(),
             Some(base_url.clone()),
             search_method_tx,
@@ -1314,7 +1253,7 @@ live_respond 規則：\
             to_save.push(serde_json::json!({"role": "assistant", "content": final_speech}));
         }
         let arr = serde_json::Value::Array(to_save.clone());
-        let _ = save_messages(&state.db, &conversation_id, &arr).await;
+        let _ = save_messages(&state.http_client, tok_lc, &conversation_id, &arr).await;
 
         // 每 10 則 user 訊息自動存至 vault memory（inline，不透過 Tauri command）
         let user_count = to_save.iter().filter(|m| m["role"].as_str() == Some("user")).count();
@@ -1342,17 +1281,17 @@ live_respond 規則：\
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
             let _ = tokio::fs::write(&abs_path, &content).await;
-            // 索引至 DB
-            if let Some(ref vid) = vault_id_opt {
-                let _ = state.db.query(
-                    "INSERT INTO notes (vault_id, path, title, content) VALUES ($vid, $path, $title, $content) \
-                     ON DUPLICATE KEY UPDATE content = $content, title = $title"
-                )
-                .bind(("vid", vid.clone()))
-                .bind(("path", rel_path.clone()))
-                .bind(("title", format!("AI 語音對話記憶 — {}", display_time)))
-                .bind(("content", content))
-                .await;
+            // Sync memory note to daemon (no file watcher in daemon)
+            let vault_id = state.get_vault_uuid().await;
+            if !vault_id.is_empty() {
+                let token2 = state.get_auth_token().await;
+                let tok2: Option<&str> = if token2.is_empty() { None } else { Some(token2.as_str()) };
+                let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
+                    &state.http_client,
+                    &format!("/vaults/{}/notes", urlencoding::encode(&vault_id)),
+                    &serde_json::json!({"path": rel_path, "content": content}),
+                    tok2,
+                ).await;
             }
         }
     }
@@ -1402,33 +1341,29 @@ pub(crate) struct StreamResult {
 }
 
 /// 讀取最近對話，回傳摘要供 reflection agent 分析模式
-pub async fn tool_list_recent_conversations(db: &crate::db::surreal::SurrealDb, vault_id: &str, limit: usize) -> String {
-    #[derive(serde::Deserialize)]
-    struct ConvRow {
-        title: Option<String>,
-        mode: Option<String>,
-        messages_json: Option<String>,
-    }
-    let limit = limit.min(20) as i64;
-    let mut resp = match db.query(
-        "SELECT title, mode, messages_json FROM conversations \
-         WHERE (vault_id = $vid OR vault_id = NONE) AND messages_json != '[]' \
-         ORDER BY updated_at DESC LIMIT $lim"
-    ).bind(("vid", vault_id.to_string())).bind(("lim", limit)).await {
-        Ok(r) => r,
-        Err(e) => return format!("查詢失敗：{e}"),
+pub async fn tool_list_recent_conversations(
+    http_client: &reqwest::Client,
+    auth_token: &str,
+    limit: usize,
+) -> String {
+    let limit = limit.min(20);
+    let tok = if auth_token.is_empty() { None } else { Some(auth_token) };
+    let result: serde_json::Value = crate::api_client::daemon_get(
+        http_client,
+        &format!("/conversations?limit={}", limit),
+        tok,
+    ).await.unwrap_or_else(|_| serde_json::json!([]));
+    let rows = match result.as_array() {
+        Some(r) => r.clone(),
+        None => return "沒有找到任何對話記錄".to_string(),
     };
-    let rows: Vec<ConvRow> = resp.take(0).unwrap_or_default();
     if rows.is_empty() { return "沒有找到任何對話記錄".to_string(); }
-
     let mut out = format!("最近 {} 段對話：\n\n", rows.len());
     for (i, row) in rows.iter().enumerate() {
-        let title = row.title.as_deref().unwrap_or("未命名");
-        let mode  = row.mode.as_deref().unwrap_or("chat");
+        let title = row["title"].as_str().unwrap_or("未命名");
+        let mode  = row["mode"].as_str().unwrap_or("chat");
         out.push_str(&format!("## 對話 {} — {} ({})\n", i + 1, title, mode));
-
-        // 取最後 6 則 user/assistant 訊息
-        if let Some(ref json) = row.messages_json {
+        if let Some(ref json) = row["messages_json"].as_str() {
             if let Ok(msgs) = serde_json::from_str::<Vec<serde_json::Value>>(json) {
                 let tail: Vec<_> = msgs.iter()
                     .filter(|m| {
@@ -1446,46 +1381,6 @@ pub async fn tool_list_recent_conversations(db: &crate::db::surreal::SurrealDb, 
         out.push('\n');
     }
     out
-}
-
-/// 建立新技能規範（供 reflection agent 呼叫，預設未啟用）
-pub async fn tool_create_agent_skill(
-    db: &crate::db::surreal::SurrealDb,
-    vault_id: &str,
-    title: &str,
-    trigger: &str,
-    behavior: &str,
-    injection_mode: &str,
-    emb_url: Option<&str>,
-) -> String {
-    let skill_id = uuid::Uuid::new_v4().to_string();
-    let mode = if injection_mode == "active" { "active" } else { "passive" };
-    let client = reqwest::Client::new();
-    let trigger_embedding: Option<Vec<f32>> = if let Some(url) = emb_url {
-        let v = get_embedding(&client, url, trigger).await;
-        if v.is_empty() { None } else { Some(v) }
-    } else { None };
-
-    let result = db.query(
-        "INSERT INTO agent_skills \
-         (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
-          tool_calls, is_active, injection_mode, trigger_count, trigger_embedding, created_at) \
-         VALUES ($sid, $vid, 'reflection', $title, $trigger, $behavior, \
-                 [], false, $mode, 0, $emb, time::now())"
-    )
-    .bind(("sid", skill_id.clone()))
-    .bind(("vid", vault_id.to_string()))
-    .bind(("title", title.to_string()))
-    .bind(("trigger", trigger.to_string()))
-    .bind(("behavior", behavior.to_string()))
-    .bind(("mode", mode.to_string()))
-    .bind(("emb", trigger_embedding))
-    .await;
-
-    match result {
-        Ok(_)  => format!("✅ 技能「{}」已建立（未啟用，請至技能規範頁面審核）", title),
-        Err(e) => format!("❌ 建立失敗：{e}"),
-    }
 }
 
 /// 工具定義（OpenAI function calling 格式）
@@ -2315,375 +2210,6 @@ fn filter_vault_tools_by_names(names: &[String]) -> serde_json::Value {
     serde_json::Value::Array(filtered)
 }
 
-/// 將 vault_tools() 清單種入 agent_tools 表（冪等）。
-/// 有 emb_url 時同步計算 embedding；無則留 NULL，之後可補填。
-pub async fn seed_agent_tools(db: &SurrealDb, emb_url: Option<&str>) {
-    let tools_json = vault_tools();
-    let client = reqwest::Client::new();
-
-    let tools = match tools_json.as_array() {
-        Some(v) => v.clone(),
-        None => return,
-    };
-
-    for tool in &tools {
-        let func = &tool["function"];
-        let name = func["name"].as_str().unwrap_or("").to_string();
-        if name.is_empty() { continue; }
-        let description = func["description"].as_str().unwrap_or("").to_string();
-        let schema = serde_json::to_string(tool).unwrap_or_default();
-
-        // embedding（有伺服器時計算，失敗或無伺服器留 None）
-        let embedding: Option<Vec<f32>> = if let Some(url) = emb_url {
-            let emb = get_embedding(&client, url, &description).await;
-            if emb.is_empty() { None } else { Some(emb) }
-        } else {
-            None
-        };
-
-        // 用 name 作為固定 record ID（確保唯一且可以 UPSERT）
-        let _ = db.query(
-            "INSERT INTO agent_tools (tool_id, name, description, schema_json, is_active, is_builtin)
-             VALUES ($name, $name, $description, $schema_json, true, true)
-             ON DUPLICATE KEY UPDATE description = $description, schema_json = $schema_json;"
-        )
-        .bind(("name", name.clone()))
-        .bind(("description", description.clone()))
-        .bind(("schema_json", schema))
-        .await;
-
-        // 若有 embedding 且尚未設定，補填
-        if let Some(ref emb) = embedding {
-            let _ = db.query(
-                "UPDATE agent_tools SET embedding = $emb WHERE name = $name AND embedding = NONE;"
-            )
-            .bind(("emb", emb.clone()))
-            .bind(("name", name))
-            .await;
-        }
-    }
-}
-
-/// 為指定 vault 種入內建 skill（幂等）。
-/// 每個 skill 定義 trigger（用於 embedding 比對）和 tool_calls（工具過濾子集）。
-/// 使用 knowledge_item_id = "__builtin__" 標記，避免與使用者建立的 skill 混淆。
-pub async fn seed_agent_skills(db: &SurrealDb, vault_id: &str, emb_url: Option<&str>) {
-    // 明確設定 namespace / database（背景 task 不繼承 session 狀態）
-    if db.use_ns("notetreelm").use_db("main").await.is_err() { return; }
-    struct BuiltinSkill {
-        id: &'static str,
-        title: &'static str,
-        trigger: &'static str,
-        behavior: &'static str,
-        tools: &'static [&'static str],
-    }
-
-    let skills: &[BuiltinSkill] = &[
-        BuiltinSkill {
-            id: "builtin_open_note",
-            title: "打開/查看筆記",
-            trigger: "打開、開啟、open、打開筆記、開啟文件、跳轉到筆記、查看筆記、幫我看某篇、看一下某個、切換到筆記、show me the note、open note、display note、navigate to、go to note、讓我看看、帶我去、開那篇",
-            behavior: "步驟1：呼叫 search_vault，傳入使用者提到的筆記名稱作為 query（若包含 .md 副檔名請去除，例如「音頻處理.md」→ query 傳「音頻處理」），取得精確的檔案路徑（格式如 folder/note.md）。步驟2：用步驟1取得的路徑呼叫 open_note。步驟3：只回覆「已打開 [筆記名稱]」，絕對不要輸出筆記內容。",
-            tools: &["search_vault", "open_note"],
-        },
-        BuiltinSkill {
-            id: "builtin_edit_note",
-            title: "編輯/修改筆記",
-            trigger: "修改、編輯、更新、改、修改筆記、編輯文件、更新內容、改一下某篇、幫我改、修改某段、重寫某節、edit note、update note、revise、幫我更新、把這段改成、把內容換成、調整一下、改掉、替換內容、覆寫",
-            behavior: "步驟1：呼叫 search_vault 取得目標筆記的精確路徑。步驟2：呼叫 read_note 讀取完整現有內容。步驟3：呼叫 plan_announce 告知使用者將修改哪個檔案、改什麼內容，deferred_tools 填 update_note。步驟4：使用者確認後，將修改後的完整內容呼叫 update_note 寫入（path 使用步驟1的路徑，content 是完整新內容）。",
-            tools: &["search_vault", "read_note", "update_note", "plan_announce"],
-        },
-        BuiltinSkill {
-            id: "builtin_create_note",
-            title: "新增/建立筆記",
-            trigger: "建立、新增、寫、記、建立新筆記、寫一篇、新增文件、記錄下來、幫我新增、建立一份、寫個筆記、create note、new note、write a note、幫我寫、新建一個、記一下、存成筆記、建立文件、新增一篇",
-            behavior: "步驟1：若使用者未指定資料夾，先呼叫 list_structure（path 傳空字串）查看現有目錄結構，選擇合適的存放位置。步驟2：呼叫 plan_announce，告知使用者將建立的檔案路徑與內容摘要，deferred_tools 填 create_note。步驟3：使用者確認後，呼叫 create_note（path 格式為 folder/filename.md，content 為完整 Markdown 內容）。",
-            tools: &["list_structure", "create_note", "plan_announce"],
-        },
-        BuiltinSkill {
-            id: "builtin_append_note",
-            title: "追加/補充筆記內容",
-            trigger: "在筆記末尾加、補充內容、追加到筆記、把這個加進去、加到筆記裡、繼續寫到某篇、append to note、add to note、在後面加上、補上去、加一段、繼續記錄、把這段加進",
-            behavior: "步驟1：呼叫 search_vault 取得目標筆記的精確路徑。步驟2：呼叫 plan_announce，說明要追加的內容，deferred_tools 填 append_to_note。步驟3：使用者確認後，呼叫 append_to_note（path 使用步驟1的路徑，content 為要追加的文字，會自動加在末尾不覆蓋原有內容）。",
-            tools: &["search_vault", "append_to_note", "plan_announce"],
-        },
-        BuiltinSkill {
-            id: "builtin_search_note",
-            title: "搜尋/查詢筆記",
-            trigger: "搜尋、找、查、搜尋筆記、找資料、查某個主題、有沒有寫過、幫我找、找找看、查詢相關筆記、search notes、find note、look up、我有沒有寫、我有記過嗎、筆記裡有沒有、幫我查一下、找找有沒有、知識庫裡有",
-            behavior: "步驟1：呼叫 search_vault，query 填入使用者問題中的關鍵字，取得相關筆記清單與摘要。步驟2：根據搜尋結果回覆使用者找到哪些筆記。步驟3（可選）：若使用者需要看完整內容，用搜尋結果中的路徑呼叫 read_note；若使用者要打開筆記，呼叫 open_note。",
-            tools: &["search_vault", "read_note", "open_note"],
-        },
-        BuiltinSkill {
-            id: "builtin_summarize_notes",
-            title: "整理/摘要多篇筆記",
-            trigger: "整理筆記、摘要多篇、幫我歸納、整合資料、總結所有、彙整、整理一份、summarize notes、consolidate、幫我做個總結、把這些筆記整理、歸納重點、統整一下、彙整成一篇、做個摘要",
-            behavior: "步驟1：呼叫 list_notes_in_folder（folder 填目標資料夾路徑）或 search_vault 取得相關筆記清單。步驟2：對清單中每篇筆記呼叫 read_note 讀取完整內容（路徑從步驟1取得）。步驟3：彙整所有內容後輸出摘要。步驟4（可選）：若使用者要存成新筆記，呼叫 plan_announce 確認後再 create_note 建立。",
-            tools: &["search_vault", "list_notes_in_folder", "read_note", "create_note", "update_note", "plan_announce"],
-        },
-        BuiltinSkill {
-            id: "builtin_browse_structure",
-            title: "瀏覽資料夾結構",
-            trigger: "看資料夾、瀏覽結構、有什麼筆記、列出所有、Vault 裡有什麼、資料夾有哪些、目錄結構、list folders、show structure、browse vault、我有哪些資料夾、筆記庫裡有什麼、幫我看一下有什麼檔案、目前有哪些筆記",
-            behavior: "步驟1：呼叫 list_structure（path 傳空字串表示根目錄）取得整個 Vault 的資料夾與檔案樹狀結構。步驟2：若使用者要看特定資料夾的筆記列表，呼叫 list_notes_in_folder（folder 填資料夾名稱，例如 'projects' 或 'projects/web'）。步驟3：以清單格式回覆結構內容。",
-            tools: &["list_structure", "list_notes_in_folder"],
-        },
-        BuiltinSkill {
-            id: "builtin_delete_note",
-            title: "刪除筆記",
-            trigger: "刪除筆記、移除文件、把某篇刪掉、刪掉這個筆記、清除某個文件、delete note、remove note、trash note、把這篇刪了、幫我刪、不要那篇了、刪除這份文件、清掉",
-            behavior: "步驟1：呼叫 search_vault 確認要刪除的筆記精確路徑。步驟2：呼叫 plan_announce，明確告知使用者「將永久刪除 [路徑]，此操作不可復原」，deferred_tools 填 delete_note。步驟3：等使用者明確確認後才呼叫 delete_note（path 使用步驟1的路徑）。若使用者取消則不執行。",
-            tools: &["search_vault", "delete_note", "plan_announce"],
-        },
-        BuiltinSkill {
-            id: "builtin_move_note",
-            title: "移動/重新命名筆記",
-            trigger: "移動筆記、重新命名、換個位置、改檔名、搬移、把筆記移到、重命名、move note、rename note、relocate、把這篇搬到、改個名字、換個名稱、移到另一個資料夾、把文件移過去",
-            behavior: "步驟1：呼叫 search_vault 確認來源筆記的精確路徑（from 參數）。步驟2：與使用者確認目標路徑（to 參數，格式如 new_folder/new_name.md）。步驟3：呼叫 plan_announce 說明搬移計畫，deferred_tools 填 move_note。步驟4：使用者確認後呼叫 move_note（from 填步驟1路徑，to 填目標路徑）。",
-            tools: &["search_vault", "move_note", "plan_announce"],
-        },
-        BuiltinSkill {
-            id: "builtin_organize_folders",
-            title: "整理資料夾架構",
-            trigger: "建立資料夾、整理目錄、新增分類、重新整理資料夾、建立分類結構、規劃目錄、create folder、organize folders、新增一個資料夾、幫我建個目錄、整理一下分類、建立子目錄、新增分類夾",
-            behavior: "步驟1：呼叫 list_structure（path 傳空字串）了解現有資料夾結構。步驟2：根據使用者需求規劃新架構，呼叫 plan_announce 說明整體計畫。步驟3：使用者確認後，依序呼叫 create_folder 建立新資料夾（path 填新資料夾路徑）。步驟4（可選）：若需搬移現有筆記，呼叫 move_note 逐一搬移。",
-            tools: &["list_structure", "create_folder", "move_note", "plan_announce"],
-        },
-        BuiltinSkill {
-            id: "builtin_query_memory",
-            title: "查詢過去對話記憶",
-            trigger: "之前說過什麼、記憶查詢、歷史對話、上次討論、我之前提到、你記得嗎、過去的對話、recall memory、what did I say、上次我們聊、你還記得、之前提過、我跟你說過、先前的對話、記得我說的",
-            behavior: "步驟1：從使用者問題中提取關鍵字（人名、主題、事件等）。步驟2：呼叫 query_memory（keywords 填提取的關鍵字陣列，若無關鍵字則傳空陣列取最新記憶）。步驟3：根據回傳的記憶內容回答使用者。",
-            tools: &["query_memory"],
-        },
-        BuiltinSkill {
-            id: "builtin_web_search",
-            title: "網路搜尋/外部資訊",
-            trigger: "搜尋網路、查最新資訊、Google 一下、查新聞、找外部資料、搜網路、最新消息、web search、search the web、look it up online、查天氣、今天天氣、現在幾度、股價、最新匯率、即時資訊、查一下網路、幫我搜尋、去網路上找、外部資訊、最新動態、新聞、時事、最近發生什麼",
-            behavior: "步驟1：呼叫 web_search（query 填具體搜尋關鍵字），取得最新網路資訊。步驟2：根據搜尋結果摘要回答使用者。步驟3（可選）：若需要更深入分析或問題超出搜尋範圍，呼叫 call_external_ai（query 填完整問題）補充回答。",
-            tools: &["web_search", "call_external_ai"],
-        },
-        BuiltinSkill {
-            id: "builtin_create_skill",
-            title: "新增/建立技能規範",
-            trigger: "新增技能、建立技能、設計技能規範、幫我建立skill、新增skill、新建技能、create skill、design skill、建一個技能、幫我設計一個skill、新增一個agent技能、我要建立技能、建立技能規範、新增行為規則",
-            behavior: "步驟1：請使用者描述技能的目的（觸發情境、希望AI執行什麼操作）。步驟2：根據描述，組成以下欄位呼叫 create_agent_skill：title（技能標題）、trigger（觸發語境描述）、behavior（分步驟操作說明）、injection_mode（'passive' 或 'active'）。步驟3：呼叫成功後告知使用者技能已建立，並說明什麼情況下此技能會被觸發。",
-            tools: &["create_agent_skill"],
-        },
-        BuiltinSkill {
-            id: "builtin_suggest_note_cards",
-            title: "AI 建議筆記卡片",
-            trigger: "幫我建立筆記卡片、建立知識卡片、整理成卡片、幫我產生筆記卡片、建議筆記卡片、生成卡片、suggest note cards、create note card、知識卡片建議、幫我做成卡片、把這個整理成卡片、幫我萃取卡片、建立 concept 卡片、建立 procedure 卡片、建立 reference 卡片",
-            behavior: "步驟1：呼叫 search_vault 或 read_note 取得使用者指定的知識內容（若使用者已提供內容則跳過）。步驟2：分析內容，依 concept（概念定義）、procedure（操作步驟）、reference（參考資料）三種模板各生成 1 張筆記卡片建議，每張包含：標題、模板類型、完整 Markdown 內容（含 frontmatter status/tags）、建立理由。步驟3：呼叫 plan_announce 列出將建立的卡片清單，deferred_tools 填 create_note。步驟4：使用者確認後，逐一呼叫 create_note 將每張卡片寫入 Vault（路徑格式：cards/[標題].md）。",
-            tools: &["search_vault", "read_note", "create_note", "plan_announce"],
-        },
-        BuiltinSkill {
-            id: "builtin_schedule_task",
-            title: "排程/提醒任務",
-            trigger: "排程、設定提醒、定時任務、設定鬧鐘、幫我排程、提醒我、到時候提醒、設定時間、定時提醒、schedule、remind me、set reminder、set alarm、幫我設一個提醒、X點提醒我、明天提醒、每天提醒、固定時間、重複執行、定期通知、設定排程任務、每週提醒",
-            behavior: "步驟1：呼叫 get_current_datetime 取得現在時間（作為計算相對時間的基準）。步驟2：根據使用者描述確定：（a）任務描述 description、（b）執行時間 run_at（ISO 8601 格式，需含時區，例如 2026-03-22T09:00:00+08:00）、（c）若需重複則填 repeat_interval_seconds（秒數，如每天=86400、每週=604800，不重複則填 0）。步驟3：呼叫 schedule_task（description、run_at、repeat_interval_seconds）完成排程。步驟4：回覆使用者已排程的時間與任務內容。",
-            tools: &["get_current_datetime", "schedule_task"],
-        },
-        BuiltinSkill {
-            id: "builtin_save_knowledge",
-            title: "儲存知識/洞見到知識庫",
-            trigger: "儲存這個知識、把這個記下來、存成知識、記錄這個洞見、把這段存進知識庫、幫我歸納存檔、這個值得記錄、存到knowledge、儲存這次的結論、把這個整理成知識卡、save knowledge、compress to knowledge、知識壓縮、歸納成知識、把這個存起來、幫我保存這個見解",
-            behavior: "步驟1：分析對話內容，歸納核心知識點（若使用者有指定內容則直接使用）。步驟2：確定標題（簡潔，不超過 30 字）、內容（結構化 Markdown）、標籤（2-4 個相關主題詞）。步驟3：呼叫 compress_to_knowledge（title、content、tags）將知識存入 knowledge/ 資料夾。步驟4：告知使用者已儲存的路徑，並簡述儲存的主要知識點。",
-            tools: &["compress_to_knowledge", "find_similar_notes"],
-        },
-        BuiltinSkill {
-            id: "builtin_deep_research",
-            title: "深度研究整合（多篇筆記）",
-            trigger: "深度研究、整合多篇筆記、綜合分析、跨筆記整理、找出關聯、知識整合、comprehensive research、deep dive、幫我深入研究、把相關筆記都找出來整合、綜合所有相關資料、跨文件分析、全面整理、多篇整合摘要、相關筆記分析",
-            behavior: "步驟1：呼叫 search_vault（query 填研究主題）找出相關筆記清單。步驟2：呼叫 find_similar_notes（query 填研究主題，limit 填 8）補充向量語意相近的筆記。步驟3：合併兩個清單，去除重複，選出最相關的 5-8 篇。步驟4：呼叫 summarize_note_collection（paths 填選出的路徑陣列，query 填研究重點）生成整合摘要。步驟5：根據摘要回答使用者，並列出來源筆記路徑。",
-            tools: &["search_vault", "find_similar_notes", "summarize_note_collection", "read_note"],
-        },
-        BuiltinSkill {
-            id: "builtin_personal_insight",
-            title: "個人洞察與知識庫分析",
-            trigger: "分析我的知識庫、了解我的習慣、知識庫健康度、我的學習模式、分析我的筆記習慣、你了解我的偏好嗎、知識庫概況、vault analytics、analyze my vault、我有多少筆記、知識庫統計、個人化建議、了解我的學習習慣、幫我分析一下知識庫、我的知識圖譜",
-            behavior: "步驟1：呼叫 get_vault_stats 取得知識庫整體統計（筆記數、資料夾數、字數、最近修改）。步驟2：呼叫 distill_preferences 分析使用者偏好（從對話記憶萃取）。步驟3：根據統計與偏好，提供個人化洞察：（a）知識庫概況評估；（b）可能的盲點或未覆蓋領域；（c）改善建議（例如整理、分類、建立筆記等）。步驟4：若使用者想了解特定筆記的關聯，呼叫 get_note_backlinks 分析反向連結。",
-            tools: &["get_vault_stats", "distill_preferences", "get_note_backlinks", "find_similar_notes"],
-        },
-        BuiltinSkill {
-            id: "builtin_update_metadata",
-            title: "更新筆記屬性/標籤",
-            trigger: "更新標籤、修改屬性、加上標籤、改狀態、標記已完成、更新 frontmatter、add tag、update status、mark as done、幫我加個標籤、把這篇標記為、更新筆記的 tags、改一下 status、幫我更新屬性、修改 metadata、設定優先級",
-            behavior: "步驟1：若路徑不確定，呼叫 search_vault 取得目標筆記的精確路徑。步驟2：確認要更新的欄位（如 tags、status、priority、due_date 等）與新值。步驟3：呼叫 update_note_frontmatter（path 填精確路徑，fields 填要更新的鍵值對，例如 {\"status\": \"done\", \"tags\": [\"project\", \"archived\"]}）。步驟4：回覆使用者已更新的欄位與新值。",
-            tools: &["search_vault", "update_note_frontmatter"],
-        },
-        BuiltinSkill {
-            id: "builtin_knowledge_graph",
-            title: "探索知識圖譜關聯",
-            trigger: "哪些筆記連到這篇、反向連結、知識圖譜、找出關聯筆記、這篇被哪些筆記引用、backlinks、linked mentions、who links here、知識網絡、找出所有引用、筆記之間的關係、知識關聯圖、探索連結",
-            behavior: "步驟1：若路徑不確定，呼叫 search_vault 取得目標筆記的精確路徑。步驟2：呼叫 get_note_backlinks（path 填目標路徑）取得所有反向連結。步驟3：呼叫 extract_note_links（path 填目標路徑）取得出向連結。步驟4：呼叫 find_similar_notes（query 填目標筆記標題或主題）補充語意上相關但未明確連結的筆記。步驟5：整合回覆：（a）反向連結清單；（b）出向連結清單；（c）語意相關但未連結的筆記，並建議可用 link_notes 建立連結。",
-            tools: &["search_vault", "get_note_backlinks", "extract_note_links", "find_similar_notes", "link_notes"],
-        },
-        BuiltinSkill {
-            id: "builtin_tag_browse",
-            title: "以標籤瀏覽筆記",
-            trigger: "標籤是X的筆記、有tag X的筆記、找tag、按標籤查、search by tag、filter by tag、給我標籤X的、tag filter、以標籤篩選、顯示所有X標籤、標籤搜尋、有哪些筆記有這個標籤、找出有X tag的",
-            behavior: "步驟1：從使用者訊息中提取標籤名稱。步驟2：呼叫 search_by_tag（tag 填標籤名稱）取得符合的筆記列表。步驟3：回覆找到的筆記清單。步驟4（可選）：若使用者想看特定筆記的內容，呼叫 read_note 或 open_note。",
-            tools: &["search_by_tag", "read_note", "open_note"],
-        },
-        BuiltinSkill {
-            id: "builtin_task_extraction",
-            title: "提取待辦事項/任務清單",
-            trigger: "有什麼待辦、幫我整理TODO、列出所有待辦、找出action item、這資料夾有哪些任務、extract tasks、list todos、找出所有TODO、整理一下代辦事項、有哪些未完成的、把待辦列出來、任務清單、action items、check todos、pending tasks",
-            behavior: "步驟1：確認掃描範圍（單一筆記或整個資料夾）。若使用者指定筆記 → path 參數；若指定資料夾 → folder 參數；若未指定 → 先呼叫 list_structure 讓使用者選擇。步驟2：呼叫 extract_action_items（填入 path 或 folder）取得所有待辦事項。步驟3：以清單格式回覆，標示來源筆記。步驟4（可選）：若使用者想排程某個待辦，呼叫 get_current_datetime + schedule_task 完成排程。",
-            tools: &["extract_action_items", "list_structure", "get_current_datetime", "schedule_task"],
-        },
-        BuiltinSkill {
-            id: "builtin_vault_health",
-            title: "知識庫健康診斷",
-            trigger: "知識庫健康、診斷筆記庫、找孤立筆記、哪些筆記沒有連結、vault health、orphan notes、孤立筆記、知識庫問題、找出未連接的、沒被引用的筆記、孤兒筆記、診斷一下我的知識庫、幫我找出問題、知識庫整理診斷",
-            behavior: "步驟1：呼叫 get_vault_stats 取得知識庫概況（筆記數、字數等）。步驟2：呼叫 find_orphan_notes 找出所有沒有反向連結的孤立筆記。步驟3：整合報告：（a）知識庫概況；（b）孤立筆記清單；（c）建議行動（用 find_similar_notes 為每篇孤立筆記找相關筆記，再用 link_notes 建立連結）。步驟4（可選）：若使用者同意修復，對孤立筆記逐一呼叫 find_similar_notes，找到相關筆記後呼叫 link_notes 建立連結。",
-            tools: &["get_vault_stats", "find_orphan_notes", "find_similar_notes", "link_notes"],
-        },
-        BuiltinSkill {
-            id: "builtin_generate_index",
-            title: "生成資料夾目錄筆記（MOC）",
-            trigger: "幫我生成目錄、建立索引筆記、generate MOC、create index、幫我做一個索引、生成 Map of Contents、這個資料夾的目錄、建立目錄頁、資料夾索引、自動生成目錄、建立 MOC 筆記、index note、幫我整理一個目錄",
-            behavior: "步驟1：確認目標資料夾路徑（若使用者未指定，呼叫 list_structure 列出可選資料夾）。步驟2：（可選）詢問使用者是否要自訂輸出路徑，或使用預設的 {folder}/index.md。步驟3：呼叫 generate_moc（folder 填資料夾路徑，output_path 可選）生成 MOC 筆記。步驟4：告知使用者 MOC 已生成在哪個路徑，並簡述包含幾篇筆記。",
-            tools: &["list_structure", "generate_moc"],
-        },
-        BuiltinSkill {
-            id: "builtin_recent_activity",
-            title: "查看最近筆記活動",
-            trigger: "最近寫了什麼、這週修改了什麼、最近的筆記、recent notes、recently modified、最近幾天的筆記、最近活動、看看最近在做什麼、這幾天有什麼更新、最近有哪些變動、recent activity、我最近在研究什麼、昨天改了什麼",
-            behavior: "步驟1：呼叫 list_recent_notes（days 根據使用者說的時間範圍填入，預設 7；使用者說「昨天」填 1、「這週」填 7、「這個月」填 30）取得最近修改的筆記。步驟2：以清單格式回覆，包含筆記標題、路徑、修改時間、字數。步驟3（可選）：若使用者想深入了解某篇，呼叫 open_note 或 read_note。",
-            tools: &["list_recent_notes", "open_note", "read_note"],
-        },
-        BuiltinSkill {
-            id: "builtin_link_builder",
-            title: "建立筆記間連結",
-            trigger: "幫我把這兩篇筆記連起來、加一個連結到另一篇、在這篇筆記加入wiki連結、link two notes、create link、建立知識連結、把這篇連到那篇、在筆記裡加入參考連結、幫我建立連結、把A連到B、加上相關筆記連結、建立交叉連結",
-            behavior: "步驟1：確認 from_path（要加連結的筆記）和 to_path（要被連結的目標筆記）。若路徑不確定，分別呼叫 search_vault 取得精確路徑。步驟2（可選）：呼叫 extract_note_links（path 填 from_path）確認是否已有連結，避免重複。步驟3：呼叫 link_notes（from_path、to_path、section 可選）插入 [[wiki link]]。步驟4：回覆已建立連結的確認，並說明連結插入在哪個章節。",
-            tools: &["search_vault", "extract_note_links", "link_notes"],
-        },
-    ];
-
-    // 每次啟動刪除並重建所有 builtin skills，確保 tool_calls / behavior 始終是最新版
-    let _ = db.query("DELETE FROM agent_skills WHERE vault_id = $vid AND knowledge_item_id = '__builtin__'")
-        .bind(("vid", vault_id.to_string()))
-        .await;
-
-    let client = reqwest::Client::new();
-
-    for s in skills {
-        let tools_json: serde_json::Value = serde_json::Value::Array(
-            s.tools.iter().map(|t| serde_json::Value::String(t.to_string())).collect()
-        );
-
-        let trigger_embedding: Option<Vec<f32>> = if let Some(url) = emb_url {
-            let emb = get_embedding(&client, url, s.trigger).await;
-            if emb.is_empty() { None } else { Some(emb) }
-        } else {
-            None
-        };
-
-        let _ = db.query(
-            "INSERT INTO agent_skills \
-             (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
-              tool_calls, is_active, injection_mode, agent_scope, trigger_count, trigger_embedding, created_at) \
-             VALUES ($sid, $vid, '__builtin__', $title, $trigger, $behavior, \
-                     $tools, true, 'passive', 'all', 0, $emb, time::now())"
-        )
-        .bind(("sid", s.id.to_string()))
-        .bind(("vid", vault_id.to_string()))
-        .bind(("title", s.title.to_string()))
-        .bind(("trigger", s.trigger.to_string()))
-        .bind(("behavior", s.behavior.to_string()))
-        .bind(("tools", tools_json))
-        .bind(("emb", trigger_embedding))
-        .await;
-    }
-}
-
-/// 依查詢向量從 agent_tools 表找出最相關的 top_k 個工具。
-/// - 有 embedding 時：余弦相似度排序
-/// - 無 embedding 時：回傳全部 (fallback = vault_tools())
-/// 永遠包含 plan_announce 工具（寫入確認機制必需）。
-#[allow(dead_code)]
-pub async fn find_relevant_tools_for_query(
-    db: &SurrealDb,
-    query: &str,
-    emb_url: Option<&str>,
-    top_k: usize,
-) -> serde_json::Value {
-    // 必須永遠包含的工具（功能關鍵，不能被過濾掉）
-    const ALWAYS_INCLUDE: &[&str] = &["plan_announce"];
-
-    // ── 嘗試 embedding 相似度搜尋 ─────────────────────────────────
-    if let Some(url) = emb_url {
-        let client = reqwest::Client::new();
-        let query_emb = get_embedding(&client, url, query).await;
-        if !query_emb.is_empty() {
-            #[derive(serde::Deserialize)]
-            struct ToolRow {
-                name: String,
-                schema_json: String,
-                embedding: Option<Vec<f32>>,
-            }
-
-            let rows: Vec<ToolRow> = db
-                .query("SELECT name, schema_json, embedding FROM agent_tools WHERE is_active = true")
-                .await
-                .and_then(|mut r| r.take(0))
-                .unwrap_or_default();
-
-            // 只對有 embedding 的 row 計算分數
-            let mut scored: Vec<(f32, &ToolRow)> = rows
-                .iter()
-                .filter_map(|row| {
-                    row.embedding.as_ref().map(|emb| {
-                        (cosine_similarity(&query_emb, emb), row)
-                    })
-                })
-                .collect();
-
-            if !scored.is_empty() {
-                scored.sort_by(|a, b| {
-                    b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
-                });
-
-                let mut result: Vec<serde_json::Value> = Vec::new();
-                let mut included: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-
-                // 先加入必須工具
-                for row in &rows {
-                    if ALWAYS_INCLUDE.contains(&row.name.as_str()) {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&row.schema_json) {
-                            result.push(v);
-                            included.insert(row.name.clone());
-                        }
-                    }
-                }
-
-                // 再加入 top-K（略過已包含）
-                let mut count = 0;
-                for (_, row) in &scored {
-                    if count >= top_k { break; }
-                    if included.contains(&row.name) { continue; }
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&row.schema_json) {
-                        result.push(v);
-                        included.insert(row.name.clone());
-                        count += 1;
-                    }
-                }
-
-                if !result.is_empty() {
-                    return serde_json::Value::Array(result);
-                }
-            }
-        }
-    }
-
-    // ── Fallback：回傳全部工具 ─────────────────────────────────────
-    vault_tools()
-}
-
 /// 驗證相對路徑安全性（防止路徑穿越），返回絕對路徑
 pub(crate) fn resolve_vault_path(rel_path: &str, vault_path: &str) -> Result<PathBuf, String> {
     if rel_path.contains("..") {
@@ -2959,258 +2485,6 @@ fn filter_lines_by_comparison(content: &str, cmp: &Comparison) -> Vec<String> {
     matched
 }
 
-/// 全文搜索 Vault（SQLite FTS5 + vector fallback），支援比較條件過濾
-pub(crate) async fn tool_search_vault(query: &str, vault_db: &SurrealDb, vault_id: &str, sqlite: Option<&crate::db::sqlite::SqliteConn>, app: &AppHandle) -> String {
-    if query.trim().is_empty() {
-        return "請提供搜索關鍵字".to_string();
-    }
-
-    // 1. 清洗 query
-    let cleaned = clean_fts_query(query);
-    let (cmp, search_query) = parse_comparison(&cleaned);
-    let fts_query = {
-        let q = if search_query.trim().is_empty() { cleaned.clone() } else { search_query.trim().to_string() };
-        clean_fts_query(&q)
-    };
-
-    let _ = app.emit("llm:stderr", format!(
-        "[search] query: {:?} → fts: {:?} cmp: {}",
-        query, fts_query,
-        cmp.as_ref().map(|c| c.label()).unwrap_or_else(|| "無".to_string())
-    ));
-
-    // 2. 嘗試 chunk-based 搜尋（有 chunks 時使用）
-    #[derive(Deserialize)]
-    struct CountRow { count: i64 }
-    let mut cr = vault_db.query("SELECT count() AS count FROM chunks WHERE vault_id = $vid GROUP ALL")
-        .bind(("vid", vault_id.to_owned()))
-        .await.ok();
-    let chunk_count = cr.as_mut()
-        .and_then(|r| r.take::<Vec<CountRow>>(0).ok())
-        .and_then(|rows| rows.first().map(|r| r.count))
-        .unwrap_or(0);
-
-    if chunk_count > 0 && cmp.is_none() {
-        if let Ok(result) = search_chunks_with_graph(vault_db, vault_id, &fts_query, sqlite).await {
-            if !result.is_empty() {
-                return result;
-            }
-        }
-    }
-
-    // 3. Fallback：notes 全文搜尋（比較條件查詢 / chunk 為空時）
-    #[derive(Deserialize)]
-    struct NoteRow { path: String, title: String, status: Option<String> }
-    let mut resp = vault_db.query(
-        "SELECT path, title, status FROM notes WHERE vault_id = $vid AND (title @1@ $q OR content @2@ $q) ORDER BY search::score(1) + search::score(2) DESC LIMIT 15"
-    )
-    .bind(("vid", vault_id.to_owned()))
-    .bind(("q", fts_query.clone()))
-    .await;
-
-    match resp {
-        Err(e) => format!("搜索失敗：{}", e),
-        Ok(ref mut r) => {
-            let rows: Vec<NoteRow> = r.take(0).unwrap_or_default();
-            if rows.is_empty() {
-                return format!("未找到包含「{}」的筆記", fts_query);
-            }
-            let mut result_lines = Vec::new();
-            for row in &rows {
-                let path = &row.path;
-                let title = &row.title;
-                let status_badge = match row.status.as_deref() {
-                    Some("verified") => " ✓",
-                    _ => "",
-                };
-
-                // Fetch content for snippet/comparison
-                #[derive(Deserialize)]
-                struct ContentRow { content: String }
-                let mut cr2 = vault_db.query(
-                    "SELECT content FROM notes WHERE vault_id = $vid AND path = $path LIMIT 1"
-                )
-                .bind(("vid", vault_id.to_owned()))
-                .bind(("path", path.clone()))
-                .await.ok();
-                let content: Option<String> = cr2.as_mut()
-                    .and_then(|r| r.take::<Vec<ContentRow>>(0).ok())
-                    .and_then(|rows| rows.into_iter().next().map(|r| r.content));
-
-                let snippet = if let Some(ref c) = content {
-                    if let Some(ref cmp_ref) = cmp {
-                        let matched = filter_lines_by_comparison(c, cmp_ref);
-                        if matched.is_empty() { continue; }
-                        format!("（符合條件的行）\n{}", matched.join("\n"))
-                    } else {
-                        let q = fts_query.to_lowercase();
-                        let cl = c.to_lowercase();
-                        if let Some(pos) = cl.find(&q) {
-                            let mut start = pos.saturating_sub(60);
-                            while start > 0 && !c.is_char_boundary(start) { start -= 1; }
-                            let mut end = (pos + q.len() + 100).min(c.len());
-                            while end < c.len() && !c.is_char_boundary(end) { end += 1; }
-                            format!("...{}...", c[start..end].trim())
-                        } else {
-                            c.chars().take(120).collect::<String>() + "..."
-                        }
-                    }
-                } else { String::new() };
-
-                result_lines.push(format!("- **{}{}** ({})\n  {}", title, status_badge, path, snippet));
-            }
-            if result_lines.is_empty() {
-                format!("在「{}」相關筆記中，未找到數值{}的項目", fts_query,
-                    cmp.as_ref().map(|c| c.label()).unwrap_or_default())
-            } else {
-                let header = if let Some(ref c) = cmp {
-                    format!("搜索「{}」，篩選數值{}，找到 {} 筆：", fts_query, c.label(), result_lines.len())
-                } else {
-                    format!("找到 {} 篇相關筆記：", result_lines.len())
-                };
-                format!("{}\n{}", header, result_lines.join("\n"))
-            }
-        }
-    }
-}
-
-/// Chunk-based search + 1-hop graph expansion
-async fn search_chunks_with_graph(vault_db: &SurrealDb, vault_id: &str, fts_query: &str, sqlite: Option<&crate::db::sqlite::SqliteConn>) -> Result<String, crate::error::AppError> {
-    // ── Step 1: SQLite FTS5 on chunks ─────────────────────────────────
-    #[derive(Deserialize)]
-    struct ChunkRow { file_path: String, section: String, content: String }
-
-    let chunk_rows: Vec<ChunkRow> = if let Some(sq) = sqlite {
-        let sq = sq.clone();
-        let q = fts_query.to_owned();
-        let vid = vault_id.to_owned();
-        tokio::task::spawn_blocking(move || {
-            match sq.lock() {
-                Ok(conn) => crate::db::sqlite::fts_search(&conn, &vid, &q, false, 10)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|r| ChunkRow { file_path: r.file_path, section: r.section, content: r.content })
-                    .collect(),
-                Err(_) => vec![],
-            }
-        }).await.unwrap_or_default()
-    } else {
-        // Fallback: SurrealDB string contains (no BM25 index)
-        vault_db.query(
-            "SELECT file_path, section, content FROM chunks
-             WHERE vault_id = $vid
-               AND string::contains(string::lowercase(content), string::lowercase($q))
-             LIMIT 10"
-        )
-        .bind(("vid", vault_id.to_owned()))
-        .bind(("q", fts_query.to_owned()))
-        .await
-        .ok()
-        .and_then(|mut r| r.take(0).ok())
-        .unwrap_or_default()
-    };
-
-    if chunk_rows.is_empty() {
-        return Ok(String::new());
-    }
-
-    // ── Step 2: Collect matched file paths ─────────────────────────────
-    let matched_paths: Vec<String> = chunk_rows
-        .iter()
-        .map(|r| r.file_path.clone())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-
-    // ── Step 3: Graph expansion — find 1-hop linked files ───────────────
-    let mut expanded_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for path in &matched_paths {
-        // Outgoing links
-        #[derive(Deserialize)] struct TargetRow { target_path: Option<String> }
-        let mut out_resp = vault_db.query(
-            "SELECT target_path FROM links WHERE vault_id = $vid AND source_path = $path AND target_path != NONE AND link_type = 'wikilink'"
-        )
-        .bind(("vid", vault_id.to_owned()))
-        .bind(("path", path.clone()))
-        .await.unwrap_or_else(|_| unreachable!());
-        let out_rows: Vec<TargetRow> = out_resp.take(0).unwrap_or_default();
-
-        // Incoming links
-        #[derive(Deserialize)] struct SourceRow { source_path: String }
-        let mut inc_resp = vault_db.query(
-            "SELECT source_path FROM links WHERE vault_id = $vid AND target_path = $path AND link_type = 'wikilink'"
-        )
-        .bind(("vid", vault_id.to_owned()))
-        .bind(("path", path.clone()))
-        .await.unwrap_or_else(|_| unreachable!());
-        let inc_rows: Vec<SourceRow> = inc_resp.take(0).unwrap_or_default();
-
-        for r in out_rows {
-            if let Some(p) = r.target_path {
-                if !matched_paths.contains(&p) { expanded_paths.insert(p); }
-            }
-        }
-        for r in inc_rows {
-            if !matched_paths.contains(&r.source_path) { expanded_paths.insert(r.source_path); }
-        }
-    }
-
-    // ── Step 4: Fetch titles for all relevant files ─────────────────────
-    let all_paths: Vec<String> = matched_paths.iter().cloned()
-        .chain(expanded_paths.iter().cloned()).collect();
-
-    let mut titles: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut statuses: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for path in &all_paths {
-        #[derive(Deserialize)] struct TitleRow { title: String, status: Option<String> }
-        let mut tr = vault_db.query(
-            "SELECT title, status FROM notes WHERE vault_id = $vid AND path = $path LIMIT 1"
-        )
-        .bind(("vid", vault_id.to_owned()))
-        .bind(("path", path.clone()))
-        .await.ok();
-        if let Some(t) = tr.as_mut()
-            .and_then(|r| r.take::<Vec<TitleRow>>(0).ok())
-            .and_then(|rows| rows.into_iter().next())
-        {
-            titles.insert(path.clone(), t.title);
-            if let Some(s) = t.status { statuses.insert(path.clone(), s); }
-        }
-    }
-
-    // ── Step 5: Build result ────────────────────────────────────────────
-    let mut result_lines = Vec::new();
-
-    for row in &chunk_rows {
-        let path = &row.file_path;
-        let section = &row.section;
-        let content = &row.content;
-        let title = titles.get(path).cloned().unwrap_or_else(|| path.clone());
-        let status_badge = match statuses.get(path).map(|s| s.as_str()) {
-            Some("verified") => " ✓",
-            _ => "",
-        };
-
-        let snippet: String = content.chars().take(200).collect();
-        let section_label = if section.is_empty() { String::new() } else { format!(" § {}", section) };
-        result_lines.push(format!("- **{}{}{}** ({})\n  {}…", title, status_badge, section_label, path, snippet.trim()));
-    }
-
-    if !expanded_paths.is_empty() {
-        result_lines.push(String::from("\n📎 相關連結筆記（透過 wikilink 擴展）："));
-        for path in &expanded_paths {
-            let title = titles.get(path).cloned().unwrap_or_else(|| path.clone());
-            let status_badge = match statuses.get(path).map(|s| s.as_str()) {
-                Some("verified") => " ✓",
-                _ => "",
-            };
-            result_lines.push(format!("- **{}{}** ({})", title, status_badge, path));
-        }
-    }
-
-    Ok(format!("找到 {} 個相關段落：\n{}", chunk_rows.len(), result_lines.join("\n")))
-}
-
 // ── Frontmatter helpers ────────────────────────────────────────────────────
 
 /// Inject `status: draft` + `created_by: ai` into frontmatter if no `status` field yet.
@@ -3272,7 +2546,7 @@ pub(crate) async fn tool_create_note(
     rel_path: &str,
     content: &str,
     vault_path: &str,
-    db_ctx: Option<(SurrealDb, String)>,
+    _db_ctx: Option<()>,
 ) -> String {
     let abs_path = match resolve_vault_path(rel_path, vault_path) {
         Ok(p) => p,
@@ -3285,33 +2559,6 @@ pub(crate) async fn tool_create_note(
     if let Err(e) = tokio::fs::write(&abs_path, &final_content).await {
         return format!("建立失敗：{}", e);
     }
-    // 同步到 notes table
-    if let Some((db, vault_id)) = db_ctx {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let now_dt = surrealdb::sql::Datetime::from(
-            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms).unwrap_or_default()
-        );
-        let title = {
-            let first = final_content.lines().find(|l| !l.trim().is_empty() && !l.starts_with("---") && !l.contains(':'))
-                .unwrap_or(rel_path);
-            first.trim_start_matches('#').trim().to_string()
-        };
-        let wc = final_content.split_whitespace().count() as i64;
-        let checksum = format!("{:x}", sha2::Sha256::digest(final_content.as_bytes()));
-        let _ = db.query(
-            "INSERT INTO notes (vault_id, path, title, content, status, word_count, created_at, modified_at, checksum) \
-             VALUES ($vid, $path, $title, $content, 'draft', $wc, $now, $now, $cs) \
-             ON DUPLICATE KEY UPDATE title = $title, content = $content, status = 'draft', word_count = $wc, modified_at = $now, checksum = $cs"
-        )
-        .bind(("vid", vault_id.clone()))
-        .bind(("path", rel_path.to_owned()))
-        .bind(("title", title))
-        .bind(("content", final_content.clone()))
-        .bind(("wc", wc))
-        .bind(("now", now_dt))
-        .bind(("cs", checksum))
-        .await;
-    }
     format!("✅ 已建立筆記：{}", rel_path)
 }
 
@@ -3320,7 +2567,7 @@ pub(crate) async fn tool_update_note(
     rel_path: &str,
     content: &str,
     vault_path: &str,
-    db_ctx: Option<(SurrealDb, String)>,
+    _db_ctx: Option<()>,
 ) -> String {
     let abs_path = match resolve_vault_path(rel_path, vault_path) {
         Ok(p) => p,
@@ -3329,32 +2576,6 @@ pub(crate) async fn tool_update_note(
     let final_content = inject_ai_frontmatter(content);
     if let Err(e) = tokio::fs::write(&abs_path, &final_content).await {
         return format!("更新失敗：{}", e);
-    }
-    // 同步到 notes table（AI 修改過的筆記重置為 draft，需重新驗證）
-    if let Some((db, vault_id)) = db_ctx {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let now_dt = surrealdb::sql::Datetime::from(
-            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms).unwrap_or_default()
-        );
-        let title = {
-            let first = final_content.lines().find(|l| !l.trim().is_empty() && !l.starts_with("---") && !l.contains(':'))
-                .unwrap_or(rel_path);
-            first.trim_start_matches('#').trim().to_string()
-        };
-        let wc = final_content.split_whitespace().count() as i64;
-        let checksum = format!("{:x}", sha2::Sha256::digest(final_content.as_bytes()));
-        let _ = db.query(
-            "UPDATE notes SET content = $content, title = $title, status = 'draft', word_count = $wc, modified_at = $now, checksum = $cs \
-             WHERE vault_id = $vid AND path = $path"
-        )
-        .bind(("content", final_content.clone()))
-        .bind(("title", title))
-        .bind(("wc", wc))
-        .bind(("now", now_dt))
-        .bind(("cs", checksum))
-        .bind(("vid", vault_id))
-        .bind(("path", rel_path.to_owned()))
-        .await;
     }
     format!("✅ 已更新筆記：{}", rel_path)
 }
@@ -3402,63 +2623,23 @@ pub async fn set_note_status(
         let updated = set_frontmatter_key(&content, "status", &status);
         tokio::fs::write(abs_path, &updated).await
             .map_err(|e| AppError::AI(format!("Write failed: {}", e)))?;
-        // Sync to notes table
-        let _ = state.db.query(
-            "UPDATE notes SET content = $content WHERE vault_id = $vid AND path = $path"
-        )
-        .bind(("content", updated.clone()))
-        .bind(("vid", vault_id.clone()))
-        .bind(("path", path.clone()))
-        .await;
+        // Sync updated note to daemon (no file watcher in daemon)
+        {
+            let token = state.get_auth_token().await;
+            let tok: Option<&str> = if token.is_empty() { None } else { Some(token.as_str()) };
+            let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
+                &state.http_client,
+                &format!("/vaults/{}/notes", urlencoding::encode(&vault_id)),
+                &serde_json::json!({"path": path, "content": updated.clone()}),
+                tok,
+            ).await;
+        }
         updated
     } else {
-        // KB import page — read/write content_md in import_pages
-        #[derive(serde::Deserialize)]
-        struct ContentRow { content_md: Option<String> }
-        let mut resp = state.db.query(
-            "SELECT content_md FROM import_pages WHERE vault_id = $vid AND note_path = $path LIMIT 1"
-        )
-        .bind(("vid", vault_id.clone()))
-        .bind(("path", path.clone()))
-        .await
-        .map_err(|e| AppError::AI(format!("DB read failed: {}", e)))?;
-        let rows: Vec<ContentRow> = resp.take(0).unwrap_or_default();
-        let content = rows.into_iter().next()
-            .and_then(|r| r.content_md)
-            .unwrap_or_else(|| format!("---\nstatus: {}\n---\n\n", status));
-        let updated = set_frontmatter_key(&content, "status", &status);
-        // Write back to import_pages
-        let _ = state.db.query(
-            "UPDATE import_pages SET content_md = $content WHERE vault_id = $vid AND note_path = $path"
-        )
-        .bind(("content", updated.clone()))
-        .bind(("vid", vault_id.clone()))
-        .bind(("path", path.clone()))
-        .await;
-        updated
+        // KB import page — no DB, just return status frontmatter
+        format!("---\nstatus: {}\n---\n\n", status)
     };
-
-    // Re-upsert chunks（確保 chunks 存在，並帶正確 status）
-    {
-        let now_ms = chrono::Local::now().timestamp_millis();
-        let chunks = crate::vault::chunker::chunk_note(&path, &new_content, now_ms);
-        let emb_url: Option<String> = {
-            let port = *state.embedding_actual_port.lock().await;
-            port.map(|p| format!("http://127.0.0.1:{}", p))
-        };
-        let _ = crate::vault::chunker::upsert_chunks(&state.db, Some(&state.sqlite), &vault_id, &chunks, emb_url.as_deref()).await;
-    }
-    // 若設為 verified，記錄 reviewed_at 時間戳
-    if status == "verified" {
-        let now_ms = chrono::Local::now().timestamp_millis();
-        let _ = state.db.query(
-            "UPDATE chunks SET reviewed_at = $ts WHERE vault_id = $vid AND file_path = $fp"
-        )
-        .bind(("ts", now_ms))
-        .bind(("vid", vault_id))
-        .bind(("fp", path))
-        .await;
-    }
+    // chunk upsert handled by daemon on /notes upsert above
     Ok(())
 }
 
@@ -3506,9 +2687,7 @@ pub(crate) fn detect_tool_calls(
 async fn execute_vault_tool(
     name: &str,
     args: &serde_json::Value,
-    vault_db: Option<(&SurrealDb, &str)>,
     vault_path: &str,
-    sqlite: Option<&crate::db::sqlite::SqliteConn>,
     app: &AppHandle,
     ext_config: &ExtAiConfig,
 ) -> String {
@@ -3524,9 +2703,27 @@ async fn execute_vault_tool(
     match name {
         "search_vault" => {
             let query = args["query"].as_str().unwrap_or("");
-            match vault_db {
-                Some((db, vid)) => tool_search_vault(query, db, vid, sqlite, app).await,
-                None => "Vault 資料庫未就緒".to_string(),
+            let state = app.state::<crate::state::AppState>();
+            let token = state.get_auth_token().await;
+            let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+            let vault_id = state.get_vault_uuid().await;
+            if vault_id.is_empty() || query.is_empty() {
+                return "搜尋失敗：未設定 Vault 或查詢為空".to_string();
+            }
+            let url = format!("/vaults/{}/search?q={}", urlencoding::encode(&vault_id), urlencoding::encode(query));
+            match crate::api_client::daemon_get::<serde_json::Value>(&state.http_client, &url, tok).await {
+                Ok(results) => {
+                    let arr = results.as_array().cloned().unwrap_or_default();
+                    if arr.is_empty() {
+                        format!("搜尋「{}」：找不到相關筆記。", query)
+                    } else {
+                        let lines: Vec<String> = arr.iter().take(5).map(|r| {
+                            format!("- **{}** ({})", r["title"].as_str().unwrap_or(""), r["path"].as_str().unwrap_or(""))
+                        }).collect();
+                        format!("搜尋「{}」結果：\n{}", query, lines.join("\n"))
+                    }
+                }
+                Err(_) => format!("搜尋「{}」失敗，請稍後再試。", query),
             }
         }
         "list_structure" => {
@@ -3540,29 +2737,103 @@ async fn execute_vault_tool(
         "create_note" => {
             let path = ensure_md(args["path"].as_str().unwrap_or(""));
             let content = args["content"].as_str().unwrap_or("");
-            let db_ctx = vault_db.map(|(db, vid)| (db.clone(), vid.to_owned()));
-            tool_create_note(&path, content, vault_path, db_ctx).await
+            let result = tool_create_note(&path, content, vault_path, None).await;
+            // Sync to daemon after filesystem write
+            {
+                let st = app.state::<crate::state::AppState>();
+                let vault_id = st.get_vault_uuid().await;
+                let token = st.get_auth_token().await;
+                let tok: Option<&str> = if token.is_empty() { None } else { Some(token.as_str()) };
+                if !vault_id.is_empty() && !path.is_empty() {
+                    let abs = std::path::PathBuf::from(vault_path).join(&path);
+                    if let Ok(c) = tokio::fs::read_to_string(&abs).await {
+                        let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
+                            &st.http_client,
+                            &format!("/vaults/{}/notes", urlencoding::encode(&vault_id)),
+                            &serde_json::json!({"path": path, "content": c}),
+                            tok,
+                        ).await;
+                    }
+                }
+            }
+            result
         }
         "update_note" => {
             let path = ensure_md(args["path"].as_str().unwrap_or(""));
             let content = args["content"].as_str().unwrap_or("");
-            let db_ctx = vault_db.map(|(db, vid)| (db.clone(), vid.to_owned()));
-            tool_update_note(&path, content, vault_path, db_ctx).await
+            let result = tool_update_note(&path, content, vault_path, None).await;
+            // Sync to daemon after filesystem write
+            {
+                let st = app.state::<crate::state::AppState>();
+                let vault_id = st.get_vault_uuid().await;
+                let token = st.get_auth_token().await;
+                let tok: Option<&str> = if token.is_empty() { None } else { Some(token.as_str()) };
+                if !vault_id.is_empty() && !path.is_empty() {
+                    let abs = std::path::PathBuf::from(vault_path).join(&path);
+                    if let Ok(c) = tokio::fs::read_to_string(&abs).await {
+                        let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
+                            &st.http_client,
+                            &format!("/vaults/{}/notes", urlencoding::encode(&vault_id)),
+                            &serde_json::json!({"path": path, "content": c}),
+                            tok,
+                        ).await;
+                    }
+                }
+            }
+            result
         }
         "create_folder" => {
             let path = args["path"].as_str().unwrap_or("");
-            tool_create_folder(path, vault_path).await
+            let result = tool_create_folder(path, vault_path).await;
+            // Trigger vault rescan so daemon indexes any new structure
+            {
+                let st = app.state::<crate::state::AppState>();
+                let vault_id = st.get_vault_uuid().await;
+                let token = st.get_auth_token().await;
+                let tok: Option<&str> = if token.is_empty() { None } else { Some(token.as_str()) };
+                if !vault_id.is_empty() {
+                    let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
+                        &st.http_client,
+                        &format!("/vaults/{}/scan", urlencoding::encode(&vault_id)),
+                        &serde_json::json!({}),
+                        tok,
+                    ).await;
+                }
+            }
+            result
         }
         "query_memory" => {
-            let keywords: Vec<String> = args["keywords"]
-                .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
-            let since = args["since"].as_str().map(String::from);
-            let limit = args["limit"].as_u64().map(|v| v as usize);
-            match vault_db {
-                Some((db, vid)) => tool_query_memory(keywords, since, limit, db, vid, None).await,
-                None => "Vault 資料庫未就緒".to_string(),
+            let keywords_val = &args["keywords"];
+            let keywords: Vec<String> = if let Some(arr) = keywords_val.as_array() {
+                arr.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect()
+            } else if let Some(s) = keywords_val.as_str() {
+                vec![s.to_string()]
+            } else {
+                vec![]
+            };
+            let limit = args["limit"].as_u64().unwrap_or(5).min(20);
+            let state = app.state::<crate::state::AppState>();
+            let token = state.get_auth_token().await;
+            let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+            let vault_id = state.get_vault_uuid().await;
+            if vault_id.is_empty() {
+                return "記憶查詢失敗：未設定 Vault".to_string();
+            }
+            let kw_param = urlencoding::encode(&keywords.join(",")).to_string();
+            let url = format!("/vaults/{}/memory/query?keywords={}&limit={}", urlencoding::encode(&vault_id), kw_param, limit);
+            match crate::api_client::daemon_get::<serde_json::Value>(&state.http_client, &url, tok).await {
+                Ok(results) => {
+                    let arr = results.as_array().cloned().unwrap_or_default();
+                    if arr.is_empty() {
+                        "記憶查詢：找不到相關記憶。".to_string()
+                    } else {
+                        let lines: Vec<String> = arr.iter().take(5).map(|r| {
+                            format!("- **{}** — {}", r["title"].as_str().unwrap_or(""), r["snippet"].as_str().unwrap_or(""))
+                        }).collect();
+                        format!("記憶查詢結果：\n{}", lines.join("\n"))
+                    }
+                }
+                Err(_) => "記憶查詢失敗，請稍後再試。".to_string(),
             }
         }
         "open_note" => {
@@ -3689,8 +2960,6 @@ pub async fn run_tool_pipeline(
 
     let session_id = Uuid::new_v4().to_string();
     let vault_path = state.get_vault_path().await;
-    let vault_id_opt = state.get_vault_id().await.ok();
-    let vault_db = state.db.clone();
 
     let all_tool_names: Vec<&str> = steps.iter().map(|s| s.name.as_str()).collect();
 
@@ -3704,11 +2973,12 @@ pub async fn run_tool_pipeline(
     // 只有 call_external_ai 需要 ext_config，避免不必要的 keychain 存取
     let needs_ext = steps.iter().any(|s| s.name == "call_external_ai");
     let ext_config = if needs_ext {
-        let db = &state.db;
-        let ext_provider = get_cached_setting(&state.settings_cache, db, "ai_provider", "").await;
-        let ext_base_url = get_cached_setting(&state.settings_cache, db, "ai_base_url", "https://api.openai.com/v1").await;
-        let ext_model = get_cached_setting(&state.settings_cache, db, "ai_model", "gpt-4o").await;
-        let ext_api_key = read_api_key(&state.api_key_cache, db, &ext_provider).await;
+        let tok_ec = state.get_auth_token().await;
+        let tok_ec_ref = if tok_ec.is_empty() { None } else { Some(tok_ec.as_str()) };
+        let ext_provider = get_cached_setting(&state.settings_cache, &state.http_client, tok_ec_ref, "ai_provider", "").await;
+        let ext_base_url = get_cached_setting(&state.settings_cache, &state.http_client, tok_ec_ref, "ai_base_url", "https://api.openai.com/v1").await;
+        let ext_model = get_cached_setting(&state.settings_cache, &state.http_client, tok_ec_ref, "ai_model", "gpt-4o").await;
+        let ext_api_key = read_api_key(&state.api_key_cache, &state.http_client, tok_ec_ref, &ext_provider).await;
         ExtAiConfig { provider: ext_provider, base_url: ext_base_url, model: ext_model, api_key: ext_api_key }
     } else {
         ExtAiConfig { provider: String::new(), base_url: String::new(), model: String::new(), api_key: String::new() }
@@ -3736,14 +3006,11 @@ pub async fn run_tool_pipeline(
             continue;
         }
 
-        let vault_db_ref = vault_id_opt.as_deref().map(|vid| (&vault_db, vid));
         let start = std::time::Instant::now();
         let output = execute_vault_tool(
             &step.name,
             &step.args,
-            vault_db_ref,
             &vault_path,
-            Some(&state.sqlite),
             &app,
             &ext_config,
         ).await;
@@ -3813,8 +3080,6 @@ pub async fn test_vault_tool(
 
     let session_id = Uuid::new_v4().to_string();
     let vault_path = state.get_vault_path().await;
-    let db = state.db.clone();
-    let vault_id_opt = state.get_vault_id().await.ok();
 
     // ── Emit prepare ─────────────────────────────────────────────────────────
     let _ = app.emit("agent:tx_debug", serde_json::json!({
@@ -3825,10 +3090,12 @@ pub async fn test_vault_tool(
 
     // Only build ext_config for call_external_ai — other tools ignore it entirely.
     let ext_config = if tool_name == "call_external_ai" {
-        let ext_provider = get_cached_setting(&state.settings_cache, &db, "ai_provider", "").await;
-        let ext_base_url = get_cached_setting(&state.settings_cache, &db, "ai_base_url", "https://api.openai.com/v1").await;
-        let ext_model = get_cached_setting(&state.settings_cache, &db, "ai_model", "gpt-4o").await;
-        let ext_api_key = read_api_key(&state.api_key_cache, &db, &ext_provider).await;
+        let tok_ec2 = state.get_auth_token().await;
+        let tok_ec2_ref = if tok_ec2.is_empty() { None } else { Some(tok_ec2.as_str()) };
+        let ext_provider = get_cached_setting(&state.settings_cache, &state.http_client, tok_ec2_ref, "ai_provider", "").await;
+        let ext_base_url = get_cached_setting(&state.settings_cache, &state.http_client, tok_ec2_ref, "ai_base_url", "https://api.openai.com/v1").await;
+        let ext_model = get_cached_setting(&state.settings_cache, &state.http_client, tok_ec2_ref, "ai_model", "gpt-4o").await;
+        let ext_api_key = read_api_key(&state.api_key_cache, &state.http_client, tok_ec2_ref, &ext_provider).await;
         ExtAiConfig { provider: ext_provider, base_url: ext_base_url, model: ext_model, api_key: ext_api_key }
     } else {
         ExtAiConfig { provider: String::new(), base_url: String::new(), model: String::new(), api_key: String::new() }
@@ -3837,9 +3104,7 @@ pub async fn test_vault_tool(
     let result = execute_vault_tool(
         &tool_name,
         &args,
-        vault_id_opt.as_deref().map(|vid| (&db, vid)),
         &vault_path,
-        Some(&state.sqlite),
         &app,
         &ext_config,
     ).await;
@@ -3866,8 +3131,6 @@ pub async fn test_vault_tool(
     Ok(result)
 }
 
-// ── Agent Skill Pre-pass ──────────────────────────────────────────────────────
-
 /// 偵測回覆是否包含可重用的結構化回答框架（bottom-up skill 歸納觸發條件）
 fn detect_response_framework(text: &str) -> bool {
     // 含有編號步驟（1. 2. 3. 或 ①②③）
@@ -3882,194 +3145,52 @@ fn detect_response_framework(text: &str) -> bool {
     text.len() > 300 && (has_numbered || has_sequential || has_framework_kw)
 }
 
-/// Skill 記錄（輕量版，只含 pre-pass 所需欄位）
-#[derive(Deserialize)]
-struct ActiveSkillRow {
-    skill_id: String,
-    title: String,
-    trigger: String,
-    behavior: String,
-    #[serde(default)]
-    tool_calls: Vec<String>,
-    #[allow(dead_code)]
-    #[serde(default = "passive_str")]
-    injection_mode: String,
-    #[serde(default = "scope_all_str")]
-    agent_scope: String,
-}
-
-fn passive_str() -> String { "passive".to_string() }
-fn scope_all_str() -> String { "all".to_string() }
-
-/// 取得所有 injection_mode = 'active' 的啟用技能（永遠注入，不做 embedding 比對）。
-/// `caller_scope` 為 "main" / "search" / "write" / "research" / "memory"；
-/// 只回傳 agent_scope = 'all' 或 agent_scope = caller_scope 的技能。
-async fn fetch_always_on_skills(
-    db: &surrealdb::Surreal<surrealdb::engine::local::Db>,
-    vault_id: &str,
-    caller_scope: &str,
-) -> Vec<ActiveSkillRow> {
-    let mut resp = db.query(
-        "SELECT skill_id, title, trigger, behavior, tool_calls OR [] AS tool_calls, injection_mode, \
-                agent_scope OR 'all' AS agent_scope \
-         FROM agent_skills \
-         WHERE vault_id = $vid AND is_active = true AND injection_mode = 'active' \
-           AND (agent_scope = 'all' OR agent_scope = NONE OR agent_scope = $scope) \
-         ORDER BY created_at ASC"
-    )
-    .bind(("vid", vault_id.to_string()))
-    .bind(("scope", caller_scope.to_string()))
-    .await.ok();
-    resp.as_mut()
-        .and_then(|r| r.take::<Vec<ActiveSkillRow>>(0).ok())
-        .unwrap_or_default()
-}
-
-/// query 關鍵字命中技能的觸發條件（、, 分隔）
-fn keyword_matches_skill(query: &str, trigger: &str) -> bool {
-    trigger.split(['、', ',', '，']).any(|kw| {
-        let kw = kw.trim();
-        !kw.is_empty() && query.contains(kw)
-    })
-}
-
-/// 向量搜尋相似度 > SKILL_THRESHOLD 的 passive skills；
-/// 若 trigger_embedding 為 None，fallback 到關鍵字 contains 匹配。
-async fn search_passive_skills(
-    db: &surrealdb::Surreal<surrealdb::engine::local::Db>,
-    vault_id: &str,
-    query: &str,
-    query_embedding: &[f32],
-    caller_scope: &str,
-) -> Vec<ActiveSkillRow> {
-    const SKILL_THRESHOLD: f64 = 0.65;
-
-    // 向量搜尋（有 embedding 的 passive skills）
-    let mut vector_results: Vec<ActiveSkillRow> = if !query_embedding.is_empty() {
-        let emb_val: Vec<f64> = query_embedding.iter().map(|&x| x as f64).collect();
-        let mut resp = db.query(
-            "SELECT skill_id, title, trigger, behavior, tool_calls OR [] AS tool_calls, injection_mode, \
-                    agent_scope OR 'all' AS agent_scope \
-             FROM agent_skills \
-             WHERE vault_id = $vid AND is_active = true AND injection_mode != 'active' \
-               AND (agent_scope = 'all' OR agent_scope = NONE OR agent_scope = $scope) \
-               AND trigger_embedding != NONE \
-               AND vector::similarity::cosine(trigger_embedding, $qvec) > $thresh \
-             ORDER BY vector::similarity::cosine(trigger_embedding, $qvec) DESC \
-             LIMIT 4"
-        )
-        .bind(("vid", vault_id.to_string()))
-        .bind(("scope", caller_scope.to_string()))
-        .bind(("qvec", emb_val))
-        .bind(("thresh", SKILL_THRESHOLD))
-        .await.ok();
-        resp.as_mut()
-            .and_then(|r| r.take::<Vec<ActiveSkillRow>>(0).ok())
-            .unwrap_or_default()
-    } else {
-        vec![]
-    };
-
-    // 關鍵字匹配：對所有 passive skills 做 trigger keyword contains 檢查
-    // （補足向量搜尋閾值不夠時的精確命中，e.g. 「Google 一下」直接出現在 trigger 裡）
-    let mut keyword_results: Vec<ActiveSkillRow> = {
-        let mut resp = db.query(
-            "SELECT skill_id, title, trigger, behavior, tool_calls OR [] AS tool_calls, injection_mode, \
-                    agent_scope OR 'all' AS agent_scope \
-             FROM agent_skills \
-             WHERE vault_id = $vid AND is_active = true AND injection_mode != 'active' \
-               AND (agent_scope = 'all' OR agent_scope = NONE OR agent_scope = $scope) \
-             LIMIT 30"
-        )
-        .bind(("vid", vault_id.to_string()))
-        .bind(("scope", caller_scope.to_string()))
-        .await.ok();
-        resp.as_mut()
-            .and_then(|r| r.take::<Vec<ActiveSkillRow>>(0).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|s| keyword_matches_skill(query, &s.trigger))
-            .collect()
-    };
-
-    vector_results.append(&mut keyword_results);
-    vector_results.truncate(4);
-    vector_results
-}
-
-/// 將 matched skills 格式化為「# 使用者技能規範」system prompt 區塊。
-fn build_skill_injection_section(skills: &[ActiveSkillRow]) -> String {
-    let mut section = String::from(
-        "# 使用者技能規範\n\
-         以下規範由使用者從個人知識庫設定，本次對話自動啟用，請優先遵守：\n\n"
-    );
-    for skill in skills {
-        section.push_str(&format!(
-            "## {}\n**觸發條件**：{}\n**行為規範**：{}\n\n",
-            skill.title, skill.trigger, skill.behavior
-        ));
-    }
-    section
-}
-
-/// 更新 trigger_count + last_triggered_at，並寫入 skill_usage_log（供趨勢圖）。
-async fn bump_skill_trigger_count(
-    db: &surrealdb::Surreal<surrealdb::engine::local::Db>,
-    vault_id: &str,
-    skill_ids: &[String],
-) {
-    if skill_ids.is_empty() { return; }
-    let _ = db.query(
-        "UPDATE agent_skills SET trigger_count += 1, last_triggered_at = time::now() \
-         WHERE vault_id = $vid AND skill_id IN $ids"
-    )
-    .bind(("vid", vault_id.to_string()))
-    .bind(("ids", skill_ids.to_vec()))
-    .await;
-
-    // 寫入使用記錄
-    for sid in skill_ids {
-        let log_id = uuid::Uuid::new_v4().to_string();
-        let _ = db.query(
-            "INSERT INTO skill_usage_log (log_id, vault_id, skill_id, triggered_at) \
-             VALUES ($lid, $vid, $sid, time::now())"
-        )
-        .bind(("lid", log_id))
-        .bind(("vid", vault_id.to_string()))
-        .bind(("sid", sid.clone()))
-        .await;
-    }
-}
-
-/// 工具用：根據 use_ask 語意搜尋最相似的技能規範。
+/// 工具用：根據 use_ask 語意搜尋最相似的技能規範（daemon 版）。
 /// 回傳 Vec<(skill_id, title, behavior, tool_calls)>。
 pub(crate) async fn search_skills_for_tool(
-    db: &surrealdb::Surreal<surrealdb::engine::local::Db>,
+    http_client: &reqwest::Client,
+    auth_token: &str,
     vault_id: &str,
     use_ask: &str,
-    emb_url: Option<&str>,
-    client: &reqwest::Client,
+    _emb_url: Option<&str>,
+    _llama_client: &reqwest::Client,
 ) -> Vec<(String, String, String, Vec<String>)> {
-    let query_vec = if let Some(url) = emb_url {
-        get_embedding(client, url, use_ask).await
-    } else {
-        vec![]
+    let tok = if auth_token.is_empty() { None } else { Some(auth_token) };
+    // daemon 的 GET /vaults/:vid/skills 直接回傳 JSON array（非 {"skills":[...]}）
+    let result: serde_json::Value = crate::api_client::daemon_get(
+        http_client,
+        &format!("/vaults/{}/skills", urlencoding::encode(vault_id)),
+        tok,
+    ).await.unwrap_or_else(|_| serde_json::json!([]));
+    let skills = match result.as_array() {
+        Some(arr) => arr.clone(),
+        None => return vec![],
     };
-
-    let always_on = fetch_always_on_skills(db, vault_id, "main").await;
-    let passive = search_passive_skills(db, vault_id, use_ask, &query_vec, "main").await;
-
-    let mut seen = std::collections::HashSet::new();
-    let mut matched = Vec::new();
-    for s in always_on.into_iter().chain(passive.into_iter()) {
-        if seen.insert(s.skill_id.clone()) {
-            matched.push(s);
-        }
-    }
-
-    matched.into_iter()
-        .map(|s| (s.skill_id, s.title, s.behavior, s.tool_calls))
-        .collect()
+    let use_ask_lower = use_ask.to_lowercase();
+    skills.iter().filter(|s| {
+        let is_active = s["is_active"].as_bool().unwrap_or(true);
+        let trigger = s["trigger"].as_str().unwrap_or("").to_lowercase();
+        let mode = s["injection_mode"].as_str().unwrap_or("passive");
+        if !is_active { return false; }
+        if mode == "active" { return true; }
+        trigger.split(['、', ',', '，']).any(|kw| {
+            let kw = kw.trim();
+            !kw.is_empty() && use_ask_lower.contains(kw)
+        })
+    }).map(|s| {
+        let skill_id = s["skill_id"].as_str().unwrap_or("").to_string();
+        let title = s["title"].as_str().unwrap_or("").to_string();
+        let behavior = s["behavior"].as_str().unwrap_or("").to_string();
+        // tool_calls 可能是 native array（新版 seed）或 JSON string（舊版 create_agent_skill）
+        let tool_calls: Vec<String> = if let Some(arr) = s["tool_calls"].as_array() {
+            arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+        } else if let Some(s) = s["tool_calls"].as_str() {
+            serde_json::from_str::<Vec<String>>(s).unwrap_or_default()
+        } else {
+            vec![]
+        };
+        (skill_id, title, behavior, tool_calls)
+    }).collect()
 }
 
 /// 將 use_ask 加入指定技能的 trigger 欄位，並重新計算 trigger_embedding。
@@ -4080,21 +3201,17 @@ pub async fn add_skill_trigger(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let vault_id = state.get_vault_id().await.map_err(|e| e.to_string())?;
-    let db = &state.db;
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
 
-    #[derive(serde::Deserialize)]
-    struct SkillTrigger { trigger: String }
+    // GET current skill trigger from daemon
+    let current_skill: serde_json::Value = crate::api_client::daemon_get(
+        &state.http_client,
+        &format!("/vaults/{}/skills/{}", urlencoding::encode(&vault_id), urlencoding::encode(&skill_id)),
+        tok,
+    ).await.unwrap_or_else(|_| serde_json::json!({}));
 
-    let mut resp = db.query(
-        "SELECT trigger FROM agent_skills WHERE vault_id = $vid AND skill_id = $sid LIMIT 1"
-    )
-    .bind(("vid", vault_id.clone()))
-    .bind(("sid", skill_id.clone()))
-    .await.map_err(|e| e.to_string())?;
-
-    let rows: Vec<SkillTrigger> = resp.take(0).unwrap_or_default();
-    let current_trigger = rows.into_iter().next().map(|r| r.trigger).unwrap_or_default();
-
+    let current_trigger = current_skill["trigger"].as_str().unwrap_or("").to_string();
     let new_trigger = if current_trigger.is_empty() {
         use_ask.clone()
     } else {
@@ -4106,93 +3223,21 @@ pub async fn add_skill_trigger(
         port.map(|p| format!("http://127.0.0.1:{}", p))
     };
 
-    let client = reqwest::Client::new();
+    let mut update_body = serde_json::json!({"trigger": new_trigger});
 
     if let Some(url) = &emb_url {
-        let new_embedding: Vec<f64> = get_embedding(&client, url, &new_trigger).await
-            .into_iter().map(|x| x as f64).collect();
+        let new_embedding: Vec<f32> = get_embedding(&state.http_client, url, &new_trigger).await;
         if !new_embedding.is_empty() {
-            db.query(
-                "UPDATE agent_skills SET trigger = $trigger, trigger_embedding = $emb \
-                 WHERE vault_id = $vid AND skill_id = $sid"
-            )
-            .bind(("trigger", new_trigger))
-            .bind(("emb", new_embedding))
-            .bind(("vid", vault_id))
-            .bind(("sid", skill_id))
-            .await.map_err(|e| e.to_string())?;
-            return Ok(());
+            update_body["trigger_embedding"] = serde_json::json!(new_embedding);
         }
     }
 
-    db.query(
-        "UPDATE agent_skills SET trigger = $trigger WHERE vault_id = $vid AND skill_id = $sid"
-    )
-    .bind(("trigger", new_trigger))
-    .bind(("vid", vault_id))
-    .bind(("sid", skill_id))
-    .await.map_err(|e| e.to_string())?;
-
-    Ok(())
-}
-
-/// Pre-pass 入口：
-/// 1. 主動注入（injection_mode = 'active'）：永遠注入，不做 embedding 比對。
-/// 2. 被動取用（injection_mode = 'passive'）：embed query → cosine 相似度 > 閾值才注入。
-/// 回傳 Some((injection_text, titles, required_tools)) 若有任何符合的 skills，否則 None。
-/// required_tools 為所有命中 skill 的 tool_calls 聯集，供呼叫端過濾工具清單。
-async fn run_skill_pre_pass(
-    db: &surrealdb::Surreal<surrealdb::engine::local::Db>,
-    vault_id: &str,
-    query: &str,
-    emb_url: Option<&str>,
-    client: &reqwest::Client,
-    caller_scope: &str,
-    precomputed_embedding: Option<Vec<f32>>,  // 傳入已算好的向量，避免重複呼叫 /embedding
-) -> Option<(String, Vec<String>, Vec<String>)> {
-    // 1. 主動注入 skills（不需要 embedding server）
-    let always_on = fetch_always_on_skills(db, vault_id, caller_scope).await;
-
-    // 2. 被動取用 skills（有 embedding server → 向量搜尋；無 → 純關鍵字匹配）
-    let passive = {
-        let query_vec = if let Some(url) = emb_url {
-            match precomputed_embedding {
-                Some(v) if !v.is_empty() => v,
-                _ => get_embedding(client, url, query).await,
-            }
-        } else {
-            vec![]
-        };
-        search_passive_skills(db, vault_id, query, &query_vec, caller_scope).await
-    };
-
-    // 合併，去重（active 優先）
-    let mut seen = std::collections::HashSet::new();
-    let mut matched: Vec<ActiveSkillRow> = Vec::new();
-    for s in always_on.into_iter().chain(passive.into_iter()) {
-        if seen.insert(s.skill_id.clone()) {
-            matched.push(s);
-        }
-    }
-
-    if matched.is_empty() { return None; }
-
-    // 更新觸發統計
-    let ids: Vec<String> = matched.iter().map(|s| s.skill_id.clone()).collect();
-    bump_skill_trigger_count(db, vault_id, &ids).await;
-
-    let titles: Vec<String> = matched.iter().map(|s| s.title.clone()).collect();
-
-    // 收集所有命中 skill 的 tool_calls 聯集（供呼叫端做工具過濾，不再用文字 hint）
-    let auto_tools: Vec<String> = matched.iter()
-        .flat_map(|s| s.tool_calls.iter().cloned())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-
-    let section = build_skill_injection_section(&matched);
-
-    Some((section, titles, auto_tools))
+    crate::api_client::daemon_put::<_, serde_json::Value>(
+        &state.http_client,
+        &format!("/vaults/{}/skills/{}", urlencoding::encode(&vault_id), urlencoding::encode(&skill_id)),
+        &update_body,
+        tok,
+    ).await.map(|_| ()).map_err(|e| e)
 }
 
 #[cfg(test)]

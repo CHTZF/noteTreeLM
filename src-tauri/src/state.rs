@@ -4,15 +4,11 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use reqwest;
 
-use crate::db::surreal::SurrealDb;
-use crate::db::sqlite::SqliteConn;
 use crate::error::AppError;
 use crate::runtime::system_agent::SystemAgentService;
 
 #[derive(Clone)]
 pub struct AppState {
-    /// 單一 SurrealDB 實例（embedded SurrealKV），取代原本的 settings_db + vault_db
-    pub db: SurrealDb,
     /// 目前 Vault 的路徑（同時作為 vault_id 使用）
     pub vault_path: Arc<RwLock<String>>,
     /// 持有 llama-server 子進程；App 結束時 kill
@@ -59,8 +55,6 @@ pub struct AppState {
     pub api_key_cache: Arc<Mutex<HashMap<String, String>>>,
     /// 外部 AI 設定快取：key → value（ai_provider / ai_base_url / ai_model），使用者儲存後失效
     pub settings_cache: Arc<Mutex<HashMap<String, String>>>,
-    /// SQLite FTS5 search index（search.db）
-    pub sqlite: SqliteConn,
     /// 共用 HTTP client（所有 LLM / embedding 呼叫共用，避免重複建立 connection pool）
     pub http_client: reqwest::Client,
     /// Intent centroid 快取（confirm / cancel / interrupt 三組固定詞組的 embedding 平均值）
@@ -76,15 +70,17 @@ pub struct AppState {
     pub username: Arc<RwLock<String>>,
     /// DB/init 就緒旗標：背景 init task 完成後設為 true，通知前端可進入 App
     pub app_ready: Arc<std::sync::atomic::AtomicBool>,
+    /// 目前登入的 daemon auth token（Bearer token for API calls）
+    pub auth_token: Arc<RwLock<String>>,
 }
 
 impl AppState {
-    pub fn new(db: SurrealDb, sqlite: SqliteConn) -> Self {
-        let system_agent = Arc::new(SystemAgentService::new(db.clone()));
+    pub fn new() -> Self {
+        let http_client = reqwest::Client::new();
+        let auth_token: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
+        let system_agent = Arc::new(SystemAgentService::new(http_client.clone(), auth_token.clone()));
         Self {
             system_agent,
-            db,
-            sqlite,
             vault_path: Arc::new(RwLock::new(String::new())),
             llama_server: Arc::new(Mutex::new(None)),
             whisper_server: Arc::new(Mutex::new(None)),
@@ -107,14 +103,27 @@ impl AppState {
             search_method_tx: Arc::new(Mutex::new(None)),
             api_key_cache: Arc::new(Mutex::new(HashMap::new())),
             settings_cache: Arc::new(Mutex::new(HashMap::new())),
-            http_client: reqwest::Client::new(),
+            http_client,
             intent_centroids: Arc::new(Mutex::new(None)),
             titled_convs: Arc::new(Mutex::new(HashSet::new())),
             live_chat_active: Arc::new(AtomicBool::new(false)),
             vault_uuid: Arc::new(RwLock::new(String::new())),
             username: Arc::new(RwLock::new(String::new())),
             app_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            auth_token,
         }
+    }
+
+    pub async fn get_auth_token(&self) -> String {
+        self.auth_token.read().await.clone()
+    }
+
+    pub async fn set_auth_token(&self, token: String) {
+        *self.auth_token.write().await = token;
+    }
+
+    pub async fn clear_auth_token(&self) {
+        *self.auth_token.write().await = String::new();
     }
 
     /// vault_id 設定後同步更新 SystemAgentService

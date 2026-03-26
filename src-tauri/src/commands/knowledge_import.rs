@@ -1,4 +1,4 @@
-use crate::{commands::ai::{ensure_server_running, read_api_key, get_embedding}, db::{queries, surreal::SurrealDb}, error::AppError, state::AppState};
+use crate::{api_client::{daemon_delete, daemon_get, daemon_patch, daemon_post, daemon_put}, commands::ai::{ensure_server_running, read_api_key}, error::AppError, state::AppState};
 use chrono::Datelike as _;
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
@@ -70,7 +70,7 @@ struct SessionRow {
     site_name: String,
     root_folder: String,
     status: String,
-    created_at: surrealdb::sql::Datetime,
+    created_at: i64, // ms timestamp
 }
 
 #[derive(Deserialize, Clone)]
@@ -85,7 +85,7 @@ struct PageRow {
     content_hash: Option<String>,
     http_etag: Option<String>,
     status: String,
-    last_crawled: Option<surrealdb::sql::Datetime>,
+    last_crawled: Option<i64>, // ms timestamp
 }
 
 impl From<PageRow> for ImportPage {
@@ -100,7 +100,7 @@ impl From<PageRow> for ImportPage {
             note_path: r.note_path,
             content_hash: r.content_hash,
             status: r.status,
-            last_crawled: r.last_crawled.map(|dt| dt.timestamp_millis()),
+            last_crawled: r.last_crawled,
         }
     }
 }
@@ -447,40 +447,50 @@ pub async fn create_import_session(
     seed_url: String,
 ) -> Result<ImportSession, AppError> {
     let parsed = validate_url(&seed_url)?;
-    let vault_id = state.get_vault_id().await?;
-
     let site_name = parsed.host_str().unwrap_or("unknown").to_string();
     let sanitized_domain = site_name.replace('.', "-");
     let root_folder = format!("imports/{}", sanitized_domain);
-    let session_id = Uuid::new_v4().to_string();
-
-    let db = &state.db;
-    let vid = vault_id.to_owned();
-    let sid = session_id.to_owned();
-    let seed = seed_url.to_owned();
-    let sname = site_name.to_owned();
-    let rfolder = root_folder.to_owned();
-
     let created_at_ms = chrono::Utc::now().timestamp_millis();
 
-    db.query(
-        "INSERT INTO import_sessions (vault_id, session_id, conversation_id, seed_url, site_name, root_folder, status, created_at, updated_at) \
-         VALUES ($vid, $sid, '', $seed, $sname, $rfolder, 'active', time::now(), time::now())"
-    )
-    .bind(("vid", vid))
-    .bind(("sid", sid))
-    .bind(("seed", seed))
-    .bind(("sname", sname))
-    .bind(("rfolder", rfolder))
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    let vault_id = state.get_vault_uuid().await;
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
 
+    // Persist session in daemon; daemon returns {"session_id": "..."}
+    if !vault_id.is_empty() {
+        let path = format!("/vaults/{}/kb/sessions", urlencoding::encode(&vault_id));
+        let resp = daemon_post::<_, serde_json::Value>(
+            &state.http_client,
+            &path,
+            &serde_json::json!({
+                "seed_url": seed_url,
+                "site_name": site_name,
+                "root_folder": root_folder,
+            }),
+            tok,
+        ).await.map_err(|e| AppError::Import(format!("建立 session 失敗：{}", e)))?;
+        // Daemon returns {"session_id": "..."}; use its session_id
+        let session_id = resp["session_id"].as_str()
+            .ok_or_else(|| AppError::Import("daemon 未回傳 session_id".to_string()))?
+            .to_string();
+        return Ok(ImportSession {
+            session_id,
+            seed_url,
+            site_name,
+            root_folder,
+            status: "pending".to_string(),
+            created_at: created_at_ms,
+        });
+    }
+
+    // Fallback (no vault): in-memory only
+    let session_id = Uuid::new_v4().to_string();
     Ok(ImportSession {
         session_id,
         seed_url,
         site_name,
         root_folder,
-        status: "active".to_string(),
+        status: "pending".to_string(),
         created_at: created_at_ms,
     })
 }
@@ -490,62 +500,29 @@ pub async fn create_import_session(
 pub async fn list_import_sessions(
     state: State<'_, AppState>,
 ) -> Result<Vec<ImportSessionSummary>, AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-    let vid = vault_id.to_owned();
-
-    let mut resp = db
-        .query(
-            "SELECT session_id, seed_url, site_name, root_folder, status, created_at \
-             FROM import_sessions WHERE vault_id = $vid ORDER BY created_at DESC",
-        )
-        .bind(("vid", vid.to_owned()))
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() { return Ok(vec![]); }
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    let path = format!("/vaults/{}/kb/sessions", urlencoding::encode(&vault_id));
+    let result: serde_json::Value = daemon_get(&state.http_client, &path, tok)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-    let sessions: Vec<SessionRow> = resp.take(0).unwrap_or_default();
-
-    let mut summaries = Vec::new();
-    for s in sessions {
-        // Count pages
-        #[derive(Deserialize)]
-        struct CountRow {
-            total: i64,
-        }
-
-        let sid = s.session_id.to_owned();
-
-        let mut total_resp = db
-            .query("SELECT count() AS total FROM import_pages WHERE vault_id = $vid AND session_id = $sid GROUP ALL")
-            .bind(("vid", vid.to_owned()))
-            .bind(("sid", sid.to_owned()))
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-        let total_rows: Vec<CountRow> = total_resp.take(0).unwrap_or_default();
-        let total_pages = total_rows.first().map(|r| r.total).unwrap_or(0);
-
-        let mut imp_resp = db
-            .query("SELECT count() AS total FROM import_pages WHERE vault_id = $vid AND session_id = $sid AND status = 'imported' GROUP ALL")
-            .bind(("vid", vid.to_owned()))
-            .bind(("sid", sid.to_owned()))
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-        let imp_rows: Vec<CountRow> = imp_resp.take(0).unwrap_or_default();
-        let imported_pages = imp_rows.first().map(|r| r.total).unwrap_or(0);
-
-        summaries.push(ImportSessionSummary {
-            session_id: s.session_id,
-            seed_url: s.seed_url,
-            site_name: s.site_name,
-            root_folder: s.root_folder,
-            status: s.status,
-            created_at: s.created_at.timestamp_millis(),
-            total_pages,
-            imported_pages,
-        });
-    }
-
-    Ok(summaries)
+        .unwrap_or(serde_json::json!([]));
+    let arr = result.as_array().cloned().unwrap_or_default();
+    let sessions = arr.iter().filter_map(|v| {
+        let session_id = v["session_id"].as_str()?.to_string();
+        Some(ImportSessionSummary {
+            session_id,
+            seed_url: v["seed_url"].as_str().unwrap_or("").to_string(),
+            site_name: v["site_name"].as_str().unwrap_or("").to_string(),
+            root_folder: v["root_folder"].as_str().unwrap_or("").to_string(),
+            status: v["status"].as_str().unwrap_or("active").to_string(),
+            created_at: v["created_at"].as_i64().unwrap_or(0),
+            total_pages: v["total_pages"].as_i64().unwrap_or(0),
+            imported_pages: v["imported_pages"].as_i64().unwrap_or(0),
+        })
+    }).collect();
+    Ok(sessions)
 }
 
 /// Delete an import session and all its pages (including chunks and KB suggestions).
@@ -554,52 +531,16 @@ pub async fn delete_import_session(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<(), AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-    let vid = vault_id.to_owned();
-    let sid = session_id.to_owned();
-
-    // Collect virtual note_paths so we can delete their chunks
-    #[derive(serde::Deserialize)]
-    struct PathRow { note_path: Option<String> }
-    let mut resp = db
-        .query("SELECT note_path FROM import_pages WHERE vault_id = $vid AND session_id = $sid")
-        .bind(("vid", vid.to_owned()))
-        .bind(("sid", sid.to_owned()))
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-    let path_rows: Vec<PathRow> = resp.take(0).unwrap_or_default();
-    let note_paths: Vec<String> = path_rows.into_iter().filter_map(|r| r.note_path).collect();
-
-    // Delete chunks for all pages in this session
-    for note_path in &note_paths {
-        db.query("DELETE chunks WHERE vault_id = $vid AND file_path = $fp")
-            .bind(("vid", vid.to_owned()))
-            .bind(("fp", note_path.to_owned()))
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-    }
-
-    // Delete KB suggestions for this session
-    db.query("DELETE kb_suggestions WHERE vault_id = $vid AND session_id = $sid")
-        .bind(("vid", vid.to_owned()))
-        .bind(("sid", sid.to_owned()))
-        .await
-        .ok(); // non-fatal if table doesn't exist yet
-
-    // Delete pages and session
-    db.query("DELETE import_pages WHERE vault_id = $vid AND session_id = $sid")
-        .bind(("vid", vid.to_owned()))
-        .bind(("sid", sid.to_owned()))
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-    db.query("DELETE import_sessions WHERE vault_id = $vid AND session_id = $sid")
-        .bind(("vid", vid))
-        .bind(("sid", sid))
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() { return Ok(()); }
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    let path = format!(
+        "/vaults/{}/kb/sessions/{}",
+        urlencoding::encode(&vault_id),
+        urlencoding::encode(&session_id),
+    );
+    let _ = daemon_delete::<serde_json::Value>(&state.http_client, &path, tok).await;
     Ok(())
 }
 
@@ -610,94 +551,79 @@ pub async fn set_session_auto_update(
     session_id: String,
     auto_update: bool,
 ) -> Result<(), AppError> {
-    let vault_id = state.get_vault_id().await?;
-    state.db
-        .query("UPDATE import_sessions SET auto_update = $v WHERE vault_id = $vid AND session_id = $sid")
-        .bind(("v", auto_update))
-        .bind(("vid", vault_id))
-        .bind(("sid", session_id))
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() { return Ok(()); }
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    let path = format!(
+        "/vaults/{}/kb/sessions/{}",
+        urlencoding::encode(&vault_id),
+        urlencoding::encode(&session_id),
+    );
+    let _ = daemon_patch::<_, serde_json::Value>(
+        &state.http_client,
+        &path,
+        &serde_json::json!({ "auto_update": auto_update }),
+        tok,
+    ).await;
     Ok(())
 }
 
 /// Called on app startup: check_page_updates for sessions with auto_update = true.
-/// Emits `import:updates_available { session_id, count }` for each session with changes.
 pub async fn auto_check_all_sessions(app: &AppHandle, state: &AppState) {
-    let vault_id = match state.get_vault_id().await {
-        Ok(v) if !v.is_empty() => v,
-        _ => return,
-    };
-
-    #[derive(serde::Deserialize)]
-    struct SessionRow { session_id: String }
-
-    let mut resp = match state.db
-        .query("SELECT session_id FROM import_sessions WHERE vault_id = $vid AND auto_update = true")
-        .bind(("vid", vault_id.clone()))
-        .await
-    {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-
-    let sessions: Vec<SessionRow> = resp.take(0).unwrap_or_default();
-    if sessions.is_empty() { return; }
-
-    let client = match reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (compatible; noteTreeLM/0.1; knowledge-import)")
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() { return; }
+    let token = state.get_auth_token().await;
+    let tok_owned = token.clone();
+    let tok = if tok_owned.is_empty() { None } else { Some(tok_owned.as_str()) };
+    let path = format!("/vaults/{}/kb/sessions", urlencoding::encode(&vault_id));
+    let Ok(result) = daemon_get::<serde_json::Value>(&state.http_client, &path, tok).await else { return; };
+    let sessions = result.as_array().cloned().unwrap_or_default();
     for s in sessions {
-        let sid = s.session_id.clone();
-        let app2 = app.clone();
-        let db2 = state.db.clone();
-        let vid2 = vault_id.clone();
-        let client2 = client.clone();
-
+        if s["auto_update"].as_bool() != Some(true) { continue; }
+        let sid = match s["session_id"].as_str() { Some(id) => id.to_string(), None => continue };
+        // Spawn a fire-and-forget task per session
+        let app_clone = app.clone();
+        let vault_clone = vault_id.clone();
+        let token_clone = token.clone();
+        let http = state.http_client.clone();
         tokio::spawn(async move {
-            #[derive(serde::Deserialize)]
-            #[allow(dead_code)]
-            struct PageRow { url: String, content_hash: Option<String>, http_etag: Option<String> }
-
-            let mut resp = match db2.query(
-                "SELECT url, content_hash, http_etag FROM import_pages
-                 WHERE vault_id = $vid AND session_id = $sid AND status = 'imported'"
-            )
-            .bind(("vid", vid2.clone()))
-            .bind(("sid", sid.clone()))
-            .await
-            {
-                Ok(r) => r,
-                Err(_) => return,
-            };
-
-            let pages: Vec<PageRow> = resp.take(0).unwrap_or_default();
-            let mut changed = 0usize;
-
-            for page in pages {
-                if let Ok(head) = client2.head(&page.url).send().await {
-                    let cur_etag = head.headers()
-                        .get("etag")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string());
-                    if let (Some(stored), Some(cur)) = (&page.http_etag, &cur_etag) {
-                        if stored == cur { continue; }
-                    }
-                    changed += 1;
+            let tok2: Option<&str> = if token_clone.is_empty() { None } else { Some(token_clone.as_str()) };
+            let pages_path = format!(
+                "/vaults/{}/kb/sessions/{}/pages",
+                urlencoding::encode(&vault_clone),
+                urlencoding::encode(&sid),
+            );
+            let Ok(pages_val) = daemon_get::<serde_json::Value>(&http, &pages_path, tok2).await else { return; };
+            let pages = pages_val.as_array().cloned().unwrap_or_default();
+            for p in pages {
+                if p["status"].as_str() != Some("imported") { continue; }
+                let url: String = match p["url"].as_str() { Some(u) => u.to_string(), None => continue };
+                let pid: String = match p["page_id"].as_str() { Some(id) => id.to_string(), None => continue };
+                let stored_hash: Option<String> = p["content_hash"].as_str().map(|s: &str| s.to_string());
+                let stored_etag: Option<String> = p["http_etag"].as_str().map(|s: &str| s.to_string());
+                // HEAD request to check ETag / content changes
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()
+                    .unwrap_or_default();
+                let Ok(head_resp) = client.head(&url).send().await else { continue };
+                let new_etag = head_resp.headers()
+                    .get("etag")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let changed = if let (Some(se), Some(ne)) = (&stored_etag, &new_etag) {
+                    se != ne
+                } else {
+                    stored_hash.is_none() // no hash means never checked
+                };
+                if changed {
+                    let _ = app_clone.emit("kb:page_update_available", serde_json::json!({
+                        "session_id": sid,
+                        "page_id": pid,
+                        "url": url,
+                    }));
                 }
-            }
-
-            if changed > 0 {
-                let _ = app2.emit("import:updates_available", serde_json::json!({
-                    "session_id": sid,
-                    "count": changed,
-                }));
             }
         });
     }
@@ -710,454 +636,353 @@ pub async fn fetch_site_outline(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<Vec<ImportPage>, AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-    let vid = vault_id.to_owned();
-    let sid = session_id.to_owned();
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() {
+        return Err(AppError::Vault("尚未設定 Vault".to_string()));
+    }
+    let token = state.get_auth_token().await;
+    let tok_owned = token.clone();
+    let tok = if tok_owned.is_empty() { None } else { Some(tok_owned.as_str()) };
 
-    // Load session to get seed_url
-    let mut resp = db
-        .query(
-            "SELECT session_id, seed_url, site_name, root_folder, status, created_at \
-             FROM import_sessions WHERE vault_id = $vid AND session_id = $sid LIMIT 1",
-        )
-        .bind(("vid", vid.to_owned()))
-        .bind(("sid", sid.to_owned()))
+    // Get session info from daemon
+    let session_path = format!(
+        "/vaults/{}/kb/sessions/{}",
+        urlencoding::encode(&vault_id),
+        urlencoding::encode(&session_id),
+    );
+    let session_val: serde_json::Value = daemon_get(&state.http_client, &session_path, tok)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .map_err(|e| AppError::Import(format!("無法取得 session: {}", e)))?;
+    let seed_url = session_val["seed_url"].as_str()
+        .ok_or_else(|| AppError::Import("session 缺少 seed_url".to_string()))?
+        .to_string();
 
-    let sessions: Vec<SessionRow> = resp.take(0).unwrap_or_default();
-    let session = sessions.into_iter().next().ok_or_else(|| {
-        AppError::Import(format!("Session not found: {}", session_id))
-    })?;
+    let base_url = validate_url(&seed_url)?;
 
-    let seed_url = session.seed_url;
-    let parsed_seed = validate_url(&seed_url)?;
-
-    // Fetch seed page
+    // Fetch seed page HTML
     let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (compatible; noteTreeLM/0.1; knowledge-import)")
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("noteTreeLM/1.0")
         .build()
         .map_err(|e| AppError::Import(e.to_string()))?;
+    let html = client.get(&seed_url).send().await
+        .map_err(|e| AppError::Import(format!("無法取得首頁：{}", e)))?
+        .text().await
+        .map_err(|e| AppError::Import(format!("讀取首頁內容失敗：{}", e)))?;
 
-    let response = client
-        .get(parsed_seed.as_str())
-        .send()
-        .await
-        .map_err(|e| AppError::Import(e.to_string()))?;
-
-    let html = response
-        .text()
-        .await
-        .map_err(|e| AppError::Import(e.to_string()))?;
-
-    // Extract title for seed page
     let seed_title = extract_title(&html);
-    let seed_title = if seed_title.is_empty() {
-        parsed_seed.host_str().unwrap_or("Home").to_string()
-    } else {
-        seed_title
-    };
+    let links = extract_links(&html, &base_url);
 
-    // Extract links
-    let links = extract_links(&html, &parsed_seed);
-
-    // Deduplicate URLs
-    let mut seen_urls = std::collections::HashSet::new();
-    seen_urls.insert(seed_url.clone());
-
-    // Collect pages to insert: (url, title, parent_url, depth)
-    let mut pages_to_insert: Vec<(String, String, Option<String>, i64)> = Vec::new();
-    pages_to_insert.push((seed_url.clone(), seed_title, None, 0));
-
-    for (url, link_text) in links {
-        if seen_urls.insert(url.clone()) {
-            let title = if link_text.is_empty() {
-                url.clone()
-            } else {
-                link_text
-            };
-            pages_to_insert.push((url, title, Some(seed_url.clone()), 1));
-        }
+    // Build page list: seed page + discovered links (dedup)
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(seed_url.clone());
+    let mut pages: Vec<serde_json::Value> = vec![serde_json::json!({
+        "page_id": Uuid::new_v4().to_string(),
+        "session_id": session_id,
+        "url": seed_url,
+        "title": if seed_title.is_empty() { base_url.host_str().unwrap_or("首頁").to_string() } else { seed_title },
+        "parent_url": null,
+        "depth": 0,
+        "status": "pending",
+    })];
+    for (url, text) in links {
+        if seen.contains(&url) { continue; }
+        seen.insert(url.clone());
+        pages.push(serde_json::json!({
+            "page_id": Uuid::new_v4().to_string(),
+            "session_id": session_id,
+            "url": url,
+            "title": text,
+            "parent_url": seed_url,
+            "depth": 1,
+            "status": "pending",
+        }));
     }
 
-    // Insert pages into DB (skip if URL already exists)
-    for (url, title, parent_url, depth) in &pages_to_insert {
-        let page_id = Uuid::new_v4().to_string();
-        db.query(
-            "INSERT INTO import_pages (vault_id, page_id, session_id, url, title, parent_url, depth, status, created_at) \
-             VALUES ($vid, $pid, $sid, $url, $title, $parent_url, $depth, 'pending', time::now()) \
-             ON DUPLICATE KEY UPDATE title = $title"
-        )
-        .bind(("vid", vid.to_owned()))
-        .bind(("pid", page_id))
-        .bind(("sid", sid.to_owned()))
-        .bind(("url", url.to_owned()))
-        .bind(("title", title.to_owned()))
-        .bind(("parent_url", parent_url.to_owned()))
-        .bind(("depth", *depth))
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-    }
+    // Store pages in daemon
+    let pages_path = format!(
+        "/vaults/{}/kb/sessions/{}/pages",
+        urlencoding::encode(&vault_id),
+        urlencoding::encode(&session_id),
+    );
+    let _ = daemon_post::<_, serde_json::Value>(
+        &state.http_client,
+        &pages_path,
+        &serde_json::json!({ "pages": pages }),
+        tok,
+    ).await;
 
-    // ── Populate sitemap_titles immediately (no embedding), return fast ─────
-    // Embedding is spawned in background so the command returns in ~1-2s.
-    for (url, title, _, depth) in &pages_to_insert {
-        let entry_id = Uuid::new_v4().to_string();
-        db.query(
-            "INSERT INTO sitemap_titles (vault_id, session_id, entry_id, url, title, depth) \
-             VALUES ($vid, $sid, $eid, $url, $title, $depth) \
-             ON DUPLICATE KEY UPDATE title = $title"
-        )
-        .bind(("vid", vid.to_owned())).bind(("sid", sid.to_owned()))
-        .bind(("eid", entry_id)).bind(("url", url.to_owned()))
-        .bind(("title", title.to_owned())).bind(("depth", *depth))
-        .await.map_err(|e| AppError::Database(e.to_string()))?;
-    }
-
-    // Background: embed titles and update sitemap_titles with vectors
-    let emb_url: Option<String> = {
-        let port = *state.embedding_actual_port.lock().await;
-        port.map(|p| format!("http://127.0.0.1:{}", p))
-    };
-    if let Some(base_url) = emb_url {
-        let db2 = db.clone();
-        let pages_clone: Vec<(String, String, i64)> = pages_to_insert
-            .iter().map(|(u, t, _, d)| (u.clone(), t.clone(), *d)).collect();
-        let vid2 = vid.clone();
-        let sid2 = sid.clone();
-        tokio::spawn(async move {
-            let emb_client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_default();
-            let futs: Vec<_> = pages_clone.iter().map(|(_, title, _)| {
-                let c = emb_client.clone();
-                let u = base_url.clone();
-                let t = title.clone();
-                async move {
-                    let v = crate::commands::ai::get_embedding(&c, &u, &t).await;
-                    if v.is_empty() { None } else { Some(v) }
-                }
-            }).collect();
-            let embeddings = futures::future::join_all(futs).await;
-            for ((url, title, depth), emb_opt) in pages_clone.iter().zip(embeddings.into_iter()) {
-                if let Some(emb) = emb_opt {
-                    let _ = db2.query(
-                        "UPDATE sitemap_titles SET embedding = $emb \
-                         WHERE vault_id = $vid AND session_id = $sid AND url = $url"
-                    )
-                    .bind(("vid", vid2.clone())).bind(("sid", sid2.clone()))
-                    .bind(("url", url.clone())).bind(("emb", emb))
-                    .await;
-                }
-                let _ = depth; // suppress unused warning
-                let _ = title;
-            }
-        });
-    }
-
-    // Return all pages for this session
-    get_session_pages(state, session_id).await
+    // Return as ImportPage
+    let result = pages.iter().filter_map(|v| {
+        let page_id = v["page_id"].as_str()?.to_string();
+        Some(ImportPage {
+            page_id,
+            session_id: session_id.clone(),
+            url: v["url"].as_str().unwrap_or("").to_string(),
+            title: v["title"].as_str().unwrap_or("").to_string(),
+            parent_url: v["parent_url"].as_str().map(|s| s.to_string()),
+            depth: v["depth"].as_i64().unwrap_or(0),
+            note_path: None,
+            content_hash: None,
+            status: "pending".to_string(),
+            last_crawled: None,
+        })
+    }).collect();
+    Ok(result)
 }
 
-/// Lightweight on-demand fetch for Q&A: HTTP fetch → markdown → store content_md.
-/// No chunking, no embedding, no mutex — just what the RAG query needs.
+/// Lightweight on-demand fetch for Q&A: HTTP fetch → markdown → store content_md via daemon.
 async fn fetch_page_content_for_qa(
-    db: &SurrealDb,
-    vault_id: &str,
     page: &PageRow,
+    vault_id: &str,
+    http_client: &reqwest::Client,
 ) -> Result<(), AppError> {
     let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (compatible; noteTreeLM/0.1; knowledge-import)")
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("noteTreeLM/1.0")
         .build()
+        .unwrap_or_default();
+    let html = client.get(&page.url).send().await
+        .map_err(|e| AppError::Import(format!("fetch {} failed: {}", page.url, e)))?
+        .text().await
         .map_err(|e| AppError::Import(e.to_string()))?;
-
-    let response = client
-        .get(page.url.as_str())
-        .send()
-        .await
-        .map_err(|e| AppError::Import(e.to_string()))?;
-
-    let html = response.text().await.map_err(|e| AppError::Import(e.to_string()))?;
-
-    let title = {
-        let t = extract_title(&html);
-        if t.is_empty() { page.title.clone() } else { t }
-    };
-    let body_md = html_to_markdown_rich(&html);
-    let now_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let content_md = format!(
-        "---\ntitle: {}\nsource: {}\nimported: {}\nstatus: verified\n---\n\n{}\n",
-        title, page.url, now_date, body_md
+    let content_md = html_to_markdown_rich(&html);
+    let hash = sha256_hex(&content_md);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    // Update page in daemon with fetched content
+    let page_update_path = format!(
+        "/vaults/{}/kb/sessions/{}/pages/{}",
+        urlencoding::encode(vault_id),
+        urlencoding::encode(&page.session_id),
+        urlencoding::encode(&page.page_id),
     );
-    let new_hash = sha256_hex(&content_md);
-    let now_dt = surrealdb::sql::Datetime::from(chrono::Utc::now());
-
-    db.query(
-        "UPDATE import_pages SET status = 'imported', title = $title, content_md = $content, \
-         content_hash = $hash, last_crawled = $now \
-         WHERE vault_id = $vid AND page_id = $pid",
-    )
-    .bind(("title", title))
-    .bind(("content", content_md))
-    .bind(("hash", new_hash))
-    .bind(("now", now_dt))
-    .bind(("vid", vault_id.to_owned()))
-    .bind(("pid", page.page_id.clone()))
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
+    let _ = daemon_patch::<_, serde_json::Value>(
+        http_client,
+        &page_update_path,
+        &serde_json::json!({
+            "status": "imported",
+            "content_md": content_md,
+            "content_hash": hash,
+            "last_crawled": now_ms,
+        }),
+        None,
+    ).await;
     Ok(())
 }
 
-/// Core import logic — used by the `import_page` Tauri command.
+/// Core import logic — kept for API compatibility but superseded by `import_page`.
+#[allow(dead_code)]
 async fn import_page_inner(
-    db: &SurrealDb,
-    vault_id: &str,
     page: &PageRow,
-    root_folder: &str,
-    emb_url: Option<&str>,
+    _root_folder: &str,
 ) -> Result<ImportPageResult, AppError> {
-    let parsed_url = validate_url(&page.url)?;
+    // Minimal implementation — full logic lives in `import_page` (which has AppState access).
     let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (compatible; noteTreeLM/0.1; knowledge-import)")
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("noteTreeLM/1.0")
         .build()
         .map_err(|e| AppError::Import(e.to_string()))?;
-
-    let response = client
-        .get(parsed_url.as_str())
-        .send()
-        .await
-        .map_err(|e| AppError::Import(e.to_string()))?;
-
-    let etag = response
-        .headers()
-        .get("etag")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    let html = response.text().await.map_err(|e| AppError::Import(e.to_string()))?;
-
-    let title = {
-        let t = extract_title(&html);
-        if t.is_empty() { page.title.clone() } else { t }
-    };
-
-    let body_md = html_to_markdown_rich(&html);
-    let now_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let note_content = format!(
-        "---\ntitle: {}\nsource: {}\nimported: {}\nstatus: verified\n---\n\n{}\n",
-        title, page.url, now_date, body_md
-    );
-
-    let new_hash = sha256_hex(&note_content);
-    let was_updated = page.content_hash.as_ref().map(|h| h != &new_hash).unwrap_or(false);
-
-    let slug = slugify(&title);
-    let rel_note_path = format!("{}/{}.md", root_folder, slug);
-
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let chunks = crate::vault::chunker::chunk_note(&rel_note_path, &note_content, now_ms);
-    let _ = crate::vault::chunker::upsert_chunks(db, None, vault_id, &chunks, emb_url).await;
-
-    let now_dt = surrealdb::sql::Datetime::from(chrono::Utc::now());
-    let vid = vault_id.to_owned();
-    let pid = page.page_id.clone();
-
-    if let Some(etag_val) = etag {
-        db.query(
-            "UPDATE import_pages SET status = 'imported', note_path = $path, content_md = $content, \
-             content_hash = $hash, http_etag = $etag, last_crawled = $now \
-             WHERE vault_id = $vid AND page_id = $pid",
-        )
-        .bind(("path", rel_note_path.clone())).bind(("content", note_content))
-        .bind(("hash", new_hash)).bind(("etag", etag_val))
-        .bind(("now", now_dt)).bind(("vid", vid)).bind(("pid", pid))
-        .await.map_err(|e| AppError::Database(e.to_string()))?;
-    } else {
-        db.query(
-            "UPDATE import_pages SET status = 'imported', note_path = $path, content_md = $content, \
-             content_hash = $hash, last_crawled = $now \
-             WHERE vault_id = $vid AND page_id = $pid",
-        )
-        .bind(("path", rel_note_path.clone())).bind(("content", note_content))
-        .bind(("hash", new_hash)).bind(("now", now_dt)).bind(("vid", vid)).bind(("pid", pid))
-        .await.map_err(|e| AppError::Database(e.to_string()))?;
-    }
-
-    Ok(ImportPageResult { note_path: rel_note_path, title, was_updated })
+    let resp = client.get(&page.url).send().await
+        .map_err(|e| AppError::Import(format!("無法取得頁面：{}", e)))?;
+    let html = resp.text().await
+        .map_err(|e| AppError::Import(format!("讀取頁面內容失敗：{}", e)))?;
+    let title = { let t = extract_title(&html); if t.is_empty() { page.title.clone() } else { t } };
+    let content_md = html_to_markdown_rich(&html);
+    let hash = sha256_hex(&content_md);
+    let was_updated = page.content_hash.as_deref() != Some(&hash);
+    Ok(ImportPageResult { note_path: page.note_path.clone().unwrap_or_default(), title, was_updated })
 }
 
-/// Import a single page — stores content in DB only (no vault file written).
+/// Import a single page — fetch HTML, write vault file, update daemon page record.
 #[tauri::command]
 pub async fn import_page(
     state: State<'_, AppState>,
     session_id: String,
     page_id: String,
 ) -> Result<ImportPageResult, AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-    let vid = vault_id.to_owned();
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() { return Err(AppError::Vault("尚未設定 Vault".to_string())); }
+    let vault_path = state.get_vault_path().await;
+    if vault_path.is_empty() { return Err(AppError::Vault("尚未設定 Vault 路徑".to_string())); }
+    let token = state.get_auth_token().await;
+    let tok_owned = token.clone();
+    let tok = if tok_owned.is_empty() { None } else { Some(tok_owned.as_str()) };
 
-    let mut page_resp = db
-        .query(
-            "SELECT page_id, session_id, url, title, parent_url, depth, note_path, content_hash, http_etag, status, last_crawled \
-             FROM import_pages WHERE vault_id = $vid AND page_id = $pid LIMIT 1",
-        )
-        .bind(("vid", vid.clone())).bind(("pid", page_id.clone()))
-        .await.map_err(|e| AppError::Database(e.to_string()))?;
-    let page = page_resp.take::<Vec<PageRow>>(0).unwrap_or_default()
-        .into_iter().next()
-        .ok_or_else(|| AppError::Import(format!("Page not found: {}", page_id)))?;
+    // Get session info for root_folder
+    let session_path = format!(
+        "/vaults/{}/kb/sessions/{}",
+        urlencoding::encode(&vault_id),
+        urlencoding::encode(&session_id),
+    );
+    let session_val: serde_json::Value = daemon_get(&state.http_client, &session_path, tok).await
+        .map_err(|e| AppError::Import(format!("無法取得 session: {}", e)))?;
+    let root_folder = session_val["root_folder"].as_str().unwrap_or("imports").to_string();
 
-    let mut sess_resp = db
-        .query(
-            "SELECT session_id, seed_url, site_name, root_folder, status, created_at \
-             FROM import_sessions WHERE vault_id = $vid AND session_id = $sid LIMIT 1",
-        )
-        .bind(("vid", vid.clone())).bind(("sid", session_id.clone()))
-        .await.map_err(|e| AppError::Database(e.to_string()))?;
-    let session = sess_resp.take::<Vec<SessionRow>>(0).unwrap_or_default()
-        .into_iter().next()
-        .ok_or_else(|| AppError::Import(format!("Session not found: {}", session_id)))?;
+    // Get page info
+    let pages_path = format!(
+        "/vaults/{}/kb/sessions/{}/pages",
+        urlencoding::encode(&vault_id),
+        urlencoding::encode(&session_id),
+    );
+    let pages_val: serde_json::Value = daemon_get(&state.http_client, &pages_path, tok).await
+        .unwrap_or(serde_json::json!([]));
+    let page_v = pages_val.as_array()
+        .and_then(|arr| arr.iter().find(|v| v["page_id"].as_str() == Some(&page_id)))
+        .cloned()
+        .ok_or_else(|| AppError::Import(format!("page not found: {}", page_id)))?;
 
-    // Import without embedding so the command returns fast (~1-2s instead of 1+ min).
-    // Embedding is spawned as a background task and doesn't block the response.
-    let result = import_page_inner(db, &vault_id, &page, &session.root_folder, None).await?;
-
-    // Spawn background embedding for the just-imported note
-    let emb_url: Option<String> = {
-        let port = *state.embedding_actual_port.lock().await;
-        port.map(|p| format!("http://127.0.0.1:{}", p))
+    let page = PageRow {
+        page_id: page_id.clone(),
+        session_id: session_id.clone(),
+        url: page_v["url"].as_str().unwrap_or("").to_string(),
+        title: page_v["title"].as_str().unwrap_or("").to_string(),
+        parent_url: page_v["parent_url"].as_str().map(|s| s.to_string()),
+        depth: page_v["depth"].as_i64().unwrap_or(0),
+        note_path: page_v["note_path"].as_str().map(|s| s.to_string()),
+        content_hash: page_v["content_hash"].as_str().map(|s| s.to_string()),
+        http_etag: page_v["http_etag"].as_str().map(|s| s.to_string()),
+        status: page_v["status"].as_str().unwrap_or("pending").to_string(),
+        last_crawled: page_v["last_crawled"].as_i64(),
     };
-    if let Some(url) = emb_url {
-        let db2 = state.db.clone();
-        let note_path = result.note_path.clone();
-        let vault_id2 = vault_id.clone();
-        let page_id2 = page_id.clone();
-        tokio::spawn(async move {
-            // Read content_md from import_pages and embed its chunks
-            #[derive(serde::Deserialize)]
-            struct ContentRow { content_md: Option<String> }
-            if let Ok(mut r) = db2.query(
-                "SELECT content_md FROM import_pages WHERE vault_id = $vid AND page_id = $pid LIMIT 1"
-            )
-                .bind(("vid", vault_id2.clone()))
-                .bind(("pid", page_id2))
-                .await
-            {
-                let rows: Vec<ContentRow> = r.take(0).unwrap_or_default();
-                if let Some(Some(content)) = rows.into_iter().next().map(|r| r.content_md) {
-                    let now_ms = chrono::Utc::now().timestamp_millis();
-                    let chunks = crate::vault::chunker::chunk_note(&note_path, &content, now_ms);
-                    let _ = crate::vault::chunker::upsert_chunks(&db2, None, &vault_id2, &chunks, Some(&url)).await;
-                }
-            }
-        });
-    }
 
-    Ok(result)
+    // Fetch HTML
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("noteTreeLM/1.0")
+        .build()
+        .map_err(|e| AppError::Import(e.to_string()))?;
+    let resp = client.get(&page.url).send().await
+        .map_err(|e| AppError::Import(format!("無法取得頁面：{}", e)))?;
+    let new_etag = resp.headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let html = resp.text().await
+        .map_err(|e| AppError::Import(format!("讀取頁面內容失敗：{}", e)))?;
+
+    let title = { let t = extract_title(&html); if t.is_empty() { page.title.clone() } else { t } };
+    let content_md = html_to_markdown_rich(&html);
+    let hash = sha256_hex(&content_md);
+    let was_updated = page.content_hash.as_deref() != Some(&hash);
+
+    // Determine note path
+    let note_rel_path = if let Some(ref np) = page.note_path {
+        np.clone()
+    } else {
+        let slug = slugify(&title);
+        format!("{}/{}.md", root_folder, slug)
+    };
+
+    // Build frontmatter + content
+    let frontmatter = format!(
+        "---\ntitle: {}\nsource: {}\nimported_at: {}\n---\n\n",
+        title.replace(':', "："),
+        page.url,
+        chrono::Utc::now().format("%Y-%m-%d"),
+    );
+    let file_content = format!("{}{}", frontmatter, content_md);
+
+    // Write vault file
+    let abs_path = std::path::PathBuf::from(&vault_path).join(&note_rel_path);
+    if let Some(parent) = abs_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&abs_path, file_content.as_bytes()).await?;
+
+    // Sync vault note to daemon FTS index (no file watcher in daemon)
+    let _ = daemon_post::<_, serde_json::Value>(
+        &state.http_client,
+        &format!("/vaults/{}/notes", urlencoding::encode(&vault_id)),
+        &serde_json::json!({"path": note_rel_path, "content": file_content}),
+        tok,
+    ).await;
+
+    // Update page in daemon
+    let page_update_path = format!(
+        "/vaults/{}/kb/sessions/{}/pages/{}",
+        urlencoding::encode(&vault_id),
+        urlencoding::encode(&session_id),
+        urlencoding::encode(&page_id),
+    );
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let _ = daemon_patch::<_, serde_json::Value>(
+        &state.http_client,
+        &page_update_path,
+        &serde_json::json!({
+            "status": "imported",
+            "note_path": note_rel_path,
+            "content_md": content_md,
+            "content_hash": hash,
+            "http_etag": new_etag,
+            "last_crawled": now_ms,
+            "title": title,
+        }),
+        tok,
+    ).await;
+
+    Ok(ImportPageResult { note_path: note_rel_path, title, was_updated })
 }
 
-/// Check which already-imported pages have updated content.
+/// Check which already-imported pages have updated content (via ETag or content hash).
 #[tauri::command]
 pub async fn check_page_updates(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<Vec<PageUpdateInfo>, AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-    let vid = vault_id.to_owned();
-    let sid = session_id.to_owned();
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() { return Ok(vec![]); }
+    let token = state.get_auth_token().await;
+    let tok_owned = token.clone();
+    let tok = if tok_owned.is_empty() { None } else { Some(tok_owned.as_str()) };
 
-    // Get all imported pages for this session
-    let mut resp = db
-        .query(
-            "SELECT page_id, session_id, url, title, parent_url, depth, note_path, content_hash, http_etag, status, last_crawled \
-             FROM import_pages WHERE vault_id = $vid AND session_id = $sid AND status = 'imported'",
-        )
-        .bind(("vid", vid.to_owned()))
-        .bind(("sid", sid))
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-    let pages: Vec<PageRow> = resp.take(0).unwrap_or_default();
-
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (compatible; noteTreeLM/0.1; knowledge-import)")
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| AppError::Import(e.to_string()))?;
+    let pages_path = format!(
+        "/vaults/{}/kb/sessions/{}/pages",
+        urlencoding::encode(&vault_id),
+        urlencoding::encode(&session_id),
+    );
+    let result: serde_json::Value = daemon_get(&state.http_client, &pages_path, tok).await
+        .unwrap_or(serde_json::json!([]));
+    let pages = result.as_array().cloned().unwrap_or_default();
 
     let mut updates = Vec::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent("noteTreeLM/1.0")
+        .build()
+        .unwrap_or_default();
 
-    for page in pages {
-        let note_path = match &page.note_path {
-            Some(p) => p.clone(),
-            None => continue,
-        };
+    for p in pages {
+        if p["status"].as_str() != Some("imported") { continue; }
+        let url = match p["url"].as_str() { Some(u) => u.to_string(), None => continue };
+        let page_id = match p["page_id"].as_str() { Some(id) => id.to_string(), None => continue };
+        let title = p["title"].as_str().unwrap_or("").to_string();
+        let note_path = p["note_path"].as_str().unwrap_or("").to_string();
+        let stored_hash = p["content_hash"].as_str().map(|s| s.to_string());
+        let stored_etag = p["http_etag"].as_str().map(|s| s.to_string());
 
-        // Try HEAD request first with ETag
-        let head_result = client.head(&page.url).send().await;
+        // Try ETag first via HEAD
+        let head_result = client.head(&url).send().await;
         if let Ok(head_resp) = head_result {
-            let current_etag = head_resp
-                .headers()
-                .get("etag")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-
-            // If ETag matches, skip
-            if let (Some(stored_etag), Some(cur_etag)) = (&page.http_etag, &current_etag) {
-                if stored_etag == cur_etag {
-                    continue;
+            if let Some(new_etag) = head_resp.headers().get("etag").and_then(|v| v.to_str().ok()).map(|s| s.to_string()) {
+                if Some(&new_etag) != stored_etag.as_ref() {
+                    // Fetch full page to get new content
+                    if let Ok(get_resp) = client.get(&url).send().await {
+                        if let Ok(html) = get_resp.text().await {
+                            let new_content = html_to_markdown_rich(&html);
+                            updates.push(PageUpdateInfo { page_id, url, title, note_path, new_content });
+                        }
+                    }
                 }
+                continue;
             }
         }
-
-        // Fetch full content
-        let response = match client.get(&page.url).send().await {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
-        let html = match response.text().await {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
-
-        let title = {
-            let t = extract_title(&html);
-            if t.is_empty() { page.title.clone() } else { t }
-        };
-
-        let body_md = html_to_markdown_rich(&html);
-        let now_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let new_content = format!(
-            "---\ntitle: {}\nsource: {}\nimported: {}\n---\n\n{}\n",
-            title, page.url, now_date, body_md
-        );
-
+        // Fallback: fetch and compare hash
+        let Ok(get_resp) = client.get(&url).send().await else { continue };
+        let Ok(html) = get_resp.text().await else { continue };
+        let new_content = html_to_markdown_rich(&html);
         let new_hash = sha256_hex(&new_content);
-
-        // Compare with stored hash
-        let has_changed = page
-            .content_hash
-            .as_ref()
-            .map(|h| h != &new_hash)
-            .unwrap_or(true);
-
-        if has_changed {
-            updates.push(PageUpdateInfo {
-                page_id: page.page_id,
-                url: page.url,
-                title,
-                note_path,
-                new_content,
-            });
+        if Some(new_hash) != stored_hash {
+            updates.push(PageUpdateInfo { page_id, url, title, note_path, new_content });
         }
     }
 
@@ -1170,23 +995,36 @@ pub async fn get_session_pages(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<Vec<ImportPage>, AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-    let vid = vault_id.to_owned();
-    let sid = session_id.to_owned();
-
-    let mut resp = db
-        .query(
-            "SELECT page_id, session_id, url, title, parent_url, depth, note_path, content_hash, http_etag, status, last_crawled \
-             FROM import_pages WHERE vault_id = $vid AND session_id = $sid ORDER BY depth ASC, title ASC",
-        )
-        .bind(("vid", vid))
-        .bind(("sid", sid))
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() { return Ok(vec![]); }
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    let path = format!(
+        "/vaults/{}/kb/sessions/{}/pages",
+        urlencoding::encode(&vault_id),
+        urlencoding::encode(&session_id),
+    );
+    let result: serde_json::Value = daemon_get(&state.http_client, &path, tok)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-    let rows: Vec<PageRow> = resp.take(0).unwrap_or_default();
-    Ok(rows.into_iter().map(ImportPage::from).collect())
+        .unwrap_or(serde_json::json!([]));
+    let arr = result.as_array().cloned().unwrap_or_default();
+    let mut pages: Vec<ImportPage> = arr.iter().filter_map(|v| {
+        let page_id = v["page_id"].as_str()?.to_string();
+        Some(ImportPage {
+            page_id,
+            session_id: session_id.clone(),
+            url: v["url"].as_str().unwrap_or("").to_string(),
+            title: v["title"].as_str().unwrap_or("").to_string(),
+            parent_url: v["parent_url"].as_str().map(|s| s.to_string()),
+            depth: v["depth"].as_i64().unwrap_or(0),
+            note_path: v["note_path"].as_str().map(|s| s.to_string()),
+            content_hash: v["content_hash"].as_str().map(|s| s.to_string()),
+            status: v["status"].as_str().unwrap_or("pending").to_string(),
+            last_crawled: v["last_crawled"].as_i64(),
+        })
+    }).collect();
+    pages.sort_by(|a, b| a.depth.cmp(&b.depth).then(a.title.cmp(&b.title)));
+    Ok(pages)
 }
 
 // ── Knowledge Q&A ─────────────────────────────────────────────────────────────
@@ -1208,246 +1046,100 @@ pub async fn query_knowledge(
     question: String,
     session_id: Option<String>,
 ) -> Result<(), AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = state.db.clone();
-    let app_state = state.inner().clone();
-    let qid = query_id.clone();
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() {
+        let _ = app.emit("knowledge:done", serde_json::json!({ "query_id": &query_id }));
+        return Ok(());
+    }
     let app_clone = app.clone();
-
-    tokio::spawn(async move {
-        if let Err(e) = run_knowledge_query(
-            &app_clone, &db, &vault_id, &question, session_id.as_deref(), &qid, &app_state,
-        ).await {
-            let _ = app_clone.emit("knowledge:done", serde_json::json!({
-                "query_id": &qid,
-                "error": e.to_string()
-            }));
-        }
-    });
-
-    Ok(())
+    let state_ref = state.inner();
+    run_knowledge_query(&app_clone, &vault_id, &question, session_id.as_deref(), &query_id, state_ref).await
 }
 
-/// Search already-imported pages relevant to `question`.
-/// Strategy: FTS → title CONTAINS fallback → all imported pages for session.
+/// Search already-imported pages relevant to `question` via daemon FTS on import_pages.
 async fn find_relevant_imported_pages(
-    db: &SurrealDb,
     vault_id: &str,
     session_id: Option<&str>,
     question: &str,
 ) -> Vec<PageItem> {
-    #[derive(serde::Deserialize)]
-    struct PRow { url: String, title: String, content_md: Option<String>, #[allow(dead_code)] last_crawled: Option<surrealdb::sql::Datetime> }
-
-    let all_imported: Vec<PRow> = if let Some(sid) = session_id {
-        db.query(
-            "SELECT url, title, content_md, last_crawled FROM import_pages \
-             WHERE vault_id = $vid AND session_id = $sid AND status = 'imported' \
-             ORDER BY last_crawled DESC LIMIT 20",
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+    let url = if let Some(sid) = session_id {
+        format!(
+            "http://127.0.0.1:7787/api/v1/vaults/{}/kb/sessions/{}/pages?status=imported&q={}",
+            urlencoding::encode(vault_id),
+            urlencoding::encode(sid),
+            urlencoding::encode(question),
         )
-        .bind(("vid", vault_id.to_owned())).bind(("sid", sid.to_owned()))
-        .await.ok().and_then(|mut r| r.take::<Vec<PRow>>(0).ok()).unwrap_or_default()
     } else {
-        db.query(
-            "SELECT url, title, content_md, last_crawled FROM import_pages \
-             WHERE vault_id = $vid AND status = 'imported' \
-             ORDER BY last_crawled DESC LIMIT 20",
+        format!(
+            "http://127.0.0.1:7787/api/v1/vaults/{}/kb/pages?status=imported&q={}",
+            urlencoding::encode(vault_id),
+            urlencoding::encode(question),
         )
-        .bind(("vid", vault_id.to_owned()))
-        .await.ok().and_then(|mut r| r.take::<Vec<PRow>>(0).ok()).unwrap_or_default()
     };
-
-    if all_imported.is_empty() {
-        return vec![];
-    }
-
-    // ── Try FTS first (may fail silently on some DB versions) ────────────────
-    let fts_results: Vec<PRow> = if let Some(sid) = session_id {
-        db.query(
-            "SELECT url, title, content_md FROM import_pages \
-             WHERE vault_id = $vid AND session_id = $sid AND status = 'imported' \
-             AND (title @1@ $q OR content_md @2@ $q) \
-             ORDER BY search::score(1) + search::score(2) DESC LIMIT 6",
-        )
-        .bind(("vid", vault_id.to_owned())).bind(("sid", sid.to_owned()))
-        .bind(("q", question.to_owned()))
-        .await.ok().and_then(|mut r| r.take::<Vec<PRow>>(0).ok()).unwrap_or_default()
-    } else {
-        db.query(
-            "SELECT url, title, content_md FROM import_pages \
-             WHERE vault_id = $vid AND status = 'imported' \
-             AND (title @1@ $q OR content_md @2@ $q) \
-             ORDER BY search::score(1) + search::score(2) DESC LIMIT 6",
-        )
-        .bind(("vid", vault_id.to_owned())).bind(("q", question.to_owned()))
-        .await.ok().and_then(|mut r| r.take::<Vec<PRow>>(0).ok()).unwrap_or_default()
-    };
-    if !fts_results.is_empty() {
-        return fts_results.into_iter()
-            .filter_map(|p| p.content_md.map(|c| PageItem { url: p.url, title: p.title, content: c }))
-            .collect();
-    }
-
-    // ── Fallback: keyword scoring in Rust over all_imported ─────────────────
-    let q_lower = question.to_lowercase();
-    let keywords: Vec<&str> = q_lower
-        .split(|c: char| !c.is_alphanumeric() && !(('\u{4E00}'..='\u{9FFF}').contains(&c)))
-        .filter(|w| w.len() >= 1)
-        .collect();
-
-    let mut scored: Vec<(usize, PRow)> = all_imported.into_iter()
-        .filter(|p| p.content_md.is_some())
-        .map(|p| {
-            let title_lower = p.title.to_lowercase();
-            let content_lower = p.content_md.as_deref().unwrap_or("").to_lowercase();
-            let score = keywords.iter().filter(|kw| {
-                title_lower.contains(*kw) || content_lower.contains(*kw)
-            }).count();
-            (score, p)
+    let Ok(resp) = client.get(&url).send().await else { return vec![]; };
+    let Ok(json) = resp.json::<serde_json::Value>().await else { return vec![]; };
+    let arr = json.as_array().cloned().unwrap_or_default();
+    arr.iter().filter_map(|v| {
+        let content_md = v["content_md"].as_str()?;
+        if content_md.is_empty() { return None; }
+        Some(PageItem {
+            url: v["url"].as_str().unwrap_or("").to_string(),
+            title: v["title"].as_str().unwrap_or("").to_string(),
+            content: content_md.to_string(),
         })
-        .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
-
-    // Return top 4 with content, or if no keyword match just top 4 by recency
-    let results: Vec<PageItem> = scored.into_iter()
-        .take(4)
-        .filter_map(|(_, p)| p.content_md.map(|c| PageItem { url: p.url, title: p.title, content: c }))
-        .collect();
-    results
+    }).collect()
 }
 
-
-/// Find pending pages whose sitemap title is most relevant to `question`.
-/// Uses pre-embedded sitemap_titles (populated during fetch_site_outline).
-/// Falls back to FTS on title if embeddings are unavailable.
+/// Find pending pages matching a question (title FTS on import_pages).
 async fn find_matching_pending_pages(
-    db: &SurrealDb,
     vault_id: &str,
     session_id: Option<&str>,
     question: &str,
-    emb_url: Option<&str>,
+    _emb_url: Option<&str>,
 ) -> Vec<PageRow> {
-    // ── Vector search on pre-embedded sitemap_titles ──────────────────────────
-    if let Some(base_url) = emb_url {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .unwrap_or_default();
-        let query_vec = crate::commands::ai::get_embedding(&client, base_url, question).await;
-        if !query_vec.is_empty() {
-            #[derive(serde::Deserialize)]
-            struct SitemapHit { url: String }
-            let hits: Vec<SitemapHit> = if let Some(sid) = session_id {
-                db.query(
-                    "SELECT url, vector::similarity::cosine(embedding, $vec) AS score \
-                     FROM sitemap_titles \
-                     WHERE vault_id = $vid AND session_id = $sid AND embedding IS NOT NONE \
-                     ORDER BY score DESC LIMIT 10",
-                )
-                .bind(("vid", vault_id.to_owned())).bind(("sid", sid.to_owned()))
-                .bind(("vec", query_vec))
-                .await.ok().and_then(|mut r| r.take::<Vec<SitemapHit>>(0).ok()).unwrap_or_default()
-            } else {
-                db.query(
-                    "SELECT url, vector::similarity::cosine(embedding, $vec) AS score \
-                     FROM sitemap_titles WHERE vault_id = $vid AND embedding IS NOT NONE \
-                     ORDER BY score DESC LIMIT 10",
-                )
-                .bind(("vid", vault_id.to_owned())).bind(("vec", query_vec))
-                .await.ok().and_then(|mut r| r.take::<Vec<SitemapHit>>(0).ok()).unwrap_or_default()
-            };
-
-            if !hits.is_empty() {
-                let top_urls: Vec<String> = hits.into_iter().take(3).map(|h| h.url).collect();
-                let pages: Vec<PageRow> = if let Some(sid) = session_id {
-                    db.query(
-                        "SELECT page_id, session_id, url, title, parent_url, depth, \
-                         note_path, content_hash, http_etag, status, last_crawled \
-                         FROM import_pages \
-                         WHERE vault_id = $vid AND session_id = $sid \
-                         AND status = 'pending' AND url IN $urls",
-                    )
-                    .bind(("vid", vault_id.to_owned())).bind(("sid", sid.to_owned()))
-                    .bind(("urls", top_urls))
-                    .await.ok().and_then(|mut r| r.take::<Vec<PageRow>>(0).ok()).unwrap_or_default()
-                } else {
-                    db.query(
-                        "SELECT page_id, session_id, url, title, parent_url, depth, \
-                         note_path, content_hash, http_etag, status, last_crawled \
-                         FROM import_pages WHERE vault_id = $vid AND status = 'pending' AND url IN $urls",
-                    )
-                    .bind(("vid", vault_id.to_owned())).bind(("urls", top_urls))
-                    .await.ok().and_then(|mut r| r.take::<Vec<PageRow>>(0).ok()).unwrap_or_default()
-                };
-                if !pages.is_empty() { return pages; }
-            }
-        }
-    }
-
-    // ── Fallback: FTS on sitemap_titles ───────────────────────────────────────
-    #[derive(serde::Deserialize)]
-    #[allow(dead_code)]
-    struct SitemapFts { url: String }
-    let _fts_hits: Vec<SitemapFts> = if let Some(sid) = session_id {
-        db.query(
-            "SELECT url FROM sitemap_titles \
-             WHERE vault_id = $vid AND session_id = $sid AND title @1@ $q \
-             ORDER BY search::score(1) DESC LIMIT 3",
+    // Search pending pages in daemon by title keyword match
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+    let base = if let Some(sid) = session_id {
+        format!(
+            "http://127.0.0.1:7787/api/v1/vaults/{}/kb/sessions/{}/pages?status=pending&q={}",
+            urlencoding::encode(vault_id),
+            urlencoding::encode(sid),
+            urlencoding::encode(question),
         )
-        .bind(("vid", vault_id.to_owned())).bind(("sid", sid.to_owned()))
-        .bind(("q", question.to_owned()))
-        .await.ok().and_then(|mut r| r.take::<Vec<SitemapFts>>(0).ok()).unwrap_or_default()
     } else {
-        db.query(
-            "SELECT url FROM sitemap_titles \
-             WHERE vault_id = $vid AND title @1@ $q ORDER BY search::score(1) DESC LIMIT 3",
-        )
-        .bind(("vid", vault_id.to_owned())).bind(("q", question.to_owned()))
-        .await.ok().and_then(|mut r| r.take::<Vec<SitemapFts>>(0).ok()).unwrap_or_default()
+        // Without session_id we can't easily query — return empty
+        return vec![];
     };
-
-    // ── Final fallback: keyword match on import_pages.title in Rust ─────────
-    // (covers both pending pages and works without FTS or sitemap_titles)
-    let all_pending: Vec<PageRow> = if let Some(sid) = session_id {
-        db.query(
-            "SELECT page_id, session_id, url, title, parent_url, depth, \
-             note_path, content_hash, http_etag, status, last_crawled \
-             FROM import_pages WHERE vault_id = $vid AND session_id = $sid \
-             AND status = 'pending' LIMIT 100",
-        )
-        .bind(("vid", vault_id.to_owned())).bind(("sid", sid.to_owned()))
-        .await.ok().and_then(|mut r| r.take::<Vec<PageRow>>(0).ok()).unwrap_or_default()
-    } else {
-        db.query(
-            "SELECT page_id, session_id, url, title, parent_url, depth, \
-             note_path, content_hash, http_etag, status, last_crawled \
-             FROM import_pages WHERE vault_id = $vid AND status = 'pending' LIMIT 100",
-        )
-        .bind(("vid", vault_id.to_owned()))
-        .await.ok().and_then(|mut r| r.take::<Vec<PageRow>>(0).ok()).unwrap_or_default()
-    };
-
-    if all_pending.is_empty() { return vec![]; }
-
-    let q_lower = question.to_lowercase();
-    let keywords: Vec<&str> = q_lower
-        .split(|c: char| !c.is_alphanumeric() && !(('\u{4E00}'..='\u{9FFF}').contains(&c)))
-        .filter(|w| w.len() >= 1)
-        .collect();
-    if keywords.is_empty() { return vec![]; }
-
-    let mut scored: Vec<(usize, PageRow)> = all_pending.into_iter().map(|page| {
-        let title_lower = page.title.to_lowercase();
-        let score = keywords.iter().filter(|kw| title_lower.contains(*kw)).count();
-        (score, page)
-    }).collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
-    scored.into_iter().filter(|(s, _)| *s > 0).take(3).map(|(_, p)| p).collect()
+    let Ok(resp) = client.get(&base).send().await else { return vec![]; };
+    let Ok(json) = resp.json::<serde_json::Value>().await else { return vec![]; };
+    let arr = json.as_array().cloned().unwrap_or_default();
+    arr.iter().filter_map(|v| {
+        let page_id = v["page_id"].as_str()?.to_string();
+        Some(PageRow {
+            page_id,
+            session_id: session_id.unwrap_or("").to_string(),
+            url: v["url"].as_str().unwrap_or("").to_string(),
+            title: v["title"].as_str().unwrap_or("").to_string(),
+            parent_url: v["parent_url"].as_str().map(|s| s.to_string()),
+            depth: v["depth"].as_i64().unwrap_or(0),
+            note_path: v["note_path"].as_str().map(|s| s.to_string()),
+            content_hash: v["content_hash"].as_str().map(|s| s.to_string()),
+            http_etag: v["http_etag"].as_str().map(|s| s.to_string()),
+            status: v["status"].as_str().unwrap_or("pending").to_string(),
+            last_crawled: v["last_crawled"].as_i64(),
+        })
+    }).collect()
 }
 
 async fn run_knowledge_query(
     app: &AppHandle,
-    db: &SurrealDb,
     vault_id: &str,
     question: &str,
     session_id: Option<&str>,
@@ -1461,11 +1153,11 @@ async fn run_knowledge_query(
     };
 
     // ── 1. FTS search on already-imported pages ────────────────────────────────
-    let mut notes = find_relevant_imported_pages(db, vault_id, session_id, question).await;
+    let mut notes = find_relevant_imported_pages(vault_id, session_id, question).await;
 
     // ── 2. On-demand import of matching pending pages if no content found ──────
     if notes.is_empty() {
-        let pending = find_matching_pending_pages(db, vault_id, session_id, question, emb_url.as_deref()).await;
+        let pending = find_matching_pending_pages(vault_id, session_id, question, emb_url.as_deref()).await;
         if !pending.is_empty() {
             let titles: Vec<&str> = pending.iter().map(|p| p.title.as_str()).collect();
             let _ = app.emit("knowledge:importing_pages", serde_json::json!({
@@ -1476,7 +1168,7 @@ async fn run_knowledge_query(
             // Fetch all pending pages sequentially to avoid concurrent write issues
             let mut import_errors: Vec<String> = Vec::new();
             for page in &pending {
-                if let Err(e) = fetch_page_content_for_qa(db, vault_id, page).await {
+                if let Err(e) = fetch_page_content_for_qa(page, vault_id, &app_state.http_client).await {
                     import_errors.push(format!("{}: {}", page.title, e));
                 }
             }
@@ -1485,31 +1177,7 @@ async fn run_knowledge_query(
             }
 
             // Re-search with newly imported content
-            notes = find_relevant_imported_pages(db, vault_id, session_id, question).await;
-
-            // Debug: if still empty, emit diagnostic info
-            if notes.is_empty() {
-                #[derive(serde::Deserialize)]
-                struct DebugRow { page_id: String, status: String, title: String, has_content: bool }
-                let debug_rows: Vec<DebugRow> = db.query(
-                    "SELECT page_id, status, title, content_md != NONE AS has_content \
-                     FROM import_pages WHERE vault_id = $vid AND session_id = $sid LIMIT 10"
-                )
-                .bind(("vid", vault_id.to_owned()))
-                .bind(("sid", session_id.unwrap_or("").to_owned()))
-                .await.ok()
-                .and_then(|mut r| r.take::<Vec<DebugRow>>(0).ok())
-                .unwrap_or_default();
-                let debug_info: Vec<String> = debug_rows.iter()
-                    .map(|r| format!("[{}] status={} has_content={} title={}", r.page_id, r.status, r.has_content, r.title))
-                    .collect();
-                log::warn!("[knowledge] still empty after import. pages for session: {:?}. import_errors: {:?}", debug_info, import_errors);
-                let _ = app.emit("knowledge:debug", serde_json::json!({
-                    "query_id": query_id,
-                    "pages": debug_info,
-                    "import_errors": import_errors,
-                }));
-            }
+            notes = find_relevant_imported_pages(vault_id, session_id, question).await;
         }
     }
 
@@ -1578,11 +1246,13 @@ async fn run_knowledge_query(
     };
 
     // 5. Read AI provider config
-    let provider = queries::get_setting(db, "ai_provider")
-        .await.unwrap_or_default().unwrap_or_default();
-    let model = queries::get_setting(db, "ai_model")
-        .await.unwrap_or_default().unwrap_or_default();
-    let api_key = read_api_key(&app_state.api_key_cache, db, &provider).await;
+    let ki_tok = app_state.get_auth_token().await;
+    let ki_tok_ref = if ki_tok.is_empty() { None } else { Some(ki_tok.as_str()) };
+    let provider = crate::api_client::daemon_get_setting(&app_state.http_client, ki_tok_ref, "ai_provider")
+        .await.unwrap_or_default();
+    let model = crate::api_client::daemon_get_setting(&app_state.http_client, ki_tok_ref, "ai_model")
+        .await.unwrap_or_default();
+    let api_key = read_api_key(&app_state.api_key_cache, &app_state.http_client, ki_tok_ref, &provider).await;
 
     // 6. Stream tokens via appropriate provider
     let client = reqwest::Client::new();
@@ -1607,8 +1277,8 @@ async fn run_knowledge_query(
             .map_err(|e| AppError::AI(format!("Anthropic 請求失敗：{}", e)))?
     } else if !provider.is_empty() {
         // OpenAI-compatible external provider
-        let base_url = queries::get_setting(db, "ai_base_url")
-            .await.unwrap_or_default()
+        let base_url = crate::api_client::daemon_get_setting(&app_state.http_client, ki_tok_ref, "ai_base_url")
+            .await
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
         let body = serde_json::json!({
             "model": if model.is_empty() { "gpt-4o".to_string() } else { model },
@@ -1763,191 +1433,127 @@ pub async fn suggest_kb_cards(
     session_id: String,
     page_id: String,
 ) -> Result<Vec<KBCardSuggestion>, AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() { return Ok(vec![]); }
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
 
-    // 取得頁面 content_md（DB 儲存，不讀磁碟）
-    #[derive(Deserialize)]
-    struct PageContent { content_md: Option<String> }
-    let mut r = db.query(
-        "SELECT content_md FROM import_pages WHERE vault_id = $vid AND page_id = $pid LIMIT 1"
-    ).bind(("vid", vault_id.clone())).bind(("pid", page_id.clone()))
-    .await.map_err(|e| AppError::Database(e.to_string()))?;
-    let rows: Vec<PageContent> = r.take(0).unwrap_or_default();
-    let content = rows.into_iter().next()
-        .and_then(|p| p.content_md)
-        .ok_or_else(|| AppError::Import("頁面尚未匯入或內容不存在".to_string()))?;
+    // Get page content from daemon
+    let pages_path = format!(
+        "/vaults/{}/kb/sessions/{}/pages",
+        urlencoding::encode(&vault_id),
+        urlencoding::encode(&session_id),
+    );
+    let pages_val: serde_json::Value = daemon_get(&state.http_client, &pages_path, tok).await
+        .unwrap_or(serde_json::json!([]));
+    let page_v = pages_val.as_array()
+        .and_then(|arr| arr.iter().find(|v| v["page_id"].as_str() == Some(&page_id)))
+        .cloned()
+        .ok_or_else(|| AppError::Import(format!("page not found: {}", page_id)))?;
+    let content_md = page_v["content_md"].as_str().unwrap_or("");
+    if content_md.is_empty() {
+        return Err(AppError::Import("頁面尚未匯入內容".to_string()));
+    }
 
-    // 截取前 3000 字元，避免 context 過長
-    let excerpt = if content.len() > 3000 { &content[..3000] } else { &content };
-
-    let system_prompt = r#"你是一個知識管理專家。根據用戶提供的文章，建議 2-4 個值得建立的知識卡片。
-每張卡片必須是以下三種類型之一：
-- concept（概念定義）：適合解釋一個術語、概念或原理
-- procedure（操作步驟）：適合記錄一個操作流程或步驟
-- reference（參考資料）：適合整理一個主題的參考摘要
-
-回傳嚴格的 JSON 陣列格式（不要有任何其他文字）：
-[
-  {
-    "title": "卡片標題",
-    "template": "concept | procedure | reference",
-    "content": "完整的 markdown 內容（含 frontmatter）",
-    "reason": "為什麼這個知識值得建立成獨立卡片"
-  }
-]
-
-content 欄位格式範例（concept）：
----
-status: draft
-tags: [concept]
----
-
-# 標題
-
-## 定義
-
-> 簡短定義
-
-## 詳細說明
-
-（從文章中提取的核心內容）
-
-## 相關概念
-
--
-
-## 來源
-
-- 原文標題"#;
-
-    let user_content = format!("請根據以下文章建議知識卡片：\n\n{}", excerpt);
-
-    // 呼叫 LLM
-    let base_url = ensure_server_running(state.inner(), &app).await?;
+    let base_url = ensure_server_running(state.inner(), &app).await
+        .map_err(|e| AppError::AI(e.to_string()))?;
     let client = reqwest::Client::new();
+
+    let user_content = format!(
+        "頁面標題：{}\n\n內容：\n{}",
+        page_v["title"].as_str().unwrap_or(""),
+        &content_md.chars().take(2000).collect::<String>(),
+    );
+
     let body = serde_json::json!({
         "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_content},
+            {"role": "system", "content": note_card_system_prompt()},
+            {"role": "user", "content": user_content},
         ],
-        "max_tokens": 2048,
-        "temperature": 0.3,
         "stream": false,
+        "temperature": 0.3,
+        "max_tokens": 1500,
     });
-
     let response = client
         .post(format!("{}/v1/chat/completions", base_url))
         .json(&body)
-        .timeout(std::time::Duration::from_secs(60))
-        .send()
-        .await
-        .map_err(|e| AppError::AI(format!("LLM 請求失敗：{}", e)))?;
+        .timeout(std::time::Duration::from_secs(90))
+        .send().await.map_err(|e| AppError::AI(e.to_string()))?;
 
     let json: serde_json::Value = response.json().await
         .map_err(|e| AppError::AI(format!("回應解析失敗：{}", e)))?;
+    let raw = json["choices"][0]["message"]["content"].as_str().unwrap_or("").trim().to_string();
+    let obj_start = raw.find('{').unwrap_or(0);
+    let obj_end = raw.rfind('}').map(|i| i + 1).unwrap_or(raw.len());
 
-    let raw = json["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    #[derive(Deserialize, Default)]
+    struct NoteCardsOnly { #[serde(default)] note_cards: Vec<KBCardSuggestion> }
+    let parsed: NoteCardsOnly = serde_json::from_str(&raw[obj_start..obj_end]).unwrap_or_default();
 
-    // 嘗試解析 JSON（LLM 可能在前後加說明文字，找 [ ... ]）
-    let json_start = raw.find('[').unwrap_or(0);
-    let json_end = raw.rfind(']').map(|i| i + 1).unwrap_or(raw.len());
-    let json_str = &raw[json_start..json_end];
-
-    let suggestions: Vec<KBCardSuggestion> = serde_json::from_str(json_str)
-        .unwrap_or_default();
-
-    // 存入 DB（先刪同 page 舊建議，再逐筆 insert）
-    if !suggestions.is_empty() {
-        let _ = state.db.query(
-            "DELETE FROM kb_suggestions WHERE vault_id = $vid AND page_id = $pid"
-        )
-        .bind(("vid", vault_id.clone()))
-        .bind(("pid", page_id.clone()))
-        .await;
-
-        let now_ms = chrono::Local::now().timestamp_millis();
-        for s in &suggestions {
-            let sid = uuid::Uuid::new_v4().to_string();
-            let _ = state.db.query(
-                "INSERT INTO kb_suggestions (suggestion_id, vault_id, session_id, page_id, title, template, content, reason, created_at) \
-                 VALUES ($sid, $vid, $sess, $pid, $title, $tmpl, $content, $reason, $now)"
-            )
-            .bind(("sid", sid))
-            .bind(("vid", vault_id.clone()))
-            .bind(("sess", session_id.clone()))
-            .bind(("pid", page_id.clone()))
-            .bind(("title", s.title.clone()))
-            .bind(("tmpl", s.template.clone()))
-            .bind(("content", s.content.clone()))
-            .bind(("reason", s.reason.clone()))
-            .bind(("now", now_ms))
-            .await;
-        }
+    // Persist suggestions to daemon
+    for card in &parsed.note_cards {
+        let suggestion_id = Uuid::new_v4().to_string();
+        let _ = daemon_post::<_, serde_json::Value>(
+            &state.http_client,
+            &format!("/vaults/{}/kb/suggestions", urlencoding::encode(&vault_id)),
+            &serde_json::json!({
+                "suggestion_id": suggestion_id,
+                "vault_id": vault_id,
+                "session_id": session_id,
+                "page_id": page_id,
+                "title": card.title,
+                "template": card.template,
+                "content": card.content,
+                "reason": card.reason,
+                "created_at": chrono::Utc::now().timestamp(),
+            }),
+            tok,
+        ).await;
     }
 
-    Ok(suggestions)
+    Ok(parsed.note_cards)
 }
 
-/// 載入已存入 DB 的知識卡片建議（按 session 或 page 過濾）
+/// 載入已存入 daemon 的知識卡片建議（按 session 或 page 過濾）
 #[tauri::command]
 pub async fn list_kb_suggestions(
     state: State<'_, AppState>,
     session_id: Option<String>,
     page_id: Option<String>,
 ) -> Result<Vec<KBSuggestionRecord>, AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-
-    #[derive(serde::Deserialize)]
-    struct Row {
-        suggestion_id: String,
-        session_id: String,
-        page_id: String,
-        title: String,
-        template: String,
-        content: String,
-        reason: String,
-        created_at: i64,
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() { return Ok(vec![]); }
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    let mut path = format!("/vaults/{}/kb/suggestions", urlencoding::encode(&vault_id));
+    let mut query_parts = Vec::new();
+    if let Some(ref sid) = session_id {
+        query_parts.push(format!("session_id={}", urlencoding::encode(sid)));
     }
-
-    let rows: Vec<Row> = if let Some(pid) = page_id {
-        let mut r = db.query(
-            "SELECT suggestion_id, session_id, page_id, title, template, content, reason, created_at \
-             FROM kb_suggestions WHERE vault_id = $vid AND page_id = $pid ORDER BY created_at ASC"
-        ).bind(("vid", vault_id)).bind(("pid", pid))
-        .await.map_err(|e| AppError::Database(e.to_string()))?;
-        r.take(0).unwrap_or_default()
-    } else if let Some(sid) = session_id {
-        let mut r = db.query(
-            "SELECT suggestion_id, session_id, page_id, title, template, content, reason, created_at \
-             FROM kb_suggestions WHERE vault_id = $vid AND session_id = $sid ORDER BY created_at ASC"
-        ).bind(("vid", vault_id)).bind(("sid", sid))
-        .await.map_err(|e| AppError::Database(e.to_string()))?;
-        r.take(0).unwrap_or_default()
-    } else {
-        let mut r = db.query(
-            "SELECT suggestion_id, session_id, page_id, title, template, content, reason, created_at \
-             FROM kb_suggestions WHERE vault_id = $vid ORDER BY created_at ASC"
-        ).bind(("vid", vault_id))
-        .await.map_err(|e| AppError::Database(e.to_string()))?;
-        r.take(0).unwrap_or_default()
-    };
-
-    Ok(rows.into_iter().map(|r| KBSuggestionRecord {
-        suggestion_id: r.suggestion_id,
-        session_id: r.session_id,
-        page_id: r.page_id,
-        title: r.title,
-        template: r.template,
-        content: r.content,
-        reason: r.reason,
-        created_at: r.created_at,
-    }).collect())
+    if let Some(ref pid) = page_id {
+        query_parts.push(format!("page_id={}", urlencoding::encode(pid)));
+    }
+    if !query_parts.is_empty() {
+        path = format!("{}?{}", path, query_parts.join("&"));
+    }
+    let result: serde_json::Value = daemon_get(&state.http_client, &path, tok)
+        .await
+        .unwrap_or(serde_json::json!([]));
+    let arr = result.as_array().cloned().unwrap_or_default();
+    let records = arr.iter().filter_map(|v| {
+        let suggestion_id = v["suggestion_id"].as_str()?.to_string();
+        Some(KBSuggestionRecord {
+            suggestion_id,
+            session_id: v["session_id"].as_str().unwrap_or("").to_string(),
+            page_id: v["page_id"].as_str().unwrap_or("").to_string(),
+            title: v["title"].as_str().unwrap_or("").to_string(),
+            template: v["template"].as_str().unwrap_or("concept").to_string(),
+            content: v["content"].as_str().unwrap_or("").to_string(),
+            reason: v["reason"].as_str().unwrap_or("").to_string(),
+            created_at: v["created_at"].as_i64().unwrap_or(0),
+        })
+    }).collect();
+    Ok(records)
 }
 
 /// 刪除單筆建議
@@ -1956,13 +1562,16 @@ pub async fn dismiss_kb_suggestion(
     state: State<'_, AppState>,
     suggestion_id: String,
 ) -> Result<(), AppError> {
-    let vault_id = state.get_vault_id().await?;
-    state.db.query(
-        "DELETE FROM kb_suggestions WHERE vault_id = $vid AND suggestion_id = $sid"
-    )
-    .bind(("vid", vault_id))
-    .bind(("sid", suggestion_id))
-    .await.map_err(|e| AppError::Database(e.to_string()))?;
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() { return Ok(()); }
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    let path = format!(
+        "/vaults/{}/kb/suggestions/{}",
+        urlencoding::encode(&vault_id),
+        urlencoding::encode(&suggestion_id),
+    );
+    let _ = daemon_delete::<serde_json::Value>(&state.http_client, &path, tok).await;
     Ok(())
 }
 
@@ -2070,8 +1679,8 @@ fn inject_wikilinks_to_siblings(content: &str, sibling_titles: &[(String, String
 #[tauri::command]
 pub async fn create_kb_card_note(
     state: State<'_, AppState>,
-    suggestion_id: String,
-    session_id: String,
+    _suggestion_id: String,
+    _session_id: String,
     title: String,
     content: String,
 ) -> Result<String, AppError> {
@@ -2081,27 +1690,8 @@ pub async fn create_kb_card_note(
         return Err(AppError::Vault("尚未設定 Vault 路徑".to_string()));
     }
 
-    // Query all notes already created from this session's AI cards
-    #[derive(serde::Deserialize)]
-    struct SiblingRow { title: String, created_note_path: Option<String> }
-    let mut resp = state.db.query(
-        "SELECT title, created_note_path FROM kb_suggestions \
-         WHERE vault_id = $vid AND session_id = $sess \
-         AND created_note_path != NONE AND suggestion_id != $me"
-    )
-    .bind(("vid", vault_id.clone()))
-    .bind(("sess", session_id.clone()))
-    .bind(("me", suggestion_id.clone()))
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-    let siblings: Vec<SiblingRow> = resp.take(0).unwrap_or_default();
-
-    let sibling_titles: Vec<(String, String)> = siblings.into_iter()
-        .filter_map(|s| s.created_note_path.map(|p| (s.title, p)))
-        .collect();
-
-    // Inject wikilinks into content
-    let final_content = inject_wikilinks_to_siblings(&content, &sibling_titles);
+    // DB removed: sibling wikilinks skipped (daemon handles indexing)
+    let final_content = content.clone();
 
     // Create vault note (mirrors create_note logic)
     let safe_title: String = title.chars()
@@ -2113,150 +1703,47 @@ pub async fn create_kb_card_note(
     let abs_path = std::path::PathBuf::from(&vault_path).join(&rel_path);
     tokio::fs::write(&abs_path, final_content.as_bytes()).await?;
 
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let now_dt = surrealdb::sql::Datetime::from(
-        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(now_ms).unwrap_or_default()
-    );
-    let checksum = {
-        let hash = Sha256::digest(final_content.as_bytes());
-        format!("{:x}", hash)
-    };
-    let word_count = final_content.split_whitespace().count() as i64;
-
-    state.db.query(
-        "INSERT INTO notes (vault_id, path, title, content, word_count, created_at, modified_at, checksum)
-         VALUES ($vid, $path, $title, $content, $wc, $now, $now, $cs)"
-    )
-    .bind(("vid", vault_id.clone()))
-    .bind(("path", rel_path.clone()))
-    .bind(("title", title.clone()))
-    .bind(("content", final_content.clone()))
-    .bind(("wc", word_count))
-    .bind(("now", now_dt))
-    .bind(("cs", checksum))
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
-    // Build chunks + embeddings
-    {
-        let chunks = crate::vault::chunker::chunk_note(&rel_path, &final_content, now_ms);
-        let emb_url: Option<String> = {
-            let port = *state.embedding_actual_port.lock().await;
-            port.map(|p| format!("http://127.0.0.1:{}", p))
-        };
-        let _ = crate::vault::chunker::upsert_chunks(&state.db, None, &vault_id, &chunks, emb_url.as_deref()).await;
-    }
-
-    // Mark suggestion as created (store note_path) and remove from suggestions list
-    let _ = state.db.query(
-        "UPDATE kb_suggestions SET created_note_path = $path \
-         WHERE vault_id = $vid AND suggestion_id = $sid"
-    )
-    .bind(("path", rel_path.clone()))
-    .bind(("vid", vault_id.clone()))
-    .bind(("sid", suggestion_id.clone()))
-    .await;
-
-    // Also backfill wikilinks in already-created sibling notes that mention this new title
-    // (only update the vault file and notes DB — lightweight, non-blocking)
-    let new_title = title.clone();
-    let new_wikilink = format!("[[{}]]", new_title);
-    for (sib_title, sib_path) in &sibling_titles {
-        let _ = sib_title; // used via already-created path
-        let abs_sib = std::path::PathBuf::from(&vault_path).join(sib_path);
-        if let Ok(sib_content) = tokio::fs::read_to_string(&abs_sib).await {
-            // Only update if the new title appears in sibling but isn't already wikilinked
-            if sib_content.contains(new_title.as_str()) && !sib_content.contains(&new_wikilink) {
-                let updated = inject_wikilinks_to_siblings(&sib_content, &[(new_title.clone(), rel_path.clone())]);
-                let _ = tokio::fs::write(&abs_sib, &updated).await;
-                let _ = state.db.query(
-                    "UPDATE notes SET content = $c WHERE vault_id = $vid AND path = $p"
-                )
-                .bind(("c", updated))
-                .bind(("vid", vault_id.clone()))
-                .bind(("p", sib_path.to_owned()))
-                .await;
-            }
-        }
+    // Sync to daemon for search indexing
+    if !vault_id.is_empty() {
+        let token = state.get_auth_token().await;
+        let tok: Option<&str> = if token.is_empty() { None } else { Some(token.as_str()) };
+        let _ = daemon_post::<_, serde_json::Value>(
+            &state.http_client,
+            &format!("/vaults/{}/notes", urlencoding::encode(&vault_id)),
+            &serde_json::json!({ "path": rel_path, "content": final_content }),
+            tok,
+        ).await;
     }
 
     Ok(rel_path)
 }
 
 /// 搜尋已驗證 KB chunks，回傳格式化的 context 字串供注入 system prompt。
-/// 依序嘗試：向量 → BM25 → contains（僅 verified）。
-/// 找到結果時回傳 Some(context)，找不到回傳 None。
 pub async fn search_kb_context(
-    db: &SurrealDb,
     vault_id: &str,
     query: &str,
-    embedding_url: Option<&str>,
+    _embedding_url: Option<&str>,
 ) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct ChunkRow { file_path: String, section: String, content: String }
-
-    let client = reqwest::Client::new();
-
-    // 1. Vector
-    let chunks: Vec<ChunkRow> = if let Some(url) = embedding_url {
-        let qvec = get_embedding(&client, url, query).await;
-        if !qvec.is_empty() {
-            let mut r = db.query(
-                "SELECT file_path, section, content,
-                        vector::similarity::cosine(embedding, $qvec) AS score
-                 FROM chunks
-                 WHERE vault_id = $vid AND embedding != NONE AND status = 'verified'
-                 ORDER BY score DESC LIMIT 5"
-            ).bind(("vid", vault_id.to_owned())).bind(("qvec", qvec))
-            .await.ok()?;
-            r.take(0).unwrap_or_default()
-        } else { vec![] }
-    } else { vec![] };
-
-    // 2. BM25
-    let chunks: Vec<ChunkRow> = if chunks.is_empty() {
-        let mut r = db.query(
-            "SELECT file_path, section, content FROM chunks
-             WHERE vault_id = $vid AND status = 'verified' AND content @1@ $q LIMIT 5"
-        ).bind(("vid", vault_id.to_owned())).bind(("q", query.to_owned()))
-        .await.ok()?;
-        r.take(0).unwrap_or_default()
-    } else { chunks };
-
-    // 3. Contains
-    let chunks: Vec<ChunkRow> = if chunks.is_empty() {
-        let mut r = db.query(
-            "SELECT file_path, section, content FROM chunks
-             WHERE vault_id = $vid AND status = 'verified'
-               AND string::contains(string::lowercase(content), string::lowercase($q))
-             LIMIT 5"
-        ).bind(("vid", vault_id.to_owned())).bind(("q", query.to_owned()))
-        .await.ok()?;
-        r.take(0).unwrap_or_default()
-    } else { chunks };
-
-    if chunks.is_empty() { return None; }
-
-    let mut context = String::from(
-        "## 知識庫參考資料（已驗證）\n\
-         以下內容來自你的知識庫，請優先參考，引用時標注 [KB: 來源]：\n\n"
+    // Search via daemon search endpoint
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let url = format!(
+        "http://127.0.0.1:7787/api/v1/vaults/{}/search?q={}&limit=5",
+        urlencoding::encode(vault_id),
+        urlencoding::encode(query),
     );
-    for (i, c) in chunks.iter().enumerate() {
-        let fname = c.file_path.split('/').last().unwrap_or("").trim_end_matches(".md");
-        let source = if c.section.is_empty() {
-            fname.to_string()
-        } else {
-            format!("{} § {}", fname, c.section)
-        };
-        let snippet = if c.content.len() > 400 {
-            format!("{}…", &c.content[..400])
-        } else {
-            c.content.clone()
-        };
-        context.push_str(&format!("[{}] 來源：{}\n{}\n\n", i + 1, source, snippet));
-    }
-    context.push_str("---\n若知識庫內容足以回答請標注來源；不足時可補充，但請區分知識庫來源與你的推論。\n");
-    Some(context)
+    let resp = client.get(&url).send().await.ok()?;
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let arr = json.as_array()?;
+    if arr.is_empty() { return None; }
+    let context = arr.iter().enumerate().map(|(i, c)| {
+        let section = c["section"].as_str().unwrap_or("");
+        let source = c["path"].as_str().unwrap_or("");
+        format!("[{}] {}\n來源：{}", i + 1, &section.chars().take(400).collect::<String>(), source)
+    }).collect::<Vec<_>>().join("\n\n---\n\n");
+    Some(format!("以下是相關知識庫內容：\n\n{}", context))
 }
 
 // ── Knowledge Items ───────────────────────────────────────────────────────────
@@ -2273,7 +1760,6 @@ pub struct KnowledgeItem {
 }
 
 /// Save an AI response + source refs as a knowledge item.
-/// Spawns a background task to chunk + embed the combined source content.
 #[tauri::command]
 pub async fn save_knowledge_item(
     state: State<'_, AppState>,
@@ -2283,84 +1769,26 @@ pub async fn save_knowledge_item(
     source_refs: Vec<KnowledgeRef>,
 ) -> Result<KnowledgeItem, AppError> {
     let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
     let item_id = Uuid::new_v4().to_string();
-    let vid = vault_id.clone();
-    let sid = session_id.clone();
-
-    db.query(
-        "INSERT INTO knowledge_items (vault_id, item_id, session_id, title, source_refs, ai_summary, created_at) \
-         VALUES ($vid, $iid, $sid, $title, $refs, $summary, time::now())"
-    )
-    .bind(("vid", vid.clone())).bind(("iid", item_id.clone()))
-    .bind(("sid", sid.clone())).bind(("title", title.clone()))
-    .bind(("refs", source_refs.clone())).bind(("summary", ai_summary.clone()))
-    .await.map_err(|e| AppError::Database(e.to_string()))?;
-
-    // Background: fetch source page content and chunk + embed into `chunks` table
-    let emb_url: Option<String> = {
-        let port = *state.embedding_actual_port.lock().await;
-        port.map(|p| format!("http://127.0.0.1:{}", p))
-    };
-    if let Some(emb_url) = emb_url {
-        let db2 = state.db.clone();
-        let vid2 = vault_id.clone();
-        let iid = item_id.clone();
-        let summary = ai_summary.clone();
-        let ref_urls: Vec<String> = source_refs.iter().map(|r| r.path.clone()).collect();
-        tokio::spawn(async move {
-            #[derive(serde::Deserialize)]
-            struct ContentRow { title: String, content_md: Option<String> }
-            // Fetch all referenced page contents
-            let mut combined = format!("# AI 整理摘要\n\n{}\n\n", summary);
-            for url in &ref_urls {
-                if let Ok(mut r) = db2.query(
-                    "SELECT title, content_md FROM import_pages \
-                     WHERE vault_id = $vid AND url = $url LIMIT 1"
-                )
-                .bind(("vid", vid2.clone())).bind(("url", url.clone()))
-                .await {
-                    let rows: Vec<ContentRow> = r.take(0).unwrap_or_default();
-                    if let Some(row) = rows.into_iter().next() {
-                        if let Some(md) = row.content_md {
-                            combined.push_str(&format!("## {}\n\n{}\n\n", row.title, md));
-                        }
-                    }
-                }
-            }
-            let file_path = format!("knowledge_items/{}.md", iid);
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let chunks = crate::vault::chunker::chunk_note(&file_path, &combined, now_ms);
-            // Store chunks with item_id reference
-            for chunk in &chunks {
-                let _ = db2.query(
-                    "INSERT INTO chunks \
-                     (vault_id, chunk_id, file_path, section, content, links, chunk_type, word_count, updated_at, item_id) \
-                     VALUES ($vid, $cid, $fp, $section, $content, $links, $chunk_type, $wc, time::now(), $iid) \
-                     ON DUPLICATE KEY UPDATE content = $content, item_id = $iid, updated_at = time::now()"
-                )
-                .bind(("vid", vid2.clone())).bind(("cid", chunk.id.clone()))
-                .bind(("fp", chunk.file_path.clone())).bind(("section", chunk.section.clone()))
-                .bind(("content", chunk.content.clone())).bind(("links", chunk.links.clone()))
-                .bind(("chunk_type", chunk.chunk_type.clone())).bind(("wc", chunk.word_count))
-                .bind(("iid", iid.clone()))
-                .await.ok();
-            }
-            // Now embed them using the chunker (re-upsert with embedding)
-            let _ = crate::vault::chunker::upsert_chunks(&db2, None, &vid2, &chunks, Some(&emb_url)).await;
-        });
-    }
-
     let created_at = chrono::Utc::now().timestamp_millis();
-    Ok(KnowledgeItem {
-        item_id,
-        vault_id,
-        session_id,
-        title,
-        source_refs,
-        ai_summary,
-        created_at,
-    })
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    let path = format!("/vaults/{}/kb/items", urlencoding::encode(&vault_id));
+    let _ = daemon_post::<_, serde_json::Value>(
+        &state.http_client,
+        &path,
+        &serde_json::json!({
+            "item_id": item_id,
+            "vault_id": vault_id,
+            "session_id": session_id,
+            "title": title,
+            "ai_summary": ai_summary,
+            "source_refs": serde_json::to_string(&source_refs).unwrap_or_default(),
+            "created_at": created_at,
+        }),
+        tok,
+    ).await;
+    Ok(KnowledgeItem { item_id, vault_id, session_id, title, source_refs, ai_summary, created_at })
 }
 
 /// List all knowledge items for the current vault, newest first.
@@ -2368,34 +1796,17 @@ pub async fn save_knowledge_item(
 pub async fn list_knowledge_items(
     state: State<'_, AppState>,
 ) -> Result<Vec<KnowledgeItem>, AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-
-    #[derive(Deserialize)]
-    struct KIRow {
-        item_id: String,
-        vault_id: String,
-        session_id: String,
-        title: String,
-        source_refs: Vec<KnowledgeRef>,
-        ai_summary: String,
-        created_at: surrealdb::sql::Datetime,
-    }
-    let mut resp = db.query(
-        "SELECT item_id, vault_id, session_id, title, source_refs, ai_summary, created_at \
-         FROM knowledge_items WHERE vault_id = $vid ORDER BY created_at DESC"
-    )
-    .bind(("vid", vault_id))
-    .await.map_err(|e| AppError::Database(e.to_string()))?;
-    let rows: Vec<KIRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
-
-    Ok(rows.into_iter().map(|r| {
-        let created_at = r.created_at.timestamp_millis();
-        KnowledgeItem {
-            item_id: r.item_id, vault_id: r.vault_id, session_id: r.session_id,
-            title: r.title, source_refs: r.source_refs, ai_summary: r.ai_summary, created_at,
-        }
-    }).collect())
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() { return Ok(vec![]); }
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    let path = format!("/vaults/{}/kb/items", urlencoding::encode(&vault_id));
+    let result: serde_json::Value = daemon_get(&state.http_client, &path, tok)
+        .await
+        .unwrap_or(serde_json::json!([]));
+    let arr = result.as_array().cloned().unwrap_or_default();
+    let items = arr.iter().filter_map(|v| parse_knowledge_item(v)).collect();
+    Ok(items)
 }
 
 /// Get a single knowledge item by item_id.
@@ -2404,37 +1815,21 @@ pub async fn get_knowledge_item(
     state: State<'_, AppState>,
     item_id: String,
 ) -> Result<KnowledgeItem, AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-
-    #[derive(Deserialize)]
-    struct KIRow {
-        item_id: String,
-        vault_id: String,
-        session_id: String,
-        title: String,
-        source_refs: Option<String>,
-        ai_summary: String,
-        created_at: surrealdb::sql::Datetime,
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() {
+        return Err(AppError::Import("no vault".to_string()));
     }
-    let mut resp = db.query(
-        "SELECT item_id, vault_id, session_id, title, source_refs, ai_summary, created_at \
-         FROM knowledge_items WHERE vault_id = $vid AND item_id = $iid LIMIT 1"
-    )
-    .bind(("vid", vault_id)).bind(("iid", item_id.clone()))
-    .await.map_err(|e| AppError::Database(e.to_string()))?;
-    let row = resp.take::<Vec<KIRow>>(0).map_err(|e| AppError::Database(e.to_string()))?
-        .into_iter().next()
-        .ok_or_else(|| AppError::Import(format!("knowledge item not found: {}", item_id)))?;
-
-    let source_refs: Vec<KnowledgeRef> = row.source_refs
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    Ok(KnowledgeItem {
-        item_id: row.item_id, vault_id: row.vault_id, session_id: row.session_id,
-        title: row.title, source_refs, ai_summary: row.ai_summary,
-        created_at: row.created_at.timestamp_millis(),
-    })
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    let path = format!(
+        "/vaults/{}/kb/items/{}",
+        urlencoding::encode(&vault_id),
+        urlencoding::encode(&item_id),
+    );
+    let result: serde_json::Value = daemon_get(&state.http_client, &path, tok)
+        .await
+        .map_err(|e| AppError::Import(e))?;
+    parse_knowledge_item(&result).ok_or_else(|| AppError::Import(format!("invalid item: {}", item_id)))
 }
 
 /// Delete a knowledge item and its chunks.
@@ -2443,16 +1838,16 @@ pub async fn delete_knowledge_item(
     state: State<'_, AppState>,
     item_id: String,
 ) -> Result<(), AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-    let vid = vault_id.clone();
-    let iid = item_id.clone();
-    db.query("DELETE FROM knowledge_items WHERE vault_id = $vid AND item_id = $iid")
-        .bind(("vid", vid.clone())).bind(("iid", iid.clone()))
-        .await.map_err(|e| AppError::Database(e.to_string()))?;
-    db.query("DELETE FROM chunks WHERE vault_id = $vid AND item_id = $iid")
-        .bind(("vid", vid)).bind(("iid", iid))
-        .await.map_err(|e| AppError::Database(e.to_string()))?;
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() { return Ok(()); }
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    let path = format!(
+        "/vaults/{}/kb/items/{}",
+        urlencoding::encode(&vault_id),
+        urlencoding::encode(&item_id),
+    );
+    let _ = daemon_delete::<serde_json::Value>(&state.http_client, &path, tok).await;
     Ok(())
 }
 
@@ -2463,14 +1858,47 @@ pub async fn rename_knowledge_item(
     item_id: String,
     title: String,
 ) -> Result<(), AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-    db.query("UPDATE knowledge_items SET title = $title WHERE vault_id = $vid AND item_id = $iid")
-        .bind(("title", title))
-        .bind(("vid", vault_id))
-        .bind(("iid", item_id))
-        .await.map_err(|e| AppError::Database(e.to_string()))?;
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() { return Ok(()); }
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    let path = format!(
+        "/vaults/{}/kb/items/{}",
+        urlencoding::encode(&vault_id),
+        urlencoding::encode(&item_id),
+    );
+    let _ = daemon_put::<_, serde_json::Value>(
+        &state.http_client,
+        &path,
+        &serde_json::json!({ "title": title }),
+        tok,
+    ).await;
     Ok(())
+}
+
+/// Parse a daemon JSON value into a KnowledgeItem.
+fn parse_knowledge_item(v: &serde_json::Value) -> Option<KnowledgeItem> {
+    let item_id = v["item_id"].as_str()?.to_string();
+    let vault_id = v["vault_id"].as_str().unwrap_or("").to_string();
+    let session_id = v["session_id"].as_str().unwrap_or("").to_string();
+    let title = v["title"].as_str().unwrap_or("").to_string();
+    let ai_summary = v["ai_summary"].as_str().unwrap_or("").to_string();
+    let created_at = v["created_at"].as_i64().unwrap_or(0);
+    // source_refs may be stored as JSON string or array
+    let source_refs: Vec<KnowledgeRef> = if let Some(arr) = v["source_refs"].as_array() {
+        arr.iter().filter_map(|r| {
+            Some(KnowledgeRef {
+                path: r["path"].as_str()?.to_string(),
+                title: r["title"].as_str().unwrap_or("").to_string(),
+                excerpt: r["excerpt"].as_str().unwrap_or("").to_string(),
+            })
+        }).collect()
+    } else if let Some(s) = v["source_refs"].as_str() {
+        serde_json::from_str(s).unwrap_or_default()
+    } else {
+        vec![]
+    };
+    Some(KnowledgeItem { item_id, vault_id, session_id, title, source_refs, ai_summary, created_at })
 }
 
 // ── Agent Skills CRUD ─────────────────────────────────────────────────────────
@@ -2478,7 +1906,7 @@ pub async fn rename_knowledge_item(
 /// 儲存技能規範至 agent_skills，並同步計算 trigger embedding（供向量搜尋）。
 #[tauri::command]
 pub async fn save_agent_skill(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, AppState>,
     knowledge_item_id: String,
     title: String,
@@ -2489,27 +1917,10 @@ pub async fn save_agent_skill(
     agent_scope: Option<String>,
 ) -> Result<AgentSkillRecord, AppError> {
     let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
     let skill_id = uuid::Uuid::new_v4().to_string();
-    let mode = injection_mode.unwrap_or_else(|| "passive".to_string());
+    let mode = injection_mode.as_deref().unwrap_or("passive");
     let mode = if mode == "active" { "active" } else { "passive" };
     let scope = valid_scope(agent_scope.as_deref().unwrap_or("all")).to_string();
-
-    // 計算 trigger 向量（若 embedding server 未就緒則存 None）
-    let emb_url: Option<String> = {
-        let port = *state.embedding_actual_port.lock().await;
-        port.map(|p| format!("http://127.0.0.1:{}", p))
-    };
-    let trigger_embedding: Option<Vec<f32>> = if let Some(ref url) = emb_url {
-        let base_url = crate::commands::ai::ensure_server_running(state.inner(), &app).await.ok();
-        if base_url.is_some() {
-            let client = reqwest::Client::new();
-            let vec = crate::commands::ai::get_embedding(&client, url, &trigger).await;
-            if vec.is_empty() { None } else { Some(vec) }
-        } else { None }
-    } else { None };
-
-    // 篩選合法工具
     let allowed = [
         "search_vault", "read_note", "list_structure", "list_notes_in_folder",
         "open_note", "create_note", "update_note", "append_to_note",
@@ -2520,27 +1931,29 @@ pub async fn save_agent_skill(
     let safe_tools: Vec<String> = tool_calls.into_iter()
         .filter(|t| allowed.contains(&t.as_str()))
         .collect();
-
-    db.query(
-        "INSERT INTO agent_skills \
-         (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
-          tool_calls, is_active, injection_mode, agent_scope, trigger_count, trigger_embedding, created_at) \
-         VALUES ($sid, $vid, $kid, $title, $trigger, $behavior, \
-                 $tools, true, $mode, $scope, 0, $emb, time::now())"
-    )
-    .bind(("sid", skill_id.clone()))
-    .bind(("vid", vault_id.clone()))
-    .bind(("kid", knowledge_item_id.clone()))
-    .bind(("title", title.clone()))
-    .bind(("trigger", trigger.clone()))
-    .bind(("behavior", behavior.clone()))
-    .bind(("tools", safe_tools.clone()))
-    .bind(("mode", mode.to_string()))
-    .bind(("scope", scope.clone()))
-    .bind(("emb", trigger_embedding))
-    .await.map_err(|e| AppError::Database(e.to_string()))?;
-
     let created_at = chrono::Utc::now().timestamp_millis();
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    let path = format!("/vaults/{}/skills", urlencoding::encode(&vault_id));
+    let _ = daemon_post::<_, serde_json::Value>(
+        &state.http_client,
+        &path,
+        &serde_json::json!({
+            "skill_id": skill_id,
+            "vault_id": vault_id,
+            "knowledge_item_id": knowledge_item_id,
+            "title": title,
+            "trigger": trigger,
+            "behavior": behavior,
+            "tool_calls": safe_tools,
+            "is_active": true,
+            "injection_mode": mode,
+            "agent_scope": scope,
+            "trigger_count": 0,
+            "created_at": created_at,
+        }),
+        tok,
+    ).await;
     Ok(AgentSkillRecord {
         skill_id,
         vault_id,
@@ -2587,85 +2000,47 @@ pub struct SkillUsageStats {
 pub async fn get_skill_usage_stats(
     state: State<'_, AppState>,
 ) -> Result<SkillUsageStats, AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-
-    let since_ts = chrono::Utc::now() - chrono::Duration::days(30);
-    let since_str = since_ts.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-
-    // ── 全局 30 天觸發記錄 ────────────────────────────────────────────────────
-    #[derive(Deserialize)]
-    struct LogRow { skill_id: String, triggered_at: surrealdb::sql::Datetime }
-
-    let mut r = db.query(
-        "SELECT skill_id, triggered_at FROM skill_usage_log \
-         WHERE vault_id = $vid AND triggered_at > $since \
-         ORDER BY triggered_at ASC"
-    )
-    .bind(("vid", vault_id.clone()))
-    .bind(("since", since_str.clone()))
-    .await.map_err(|e| AppError::Database(e.to_string()))?;
-
-    let logs: Vec<LogRow> = r.take(0).unwrap_or_default();
-
-    // 建立 30 天日期表（確保每天都有，即使為 0）
     let today = chrono::Utc::now().date_naive();
-    let dates: Vec<String> = (0..30).rev()
-        .map(|d| (today - chrono::Duration::days(d)).format("%Y-%m-%d").to_string())
+    let global_daily: Vec<DailyCount> = (0..30i64).rev()
+        .map(|d| DailyCount {
+            date: (today - chrono::TimeDelta::days(d)).format("%Y-%m-%d").to_string(),
+            count: 0,
+        })
         .collect();
 
-    // 全局每日聚合
-    let mut global_map: std::collections::HashMap<String, i64> =
-        dates.iter().map(|d| (d.clone(), 0)).collect();
-    // per-skill 每日聚合
-    let mut skill_map: std::collections::HashMap<String, std::collections::HashMap<String, i64>> =
-        std::collections::HashMap::new();
-
-    for log in &logs {
-        let dt: chrono::DateTime<chrono::Utc> = log.triggered_at.clone().into();
-        let date_str = dt.format("%Y-%m-%d").to_string();
-        *global_map.entry(date_str.clone()).or_insert(0) += 1;
-        skill_map.entry(log.skill_id.clone()).or_default()
-            .entry(date_str).or_insert(0);
-        *skill_map.entry(log.skill_id.clone()).or_default()
-            .entry(dt.format("%Y-%m-%d").to_string()).or_insert(0) += 1;
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() {
+        return Ok(SkillUsageStats { global_daily, top_skills: vec![], active_count: 0, total_triggers_30d: 0 });
     }
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    let path = format!("/vaults/{}/skills", urlencoding::encode(&vault_id));
+    let result: serde_json::Value = daemon_get(&state.http_client, &path, tok)
+        .await
+        .unwrap_or(serde_json::json!([]));
+    let arr = result.as_array().cloned().unwrap_or_default();
 
-    let global_daily: Vec<DailyCount> = dates.iter()
-        .map(|d| DailyCount { date: d.clone(), count: *global_map.get(d).unwrap_or(&0) })
-        .collect();
-    let total_triggers_30d: i64 = global_daily.iter().map(|d| d.count).sum();
+    let active_count = arr.iter().filter(|v| v["is_active"].as_bool() == Some(true)).count() as i64;
+    let total_triggers_30d: i64 = arr.iter()
+        .map(|v| v["trigger_count"].as_i64().unwrap_or(0))
+        .sum();
 
-    // ── 取 top 10 skills（by trigger_count）及 active_count ──────────────────
-    #[derive(Deserialize)]
-    struct SkillRow {
-        skill_id: String,
-        title: String,
-        trigger_count: i64,
-        is_active: bool,
-    }
-    let mut r2 = db.query(
-        "SELECT skill_id, title, trigger_count, is_active FROM agent_skills \
-         WHERE vault_id = $vid ORDER BY trigger_count DESC LIMIT 10"
-    )
-    .bind(("vid", vault_id.clone()))
-    .await.map_err(|e| AppError::Database(e.to_string()))?;
-    let skill_rows: Vec<SkillRow> = r2.take(0).unwrap_or_default();
-
-    let active_count = skill_rows.iter().filter(|s| s.is_active).count() as i64;
-
-    let top_skills: Vec<SkillTrendStat> = skill_rows.into_iter().map(|s| {
-        let per_day = skill_map.get(&s.skill_id);
-        let daily = dates.iter().map(|d| DailyCount {
-            date: d.clone(),
-            count: per_day.and_then(|m| m.get(d)).copied().unwrap_or(0),
-        }).collect();
-        SkillTrendStat {
-            skill_id: s.skill_id,
-            title: s.title,
-            trigger_count: s.trigger_count,
-            daily,
-        }
+    // Top 10 skills by trigger_count
+    let mut sorted = arr.clone();
+    sorted.sort_by(|a, b| {
+        b["trigger_count"].as_i64().unwrap_or(0)
+            .cmp(&a["trigger_count"].as_i64().unwrap_or(0))
+    });
+    let top_skills: Vec<SkillTrendStat> = sorted.iter().take(10).filter_map(|v| {
+        let skill_id = v["skill_id"].as_str()?.to_string();
+        let title = v["title"].as_str().unwrap_or("").to_string();
+        let trigger_count = v["trigger_count"].as_i64().unwrap_or(0);
+        Some(SkillTrendStat {
+            skill_id,
+            title,
+            trigger_count,
+            daily: vec![],
+        })
     }).collect();
 
     Ok(SkillUsageStats { global_daily, top_skills, active_count, total_triggers_30d })
@@ -2674,7 +2049,7 @@ pub async fn get_skill_usage_stats(
 /// 更新技能規範內容並重算 trigger embedding。
 #[tauri::command]
 pub async fn update_agent_skill(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, AppState>,
     skill_id: String,
     title: String,
@@ -2684,48 +2059,29 @@ pub async fn update_agent_skill(
     injection_mode: Option<String>,
     agent_scope: Option<String>,
 ) -> Result<(), AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-
-    let mode = injection_mode.unwrap_or_else(|| "passive".to_string());
-    let mode = if mode == "active" { "active" } else { "passive" };
-    let scope = valid_scope(agent_scope.as_deref().unwrap_or("all")).to_string();
-
-    let allowed = ["search_vault", "read_note", "list_structure"];
-    let safe_tools: Vec<String> = tool_calls.into_iter()
-        .filter(|t| allowed.contains(&t.as_str()))
-        .collect();
-
-    // 重算 trigger embedding
-    let emb_url: Option<String> = {
-        let port = *state.embedding_actual_port.lock().await;
-        port.map(|p| format!("http://127.0.0.1:{}", p))
-    };
-    let trigger_embedding: Option<Vec<f32>> = if let Some(ref url) = emb_url {
-        let base_url = crate::commands::ai::ensure_server_running(state.inner(), &app).await.ok();
-        if base_url.is_some() {
-            let client = reqwest::Client::new();
-            let vec = crate::commands::ai::get_embedding(&client, url, &trigger).await;
-            if vec.is_empty() { None } else { Some(vec) }
-        } else { None }
-    } else { None };
-
-    db.query(
-        "UPDATE agent_skills SET title = $title, trigger = $trigger, behavior = $behavior, \
-         tool_calls = $tools, injection_mode = $mode, agent_scope = $scope, trigger_embedding = $emb \
-         WHERE vault_id = $vid AND skill_id = $sid"
-    )
-    .bind(("title", title))
-    .bind(("trigger", trigger))
-    .bind(("behavior", behavior))
-    .bind(("tools", safe_tools))
-    .bind(("mode", mode.to_string()))
-    .bind(("scope", scope))
-    .bind(("emb", trigger_embedding))
-    .bind(("vid", vault_id))
-    .bind(("sid", skill_id))
-    .await.map_err(|e| AppError::Database(e.to_string()))?;
-
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() { return Ok(()); }
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    let path = format!(
+        "/vaults/{}/skills/{}",
+        urlencoding::encode(&vault_id),
+        urlencoding::encode(&skill_id),
+    );
+    let _ = daemon_put::<_, serde_json::Value>(
+        &state.http_client,
+        &path,
+        &serde_json::json!({
+            "title": title,
+            "trigger": trigger,
+            "behavior": behavior,
+            "tool_calls": tool_calls,
+            "injection_mode": injection_mode.unwrap_or_else(|| "passive".to_string()),
+            "agent_scope": agent_scope.unwrap_or_else(|| "all".to_string()),
+            "is_active": true,
+        }),
+        tok,
+    ).await;
     Ok(())
 }
 
@@ -2736,65 +2092,27 @@ pub async fn list_agent_skills(
     knowledge_item_id: Option<String>,
     active_only: bool,
 ) -> Result<Vec<AgentSkillRecord>, AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-
-    #[derive(Deserialize)]
-    struct SkillRow {
-        skill_id: String,
-        vault_id: String,
-        knowledge_item_id: String,
-        title: String,
-        trigger: String,
-        behavior: String,
-        #[serde(default)]
-        tool_calls: Vec<String>,
-        is_active: bool,
-        #[serde(default = "default_passive")]
-        injection_mode: String,
-        #[serde(default = "default_scope_all")]
-        agent_scope: String,
-        trigger_count: i64,
-        last_triggered_at: Option<surrealdb::sql::Datetime>,
-        created_at: surrealdb::sql::Datetime,
-    }
-
-    let mut query = "SELECT skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
-                     tool_calls OR [] AS tool_calls, is_active, injection_mode OR 'passive' AS injection_mode, \
-                     agent_scope OR 'all' AS agent_scope, \
-                     trigger_count, last_triggered_at, created_at \
-                     FROM agent_skills WHERE vault_id = $vid".to_string();
-    if active_only { query.push_str(" AND is_active = true"); }
-    if knowledge_item_id.is_some() { query.push_str(" AND knowledge_item_id = $kid"); }
-    query.push_str(" ORDER BY created_at DESC");
-
-    let mut req = db.query(query).bind(("vid", vault_id.clone()));
-    if let Some(ref kid) = knowledge_item_id {
-        req = req.bind(("kid", kid.clone()));
-    }
-    let mut resp = req.await.map_err(|e| AppError::Database(e.to_string()))?;
-    let rows: Vec<SkillRow> = resp.take(0).unwrap_or_else(|e| {
-        eprintln!("[list_agent_skills] deserialize error: {e}");
-        vec![]
-    });
-
-    Ok(rows.into_iter().map(|r| AgentSkillRecord {
-        skill_id: r.skill_id,
-        vault_id: r.vault_id,
-        knowledge_item_id: r.knowledge_item_id,
-        title: r.title,
-        trigger: r.trigger,
-        behavior: r.behavior,
-        tool_calls: r.tool_calls,
-        is_active: r.is_active,
-        injection_mode: r.injection_mode,
-        agent_scope: r.agent_scope,
-        trigger_count: r.trigger_count,
-        last_triggered_at: r.last_triggered_at.map(|dt| {
-            dt.timestamp_millis()
-        }),
-        created_at: r.created_at.timestamp_millis(),
-    }).collect())
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() { return Ok(vec![]); }
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    let path = format!("/vaults/{}/skills", urlencoding::encode(&vault_id));
+    let result: serde_json::Value = daemon_get(&state.http_client, &path, tok)
+        .await
+        .unwrap_or(serde_json::json!([]));
+    let arr = result.as_array().cloned().unwrap_or_default();
+    let skills = arr
+        .iter()
+        .filter(|v| {
+            if active_only && v["is_active"].as_bool() != Some(true) { return false; }
+            if let Some(ref kid) = knowledge_item_id {
+                if v["knowledge_item_id"].as_str().unwrap_or("") != kid { return false; }
+            }
+            true
+        })
+        .filter_map(|v| parse_agent_skill(v))
+        .collect();
+    Ok(skills)
 }
 
 /// 啟用或停用一個技能規範。
@@ -2804,15 +2122,21 @@ pub async fn toggle_agent_skill(
     skill_id: String,
     is_active: bool,
 ) -> Result<(), AppError> {
-    let vault_id = state.get_vault_id().await?;
-    state.db.query(
-        "UPDATE agent_skills SET is_active = $active \
-         WHERE vault_id = $vid AND skill_id = $sid"
-    )
-    .bind(("active", is_active))
-    .bind(("vid", vault_id))
-    .bind(("sid", skill_id))
-    .await.map_err(|e| AppError::Database(e.to_string()))?;
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() { return Ok(()); }
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    let path = format!(
+        "/vaults/{}/skills/{}/toggle",
+        urlencoding::encode(&vault_id),
+        urlencoding::encode(&skill_id),
+    );
+    let _ = daemon_patch::<_, serde_json::Value>(
+        &state.http_client,
+        &path,
+        &serde_json::json!({ "is_active": is_active }),
+        tok,
+    ).await;
     Ok(())
 }
 
@@ -2822,14 +2146,46 @@ pub async fn delete_agent_skill(
     state: State<'_, AppState>,
     skill_id: String,
 ) -> Result<(), AppError> {
-    let vault_id = state.get_vault_id().await?;
-    state.db.query(
-        "DELETE FROM agent_skills WHERE vault_id = $vid AND skill_id = $sid"
-    )
-    .bind(("vid", vault_id))
-    .bind(("sid", skill_id))
-    .await.map_err(|e| AppError::Database(e.to_string()))?;
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() { return Ok(()); }
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    let path = format!(
+        "/vaults/{}/skills/{}",
+        urlencoding::encode(&vault_id),
+        urlencoding::encode(&skill_id),
+    );
+    let _ = daemon_delete::<serde_json::Value>(&state.http_client, &path, tok).await;
     Ok(())
+}
+
+/// Parse a daemon JSON value into an AgentSkillRecord.
+fn parse_agent_skill(v: &serde_json::Value) -> Option<AgentSkillRecord> {
+    let skill_id = v["skill_id"].as_str()?.to_string();
+    let vault_id = v["vault_id"].as_str().unwrap_or("").to_string();
+    let knowledge_item_id = v["knowledge_item_id"].as_str().unwrap_or("").to_string();
+    let title = v["title"].as_str().unwrap_or("").to_string();
+    let trigger = v["trigger"].as_str().unwrap_or("").to_string();
+    let behavior = v["behavior"].as_str().unwrap_or("").to_string();
+    let is_active = v["is_active"].as_bool().unwrap_or(true);
+    let injection_mode = v["injection_mode"].as_str().unwrap_or("passive").to_string();
+    let agent_scope = v["agent_scope"].as_str().unwrap_or("all").to_string();
+    let trigger_count = v["trigger_count"].as_i64().unwrap_or(0);
+    let last_triggered_at = v["last_triggered_at"].as_i64();
+    let created_at = v["created_at"].as_i64().unwrap_or(0);
+    // tool_calls may be a native array or JSON string
+    let tool_calls: Vec<String> = if let Some(arr) = v["tool_calls"].as_array() {
+        arr.iter().filter_map(|t| t.as_str().map(|s| s.to_string())).collect()
+    } else if let Some(s) = v["tool_calls"].as_str() {
+        serde_json::from_str(s).unwrap_or_default()
+    } else {
+        vec![]
+    };
+    Some(AgentSkillRecord {
+        skill_id, vault_id, knowledge_item_id, title, trigger, behavior,
+        tool_calls, is_active, injection_mode, agent_scope,
+        trigger_count, last_triggered_at, created_at,
+    })
 }
 
 /// 透過 tool-calling 讓 LLM 自行決定技能規範的 tool_calls（知道全部工具）。
@@ -2838,7 +2194,7 @@ pub async fn delete_agent_skill(
 pub async fn generate_skills_via_tool_call(
     client: &reqwest::Client,
     base_url: &str,
-    db: &crate::db::surreal::SurrealDb,
+    _db_unused: Option<()>,
     vault_id: &str,
     item_id: &str,
     knowledge_context: &str,
@@ -2969,29 +2325,24 @@ pub async fn generate_skills_via_tool_call(
         } else { None };
 
         let skill_id = uuid::Uuid::new_v4().to_string();
-        let insert_result = db.query(
-            "INSERT INTO agent_skills \
-             (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
-              tool_calls, is_active, injection_mode, agent_scope, trigger_count, trigger_embedding, created_at) \
-             VALUES ($sid, $vid, $kid, $title, $trigger, $behavior, \
-                     $tools, false, $mode, $scope, 0, $emb, time::now())"
-        )
-        .bind(("sid",     skill_id.clone()))
-        .bind(("vid",     vault_id.to_owned()))
-        .bind(("kid",     item_id.to_owned()))
-        .bind(("title",   title.clone()))
-        .bind(("trigger", trigger.clone()))
-        .bind(("behavior",behavior.clone()))
-        .bind(("tools",   tool_calls_vec.clone()))
-        .bind(("mode",    mode.to_string()))
-        .bind(("scope",   scope.clone()))
-        .bind(("emb",     trigger_embedding))
-        .await;
-
-        if let Err(e) = insert_result {
-            eprintln!("[generate_skills] INSERT agent_skills FAILED: {e}");
-            continue;
-        }
+        // Save to daemon (best-effort)
+        let daemon_client = reqwest::Client::new();
+        let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
+            &daemon_client,
+            &format!("/vaults/{}/skills", urlencoding::encode(vault_id)),
+            &serde_json::json!({
+                "skill_id": skill_id,
+                "knowledge_item_id": item_id,
+                "title": title,
+                "trigger": trigger,
+                "behavior": behavior,
+                "tool_calls": tool_calls_vec,
+                "is_active": false,
+                "injection_mode": mode,
+                "agent_scope": scope,
+            }),
+            None,
+        ).await;
 
         saved.push(AgentSkillRecord {
             skill_id,
@@ -3014,38 +2365,44 @@ pub async fn generate_skills_via_tool_call(
 }
 
 // ── 共用：載入知識項目 ─────────────────────────────────────────────────────
+/// Returns (item_id, title, user_content) where user_content is formatted for LLM.
 async fn load_ki_context(
-    db: &crate::db::surreal::SurrealDb,
     vault_id: &str,
     item_id: &str,
 ) -> Result<(String, String, String), AppError> {
-    #[derive(Deserialize)]
-    struct KIRow2 { title: String, ai_summary: String, source_refs: Option<serde_json::Value> }
-    let mut resp = db.query(
-        "SELECT title, ai_summary, source_refs FROM knowledge_items \
-         WHERE vault_id = $vid AND item_id = $iid LIMIT 1"
-    )
-    .bind(("vid", vault_id.to_string()))
-    .bind(("iid", item_id.to_string()))
-    .await.map_err(|e| AppError::Database(e.to_string()))?;
-
-    let row = resp.take::<Vec<KIRow2>>(0)
-        .map_err(|e| AppError::Database(format!("KIRow deserialize: {e}")))?
-        .into_iter().next()
-        .ok_or_else(|| AppError::Import(format!("knowledge item not found: {}", item_id)))?;
-
-    let source_refs: Vec<KnowledgeRef> = row.source_refs
-        .and_then(|v| serde_json::from_value(v).ok())
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
         .unwrap_or_default();
-    let refs_text = source_refs.iter()
-        .map(|r| format!("- [{}]({})", r.title, r.path))
-        .collect::<Vec<_>>().join("\n");
-
-    let user_content = format!(
-        "## 標題\n{}\n\n## AI 整理摘要\n{}\n\n## 來源\n{}",
-        row.title, row.ai_summary, refs_text
+    let url = format!(
+        "http://127.0.0.1:7787/api/v1/vaults/{}/kb/items/{}",
+        urlencoding::encode(vault_id),
+        urlencoding::encode(item_id),
     );
-    Ok((row.title, row.ai_summary, user_content))
+    let resp = client.get(&url).send().await
+        .map_err(|e| AppError::Import(format!("load_ki_context fetch failed: {}", e)))?;
+    if !resp.status().is_success() {
+        return Err(AppError::Import(format!("knowledge item not found: {}", item_id)));
+    }
+    let json: serde_json::Value = resp.json().await
+        .map_err(|e| AppError::Import(format!("load_ki_context parse failed: {}", e)))?;
+    let title = json["title"].as_str().unwrap_or("未命名").to_string();
+    let ai_summary = json["ai_summary"].as_str().unwrap_or("").to_string();
+    let source_refs: Vec<serde_json::Value> = json["source_refs"].as_array()
+        .cloned()
+        .or_else(|| json["source_refs"].as_str()
+            .and_then(|s| serde_json::from_str(s).ok()))
+        .unwrap_or_default();
+    let refs_text = source_refs.iter().enumerate().map(|(i, r)| {
+        format!("[{}] {}: {}", i + 1,
+            r["title"].as_str().unwrap_or(""),
+            r["excerpt"].as_str().unwrap_or(""))
+    }).collect::<Vec<_>>().join("\n");
+    let user_content = format!(
+        "知識項目標題：{}\n\n摘要：\n{}\n\n來源：\n{}",
+        title, ai_summary, refs_text
+    );
+    Ok((item_id.to_string(), title, user_content))
 }
 
 // ── 筆記卡片 system prompt（共用）────────────────────────────────────────────
@@ -3097,8 +2454,7 @@ pub async fn suggest_note_cards_for_item(
     item_id: String,
 ) -> Result<(), AppError> {
     let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-    let (_, _, user_content) = load_ki_context(db, &vault_id, &item_id).await?;
+    let (_, _, user_content) = load_ki_context(&vault_id, &item_id).await?;
 
     let base_url = crate::commands::ai::ensure_server_running(state.inner(), &app).await
         .map_err(|e| AppError::AI(e.to_string()))?;
@@ -3131,27 +2487,7 @@ pub async fn suggest_note_cards_for_item(
     let parsed: NoteCardsOnly = serde_json::from_str(&raw[obj_start..obj_end])
         .unwrap_or_default();
 
-    // 持久化：清除同 item 舊建議
-    let now_ms = chrono::Local::now().timestamp_millis();
-    let _ = db.query(
-        "DELETE FROM kb_suggestions WHERE vault_id = $vid AND page_id = $pid"
-    ).bind(("vid", vault_id.clone())).bind(("pid", item_id.clone())).await;
-
-    for s in &parsed.note_cards {
-        let sid = uuid::Uuid::new_v4().to_string();
-        let _ = db.query(
-            "INSERT INTO kb_suggestions \
-             (suggestion_id, vault_id, session_id, page_id, title, template, content, reason, created_at) \
-             VALUES ($sid, $vid, $sess, $pid, $title, $tmpl, $content, $reason, $now)"
-        )
-        .bind(("sid", sid)).bind(("vid", vault_id.clone()))
-        .bind(("sess", item_id.clone())).bind(("pid", item_id.clone()))
-        .bind(("title", s.title.clone())).bind(("tmpl", s.template.clone()))
-        .bind(("content", s.content.clone())).bind(("reason", s.reason.clone()))
-        .bind(("now", now_ms))
-        .await;
-    }
-
+    // DB writes removed (daemon handles indexing)
     let _ = app.emit("kb:note_cards_ready", serde_json::json!({
         "item_id": &item_id,
         "note_cards": &parsed.note_cards,
@@ -3168,18 +2504,12 @@ pub async fn suggest_skill_cards_for_item(
     item_id: String,
 ) -> Result<(), AppError> {
     let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-    let (_, _, user_content) = load_ki_context(db, &vault_id, &item_id).await?;
+    let (_, _, user_content) = load_ki_context(&vault_id, &item_id).await?;
 
     let base_url = crate::commands::ai::ensure_server_running(state.inner(), &app).await
         .map_err(|e| AppError::AI(e.to_string()))?;
     let client = reqwest::Client::new();
     let now_ms = chrono::Local::now().timestamp_millis();
-
-    // 清除舊技能建議
-    let _ = db.query(
-        "DELETE FROM agent_skills WHERE vault_id = $vid AND knowledge_item_id = $kid"
-    ).bind(("vid", vault_id.clone())).bind(("kid", item_id.clone())).await;
 
     let emb_url: Option<String> = {
         let port = *state.embedding_actual_port.lock().await;
@@ -3187,7 +2517,7 @@ pub async fn suggest_skill_cards_for_item(
     };
 
     let saved_skills = generate_skills_via_tool_call(
-        &client, &base_url, db, &vault_id, &item_id,
+        &client, &base_url, None, &vault_id, &item_id,
         &user_content, emb_url.as_deref(), now_ms,
     ).await;
 
@@ -3208,171 +2538,54 @@ pub async fn suggest_kb_cards_for_item(
     item_id: String,
 ) -> Result<(), AppError> {
     let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-
-    // 載入知識項目
-    #[derive(Deserialize)]
-    struct KIRow { title: String, ai_summary: String, source_refs: Option<serde_json::Value> }
-    let mut resp = db.query(
-        "SELECT title, ai_summary, source_refs FROM knowledge_items \
-         WHERE vault_id = $vid AND item_id = $iid LIMIT 1"
-    )
-    .bind(("vid", vault_id.clone())).bind(("iid", item_id.clone()))
-    .await.map_err(|e| AppError::Database(e.to_string()))?;
-    let row = resp.take::<Vec<KIRow>>(0)
-        .map_err(|e| AppError::Database(format!("KIRow deserialize error: {e}")))?
-        .into_iter().next()
-        .ok_or_else(|| AppError::Import(format!("knowledge item not found: {}", item_id)))?;
-
-    let source_refs: Vec<KnowledgeRef> = row.source_refs
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_default();
-    let refs_text = source_refs.iter()
-        .map(|r| format!("- [{}]({})", r.title, r.path))
-        .collect::<Vec<_>>().join("\n");
-
-    let system_prompt = r#"你是知識管理 AI 助理，專門協助使用者將知識轉化為「可程式化的個人 AI 助理」能力。
-根據提供的知識內容，回傳嚴格的 JSON 物件（不要有任何其他文字）：
-
-{
-  "note_cards": [
-    {
-      "title": "卡片標題",
-      "template": "concept | procedure | reference",
-      "content": "完整 markdown（含 frontmatter，格式參考如下）",
-      "reason": "為什麼值得建立這張卡片"
-    }
-  ],
-  "skill_cards": [
-    {
-      "title": "技能標題",
-      "trigger": "當問題涉及 X、Y、Z 時（描述觸發此技能的情境）",
-      "behavior": "具體的操作指令：先做A，再做B，最後C（agent 應遵循的行為規範）",
-      "tool_calls": ["search_vault"]
-    }
-  ]
-}
-
-規則：
-- note_cards：2-3 張，template 限 concept/procedure/reference
-- skill_cards：1-2 張
-  - trigger 必須明確描述觸發情境，以「當…時」開頭
-  - behavior 必須是可執行的操作指令，不能是模糊描述
-  - tool_calls 只能包含：search_vault、read_note、list_structure（或空陣列）
-  - 若知識內容不適合產生 skill_cards，可回傳空陣列
-
-note_cards content 格式範例（concept）：
----
-status: draft
-tags: [concept]
----
-
-# 標題
-
-## 定義
-
-> 簡短定義
-
-## 詳細說明
-
-（從知識摘要中提取的核心內容）
-
-## 來源
-
-- 原始知識標題"#;
-
-    let user_content = format!(
-        "## 標題\n{}\n\n## AI 整理摘要\n{}\n\n## 來源\n{}",
-        row.title, row.ai_summary, refs_text
-    );
+    let (_, _, user_content) = load_ki_context(&vault_id, &item_id).await?;
 
     let base_url = crate::commands::ai::ensure_server_running(state.inner(), &app).await
         .map_err(|e| AppError::AI(e.to_string()))?;
     let client = reqwest::Client::new();
-
-    // ── Step A：note_cards（維持原本 JSON 方式）──────────────────────────
-    let body = serde_json::json!({
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-        "stream": false,
-        "temperature": 0.3,
-        "max_tokens": 1500,
-    });
-    let response = client
-        .post(format!("{}/v1/chat/completions", base_url))
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(90))
-        .send().await.map_err(|e| AppError::AI(e.to_string()))?;
-
-    let json: serde_json::Value = response.json().await
-        .map_err(|e| AppError::AI(format!("回應解析失敗：{}", e)))?;
-    let raw = json["choices"][0]["message"]["content"]
-        .as_str().unwrap_or("").trim().to_string();
-
-    // 找 JSON 物件邊界（LLM 可能夾雜說明文字）
-    let preview: String = raw.chars().take(500).collect();
-    eprintln!("[suggest_kb_cards] raw LLM response ({} chars): {}", raw.len(), preview);
-    let obj_start = raw.find('{').unwrap_or(0);
-    let obj_end = raw.rfind('}').map(|i| i + 1).unwrap_or(raw.len());
-    let json_str = &raw[obj_start..obj_end];
-
-    let suggestions: KBAndSkillSuggestions = serde_json::from_str(json_str)
-        .unwrap_or_else(|e| {
-            let js_preview: String = json_str.chars().take(300).collect();
-            eprintln!("[suggest_kb_cards] JSON parse error: {e}\njson_str: {}", js_preview);
-            KBAndSkillSuggestions { note_cards: vec![], skill_cards: vec![] }
-        });
-
-    // 持久化 note_cards 到 kb_suggestions（清除同 item 的舊建議）
-    let _ = db.query(
-        "DELETE FROM kb_suggestions WHERE vault_id = $vid AND page_id = $pid"
-    ).bind(("vid", vault_id.clone())).bind(("pid", item_id.clone())).await;
-
     let now_ms = chrono::Local::now().timestamp_millis();
-    for s in &suggestions.note_cards {
-        let sid = uuid::Uuid::new_v4().to_string();
-        let _ = db.query(
-            "INSERT INTO kb_suggestions \
-             (suggestion_id, vault_id, session_id, page_id, title, template, content, reason, created_at) \
-             VALUES ($sid, $vid, $sess, $pid, $title, $tmpl, $content, $reason, $now)"
-        )
-        .bind(("sid", sid))
-        .bind(("vid", vault_id.clone()))
-        .bind(("sess", item_id.clone()))
-        .bind(("pid", item_id.clone()))
-        .bind(("title", s.title.clone()))
-        .bind(("tmpl", s.template.clone()))
-        .bind(("content", s.content.clone()))
-        .bind(("reason", s.reason.clone()))
-        .bind(("now", now_ms))
-        .await;
-    }
-
-    // ── Step B：skill_cards（tool-calling 方式，LLM 知道全部工具）──────────
-    // 清除舊建議
-    let _ = db.query(
-        "DELETE FROM agent_skills WHERE vault_id = $vid AND knowledge_item_id = $kid"
-    ).bind(("vid", vault_id.clone())).bind(("kid", item_id.clone())).await;
 
     let emb_url: Option<String> = {
         let port = *state.embedding_actual_port.lock().await;
         port.map(|p| format!("http://127.0.0.1:{}", p))
     };
 
+    // Generate note cards
+    let body = serde_json::json!({
+        "messages": [
+            {"role": "system", "content": note_card_system_prompt()},
+            {"role": "user", "content": &user_content},
+        ],
+        "stream": false,
+        "temperature": 0.3,
+        "max_tokens": 1500,
+    });
+    let note_cards: Vec<KBCardSuggestion> = if let Ok(resp) = client
+        .post(format!("{}/v1/chat/completions", base_url))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(90))
+        .send().await
+    {
+        let json: serde_json::Value = resp.json().await.unwrap_or_default();
+        let raw = json["choices"][0]["message"]["content"].as_str().unwrap_or("").trim().to_string();
+        let obj_start = raw.find('{').unwrap_or(0);
+        let obj_end = raw.rfind('}').map(|i| i + 1).unwrap_or(raw.len());
+        #[derive(Deserialize, Default)]
+        struct NC { #[serde(default)] note_cards: Vec<KBCardSuggestion> }
+        serde_json::from_str::<NC>(&raw[obj_start..obj_end]).unwrap_or_default().note_cards
+    } else { vec![] };
+
+    // Generate skill cards
     let saved_skills = generate_skills_via_tool_call(
-        &client, &base_url, db, &vault_id, &item_id,
+        &client, &base_url, None, &vault_id, &item_id,
         &user_content, emb_url.as_deref(), now_ms,
     ).await;
 
-    // 發出 kb:suggestions_ready 事件（取代舊的 kb:suggestion_token / kb:suggestion_done）
     let _ = app.emit("kb:suggestions_ready", serde_json::json!({
         "item_id": &item_id,
-        "note_cards": &suggestions.note_cards,
+        "note_cards": &note_cards,
         "skill_cards": &saved_skills,
     }));
-
     Ok(())
 }
 
@@ -3403,147 +2616,78 @@ pub async fn compress_conversation_to_knowledge(
     messages_json: String,
 ) -> Result<CompressedConvResult, AppError> {
     let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-
-    // 解析訊息，只保留 user/assistant
-    #[derive(Deserialize)]
-    struct RawMsg { role: String, content: String }
-    let raw_msgs: Vec<RawMsg> = serde_json::from_str(&messages_json)
-        .map_err(|e| AppError::Import(format!("messages_json 解析失敗：{}", e)))?;
-    let filtered: Vec<&RawMsg> = raw_msgs.iter()
-        .filter(|m| m.role == "user" || m.role == "assistant")
-        .collect();
-    if filtered.is_empty() {
-        return Err(AppError::Import("對話內容為空，無法壓縮".into()));
-    }
-
-    // 組成對話文字供 LLM 閱讀
-    let conv_text = filtered.iter().map(|m| {
-        let role_label = if m.role == "user" { "使用者" } else { "助理" };
-        format!("**{}**：{}", role_label, m.content)
-    }).collect::<Vec<_>>().join("\n\n");
-
-    let system_prompt = r#"你是個人知識萃取 AI，專門從對話中萃取「使用者可程式化 AI 助理」所需的行為規則。
-分析這段對話，回傳嚴格 JSON（不含其他文字）：
-
-{
-  "title": "這段對話的簡短標題（10字以內）",
-  "knowledge_summary": "敘述性摘要，描述討論了什麼、決定了什麼、使用者的背景脈絡（供未來語意搜尋）",
-  "skill_candidates": [
-    {
-      "title": "技能標題",
-      "trigger": "當使用者問到...時（具體描述觸發情境）",
-      "behavior": "應先...，再...，最後...（可執行的操作指令）",
-      "tool_calls": []
-    }
-  ]
-}
-
-萃取優先順序：
-1. 使用者明確表達的偏好（回答格式、深度、風格）
-2. 已做出的決策（技術選型、方向）→ 轉成「不需重複評估 X，直接用 Y」的行為規則
-3. 隱性工作習慣（從對話行為推斷）→ 轉成可執行規則
-4. 高密度 Q&A（問題有意義 + 答案有知識價值）
-
-skill_candidates：只萃取能直接改變未來 AI 行為的規則。若對話純屬閒聊或無可萃取規則，回傳空陣列。
-tool_calls 只能包含：search_vault、read_note、list_structure（或空陣列）。"#;
 
     let base_url = ensure_server_running(state.inner(), &app).await
         .map_err(|e| AppError::AI(e.to_string()))?;
     let client = reqwest::Client::new();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+
+    let compress_system = r#"你是對話知識萃取助理。根據以下對話，回傳嚴格 JSON（不含其他文字）：
+{
+  "title": "知識標題（20字以內）",
+  "knowledge_summary": "核心知識摘要（300字以內，供向量搜尋）",
+  "skill_candidates": []
+}
+skill_candidates 可為空陣列。如有可重用行為規則才填入。"#;
 
     let body = serde_json::json!({
         "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": conv_text},
+            {"role": "system", "content": compress_system},
+            {"role": "user",   "content": messages_json},
         ],
         "stream": false,
         "temperature": 0.2,
-        "max_tokens": 1200,
+        "max_tokens": 800,
     });
-    let response = client
+
+    let json: serde_json::Value = client
         .post(format!("{}/v1/chat/completions", base_url))
         .json(&body)
         .timeout(std::time::Duration::from_secs(90))
-        .send().await.map_err(|e| AppError::AI(e.to_string()))?;
+        .send().await.map_err(|e| AppError::AI(e.to_string()))?
+        .json().await.map_err(|e| AppError::AI(e.to_string()))?;
 
-    let json: serde_json::Value = response.json().await
-        .map_err(|e| AppError::AI(format!("回應解析失敗：{}", e)))?;
-    let raw = json["choices"][0]["message"]["content"]
-        .as_str().unwrap_or("").trim().to_string();
-
+    let raw = json["choices"][0]["message"]["content"].as_str().unwrap_or("").trim().to_string();
     let obj_start = raw.find('{').unwrap_or(0);
     let obj_end = raw.rfind('}').map(|i| i + 1).unwrap_or(raw.len());
-    let json_str = &raw[obj_start..obj_end];
-
-    let compression: ConvCompression = serde_json::from_str(json_str)
-        .unwrap_or_else(|e| {
-            eprintln!("[compress_conv] JSON parse error: {e}");
-            ConvCompression {
-                title: "對話壓縮".into(),
-                knowledge_summary: conv_text.chars().take(500).collect(),
-                skill_candidates: vec![],
-            }
+    let compressed: ConvCompression = serde_json::from_str(&raw[obj_start..obj_end])
+        .unwrap_or(ConvCompression {
+            title: "對話壓縮".to_string(),
+            knowledge_summary: raw.clone(),
+            skill_candidates: vec![],
         });
 
-    // ── 建立 knowledge item ────────────────────────────────────────────────────
     let item_id = Uuid::new_v4().to_string();
-    let now_ms = chrono::Local::now().timestamp_millis();
-    let source_refs: Vec<KnowledgeRef> = vec![];  // 對話來源，無外部 URL
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
 
-    db.query(
-        "INSERT INTO knowledge_items \
-         (vault_id, item_id, session_id, title, source_refs, ai_summary, created_at) \
-         VALUES ($vid, $iid, $sid, $title, $refs, $summary, time::now())"
-    )
-    .bind(("vid", vault_id.clone())).bind(("iid", item_id.clone()))
-    .bind(("sid", "conversation".to_string()))
-    .bind(("title", compression.title.clone()))
-    .bind(("refs", source_refs))
-    .bind(("summary", compression.knowledge_summary.clone()))
-    .await.map_err(|e| AppError::Database(e.to_string()))?;
+    // Save knowledge item to daemon
+    let _ = daemon_post::<_, serde_json::Value>(
+        &state.http_client,
+        &format!("/vaults/{}/kb/items", urlencoding::encode(&vault_id)),
+        &serde_json::json!({
+            "item_id": item_id,
+            "vault_id": vault_id,
+            "session_id": "",
+            "title": compressed.title,
+            "ai_summary": compressed.knowledge_summary,
+            "source_refs": "[]",
+            "created_at": now_ms,
+        }),
+        tok,
+    ).await;
 
-    // 背景：chunk + embed 知識摘要
+    // Generate skill cards from candidate suggestions
     let emb_url: Option<String> = {
         let port = *state.embedding_actual_port.lock().await;
         port.map(|p| format!("http://127.0.0.1:{}", p))
     };
-    {
-        let db2 = db.clone();
-        let vid2 = vault_id.clone();
-        let iid2 = item_id.clone();
-        let summary2 = compression.knowledge_summary.clone();
-        let emb_url2 = emb_url.clone();
-        tokio::spawn(async move {
-            let file_path = format!("knowledge_items/{}.md", iid2);
-            let chunks = crate::vault::chunker::chunk_note(&file_path, &summary2, now_ms);
-            for chunk in &chunks {
-                let _ = db2.query(
-                    "INSERT INTO chunks \
-                     (vault_id, chunk_id, file_path, section, content, links, chunk_type, word_count, updated_at, item_id) \
-                     VALUES ($vid, $cid, $fp, $section, $content, $links, $chunk_type, $wc, time::now(), $iid) \
-                     ON DUPLICATE KEY UPDATE content = $content, item_id = $iid, updated_at = time::now()"
-                )
-                .bind(("vid", vid2.clone())).bind(("cid", chunk.id.clone()))
-                .bind(("fp", chunk.file_path.clone())).bind(("section", chunk.section.clone()))
-                .bind(("content", chunk.content.clone())).bind(("links", chunk.links.clone()))
-                .bind(("chunk_type", chunk.chunk_type.clone())).bind(("wc", chunk.word_count))
-                .bind(("iid", iid2.clone()))
-                .await.ok();
-            }
-            if let Some(ref url) = emb_url2 {
-                let _ = crate::vault::chunker::upsert_chunks(&db2, None, &vid2, &chunks, Some(url)).await;
-            }
-        });
-    }
-
-    // ── 持久化 skill_candidates（透過 generate_skills_via_tool_call，LLM 知悉所有工具）──────────
     let saved_skills = generate_skills_via_tool_call(
-        &client, &base_url, db, &vault_id, &item_id,
-        &compression.knowledge_summary, emb_url.as_deref(), now_ms,
+        &client, &base_url, None, &vault_id, &item_id,
+        &compressed.knowledge_summary, emb_url.as_deref(), now_ms,
     ).await;
+    let skill_count = saved_skills.len();
 
-    // emit kb:suggestions_ready（note_cards 為空，因為壓縮不產生筆記卡片）
     let _ = app.emit("kb:suggestions_ready", serde_json::json!({
         "item_id": &item_id,
         "note_cards": serde_json::json!([]),
@@ -3552,8 +2696,8 @@ tool_calls 只能包含：search_vault、read_note、list_structure（或空陣�
 
     Ok(CompressedConvResult {
         item_id,
-        title: compression.title,
-        skill_count: saved_skills.len(),
+        title: compressed.title,
+        skill_count,
     })
 }
 
@@ -3622,80 +2766,43 @@ tool_calls 只能包含：search_vault、read_note、list_structure（或空陣�
 #[tauri::command]
 pub async fn debug_kb_chunks(state: State<'_, AppState>) -> Result<String, AppError> {
     let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-    let mut out = format!("=== debug_kb_chunks ===\nvault_id: {}\n\n", vault_id);
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    let mut output = format!("=== debug_kb_chunks ===\nvault_id: {}\n\n", vault_id);
 
-    // ── Import sessions ──────────────────────────────────────────────────────
-    #[derive(serde::Deserialize)]
-    struct SessRow { session_id: String, seed_url: String, site_name: String, status: String }
-    let mut rs = db.query(
-        "SELECT session_id, seed_url, site_name, status FROM import_sessions WHERE vault_id = $vid LIMIT 10"
-    ).bind(("vid", vault_id.clone())).await.map_err(|e| AppError::Database(e.to_string()))?;
-    let sessions: Vec<SessRow> = rs.take(0).unwrap_or_default();
-    out += &format!("--- import_sessions ({} 筆) ---\n", sessions.len());
+    // Sessions
+    let sessions_path = format!("/vaults/{}/kb/sessions", urlencoding::encode(&vault_id));
+    let sessions_val: serde_json::Value = daemon_get(&state.http_client, &sessions_path, tok)
+        .await.unwrap_or(serde_json::json!([]));
+    let sessions = sessions_val.as_array().cloned().unwrap_or_default();
+    output.push_str(&format!("Sessions: {}\n", sessions.len()));
     for s in &sessions {
-        out += &format!("  [{}] {} | {} | status={}\n", s.session_id, s.site_name, s.seed_url, s.status);
+        output.push_str(&format!("  - {} [{}]: {} pages total, {} imported\n",
+            s["site_name"].as_str().unwrap_or("?"),
+            s["status"].as_str().unwrap_or("?"),
+            s["total_pages"].as_i64().unwrap_or(0),
+            s["imported_pages"].as_i64().unwrap_or(0),
+        ));
     }
-    out += "\n";
 
-    // ── Import pages per session ──────────────────────────────────────────────
-    #[derive(serde::Deserialize)]
-    struct PageDebugRow {
-        page_id: String,
-        session_id: String,
-        url: String,
-        title: String,
-        status: String,
-        content_md: Option<String>,
-        #[allow(dead_code)]
-        last_crawled: Option<serde_json::Value>,
-    }
-    let mut rp = db.query(
-        "SELECT page_id, session_id, url, title, status, content_md, last_crawled \
-         FROM import_pages WHERE vault_id = $vid ORDER BY last_crawled DESC LIMIT 30"
-    ).bind(("vid", vault_id.clone())).await.map_err(|e| AppError::Database(e.to_string()))?;
-    let pages: Vec<PageDebugRow> = rp.take(0).unwrap_or_default();
-    out += &format!("--- import_pages ({} 筆, newest first) ---\n", pages.len());
-    for p in &pages {
-        let md_info = match &p.content_md {
-            None => "content_md=None".to_string(),
-            Some(s) if s.is_empty() => "content_md=Some(\"\")".to_string(),
-            Some(s) => format!("content_md_len={}", s.len()),
-        };
-        out += &format!(
-            "  [{}] sess={} | status={} | {} | {}\n  title: {}\n",
-            p.page_id, p.session_id, p.status, md_info, p.url, p.title
-        );
-    }
-    out += "\n";
+    // KB items
+    let items_path = format!("/vaults/{}/kb/items", urlencoding::encode(&vault_id));
+    let items_val: serde_json::Value = daemon_get(&state.http_client, &items_path, tok)
+        .await.unwrap_or(serde_json::json!([]));
+    let items = items_val.as_array().cloned().unwrap_or_default();
+    output.push_str(&format!("\nKnowledge Items: {}\n", items.len()));
 
-    // ── Chunks ───────────────────────────────────────────────────────────────
-    #[derive(serde::Deserialize)]
-    struct StatusCount { status: String, count: i64 }
-    let mut r1 = db.query(
-        "SELECT status, count() AS count FROM chunks WHERE vault_id = $vid GROUP BY status"
-    ).bind(("vid", vault_id.clone())).await.map_err(|e| AppError::Database(e.to_string()))?;
-    let rows: Vec<StatusCount> = r1.take(0).unwrap_or_default();
-    if rows.is_empty() {
-        out += "chunks: 無任何資料（vault 尚未建立 chunks 索引）\n";
-    } else {
-        out += "--- chunks 狀態分佈 ---\n";
-        for r in &rows { out += &format!("  status={:?}  count={}\n", r.status, r.count); }
+    // Stats
+    let stats_path = format!("/vaults/{}/kb/stats", urlencoding::encode(&vault_id));
+    if let Ok(stats) = daemon_get::<serde_json::Value>(&state.http_client, &stats_path, tok).await {
+        output.push_str(&format!("\nStats: notes={}, verified={}, draft={}\n",
+            stats["total_notes"].as_i64().unwrap_or(0),
+            stats["verified"].as_i64().unwrap_or(0),
+            stats["draft"].as_i64().unwrap_or(0),
+        ));
     }
-    out += "\n";
 
-    #[derive(serde::Deserialize)]
-    #[allow(dead_code)]
-    struct SampleChunk { file_path: String, section: String, status: String, updated_at: Option<serde_json::Value> }
-    let mut r2 = db.query(
-        "SELECT file_path, section, status, updated_at FROM chunks WHERE vault_id = $vid ORDER BY updated_at DESC LIMIT 5"
-    ).bind(("vid", vault_id.clone())).await.map_err(|e| AppError::Database(e.to_string()))?;
-    let samples: Vec<SampleChunk> = r2.take(0).unwrap_or_default();
-    out += &format!("--- 最近 {} 筆 chunks ---\n", samples.len());
-    for s in &samples {
-        out += &format!("  {} [{}] status={:?}\n", s.file_path, s.section, s.status);
-    }
-    Ok(out)
+    Ok(output)
 }
 
 // ── KB Assistant（vault-wide verified-only RAG）────────────────────────────
@@ -3709,236 +2816,12 @@ pub async fn query_kb(
     query_id: String,
     question: String,
 ) -> Result<(), AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = state.db.clone();
-    let app_state = state.inner().clone();
-    let qid = query_id.clone();
-    let app_clone = app.clone();
-
-    tokio::spawn(async move {
-        if let Err(e) = run_kb_query(&app_clone, &db, &vault_id, &question, &qid, &app_state).await {
-            let _ = app_clone.emit("knowledge:done", serde_json::json!({
-                "query_id": &qid,
-                "error": e.to_string()
-            }));
-        }
-    });
-    Ok(())
-}
-
-async fn run_kb_query(
-    app: &AppHandle,
-    db: &SurrealDb,
-    vault_id: &str,
-    question: &str,
-    query_id: &str,
-    app_state: &AppState,
-) -> Result<(), AppError> {
-    #[derive(serde::Deserialize)]
-    struct ChunkRow { file_path: String, section: String, content: String }
-
-    // 1. Vector search → BM25 → contains（只搜 verified）
-    let emb_port = *app_state.embedding_actual_port.lock().await;
-    let emb_url = emb_port.map(|p| format!("http://127.0.0.1:{}", p));
-    let client = reqwest::Client::new();
-
-    let chunks: Vec<ChunkRow> = if let Some(ref url) = emb_url {
-        let qvec = get_embedding(&client, url, question).await;
-        if !qvec.is_empty() {
-            let mut resp = db.query(
-                "SELECT file_path, section, content,
-                        vector::similarity::cosine(embedding, $qvec) AS score
-                 FROM chunks
-                 WHERE vault_id = $vid AND embedding != NONE AND status = 'verified'
-                 ORDER BY score DESC LIMIT 8"
-            )
-            .bind(("vid", vault_id.to_owned()))
-            .bind(("qvec", qvec))
-            .await.map_err(|e| AppError::Database(e.to_string()))?;
-            let rows: Vec<ChunkRow> = resp.take(0).unwrap_or_default();
-            rows
-        } else { vec![] }
-    } else { vec![] };
-
-    let chunks: Vec<ChunkRow> = if chunks.is_empty() {
-        let mut resp = db.query(
-            "SELECT file_path, section, content FROM chunks
-             WHERE vault_id = $vid AND status = 'verified' AND content @1@ $q
-             LIMIT 8"
-        )
-        .bind(("vid", vault_id.to_owned()))
-        .bind(("q", question.to_owned()))
-        .await.map_err(|e| AppError::Database(e.to_string()))?;
-        resp.take(0).unwrap_or_default()
-    } else { chunks };
-
-    let chunks: Vec<ChunkRow> = if chunks.is_empty() {
-        let mut resp = db.query(
-            "SELECT file_path, section, content FROM chunks
-             WHERE vault_id = $vid AND status = 'verified'
-               AND string::contains(string::lowercase(content), string::lowercase($q))
-             LIMIT 8"
-        )
-        .bind(("vid", vault_id.to_owned()))
-        .bind(("q", question.to_owned()))
-        .await.map_err(|e| AppError::Database(e.to_string()))?;
-        resp.take(0).unwrap_or_default()
-    } else { chunks };
-
-    if chunks.is_empty() {
-        let msg = "知識庫中沒有相關的已驗證資料，無法回答此問題。請先匯入並驗證相關知識。";
-        let _ = app.emit("knowledge:token", serde_json::json!({ "query_id": query_id, "content": msg }));
-        let _ = app.emit("knowledge:done", serde_json::json!({ "query_id": query_id }));
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() {
+        let _ = app.emit("knowledge:done", serde_json::json!({ "query_id": &query_id }));
         return Ok(());
     }
-
-    // 2. Build refs (chunk-level, with section anchor)
-    let refs: Vec<KnowledgeRef> = chunks.iter().map(|c| {
-        let fname = c.file_path.split('/').last().unwrap_or("").trim_end_matches(".md");
-        let title = if c.section.is_empty() {
-            fname.to_string()
-        } else {
-            format!("{} § {}", fname, c.section)
-        };
-        let path = if c.section.is_empty() {
-            c.file_path.clone()
-        } else {
-            format!("{}#{}", c.file_path, c.section)
-        };
-        let excerpt: String = c.content.chars().take(160).collect();
-        KnowledgeRef { path, title, excerpt }
-    }).collect();
-
-    let _ = app.emit("knowledge:refs", serde_json::json!({ "query_id": query_id, "refs": refs }));
-
-    // 3. STRICT system prompt（依題型選擇一般問答或跨筆記推理）
-    let is_cross_note = {
-        let q = question.to_lowercase();
-        q.contains("比較") || q.contains("對比") || q.contains("異同") || q.contains("差異")
-        || q.contains("總結") || q.contains("綜合") || q.contains("差別") || q.contains("共同")
-        || q.contains("相同") || q.contains("不同") || q.contains("compare") || q.contains("synthesize")
-    };
-
-    // Emit a hint so UI can show cross-note mode indicator
-    if is_cross_note {
-        let _ = app.emit("knowledge:cross_note", serde_json::json!({ "query_id": query_id }));
-    }
-
-    let context = chunks.iter().enumerate().map(|(i, c)| {
-        let loc = if c.section.is_empty() {
-            c.file_path.clone()
-        } else {
-            format!("{} § {}", c.file_path, c.section)
-        };
-        let excerpt: String = c.content.chars().take(1500).collect();
-        format!("[{}] 來源：{}\n{}", i + 1, loc, excerpt)
-    }).collect::<Vec<_>>().join("\n\n---\n\n");
-
-    let system = if is_cross_note {
-        format!(
-            "你是知識庫跨筆記推理助手。\
-            規則：\
-            1. 根據以下多個「知識庫片段」進行比較、對比或綜合分析。\
-            2. 每個陳述必須以 [1]、[2] 等格式標示來源編號。\
-            3. 若有多個來源可以比較，請用結構化方式（如表格或對比清單）呈現。\
-            4. 若知識庫片段中找不到足夠資訊，必須明確說明。\
-            5. 用繁體中文回答。\n\n知識庫片段：\n\n{}",
-            context
-        )
-    } else {
-        format!(
-            "你是嚴格的知識庫問答助手。\
-            規則：\
-            1. 只能根據以下「知識庫片段」回答，禁止使用訓練資料中的知識。\
-            2. 每個陳述必須以 [1]、[2] 等格式標示來源編號。\
-            3. 若知識庫片段中找不到答案，必須明確說「知識庫中沒有此資訊」，不得猜測或補充。\
-            4. 用繁體中文回答。\n\n知識庫片段：\n\n{}",
-            context
-        )
-    };
-
-    // 4. AI streaming
-    let provider = queries::get_setting(db, "ai_provider").await.unwrap_or_default().unwrap_or_default();
-    let model = queries::get_setting(db, "ai_model").await.unwrap_or_default().unwrap_or_default();
-    let api_key = read_api_key(&app_state.api_key_cache, db, &provider).await;
-
-    let response = if provider == "anthropic" {
-        let body = serde_json::json!({
-            "model": if model.is_empty() { "claude-3-5-haiku-20241022" } else { model.as_str() },
-            "max_tokens": 1024, "system": system, "stream": true,
-            "messages": [{ "role": "user", "content": question }],
-        });
-        client.post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&body).timeout(std::time::Duration::from_secs(120))
-            .send().await.map_err(|e| AppError::AI(e.to_string()))?
-    } else if !provider.is_empty() {
-        let base_url = queries::get_setting(db, "ai_base_url").await.unwrap_or_default()
-            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-        let body = serde_json::json!({
-            "model": if model.is_empty() { "gpt-4o" } else { model.as_str() },
-            "messages": [{ "role": "system", "content": system }, { "role": "user", "content": question }],
-            "stream": true, "temperature": 0.1, "max_tokens": 1024,
-        });
-        let mut req = client.post(format!("{}/chat/completions", base_url.trim_end_matches('/')))
-            .json(&body).timeout(std::time::Duration::from_secs(120));
-        if !api_key.is_empty() { req = req.header("Authorization", format!("Bearer {}", api_key)); }
-        req.send().await.map_err(|e| AppError::AI(e.to_string()))?
-    } else {
-        let base_url = ensure_server_running(app_state, app).await?;
-        let body = serde_json::json!({
-            "model": "local",
-            "messages": [{ "role": "system", "content": system }, { "role": "user", "content": question }],
-            "stream": true, "temperature": 0.1, "max_tokens": 1024,
-        });
-        client.post(format!("{}/v1/chat/completions", base_url))
-            .json(&body).timeout(std::time::Duration::from_secs(120))
-            .send().await.map_err(|e| AppError::AI(e.to_string()))?
-    };
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        return Err(AppError::AI(format!("LLM 回應錯誤 {}：{}", status, text)));
-    }
-
-    let mut stream = response.bytes_stream();
-    let mut sse_buf = String::new();
-    let is_anthropic = provider == "anthropic";
-
-    while let Some(item) = stream.next().await {
-        let bytes = item.map_err(|e| AppError::AI(e.to_string()))?;
-        sse_buf.push_str(&String::from_utf8_lossy(&bytes));
-        while let Some(end) = sse_buf.find("\n\n") {
-            let event = sse_buf[..end].to_string();
-            sse_buf = sse_buf[end + 2..].to_string();
-            for line in event.lines() {
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data.trim() == "[DONE]" { continue; }
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                        let content = if is_anthropic {
-                            if json["type"] == "content_block_delta" {
-                                json["delta"]["text"].as_str().map(|s| s.to_string())
-                            } else { None }
-                        } else {
-                            json["choices"][0]["delta"]["content"].as_str().map(|s| s.to_string())
-                        };
-                        if let Some(text) = content {
-                            if !text.is_empty() {
-                                let _ = app.emit("knowledge:token", serde_json::json!({
-                                    "query_id": query_id, "content": text
-                                }));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let _ = app.emit("knowledge:done", serde_json::json!({ "query_id": query_id }));
-    Ok(())
+    run_knowledge_query(&app, &vault_id, &question, None, &query_id, state.inner()).await
 }
 
 // ── KB Dashboard ─────────────────────────────────────────────────────────────
@@ -3970,87 +2853,47 @@ pub struct KBDayEntry {
 /// 回傳知識庫統計：筆記狀態分佈、資料夾主題分佈、最近 30 天每日統計。
 #[tauri::command]
 pub async fn get_kb_stats(state: State<'_, AppState>) -> Result<KBStats, AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-
-    #[derive(serde::Deserialize)]
-    struct NoteRow { file_path: String, status: String, updated_at: i64 }
-
-    let mut r = db.query(
-        "SELECT file_path, status, updated_at FROM chunks \
-         WHERE vault_id = $vid \
-         GROUP BY file_path, status, updated_at"
-    ).bind(("vid", vault_id.clone()))
-    .await.map_err(|e| AppError::Database(e.to_string()))?;
-    let all_chunks: Vec<NoteRow> = r.take(0).unwrap_or_default();
-
-    use std::collections::HashMap;
-    let mut note_map: HashMap<String, NoteRow> = HashMap::new();
-    for row in all_chunks {
-        note_map.entry(row.file_path.clone()).or_insert(row);
-    }
-    let notes: Vec<NoteRow> = note_map.into_values().collect();
-
-    let total_notes = notes.len() as i64;
-    let mut verified = 0i64;
-    let mut draft = 0i64;
-    let mut deprecated = 0i64;
-    let mut no_status = 0i64;
-
-    let mut topic_map: HashMap<String, i64> = HashMap::new();
-
-    use chrono::{Local, Duration, NaiveDate};
+    use chrono::Local;
     let today = Local::now().date_naive();
-    let cutoff_ms = (Local::now() - Duration::days(30)).timestamp_millis();
-    let mut day_total: HashMap<NaiveDate, i64> = HashMap::new();
-    let mut day_verified: HashMap<NaiveDate, i64> = HashMap::new();
-
-    for note in &notes {
-        match note.status.as_str() {
-            "verified" => verified += 1,
-            "draft" => draft += 1,
-            "deprecated" => deprecated += 1,
-            _ => no_status += 1,
-        }
-
-        let topic = note.file_path
-            .trim_start_matches('/')
-            .split('/')
-            .next()
-            .unwrap_or("其他")
-            .to_string();
-        *topic_map.entry(topic).or_insert(0) += 1;
-
-        if note.updated_at >= cutoff_ms {
-            let dt = chrono::DateTime::from_timestamp_millis(note.updated_at)
-                .map(|d| d.with_timezone(&Local).date_naive())
-                .unwrap_or(today);
-            *day_total.entry(dt).or_insert(0) += 1;
-            if note.status == "verified" {
-                *day_verified.entry(dt).or_insert(0) += 1;
-            }
-        }
-    }
-
-    let mut topics: Vec<KBTopic> = topic_map.into_iter()
-        .map(|(name, count)| KBTopic { name, count })
-        .collect();
-    topics.sort_by(|a, b| b.count.cmp(&a.count));
-    topics.truncate(10);
-
-    let daily_trend: Vec<KBDayEntry> = (0..30i64).map(|i| {
-        let d = today - Duration::days(29 - i);
-        let total = *day_total.get(&d).unwrap_or(&0);
-        let v = *day_verified.get(&d).unwrap_or(&0);
-        KBDayEntry { date: d.format("%Y-%m-%d").to_string(), total, verified: v }
+    let empty_trend: Vec<KBDayEntry> = (0..30i64).map(|i| {
+        let d = today - chrono::TimeDelta::days(29 - i);
+        KBDayEntry { date: d.format("%Y-%m-%d").to_string(), total: 0, verified: 0 }
     }).collect();
 
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() {
+        return Ok(KBStats { total_notes: 0, verified: 0, draft: 0, deprecated: 0, no_status: 0, topics: vec![], daily_trend: empty_trend });
+    }
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    let path = format!("/vaults/{}/kb/stats", urlencoding::encode(&vault_id));
+    let result: serde_json::Value = daemon_get(&state.http_client, &path, tok)
+        .await
+        .unwrap_or(serde_json::json!({}));
+
+    let daily_trend: Vec<KBDayEntry> = result["daily_trend"].as_array()
+        .map(|arr| arr.iter().map(|v| KBDayEntry {
+            date: v["date"].as_str().unwrap_or("").to_string(),
+            total: v["total"].as_i64().unwrap_or(0),
+            verified: v["verified"].as_i64().unwrap_or(0),
+        }).collect())
+        .unwrap_or(empty_trend);
+
+    let topics: Vec<KBTopic> = result["topics"].as_array()
+        .map(|arr| arr.iter().filter_map(|v| {
+            Some(KBTopic {
+                name: v["name"].as_str()?.to_string(),
+                count: v["count"].as_i64().unwrap_or(0),
+            })
+        }).collect())
+        .unwrap_or_default();
+
     Ok(KBStats {
-        total_notes,
-        verified,
-        draft,
-        deprecated,
-        no_status,
+        total_notes: result["total_notes"].as_i64().unwrap_or(0),
+        verified: result["verified"].as_i64().unwrap_or(0),
+        draft: result["draft"].as_i64().unwrap_or(0),
+        deprecated: result["deprecated"].as_i64().unwrap_or(0),
+        no_status: result["no_status"].as_i64().unwrap_or(0),
         topics,
         daily_trend,
     })
@@ -4067,82 +2910,128 @@ pub struct AgingNote {
 }
 
 /// 回傳已驗證但超過 threshold_days 天未審查的筆記列表。
+/// Scans vault .md files for frontmatter `status: verified` + `reviewed_at`.
 #[tauri::command]
 pub async fn get_aging_notes(
     state: State<'_, AppState>,
     threshold_days: Option<i64>,
 ) -> Result<Vec<AgingNote>, AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-    let days = threshold_days.unwrap_or(30);
+    let vault_path = state.get_vault_path().await;
+    if vault_path.is_empty() { return Ok(vec![]); }
+    let threshold = threshold_days.unwrap_or(30);
+    let now_secs = chrono::Utc::now().timestamp();
+    let threshold_secs = threshold * 86400;
+    let vault_root = std::path::PathBuf::from(&vault_path);
 
-    use chrono::Local;
-    let now_ms = Local::now().timestamp_millis();
-    let cutoff_ms = now_ms - days * 24 * 60 * 60 * 1000;
-
-    #[derive(serde::Deserialize)]
-    struct ChunkAging {
-        file_path: String,
-        updated_at: i64,
-        reviewed_at: Option<i64>,
-    }
-
-    let mut r = db.query(
-        "SELECT file_path, updated_at, reviewed_at FROM chunks \
-         WHERE vault_id = $vid AND status = 'verified' \
-         GROUP BY file_path, updated_at, reviewed_at"
-    ).bind(("vid", vault_id.clone()))
-    .await.map_err(|e| AppError::Database(e.to_string()))?;
-    let rows: Vec<ChunkAging> = r.take(0).unwrap_or_default();
-
-    // Deduplicate per file_path; use reviewed_at if set, else updated_at
-    use std::collections::HashMap;
-    let mut note_map: HashMap<String, ChunkAging> = HashMap::new();
-    for row in rows {
-        note_map.entry(row.file_path.clone()).or_insert(row);
-    }
-
-    let mut aging: Vec<AgingNote> = note_map.into_values()
-        .filter_map(|row| {
-            let effective_ts = row.reviewed_at.unwrap_or(row.updated_at);
-            if effective_ts <= cutoff_ms {
-                let days_since = (now_ms - effective_ts) / (24 * 60 * 60 * 1000);
-                let title = row.file_path
-                    .split('/').last().unwrap_or("")
-                    .trim_end_matches(".md")
-                    .to_string();
-                Some(AgingNote {
-                    file_path: row.file_path,
-                    title,
-                    days_since_review: days_since,
-                    reviewed_at: row.reviewed_at,
-                })
-            } else {
-                None
+    let mut results = Vec::new();
+    let mut stack = vec![vault_root.clone()];
+    while let Some(dir) = stack.pop() {
+        let mut rd = match tokio::fs::read_dir(&dir).await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
             }
-        })
-        .collect();
-
-    aging.sort_by(|a, b| b.days_since_review.cmp(&a.days_since_review));
-    Ok(aging)
+            if path.extension().and_then(|e| e.to_str()) != Some("md") { continue; }
+            let Ok(content) = tokio::fs::read_to_string(&path).await else { continue };
+            // Parse frontmatter
+            if !content.starts_with("---") { continue; }
+            let fm_end = match content[3..].find("\n---") {
+                Some(e) => 3 + e,
+                None => continue,
+            };
+            let fm = &content[3..fm_end];
+            // Check status: verified
+            let is_verified = fm.lines().any(|l| {
+                let l = l.trim();
+                l == "status: verified" || l.starts_with("status:") && l.contains("verified")
+            });
+            if !is_verified { continue; }
+            // Parse reviewed_at
+            let reviewed_at: Option<i64> = fm.lines().find_map(|l| {
+                let l = l.trim();
+                if l.starts_with("reviewed_at:") {
+                    let val = l["reviewed_at:".len()..].trim();
+                    // Try parse as Unix timestamp or YYYY-MM-DD
+                    val.parse::<i64>().ok().or_else(|| {
+                        chrono::NaiveDate::parse_from_str(val, "%Y-%m-%d").ok()
+                            .and_then(|d| d.and_hms_opt(0, 0, 0))
+                            .map(|dt| dt.and_utc().timestamp())
+                    })
+                } else { None }
+            });
+            let days_since = match reviewed_at {
+                Some(ts) => (now_secs - ts) / 86400,
+                None => threshold + 1, // no reviewed_at → treat as aging
+            };
+            if days_since < threshold { continue; }
+            // Get title from frontmatter or filename
+            let title = fm.lines().find_map(|l| {
+                let l = l.trim();
+                if l.starts_with("title:") {
+                    Some(l["title:".len()..].trim().trim_matches('"').to_string())
+                } else { None }
+            }).unwrap_or_else(|| {
+                path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string()
+            });
+            let rel_path = path.strip_prefix(&vault_root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            results.push(AgingNote { file_path: rel_path, title, days_since_review: days_since, reviewed_at });
+        }
+    }
+    results.sort_by(|a, b| b.days_since_review.cmp(&a.days_since_review));
+    Ok(results)
 }
 
-/// 標記筆記為「已審查」（更新 reviewed_at）
+/// 標記筆記為「已審查」（更新 reviewed_at frontmatter 欄位）
 #[tauri::command]
 pub async fn mark_note_reviewed(
     state: State<'_, AppState>,
     path: String,
 ) -> Result<(), AppError> {
-    let vault_id = state.get_vault_id().await?;
-    use chrono::Local;
-    let now_ms = Local::now().timestamp_millis();
-    state.db.query(
-        "UPDATE chunks SET reviewed_at = $ts WHERE vault_id = $vid AND file_path = $fp"
-    )
-    .bind(("ts", now_ms))
-    .bind(("vid", vault_id))
-    .bind(("fp", path))
-    .await.map_err(|e| AppError::Database(e.to_string()))?;
+    let vault_path = state.get_vault_path().await;
+    if vault_path.is_empty() { return Ok(()); }
+    let abs_path = std::path::PathBuf::from(&vault_path).join(&path);
+    let content = tokio::fs::read_to_string(&abs_path).await?;
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let new_content = if content.starts_with("---") {
+        if let Some(fm_end) = content[3..].find("\n---") {
+            let fm = &content[3..3 + fm_end];
+            let rest = &content[3 + fm_end + 4..]; // after closing ---
+            let new_fm = if fm.lines().any(|l| l.trim().starts_with("reviewed_at:")) {
+                fm.lines().map(|l| {
+                    if l.trim().starts_with("reviewed_at:") {
+                        format!("reviewed_at: {}", today)
+                    } else { l.to_string() }
+                }).collect::<Vec<_>>().join("\n")
+            } else {
+                format!("{}\nreviewed_at: {}", fm, today)
+            };
+            format!("---\n{}{}---{}", new_fm, if new_fm.ends_with('\n') { "" } else { "\n" }, rest)
+        } else { content }
+    } else { content };
+    tokio::fs::write(&abs_path, new_content.as_bytes()).await?;
+
+    // Sync to daemon
+    if let Ok(vault_id) = state.get_vault_id().await {
+        if !vault_id.is_empty() {
+            let token = state.get_auth_token().await;
+            let tok: Option<&str> = if token.is_empty() { None } else { Some(token.as_str()) };
+            let _ = daemon_post::<_, serde_json::Value>(
+                &state.http_client,
+                &format!("/vaults/{}/notes", urlencoding::encode(&vault_id)),
+                &serde_json::json!({ "path": path, "content": new_content }),
+                tok,
+            ).await;
+        }
+    }
+
     Ok(())
 }
 
@@ -4169,42 +3058,41 @@ fn brave_key_id(api_key: &str) -> String {
 }
 
 /// How many Brave searches have been used this calendar month for the given API key.
-pub async fn get_brave_used(db: &SurrealDb, key_id: &str) -> u32 {
+pub async fn get_brave_used(http_client: &reqwest::Client, tok: Option<&str>, key_id: &str) -> u32 {
     let month_key = format!("brave_search_month_{}", key_id);
     let used_key  = format!("brave_search_used_{}", key_id);
-    let stored_month = queries::get_setting(db, &month_key)
-        .await.ok().flatten().unwrap_or_default();
+    let stored_month = crate::api_client::daemon_get_setting(http_client, tok, &month_key)
+        .await.unwrap_or_default();
     if stored_month != current_month_str() {
         return 0;
     }
-    queries::get_setting(db, &used_key)
-        .await.ok().flatten()
+    crate::api_client::daemon_get_setting(http_client, tok, &used_key)
+        .await
         .and_then(|s| s.parse().ok())
         .unwrap_or(0)
 }
 
 /// Increment the monthly Brave search counter for the given API key,
 /// resetting automatically when the month changes.
-async fn increment_brave_used(db: &SurrealDb, key_id: &str) {
+async fn increment_brave_used(http_client: &reqwest::Client, tok: Option<&str>, key_id: &str) {
     let month_key = format!("brave_search_month_{}", key_id);
     let used_key  = format!("brave_search_used_{}", key_id);
     let month = current_month_str();
-    let stored_month = queries::get_setting(db, &month_key)
-        .await.ok().flatten().unwrap_or_default();
+    let stored_month = crate::api_client::daemon_get_setting(http_client, tok, &month_key)
+        .await.unwrap_or_default();
     let new_used = if stored_month != month {
-        let _ = queries::set_setting(db, &month_key, &month).await;
+        crate::api_client::daemon_set_setting(http_client, tok, &month_key, &month).await;
         1u32
     } else {
-        get_brave_used(db, key_id).await + 1
+        get_brave_used(http_client, tok, key_id).await + 1
     };
-    let _ = queries::set_setting(db, &used_key, &new_used.to_string()).await;
+    crate::api_client::daemon_set_setting(http_client, tok, &used_key, &new_used.to_string()).await;
 }
 
-/// Read Brave Search API key from DB (decrypted).
-async fn read_brave_api_key(db: &crate::db::surreal::SurrealDb) -> Option<String> {
-    let enc = crate::db::queries::get_setting(db, "api_key_brave_search")
-        .await.unwrap_or_default()
-        .unwrap_or_default();
+/// Read Brave Search API key from daemon settings (decrypted).
+async fn read_brave_api_key(http_client: &reqwest::Client, tok: Option<&str>) -> Option<String> {
+    let enc = crate::api_client::daemon_get_setting(http_client, tok, "api_key_brave_search")
+        .await.unwrap_or_default();
     let plain = crate::crypto::decrypt_api_key(&enc);
     if plain.is_empty() { None } else { Some(plain) }
 }
@@ -4268,145 +3156,87 @@ async fn brave_search(api_key: &str, query: &str) -> Result<Vec<(String, String,
 
 /// Import search result URLs in the background into a new import session.
 async fn background_import_search_results(
-    db: SurrealDb,
     vault_id: String,
     query: String,
     urls: Vec<(String, String)>, // (url, title)
     app: AppHandle,
-    emb_url: Option<String>,
+    _emb_url: Option<String>,
 ) {
-    if urls.is_empty() {
-        return;
-    }
-
-    let session_id = Uuid::new_v4().to_string();
-    let q_short: String = query.chars().take(30).collect();
-    let site_name = format!("搜尋：{}", q_short);
-    let root_folder = format!("imports/search-{}", &session_id[..8]);
-
-    // Create import session
-    if db
-        .query(
-            "INSERT INTO import_sessions \
-             (vault_id, session_id, conversation_id, seed_url, site_name, root_folder, status, created_at, updated_at) \
-             VALUES ($vid, $sid, '', $seed, $sname, $rfolder, 'active', time::now(), time::now())",
-        )
-        .bind(("vid", vault_id.clone()))
-        .bind(("sid", session_id.clone()))
-        .bind(("seed", format!("search:{}", query)))
-        .bind(("sname", site_name.clone()))
-        .bind(("rfolder", root_folder.clone()))
-        .await
-        .is_err()
-    {
-        return;
-    }
-
-    let client = match reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (compatible; noteTreeLM/0.1; knowledge-import)")
-        .timeout(std::time::Duration::from_secs(15))
+    if urls.is_empty() { return; }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
         .build()
-    {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+        .unwrap_or_default();
 
-    let now_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    // Create import session for the search query
+    let session_id = Uuid::new_v4().to_string();
+    let site_name = format!("搜尋：{}", query.chars().take(20).collect::<String>());
+    let sanitized = query.chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>();
+    let root_folder = format!("imports/search-{}", &sanitized.chars().take(20).collect::<String>());
+    let now_ms = chrono::Utc::now().timestamp_millis();
 
-    for (url, title) in &urls {
-        // Security check: block internal addresses
-        if validate_url(url).is_err() {
-            continue;
-        }
-
-        let page_id = Uuid::new_v4().to_string();
-
-        let _ = db
-            .query(
-                "INSERT INTO import_pages \
-                 (vault_id, page_id, session_id, url, title, depth, status, created_at) \
-                 VALUES ($vid, $pid, $sid, $url, $title, 0, 'pending', time::now())",
-            )
-            .bind(("vid", vault_id.clone()))
-            .bind(("pid", page_id.clone()))
-            .bind(("sid", session_id.clone()))
-            .bind(("url", url.clone()))
-            .bind(("title", title.clone()))
-            .await;
-
-        // Fetch and convert page
-        let html = match client.get(url).send().await {
-            Ok(resp) => match resp.text().await {
-                Ok(t) => t,
-                Err(_) => continue,
-            },
-            Err(_) => continue,
-        };
-
-        let actual_title = {
-            let t = extract_title(&html);
-            if t.is_empty() { title.clone() } else { t }
-        };
-
-        let body_md = html_to_markdown_rich(&html);
-        let note_content = format!(
-            "---\ntitle: {}\nsource: {}\nimported: {}\nstatus: verified\n---\n\n{}\n",
-            actual_title, url, now_date, body_md
-        );
-
-        let slug = slugify(&actual_title);
-        let note_path = format!("{}/{}.md", root_folder, slug);
-        let new_hash = sha256_hex(&note_content);
-
-        // Store chunks
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let chunks = crate::vault::chunker::chunk_note(&note_path, &note_content, now_ms);
-        let _ = crate::vault::chunker::upsert_chunks(&db, None, &vault_id, &chunks, emb_url.as_deref()).await;
-
-        // Update import_pages record
-        let now_dt = surrealdb::sql::Datetime::from(chrono::Utc::now());
-        let _ = db
-            .query(
-                "UPDATE import_pages SET status = 'imported', note_path = $path, content_md = $content, \
-                 content_hash = $hash, last_crawled = $now \
-                 WHERE vault_id = $vid AND page_id = $pid",
-            )
-            .bind(("path", note_path))
-            .bind(("content", note_content))
-            .bind(("hash", new_hash))
-            .bind(("now", now_dt))
-            .bind(("vid", vault_id.clone()))
-            .bind(("pid", page_id))
-            .await;
-    }
-
-    // Notify frontend so Import Center can refresh
-    let _ = app.emit(
-        "import:session_created",
-        serde_json::json!({
-            "session_id": session_id,
-            "site_name": site_name,
-        }),
+    let session_url = format!(
+        "http://127.0.0.1:7787/api/v1/vaults/{}/kb/sessions",
+        urlencoding::encode(&vault_id)
     );
+    let _ = client.post(&session_url).json(&serde_json::json!({
+        "session_id": session_id,
+        "vault_id": vault_id,
+        "seed_url": urls.first().map(|(u, _)| u.as_str()).unwrap_or(""),
+        "site_name": site_name,
+        "root_folder": root_folder,
+        "status": "active",
+        "auto_update": false,
+        "created_at": now_ms,
+    })).send().await;
+
+    // Add pages
+    let pages: Vec<serde_json::Value> = urls.iter().enumerate().map(|(i, (url, title))| {
+        serde_json::json!({
+            "page_id": Uuid::new_v4().to_string(),
+            "session_id": session_id,
+            "url": url,
+            "title": title,
+            "parent_url": null,
+            "depth": i,
+            "status": "pending",
+        })
+    }).collect();
+    let pages_url = format!(
+        "http://127.0.0.1:7787/api/v1/vaults/{}/kb/sessions/{}/pages",
+        urlencoding::encode(&vault_id),
+        urlencoding::encode(&session_id),
+    );
+    let _ = client.post(&pages_url).json(&serde_json::json!({ "pages": pages })).send().await;
+
+    let _ = app.emit("kb:search_import_ready", serde_json::json!({
+        "session_id": session_id,
+        "query": query,
+        "page_count": urls.len(),
+    }));
 }
 
 /// Web search tool called by the Agent.
-/// Searches via Brave Search API and spawns a background import of the top results.
+/// Searches via Brave Search API.
 pub async fn tool_web_search(
-    db: &SurrealDb,
-    vault_id: &str,
+    http_client: &reqwest::Client,
+    auth_token: &str,
+    _vault_id: &str,
     query: &str,
     app: &AppHandle,
-    emb_url: Option<&str>,
+    _emb_url: Option<&str>,
 ) -> String {
-    let api_key = match read_brave_api_key(db).await {
+    let tok = if auth_token.is_empty() { None } else { Some(auth_token) };
+    let api_key = match read_brave_api_key(http_client, tok).await {
         Some(k) => k,
         None => return "請至設定頁面設定 Brave Search API Key".to_string(),
     };
     let key_id = brave_key_id(&api_key);
 
     // Check monthly quota before making the request
-    let used = get_brave_used(db, &key_id).await;
+    let used = get_brave_used(http_client, tok, &key_id).await;
     if used >= BRAVE_SEARCH_MONTHLY_LIMIT {
         return format!(
             "已達每月搜尋上限（{}/{}），{}重置。",
@@ -4421,7 +3251,7 @@ pub async fn tool_web_search(
 
     // Increment counter on successful response
     if !results.is_empty() {
-        increment_brave_used(db, &key_id).await;
+        increment_brave_used(http_client, tok, &key_id).await;
     }
 
     if results.is_empty() {
@@ -4429,23 +3259,6 @@ pub async fn tool_web_search(
             "Brave Search 未回傳「{}」的搜尋結果（回應成功但結果為空）。",
             query
         );
-    }
-
-    // Spawn background import (non-blocking)
-    {
-        let top_urls: Vec<(String, String)> = results
-            .iter()
-            .take(3)
-            .map(|(title, url, _)| (url.clone(), title.clone()))
-            .collect();
-        let db = db.clone();
-        let vid = vault_id.to_string();
-        let q = query.to_string();
-        let app = app.clone();
-        let emb = emb_url.map(str::to_string);
-        tokio::spawn(async move {
-            background_import_search_results(db, vid, q, top_urls, app, emb).await;
-        });
     }
 
     // Emit web refs for frontend "儲存為知識" button
@@ -4467,7 +3280,7 @@ pub async fn tool_web_search(
         .join("\n\n");
 
     format!(
-        "搜尋「{}」的結果：\n\n{}\n\n（已在背景將搜尋結果加入「匯入知識」，稍後可在匯入中心查看。）",
+        "搜尋「{}」的結果：\n\n{}",
         query, formatted
     )
 }
@@ -4487,26 +3300,37 @@ pub async fn get_cached_page(
     state: State<'_, AppState>,
     source_url: String,
 ) -> Result<Option<CachedPage>, AppError> {
-    let vault_id = state.get_vault_id().await?;
-    let db = &state.db;
-
-    #[derive(serde::Deserialize)]
-    struct Row { title: String, url: String, content_md: Option<String> }
-
-    let mut resp = db.query(
-        "SELECT title, url, content_md FROM import_pages \
-         WHERE vault_id = $vid AND url = $url LIMIT 1"
-    )
-    .bind(("vid", vault_id))
-    .bind(("url", source_url))
-    .await.map_err(|e| AppError::Database(e.to_string()))?;
-
-    let row = resp.take::<Vec<Row>>(0).unwrap_or_default().into_iter().next();
-    Ok(row.map(|r| CachedPage {
-        title: r.title,
-        url: r.url,
-        content_md: r.content_md.unwrap_or_default(),
-    }))
+    let vault_id = state.get_vault_uuid().await;
+    if vault_id.is_empty() { return Ok(None); }
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    // Search via sessions list then pages
+    let sessions_path = format!("/vaults/{}/kb/sessions", urlencoding::encode(&vault_id));
+    let sessions_val: serde_json::Value = daemon_get(&state.http_client, &sessions_path, tok)
+        .await.unwrap_or(serde_json::json!([]));
+    let sessions = sessions_val.as_array().cloned().unwrap_or_default();
+    for s in sessions {
+        let sid = match s["session_id"].as_str() { Some(id) => id.to_string(), None => continue };
+        let pages_path = format!(
+            "/vaults/{}/kb/sessions/{}/pages",
+            urlencoding::encode(&vault_id),
+            urlencoding::encode(&sid),
+        );
+        let pages_val: serde_json::Value = daemon_get(&state.http_client, &pages_path, tok)
+            .await.unwrap_or(serde_json::json!([]));
+        let pages = pages_val.as_array().cloned().unwrap_or_default();
+        if let Some(page) = pages.iter().find(|p| p["url"].as_str() == Some(&source_url)) {
+            let content_md = page["content_md"].as_str().unwrap_or("").to_string();
+            if !content_md.is_empty() {
+                return Ok(Some(CachedPage {
+                    title: page["title"].as_str().unwrap_or("").to_string(),
+                    url: source_url,
+                    content_md,
+                }));
+            }
+        }
+    }
+    Ok(None)
 }
 
 // ── Brave Search Usage ────────────────────────────────────────────────────────
@@ -4523,16 +3347,20 @@ pub struct BraveUsageInfo {
 #[tauri::command]
 pub async fn sync_brave_key_id(state: State<'_, AppState>, key: String) -> Result<(), AppError> {
     let kid = if key.is_empty() { String::new() } else { brave_key_id(&key) };
-    queries::set_setting(&state.db, "brave_current_key_id", &kid).await?;
+    let tok = state.get_auth_token().await;
+    let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+    crate::api_client::daemon_set_setting(&state.http_client, tok_ref, "brave_current_key_id", &kid).await;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn get_brave_search_usage(state: State<'_, AppState>) -> Result<BraveUsageInfo, AppError> {
-    // Read key_id from DB — no keychain access needed here
-    let key_id = queries::get_setting(&state.db, "brave_current_key_id")
-        .await.ok().flatten().unwrap_or_default();
-    let used = if key_id.is_empty() { 0 } else { get_brave_used(&state.db, &key_id).await };
+    // Read key_id from daemon — no keychain access needed here
+    let tok = state.get_auth_token().await;
+    let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+    let key_id = crate::api_client::daemon_get_setting(&state.http_client, tok_ref, "brave_current_key_id")
+        .await.unwrap_or_default();
+    let used = if key_id.is_empty() { 0 } else { get_brave_used(&state.http_client, tok_ref, &key_id).await };
     Ok(BraveUsageInfo {
         used,
         limit: BRAVE_SEARCH_MONTHLY_LIMIT,

@@ -8,11 +8,10 @@ import { open as openPath } from '@tauri-apps/plugin-shell'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
 import { faGear, faBolt, faChevronLeft, faChevronRight, faSitemap, faFolderTree, faMagnifyingGlass, faBug, faComments, faMicrophone, faArrowRightArrowLeft, faTrash, faArrowRightFromBracket, faCircleQuestion, faUser, faFileImport, faShieldHalved, faSliders } from '@fortawesome/free-solid-svg-icons'
 import { useSettingsStore } from './stores/settingsStore'
-import { api, registerVaultIdResolver } from './lib/api'
+import { api } from './lib/api'
 import { useVaultStore } from './stores/vaultStore'
 
-// Register vault ID resolver for api.ts methods that don't take an explicit vaultId
-registerVaultIdResolver(() => useSettingsStore.getState().settings.system_current_vault_path ?? '')
+
 import { useGraphStore } from './stores/graphStore'
 import { useEditorStore } from './stores/editorStore'
 import { useNavigationStore } from './stores/navigationStore'

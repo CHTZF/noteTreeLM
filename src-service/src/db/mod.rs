@@ -317,6 +317,29 @@ async fn run_migrations(db: &SurrealDb) -> Result<(), surrealdb::Error> {
         "DEFINE FIELD IF NOT EXISTS status     ON imports TYPE string DEFAULT 'pending';",
         "DEFINE FIELD IF NOT EXISTS created_at ON imports TYPE int DEFAULT 0;",
 
+        // ── kb suggestions ───────────────────────────────────────────────────
+        "DEFINE TABLE IF NOT EXISTS kb_suggestions SCHEMALESS;",
+        "DEFINE FIELD IF NOT EXISTS suggestion_id ON kb_suggestions TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS vault_id      ON kb_suggestions TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS session_id    ON kb_suggestions TYPE option<string>;",
+        "DEFINE FIELD IF NOT EXISTS page_id       ON kb_suggestions TYPE option<string>;",
+        "DEFINE FIELD IF NOT EXISTS title         ON kb_suggestions TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS template      ON kb_suggestions TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS content       ON kb_suggestions TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS reason        ON kb_suggestions TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS created_at    ON kb_suggestions TYPE int DEFAULT 0;",
+        "DEFINE INDEX IF NOT EXISTS idx_kb_suggestions_id ON kb_suggestions FIELDS suggestion_id UNIQUE;",
+
+        // ── response ratings ─────────────────────────────────────────────────
+        "DEFINE TABLE IF NOT EXISTS response_ratings SCHEMALESS;",
+        "DEFINE FIELD IF NOT EXISTS rating_id        ON response_ratings TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS vault_id         ON response_ratings TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS conversation_id  ON response_ratings TYPE option<string>;",
+        "DEFINE FIELD IF NOT EXISTS content_hash     ON response_ratings TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS rating           ON response_ratings TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS created_at       ON response_ratings TYPE int DEFAULT 0;",
+        "DEFINE INDEX IF NOT EXISTS idx_response_ratings_id ON response_ratings FIELDS rating_id UNIQUE;",
+
         // ── graph nodes & edges ──────────────────────────────────────────────
         "DEFINE TABLE IF NOT EXISTS graph_nodes SCHEMALESS;",
         "DEFINE FIELD IF NOT EXISTS vault_id   ON graph_nodes TYPE string;",

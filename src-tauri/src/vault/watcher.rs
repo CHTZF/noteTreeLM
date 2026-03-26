@@ -2,7 +2,7 @@ use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 /// 啟動 FileWatcher，回傳停止 sender。
 /// Drop 該 sender（或呼叫 stop_watcher）即可停止舊的 watcher thread。
@@ -37,7 +37,7 @@ pub fn start_watcher(app: AppHandle, vault_path: PathBuf) -> mpsc::SyncSender<()
             }
             // 等待 notify 事件（最多 200ms，避免阻塞停止檢查）
             match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(Ok(event)) => handle_event(&app, event),
+                Ok(Ok(event)) => handle_event(&app, &vault_path, event),
                 Ok(Err(e)) => eprintln!("FileWatcher 事件錯誤：{}", e),
                 Err(mpsc::RecvTimeoutError::Timeout) => {} // 繼續 loop
                 Err(mpsc::RecvTimeoutError::Disconnected) => break, // sender dropped
@@ -48,7 +48,7 @@ pub fn start_watcher(app: AppHandle, vault_path: PathBuf) -> mpsc::SyncSender<()
     stop_tx
 }
 
-fn handle_event(app: &AppHandle, event: Event) {
+fn handle_event(app: &AppHandle, vault_path: &PathBuf, event: Event) {
     use notify::EventKind::*;
 
     let paths: Vec<String> = event
@@ -73,13 +73,62 @@ fn handle_event(app: &AppHandle, event: Event) {
     match event.kind {
         Create(_) => {
             let _ = app.emit("vault:note-created", &paths);
+            sync_notes_to_daemon(app, vault_path, &paths, false);
         }
         Modify(_) => {
             let _ = app.emit("vault:note-updated", &paths);
+            sync_notes_to_daemon(app, vault_path, &paths, false);
         }
         Remove(_) => {
             let _ = app.emit("vault:note-deleted", &paths);
+            sync_notes_to_daemon(app, vault_path, &paths, true);
         }
         _ => {}
     }
+}
+
+/// Sync file changes to daemon (no file watcher in daemon).
+/// Called for external edits (e.g. user editing notes in another editor).
+fn sync_notes_to_daemon(app: &AppHandle, vault_path: &PathBuf, abs_paths: &[String], deleted: bool) {
+    let state = app.state::<crate::state::AppState>().inner().clone();
+    let vault_path = vault_path.clone();
+    let abs_paths: Vec<String> = abs_paths.to_vec();
+
+    tauri::async_runtime::spawn(async move {
+        let vault_id = state.get_vault_uuid().await;
+        if vault_id.is_empty() { return; }
+        let token = state.get_auth_token().await;
+        let tok_owned = token.clone();
+        let tok: Option<&str> = if tok_owned.is_empty() { None } else { Some(tok_owned.as_str()) };
+
+        for abs_path_str in &abs_paths {
+            let abs = PathBuf::from(abs_path_str);
+            let rel = match abs.strip_prefix(&vault_path) {
+                Ok(r) => r.to_string_lossy().to_string(),
+                Err(_) => continue,
+            };
+
+            if deleted {
+                let url = format!(
+                    "/vaults/{}/notes?path={}",
+                    urlencoding::encode(&vault_id),
+                    urlencoding::encode(&rel),
+                );
+                let _ = crate::api_client::daemon_delete::<serde_json::Value>(
+                    &state.http_client, &url, tok,
+                ).await;
+            } else {
+                let content = match tokio::fs::read_to_string(&abs).await {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
+                    &state.http_client,
+                    &format!("/vaults/{}/notes", urlencoding::encode(&vault_id)),
+                    &serde_json::json!({"path": rel, "content": content}),
+                    tok,
+                ).await;
+            }
+        }
+    });
 }

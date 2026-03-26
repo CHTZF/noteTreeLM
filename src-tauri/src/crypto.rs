@@ -19,8 +19,6 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use std::sync::OnceLock;
 
-use crate::db::surreal::SurrealDb;
-
 static DERIVED_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 
 // ── Machine UUID ──────────────────────────────────────────────────────────────
@@ -59,36 +57,30 @@ fn machine_uuid() -> String {
 
 // ── Initialisation ────────────────────────────────────────────────────────────
 
-/// 啟動時呼叫一次：讀取（或生成）DB salt，衍生 AES-256-GCM 金鑰並存入 OnceLock。
-/// 若 OnceLock 已設定（重複呼叫）則直接回傳。
-pub async fn init_encryption_key(db: &SurrealDb) {
+/// 啟動時呼叫一次（daemon 版本）：透過 daemon API 讀取/寫入 crypto_salt，其餘與 init_encryption_key 相同。
+pub async fn init_encryption_key_daemon(client: &reqwest::Client, tok: Option<&str>) {
     if DERIVED_KEY.get().is_some() {
         return;
     }
 
-    // 讀取 DB 內的 salt；不存在則生成並持久化
-    let salt_b64 = match crate::db::queries::get_setting(db, "crypto_salt").await {
-        Ok(Some(s)) if !s.is_empty() => s,
+    let salt_b64 = match crate::api_client::daemon_get_setting(client, tok, "crypto_salt").await {
+        Some(s) if !s.is_empty() => s,
         _ => {
-            // 首次啟動：生成 32-byte random salt
             use aes_gcm::aead::rand_core::RngCore;
             let mut salt = [0u8; 32];
             OsRng.fill_bytes(&mut salt);
             let encoded = B64.encode(&salt);
-            let _ = crate::db::queries::set_setting(db, "crypto_salt", &encoded).await;
+            crate::api_client::daemon_set_setting(client, tok, "crypto_salt", &encoded).await;
             encoded
         }
     };
 
     let salt_bytes = B64.decode(&salt_b64).unwrap_or_else(|_| salt_b64.into_bytes());
-
-    // IKM = machine_uuid bytes；HKDF salt = db_random_salt
     let uuid = machine_uuid();
     let hk = Hkdf::<Sha256>::new(Some(&salt_bytes), uuid.as_bytes());
     let mut okm = [0u8; 32];
     hk.expand(b"com.notetreelm.app", &mut okm).expect("HKDF expand failed");
-
-    let _ = DERIVED_KEY.set(okm); // 忽略重複 set（race condition 安全）
+    let _ = DERIVED_KEY.set(okm);
 }
 
 /// 取得快取的加密金鑰。必須在 init_encryption_key 之後呼叫。

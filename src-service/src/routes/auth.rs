@@ -37,6 +37,7 @@ pub fn router() -> Router<ApiState> {
         .route("/auth/logout", post(logout))
         .route("/auth/session", get(session))
         .route("/auth/register", post(register))
+        .route("/auth/change-password", post(change_password))
 }
 
 async fn login(
@@ -123,12 +124,13 @@ async fn session(
         token: String,
         username: String,
         expires_at: i64,
+        auth_provider: Option<String>,
     }
 
     let now = Utc::now().timestamp();
     let mut resp = state
         .db
-        .query("SELECT token, username, expires_at FROM sessions WHERE token = $t AND expires_at > $now")
+        .query("SELECT token, username, expires_at, auth_provider FROM sessions WHERE token = $t AND expires_at > $now")
         .bind(("t", token))
         .bind(("now", now))
         .await
@@ -143,6 +145,7 @@ async fn session(
             "token": s.token,
             "username": s.username,
             "expires_at": s.expires_at,
+            "auth_provider": s.auth_provider.unwrap_or_else(|| "local".to_string()),
         }))),
         None => Ok(Json(json!(null))),
     }
@@ -185,6 +188,66 @@ async fn register(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({ "ok": true, "username": req.username })))
+}
+
+#[derive(serde::Deserialize)]
+struct ChangePasswordRequest {
+    current_password: String,
+    new_password: String,
+}
+
+async fn change_password(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<ChangePasswordRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // Resolve username from Bearer token
+    let token = extract_bearer(&headers)
+        .ok_or((StatusCode::UNAUTHORIZED, "Missing token".to_string()))?;
+    let now = Utc::now().timestamp();
+
+    #[derive(serde::Deserialize)]
+    struct SessionRow { username: String }
+    let mut sr = state.db
+        .query("SELECT username FROM sessions WHERE token = $t AND expires_at > $now")
+        .bind(("t", token))
+        .bind(("now", now))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let username = sr.take::<Vec<SessionRow>>(0).unwrap_or_default()
+        .into_iter().next()
+        .map(|r| r.username)
+        .ok_or((StatusCode::UNAUTHORIZED, "Invalid or expired session".to_string()))?;
+
+    // Verify current password
+    #[derive(serde::Deserialize)]
+    struct UserRow { password_hash: String }
+    let mut resp = state.db
+        .query("SELECT password_hash FROM users WHERE username = $u")
+        .bind(("u", username.clone()))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let user = resp.take::<Vec<UserRow>>(0).unwrap_or_default()
+        .into_iter().next()
+        .ok_or((StatusCode::UNAUTHORIZED, "User not found".to_string()))?;
+
+    let valid = verify(&req.current_password, &user.password_hash)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !valid {
+        return Err((StatusCode::UNAUTHORIZED, "目前密碼錯誤".to_string()));
+    }
+
+    let new_hash = hash(&req.new_password, DEFAULT_COST)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    state.db
+        .query("UPDATE users SET password_hash = $ph WHERE username = $u")
+        .bind(("ph", new_hash))
+        .bind(("u", username))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({ "ok": true })))
 }
 
 pub fn extract_bearer(headers: &HeaderMap) -> Option<String> {

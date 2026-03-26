@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { api } from '../../lib/api'
+import { useAuthStore } from '../../stores/authStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useVoiceRecorder } from '../../hooks/useVoiceRecorder'
 import { useEditorStore } from '../../stores/editorStore'
@@ -33,7 +34,7 @@ interface LiveChatSheetProps {
 // ── Component ────────────────────────────────────────────────────────────────
 
 export default function LiveChatSheet({ open, onClose, onOpenNote, onOpenTab, onShowResults }: LiveChatSheetProps) {
-  const { settings } = useSettingsStore()
+  const { settings, currentVaultId } = useSettingsStore()
   const { t } = useTranslation()
   const currentNotePath = useEditorStore(s => s.currentPath)
 
@@ -65,12 +66,14 @@ export default function LiveChatSheet({ open, onClose, onOpenNote, onOpenTab, on
   useEffect(() => { sheetStateRef.current = sheetState }, [sheetState])
   useEffect(() => { convIdRef.current = conversationId }, [conversationId])
 
-  // ── Init conversation ────────────────────────────────────────────────────
+  // ── Init conversation (re-init on vault switch) ──────────────────────────
   useEffect(() => {
-    api.getOrCreateLiveChatConv('__live_chat__')
+    if (!currentVaultId) return
+    const username = useAuthStore.getState().session?.username ?? ''
+    api.getOrCreateLiveChatConv(currentVaultId, username)
       .then(result => setConversationId(result.id))
       .catch(console.error)
-  }, [])
+  }, [currentVaultId])
 
   // ── Voice recorder ───────────────────────────────────────────────────────
   const handleTranscript = useCallback((text: string) => {
@@ -146,8 +149,7 @@ export default function LiveChatSheet({ open, onClose, onOpenNote, onOpenTab, on
     const snap = useActivityStore.getState()
     if (snap.activePattern) {
       const { signature } = snap.activePattern
-      const vaultId = (await import('../../stores/settingsStore'))
-        .useSettingsStore.getState().settings.system_current_vault_path ?? ''
+      const vaultId = await invoke<string>('get_vault_uuid').catch(() => '')
       if (vaultId) {
         api.updatePatternScore(vaultId, signature, true).catch(() => {})
       }

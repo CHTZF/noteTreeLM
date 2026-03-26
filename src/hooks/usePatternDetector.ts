@@ -27,6 +27,7 @@
 import { useEffect, useRef, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { useActivityStore } from '../stores/activityStore'
+import { useSettingsStore } from '../stores/settingsStore'
 import { api } from '../lib/api'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -51,13 +52,12 @@ export function usePatternDetector() {
   const silenceTimerRef       = useRef<ReturnType<typeof setTimeout> | null>(null)
   const activePatternSigRef   = useRef<string | null>(null)
   const vaultId               = useRef<string>('')
+  const currentVaultId        = useSettingsStore(s => s.currentVaultId)
 
-  // Keep vaultId in sync with settings (read once at mount, vault changes are rare)
+  // Keep vaultId ref in sync with store (updates on vault switch)
   useEffect(() => {
-    import('../stores/settingsStore').then(({ useSettingsStore }) => {
-      vaultId.current = useSettingsStore.getState().settings.system_current_vault_path ?? ''
-    })
-  }, [])
+    vaultId.current = currentVaultId
+  }, [currentVaultId])
 
   // ── Daily Decay (run once per session) ────────────────────────────────────
   useEffect(() => {

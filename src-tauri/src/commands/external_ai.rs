@@ -1,5 +1,4 @@
-use crate::{db::queries, error::AppError, state::AppState};
-use crate::db::surreal::SurrealDb;
+use crate::{error::AppError, state::AppState};
 use futures_util::StreamExt;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, State};
@@ -14,10 +13,11 @@ pub struct ExtAiConfig {
     pub api_key: String,
 }
 
-/// DB 設定讀取快取輔助：先查快取，miss 時讀 DB 並寫入快取
+/// 設定讀取快取輔助：先查快取，miss 時查 daemon 並寫入快取
 pub async fn get_cached_setting(
     cache: &tokio::sync::Mutex<std::collections::HashMap<String, String>>,
-    db: &SurrealDb,
+    client: &reqwest::Client,
+    tok: Option<&str>,
     key: &str,
     default: &str,
 ) -> String {
@@ -27,17 +27,18 @@ pub async fn get_cached_setting(
             return v.clone();
         }
     }
-    let val = queries::get_setting(db, key)
-        .await.unwrap_or_default()
+    let val = crate::api_client::daemon_get_setting(client, tok, key)
+        .await
         .unwrap_or_else(|| default.to_string());
     cache.lock().await.insert(key.to_string(), val.clone());
     val
 }
 
-/// 從記憶體快取讀取 API 金鑰；cache miss 時查 DB 並回填快取（不再存取 keychain）
+/// 從記憶體快取讀取 API 金鑰；cache miss 時查 daemon 並回填快取
 pub(crate) async fn read_api_key(
     cache: &tokio::sync::Mutex<std::collections::HashMap<String, String>>,
-    db: &SurrealDb,
+    client: &reqwest::Client,
+    tok: Option<&str>,
     provider: &str,
 ) -> String {
     if provider.is_empty() {
@@ -50,8 +51,8 @@ pub(crate) async fn read_api_key(
         }
     }
     let db_key = format!("api_key_{}", provider);
-    let encrypted = queries::get_setting(db, &db_key)
-        .await.unwrap_or_default()
+    let encrypted = crate::api_client::daemon_get_setting(client, tok, &db_key)
+        .await
         .unwrap_or_default();
     let key = crate::crypto::decrypt_api_key(&encrypted);
     cache.lock().await.insert(provider.to_string(), key.clone());
@@ -141,18 +142,19 @@ pub async fn call_external_ai_tool(query: &str, config: &ExtAiConfig, app: &AppH
     response_text
 }
 
-/// 從快取（或 DB）讀取外部 AI 設定並執行查詢（供 ToolRegistry 的 call_external_ai 工具使用）
-pub(crate) async fn call_external_ai_via_db(
+/// 從快取（或 daemon）讀取外部 AI 設定並執行查詢（供 ToolRegistry 的 call_external_ai 工具使用）
+pub(crate) async fn call_external_ai_via_client(
     query: &str,
-    db: &SurrealDb,
+    client: &reqwest::Client,
+    tok: Option<&str>,
     app: &AppHandle,
     api_key_cache: &tokio::sync::Mutex<std::collections::HashMap<String, String>>,
     settings_cache: &tokio::sync::Mutex<std::collections::HashMap<String, String>>,
 ) -> String {
-    let provider = get_cached_setting(settings_cache, db, "ai_provider", "").await;
-    let base_url = get_cached_setting(settings_cache, db, "ai_base_url", "https://api.openai.com/v1").await;
-    let model = get_cached_setting(settings_cache, db, "ai_model", "gpt-4o").await;
-    let api_key = read_api_key(api_key_cache, db, &provider).await;
+    let provider = get_cached_setting(settings_cache, client, tok, "ai_provider", "").await;
+    let base_url = get_cached_setting(settings_cache, client, tok, "ai_base_url", "https://api.openai.com/v1").await;
+    let model = get_cached_setting(settings_cache, client, tok, "ai_model", "gpt-4o").await;
+    let api_key = read_api_key(api_key_cache, client, tok, &provider).await;
     let config = ExtAiConfig { provider, base_url, model, api_key };
     call_external_ai_tool(query, &config, app).await
 }
@@ -170,28 +172,8 @@ pub async fn stream_chat_external(
     model: String,
     api_key: String,
 ) -> Result<String, AppError> {
-    // KB context injection（同 invoke_agent）
-    let enriched_system: Option<String> = {
-        let vault_id = state.get_vault_id().await.ok();
-        if let Some(ref vid) = vault_id {
-            let emb_url: Option<String> = {
-                let port = *state.embedding_actual_port.lock().await;
-                port.map(|p| format!("http://127.0.0.1:{}", p))
-            };
-            let kb_query = messages.iter().rev()
-                .find(|m| m.role == "user")
-                .map(|m| m.content.clone())
-                .unwrap_or_default();
-            if !kb_query.is_empty() {
-                if let Some(kb_ctx) = crate::commands::knowledge_import::search_kb_context(
-                    &state.db, vid, &kb_query, emb_url.as_deref()
-                ).await {
-                    let base = system.as_deref().unwrap_or("");
-                    Some(if base.is_empty() { kb_ctx } else { format!("{}\n\n{}", base, kb_ctx) })
-                } else { system.clone() }
-            } else { system.clone() }
-        } else { system.clone() }
-    };
+    // KB context injection（skipped — daemon-based search not yet wired here）
+    let enriched_system: Option<String> = system.clone();
 
     match provider.as_str() {
         "anthropic" => stream_external_anthropic(messages, enriched_system, model, api_key, app).await,

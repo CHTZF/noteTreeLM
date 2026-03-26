@@ -4,11 +4,9 @@ use sha2::{Digest, Sha256};
 use tauri::Manager;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::state::AppState;
-use crate::db::queries::get_or_create_vault_uuid;
+use crate::api_client::{daemon_get, daemon_post, DAEMON_BASE};
 
 // ── Google OAuth 2.0 憑證（桌面應用程式類型）────────────────────────────────
-// 從 src-tauri/google-oauth.json 讀取（compile time embed，該檔案已 gitignore）
-// 範本：src-tauri/google-oauth.example.json
 const GOOGLE_OAUTH_JSON: &str = include_str!("../../google-oauth.json");
 
 fn google_credentials() -> (String, String) {
@@ -26,24 +24,10 @@ pub struct SessionInfo {
     pub username: String,
     pub expires_at: i64,
     #[serde(default = "default_auth_provider")]
-    pub auth_provider: String, // "local" | "google"
+    pub auth_provider: String,
 }
 
-fn default_auth_provider() -> String {
-    "local".to_string()
-}
-
-fn hash_password(password: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(password.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-#[derive(Deserialize)]
-struct UserRow {
-    #[allow(dead_code)]
-    username: String,
-}
+fn default_auth_provider() -> String { "local".to_string() }
 
 #[tauri::command]
 pub async fn login(
@@ -51,65 +35,49 @@ pub async fn login(
     password: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<SessionInfo, String> {
-    let hash = hash_password(&password);
+    #[derive(Deserialize)]
+    struct LoginResp { token: String, username: String, expires_at: i64 }
 
-    let mut resp = state.db
-        .query("SELECT username FROM users WHERE username = $username AND password_hash = $hash LIMIT 1")
-        .bind(("username", username.clone()))
-        .bind(("hash", hash.clone()))
-        .await
-        .map_err(|e| e.to_string())?;
-    let rows: Vec<UserRow> = resp.take(0).map_err(|e| e.to_string())?;
+    let resp = daemon_post::<_, LoginResp>(
+        &state.http_client,
+        "/auth/login",
+        &serde_json::json!({"username": username, "password": password}),
+        None,
+    ).await.map_err(|e| format!("登入失敗：{}", e))?;
 
-    if rows.is_empty() {
-        return Err("帳號或密碼錯誤".to_string());
-    }
+    state.set_auth_token(resp.token.clone()).await;
+    state.set_username(resp.username.clone()).await;
 
-    let token = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().timestamp();
-    let expires_at = now + 30 * 24 * 3600; // 30 days
-
-    // 清除舊 session
-    let _ = state.db
-        .query("DELETE FROM sessions WHERE username = $username")
-        .bind(("username", username.clone()))
-        .await;
-
-    // 寫入新 session
-    state.db
-        .query("INSERT INTO sessions (token, username, expires_at, auth_provider, created_at) VALUES ($token, $username, $expires_at, $provider, $created_at)")
-        .bind(("token", token.clone()))
-        .bind(("username", username.clone()))
-        .bind(("expires_at", expires_at))
-        .bind(("provider", "local".to_string()))
-        .bind(("created_at", now))
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let session = SessionInfo { token, username: username.clone(), expires_at, auth_provider: "local".to_string() };
-
-    // 同步更新 state
-    state.set_username(username.clone()).await;
-
-    // 若 vault_path 非空，建立 vault UUID
+    // 若 vault_path 非空，向 daemon 取得 vault UUID
     let vp = state.get_vault_path().await;
     if !vp.is_empty() {
-        let vault_uuid = get_or_create_vault_uuid(&state.db, &vp, &username).await;
-        state.set_vault_uuid(vault_uuid).await;
+        if let Ok(v) = daemon_post::<_, serde_json::Value>(
+            &state.http_client,
+            "/vaults",
+            &serde_json::json!({"path": vp, "account": resp.username}),
+            Some(&resp.token),
+        ).await {
+            if let Some(uuid) = v["vault_id"].as_str() {
+                state.set_vault_uuid(uuid.to_string()).await;
+            }
+        }
     }
 
-    Ok(session)
+    Ok(SessionInfo { token: resp.token, username: resp.username, expires_at: resp.expires_at, auth_provider: "local".to_string() })
 }
 
 #[tauri::command]
 pub async fn logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let username = state.get_username().await;
-    if !username.is_empty() {
-        let _ = state.db
-            .query("DELETE FROM sessions WHERE username = $username")
-            .bind(("username", username))
-            .await;
+    let token = state.get_auth_token().await;
+    if !token.is_empty() {
+        let _ = daemon_post::<_, serde_json::Value>(
+            &state.http_client,
+            "/auth/logout",
+            &serde_json::json!({}),
+            Some(&token),
+        ).await;
     }
+    state.clear_auth_token().await;
     state.set_username(String::new()).await;
     state.set_vault_uuid(String::new()).await;
     Ok(())
@@ -117,37 +85,27 @@ pub async fn logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn get_session(state: tauri::State<'_, AppState>) -> Result<Option<SessionInfo>, String> {
-    // 先嘗試從 state 取得 username
-    let cached_username = state.get_username().await;
-
-    #[derive(Deserialize)]
-    struct SessionRow {
-        token: String,
-        username: String,
-        expires_at: i64,
-        auth_provider: String,
+    let token = state.get_auth_token().await;
+    if token.is_empty() {
+        return Ok(None);
     }
 
-    let now_ts = chrono::Utc::now().timestamp();
-    let mut resp = state.db
-        .query("SELECT token, username, expires_at, auth_provider FROM sessions WHERE expires_at > $now ORDER BY expires_at DESC LIMIT 1")
-        .bind(("now", now_ts))
-        .await
-        .map_err(|e| e.to_string())?;
-    let rows: Vec<SessionRow> = resp.take(0).map_err(|e| e.to_string())?;
+    #[derive(Deserialize)]
+    struct SessionResp { token: String, username: String, expires_at: i64 }
 
-    if let Some(row) = rows.into_iter().next() {
-        if cached_username.is_empty() {
-            state.set_username(row.username.clone()).await;
+    match daemon_get::<Option<SessionResp>>(&state.http_client, "/auth/session", Some(&token)).await {
+        Ok(Some(s)) => {
+            state.set_username(s.username.clone()).await;
+            Ok(Some(SessionInfo { token: s.token, username: s.username, expires_at: s.expires_at, auth_provider: "local".to_string() }))
         }
-        Ok(Some(SessionInfo {
-            token: row.token,
-            username: row.username,
-            expires_at: row.expires_at,
-            auth_provider: row.auth_provider,
-        }))
-    } else {
-        Ok(None)
+        Ok(None) => {
+            state.clear_auth_token().await;
+            Ok(None)
+        }
+        Err(_) => {
+            state.clear_auth_token().await;
+            Ok(None)
+        }
     }
 }
 
@@ -157,44 +115,22 @@ pub async fn change_password(
     new_password: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let username = state.get_username().await;
-    if username.is_empty() {
-        return Err("未登入".to_string());
-    }
-
-    let current_hash = hash_password(&current_password);
-    let mut resp = state.db
-        .query("SELECT username FROM users WHERE username = $username AND password_hash = $hash LIMIT 1")
-        .bind(("username", username.clone()))
-        .bind(("hash", current_hash.clone()))
-        .await
-        .map_err(|e| e.to_string())?;
-    let rows: Vec<UserRow> = resp.take(0).map_err(|e| e.to_string())?;
-
-    if rows.is_empty() {
-        return Err("目前密碼錯誤".to_string());
-    }
-
-    let new_hash = hash_password(&new_password);
-    state.db
-        .query("UPDATE users SET password_hash = $hash WHERE username = $username")
-        .bind(("hash", new_hash.clone()))
-        .bind(("username", username.clone()))
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
+    let token = state.get_auth_token().await;
+    daemon_post::<_, serde_json::Value>(
+        &state.http_client,
+        "/auth/change-password",
+        &serde_json::json!({"current_password": current_password, "new_password": new_password}),
+        Some(&token),
+    ).await.map(|_| ()).map_err(|e| format!("修改密碼失敗：{}", e))
 }
 
 // ── Google OAuth 2.0（PKCE + 本地 HTTP callback）──────────────────────────
 
 fn generate_pkce() -> (String, String) {
-    // code_verifier: 64 bytes 隨機資料，以 base64url 編碼
     let bytes: Vec<u8> = (0..4)
         .flat_map(|_| uuid::Uuid::new_v4().as_bytes().to_vec())
         .collect();
     let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes);
-    // code_challenge = BASE64URL(SHA256(verifier))
     let hash = Sha256::digest(verifier.as_bytes());
     let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash.as_slice());
     (verifier, challenge)
@@ -208,14 +144,11 @@ pub async fn start_google_oauth(app: tauri::AppHandle, state: tauri::State<'_, A
     let (code_verifier, code_challenge) = generate_pkce();
     let oauth_state = uuid::Uuid::new_v4().to_string();
 
-    // 綁定隨機 port（系統分配，避免衝突）
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|e| e.to_string())?;
+        .await.map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let redirect_uri = format!("http://127.0.0.1:{}/callback", port);
 
-    // 建立 Google OAuth 授權 URL
     let mut auth_url = url::Url::parse("https://accounts.google.com/o/oauth2/v2/auth")
         .map_err(|e| e.to_string())?;
     auth_url.query_pairs_mut()
@@ -228,38 +161,30 @@ pub async fn start_google_oauth(app: tauri::AppHandle, state: tauri::State<'_, A
         .append_pair("state", &oauth_state)
         .append_pair("access_type", "offline");
 
-    // 在系統預設瀏覽器開啟 Google 登入頁
-    app.shell()
-        .open(auth_url.as_str(), None)
+    app.shell().open(auth_url.as_str(), None)
         .map_err(|e| format!("無法開啟瀏覽器: {e}"))?;
 
-    // 等待 Google 的 redirect callback（最多 2 分鐘）
     let (mut stream, _) = tokio::time::timeout(
         std::time::Duration::from_secs(120),
         listener.accept(),
-    )
-    .await
+    ).await
     .map_err(|_| "Google 登入逾時（2 分鐘）".to_string())?
     .map_err(|e| e.to_string())?;
 
-    // 讀取 HTTP 請求
     let mut buf = vec![0u8; 8192];
     let n = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         stream.read(&mut buf),
-    )
-    .await
+    ).await
     .map_err(|_| "讀取 callback 逾時".to_string())?
     .map_err(|e| e.to_string())?;
 
     let request_str = String::from_utf8_lossy(&buf[..n]);
     let request_line = request_str.lines().next().unwrap_or("");
-    // e.g. "GET /callback?code=xxx&state=yyy HTTP/1.1"
     let raw_path = request_line.split_whitespace().nth(1).unwrap_or("");
-
-    // 解析 query string
     let dummy = format!("http://dummy{}", raw_path);
     let parsed_url = url::Url::parse(&dummy).map_err(|_| "解析 callback URL 失敗".to_string())?;
+
     let mut auth_code: Option<String> = None;
     let mut returned_state: Option<String> = None;
     for (k, v) in parsed_url.query_pairs() {
@@ -274,17 +199,14 @@ pub async fn start_google_oauth(app: tauri::AppHandle, state: tauri::State<'_, A
         }
     }
 
-    // 回應瀏覽器
     let _ = send_html_response(&mut stream, true).await;
     drop(stream);
 
-    // 驗證 state（防 CSRF）
     if returned_state.as_deref() != Some(oauth_state.as_str()) {
         return Err("OAuth state 不符，請重試".to_string());
     }
     let code = auth_code.ok_or("未收到授權碼")?;
 
-    // 用授權碼換取 access_token
     let client = reqwest::Client::new();
     let token_resp = client
         .post("https://oauth2.googleapis.com/token")
@@ -296,81 +218,62 @@ pub async fn start_google_oauth(app: tauri::AppHandle, state: tauri::State<'_, A
             ("grant_type",    "authorization_code"),
             ("code_verifier", code_verifier.as_str()),
         ])
-        .send()
-        .await
-        .map_err(|e| format!("Token 交換失敗: {e}"))?
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|e| format!("Token 解析失敗: {e}"))?;
+        .send().await.map_err(|e| format!("Token 交換失敗: {e}"))?
+        .json::<serde_json::Value>().await.map_err(|e| format!("Token 解析失敗: {e}"))?;
 
-    let access_token = token_resp["access_token"]
-        .as_str()
+    let access_token = token_resp["access_token"].as_str()
         .ok_or_else(|| {
             let err = token_resp["error_description"].as_str().unwrap_or("未知錯誤");
             format!("取得 access_token 失敗: {err}")
         })?;
 
-    // 取得使用者資訊
     let userinfo = client
         .get("https://www.googleapis.com/oauth2/v3/userinfo")
         .bearer_auth(access_token)
-        .send()
-        .await
-        .map_err(|e| format!("UserInfo 請求失敗: {e}"))?
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|e| format!("UserInfo 解析失敗: {e}"))?;
+        .send().await.map_err(|e| format!("UserInfo 請求失敗: {e}"))?
+        .json::<serde_json::Value>().await.map_err(|e| format!("UserInfo 解析失敗: {e}"))?;
 
-    let email = userinfo["email"].as_str().ok_or("無法取得 Email")?;
-    let name  = userinfo["name"].as_str().unwrap_or(email);
+    let email    = userinfo["email"].as_str().ok_or("無法取得 Email")?;
+    let name     = userinfo["name"].as_str().unwrap_or(email);
+    let username = name.to_string();
 
-    // 建立 session 並寫入 DB
-    let token      = uuid::Uuid::new_v4().to_string();
-    let now        = chrono::Utc::now().timestamp();
-    let expires_at = now + 30 * 24 * 3600;
-    let username   = name.to_string();
+    // 用 daemon register (upsert) + login 取得 token
+    let _ = state.http_client
+        .post(format!("{}/auth/register", DAEMON_BASE))
+        .json(&serde_json::json!({"username": username, "password": access_token, "auth_provider": "google"}))
+        .send().await;
 
-    // 清除舊 session
-    let _ = state.db
-        .query("DELETE FROM sessions WHERE username = $username")
-        .bind(("username", username.clone()))
-        .await;
+    #[derive(Deserialize)]
+    struct LoginResp { token: String, username: String, expires_at: i64 }
+    let resp = daemon_post::<_, LoginResp>(
+        &state.http_client,
+        "/auth/login",
+        &serde_json::json!({"username": username, "password": access_token}),
+        None,
+    ).await.map_err(|e| format!("登入失敗：{}", e))?;
 
-    // 寫入新 session
-    state.db
-        .query("INSERT INTO sessions (token, username, expires_at, auth_provider, created_at) VALUES ($token, $username, $expires_at, $provider, $created_at)")
-        .bind(("token", token.clone()))
-        .bind(("username", username.clone()))
-        .bind(("expires_at", expires_at))
-        .bind(("provider", "google".to_string()))
-        .bind(("created_at", now))
-        .await
-        .map_err(|e| e.to_string())?;
+    state.set_auth_token(resp.token.clone()).await;
+    state.set_username(resp.username.clone()).await;
 
-    let session = SessionInfo { token, username: username.clone(), expires_at, auth_provider: "google".to_string() };
-
-    // 同步更新 state
-    state.set_username(username.clone()).await;
-
-    // 若 vault_path 非空，建立 vault UUID
     let vp = state.get_vault_path().await;
     if !vp.is_empty() {
-        let vault_uuid = get_or_create_vault_uuid(&state.db, &vp, &username).await;
-        state.set_vault_uuid(vault_uuid).await;
+        if let Ok(v) = daemon_post::<_, serde_json::Value>(
+            &state.http_client,
+            "/vaults",
+            &serde_json::json!({"path": vp, "account": username}),
+            Some(&resp.token),
+        ).await {
+            if let Some(uuid) = v["vault_id"].as_str() {
+                state.set_vault_uuid(uuid.to_string()).await;
+            }
+        }
     }
 
-    Ok(session)
+    Ok(SessionInfo { token: resp.token, username: resp.username, expires_at: resp.expires_at, auth_provider: "google".to_string() })
 }
 
-async fn send_html_response(
-    stream: &mut tokio::net::TcpStream,
-    success: bool,
-) -> std::io::Result<()> {
-    let (title, msg) = if success {
-        ("登入成功", "請返回 noteTreeLM 應用程式")
-    } else {
-        ("登入失敗", "請關閉此視窗並重試")
-    };
+async fn send_html_response(stream: &mut tokio::net::TcpStream, success: bool) -> std::io::Result<()> {
+    let (title, msg) = if success { ("登入成功", "請返回 noteTreeLM 應用程式") } else { ("登入失敗", "請關閉此視窗並重試") };
     let icon = if success { "✅" } else { "❌" };
     let body = format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{title}</title>\

@@ -55,27 +55,6 @@ pub async fn import_url(
         return Err(AppError::Vault("尚未設定 Vault 路徑".to_string()));
     }
 
-    let db = &state.db;
-    let vault_id = state.get_vault_id().await?;
-
-    // 檢查是否已匯入過
-    #[derive(Deserialize)]
-    struct ImportRow { note_path: String }
-    let mut resp = db.query("SELECT note_path FROM imports WHERE vault_id = $vid AND source_url = $url LIMIT 1")
-        .bind(("vid", vault_id.clone()))
-        .bind(("url", url.clone()))
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-    let existing: Vec<ImportRow> = resp.take(0).unwrap_or_default();
-
-    if let Some(row) = existing.into_iter().next() {
-        return Ok(ImportResult {
-            note_path: row.note_path,
-            title: String::new(),
-            was_duplicate: true,
-        });
-    }
-
     // 使用 reqwest 擷取頁面（非 SPA 靜態頁面）
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (compatible; noteTreeLM/0.1)")
@@ -100,14 +79,6 @@ pub async fn import_url(
         Some("imports".to_string()),
         Some(content),
     ).await?;
-
-    // 記錄匯入歷史
-    db.query("INSERT INTO imports (vault_id, source_url, note_path, status) VALUES ($vid, $url, $path, 'success')")
-        .bind(("vid", vault_id))
-        .bind(("url", url))
-        .bind(("path", note.path.clone()))
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
 
     Ok(ImportResult {
         note_path: note.path,

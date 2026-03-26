@@ -1,4 +1,4 @@
-use crate::{error::AppError, state::AppState};
+use crate::{api_client::daemon_get, error::AppError, state::AppState};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -12,15 +12,6 @@ pub struct SearchResult {
     pub source_url: Option<String>,
 }
 
-/// Extract `source: <url>` from YAML frontmatter if present
-fn extract_source_url(content: &str) -> Option<String> {
-    let body = content.strip_prefix("---")?;
-    let end = body.find("---")?;
-    body[..end].lines()
-        .find_map(|line| line.strip_prefix("source:").map(|v| v.trim().to_string()))
-        .filter(|s| !s.is_empty())
-}
-
 #[tauri::command]
 pub async fn search(
     state: State<'_, AppState>,
@@ -32,177 +23,38 @@ pub async fn search(
     }
 
     let limit = limit.unwrap_or(20);
-    let db = state.db.clone();
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
     let vault_id = state.get_vault_id().await?;
 
-    // ── 向量搜尋（embedding server 執行中時）──────────────────────────
-    let emb_url: Option<String> = {
-        let port = *state.embedding_actual_port.lock().await;
-        port.map(|p| format!("http://127.0.0.1:{}", p))
-    };
+    let rows: Vec<serde_json::Value> = daemon_get(
+        &state.http_client,
+        &format!(
+            "/vaults/{}/search?q={}&limit={}",
+            urlencoding::encode(&vault_id),
+            urlencoding::encode(query.trim()),
+            limit,
+        ),
+        tok,
+    ).await.unwrap_or_default();
 
-    if let Some(ref base_url) = emb_url {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .unwrap_or_default();
-
-        let query_vec = crate::commands::ai::get_embedding(&client, base_url, query.trim()).await;
-
-        if !query_vec.is_empty() {
-            #[derive(Deserialize)]
-            struct ChunkRow { file_path: String, content: String, score: f64 }
-
-            let fetch_limit = limit * 3; // 多取再 dedup
-            let mut resp = db.query(
-                "SELECT file_path, section, content, \
-                 vector::similarity::cosine(embedding, $vec) AS score \
-                 FROM chunks WHERE vault_id = $vid AND embedding IS NOT NONE \
-                 ORDER BY score DESC LIMIT $lim"
-            )
-            .bind(("vid", vault_id.clone()))
-            .bind(("vec", query_vec))
-            .bind(("lim", fetch_limit))
-            .await.ok();
-
-            let chunk_rows: Vec<ChunkRow> = resp.as_mut()
-                .and_then(|r| r.take::<Vec<ChunkRow>>(0).ok())
-                .unwrap_or_default();
-
-            if !chunk_rows.is_empty() {
-                // Dedup by file_path，每個檔案只保留分數最高的 chunk
-                let mut seen = std::collections::HashSet::new();
-                let mut deduped: Vec<ChunkRow> = Vec::new();
-                for row in chunk_rows {
-                    if seen.insert(row.file_path.clone()) {
-                        deduped.push(row);
-                        if deduped.len() >= limit as usize { break; }
-                    }
-                }
-
-                // 批次取 title（一次 query）
-                let paths: Vec<String> = deduped.iter().map(|r| r.file_path.clone()).collect();
-                #[derive(Deserialize)]
-                struct TitleRow { path: String, title: String }
-                let mut tr = db.query(
-                    "SELECT path, title FROM notes WHERE vault_id = $vid AND path IN $paths"
-                )
-                .bind(("vid", vault_id.clone()))
-                .bind(("paths", paths))
-                .await.ok();
-                let title_rows: Vec<TitleRow> = tr.as_mut()
-                    .and_then(|r| r.take::<Vec<TitleRow>>(0).ok())
-                    .unwrap_or_default();
-                let title_map: std::collections::HashMap<String, String> =
-                    title_rows.into_iter().map(|r| (r.path, r.title)).collect();
-
-                let mut results: Vec<SearchResult> = deduped.into_iter().map(|row| {
-                    let title = title_map.get(&row.file_path)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            row.file_path.split('/').last()
-                                .unwrap_or(&row.file_path)
-                                .trim_end_matches(".md")
-                                .to_string()
-                        });
-                    let snippet = extract_snippet(&row.content, query.trim());
-                    // Try to extract source URL from this chunk's content (works if preamble chunk)
-                    let source_url = if row.file_path.starts_with("imports/") {
-                        extract_source_url(&row.content)
-                    } else { None };
-                    SearchResult { path: row.file_path, title, snippet, score: row.score, source_url }
-                }).collect();
-
-                // For import results where source_url is still None (non-preamble chunk matched),
-                // do a single batch query for preamble chunks to get the source URL.
-                let missing: Vec<String> = results.iter()
-                    .filter(|r| r.path.starts_with("imports/") && r.source_url.is_none())
-                    .map(|r| r.path.clone())
-                    .collect();
-                if !missing.is_empty() {
-                    #[derive(Deserialize)]
-                    struct PreambleRow { file_path: String, content: String }
-                    let n = missing.len() as i64;
-                    let mut pr = db.query(
-                        "SELECT file_path, content FROM chunks \
-                         WHERE vault_id = $vid AND file_path IN $paths AND section = '' \
-                         LIMIT $n"
-                    )
-                    .bind(("vid", vault_id.clone()))
-                    .bind(("paths", missing))
-                    .bind(("n", n))
-                    .await.ok();
-                    let preamble_rows: Vec<PreambleRow> = pr.as_mut()
-                        .and_then(|r| r.take::<Vec<PreambleRow>>(0).ok())
-                        .unwrap_or_default();
-                    let url_map: std::collections::HashMap<String, String> = preamble_rows
-                        .into_iter()
-                        .filter_map(|row| extract_source_url(&row.content).map(|u| (row.file_path, u)))
-                        .collect();
-                    for r in results.iter_mut() {
-                        if r.source_url.is_none() {
-                            r.source_url = url_map.get(&r.path).cloned();
-                        }
-                    }
-                }
-
-                return Ok(results);
-            }
+    Ok(rows.into_iter().map(|r| {
+        let snippet = r["section"].as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| r["snippet"].as_str().unwrap_or(""))
+            .chars().take(200).collect();
+        let path = r["path"].as_str().unwrap_or("").to_string();
+        let source_url = if path.starts_with("imports/") {
+            r["source_url"].as_str().map(|s| s.to_string())
+        } else {
+            None
+        };
+        SearchResult {
+            path,
+            title: r["title"].as_str().unwrap_or("").to_string(),
+            snippet,
+            score: r["score"].as_f64().unwrap_or(0.0),
+            source_url,
         }
-    }
-
-    // ── Fallback：FTS（embedding 不可用或無結果）──────────────────────
-    #[derive(Deserialize)]
-    struct SearchRow { path: String, title: String }
-
-    let mut resp = db
-        .query(
-            "SELECT path, title FROM notes WHERE vault_id = $vid \
-             AND (title @1@ $q OR content @2@ $q) \
-             ORDER BY search::score(1) + search::score(2) DESC LIMIT $limit",
-        )
-        .bind(("vid", vault_id.clone()))
-        .bind(("q", query.trim().to_owned()))
-        .bind(("limit", limit))
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-    let rows: Vec<SearchRow> = resp.take(0).map_err(|e| AppError::Database(e.to_string()))?;
-
-    let mut results = Vec::new();
-    for (i, row) in rows.into_iter().enumerate() {
-        #[derive(Deserialize)]
-        struct ContentRow { content: String }
-
-        let mut resp2 = db
-            .query("SELECT content FROM notes WHERE vault_id = $vid AND path = $path LIMIT 1")
-            .bind(("vid", vault_id.clone()))
-            .bind(("path", row.path.clone()))
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-        let content_rows: Vec<ContentRow> = resp2.take(0).unwrap_or_default();
-        let content = content_rows.into_iter().next().map(|r| r.content).unwrap_or_default();
-
-        let snippet = extract_snippet(&content, query.trim());
-        let score = 1.0 / (i as f64 + 1.0);
-
-        results.push(SearchResult { path: row.path, title: row.title, snippet, score, source_url: None });
-    }
-
-    Ok(results)
-}
-
-fn extract_snippet(content: &str, query: &str) -> String {
-    let query_lower = query.to_lowercase();
-    let content_lower = content.to_lowercase();
-
-    if let Some(pos) = content_lower.find(&query_lower) {
-        let raw_start = pos.saturating_sub(60);
-        let start = (0..=raw_start).rev().find(|&i| content.is_char_boundary(i)).unwrap_or(0);
-        let raw_end = (pos + query_lower.len() + 60).min(content.len());
-        let end = (raw_end..=content.len()).find(|&i| content.is_char_boundary(i)).unwrap_or(content.len());
-        format!("...{}...", content[start..end].trim())
-    } else {
-        content.chars().take(120).collect::<String>() + "..."
-    }
+    }).collect())
 }

@@ -1,4 +1,5 @@
-use crate::{db::queries, error::AppError, state::AppState};
+use crate::{error::AppError, state::AppState};
+use crate::api_client::daemon_get_setting;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -16,17 +17,21 @@ pub fn find_free_port(preferred: u16) -> u16 {
     preferred
 }
 
-/// 從 DB 讀取 llama-server 路徑、模型路徑（port 由執行時自動分配）
+/// 從 daemon 讀取 llama-server 路徑、模型路徑（port 由執行時自動分配）
 async fn resolve_server_config(state: &AppState) -> Result<(PathBuf, String), AppError> {
-    let db = &state.db;
+    let tok = {
+        let t = state.get_auth_token().await;
+        if t.is_empty() { None } else { Some(t) }
+    };
+    let tok_ref = tok.as_deref();
 
-    let server_path = queries::get_setting(db, "llama_cli_path")
-        .await?
+    let server_path = daemon_get_setting(&state.http_client, tok_ref, "llama_cli_path")
+        .await
         .unwrap_or_default();
     let server_path = server_path.trim().trim_matches('"').trim_matches('\'').to_string();
 
-    let model_path = queries::get_setting(db, "llm_model_path")
-        .await?
+    let model_path = daemon_get_setting(&state.http_client, tok_ref, "llm_model_path")
+        .await
         .unwrap_or_default();
     let model_path = model_path.trim().trim_matches('"').trim_matches('\'').to_string();
 
@@ -398,14 +403,20 @@ pub async fn get_embeddings_batch(
 
 /// App 啟動時呼叫：若已設定路徑則背景預熱 llama-server
 pub async fn warmup_llama_server(state: &AppState, app: &AppHandle) {
-    let configured = matches!(
-        queries::get_setting(&state.db, "llama_cli_path").await,
-        Ok(Some(ref p)) if !p.is_empty()
-    ) && matches!(
-        queries::get_setting(&state.db, "llm_model_path").await,
-        Ok(Some(ref p)) if !p.is_empty()
-    );
-    if !configured {
+    let tok = {
+        let t = state.get_auth_token().await;
+        if t.is_empty() { None } else { Some(t) }
+    };
+    let tok_ref = tok.as_deref();
+    let cli_ok = daemon_get_setting(&state.http_client, tok_ref, "llama_cli_path")
+        .await
+        .map(|p| !p.is_empty())
+        .unwrap_or(false);
+    let model_ok = daemon_get_setting(&state.http_client, tok_ref, "llm_model_path")
+        .await
+        .map(|p| !p.is_empty())
+        .unwrap_or(false);
+    if !cli_ok || !model_ok {
         return;
     }
     if let Err(e) = ensure_server_running(state, app).await {
@@ -491,12 +502,16 @@ pub async fn restart_llama_server(
 // ─── Embedding Server ─────────────────────────────────────────────────────────
 
 async fn resolve_embedding_config(state: &AppState) -> Result<(PathBuf, String), AppError> {
-    let db = &state.db;
-    let server_path = queries::get_setting(db, "llama_cli_path")
-        .await?
+    let tok = {
+        let t = state.get_auth_token().await;
+        if t.is_empty() { None } else { Some(t) }
+    };
+    let tok_ref = tok.as_deref();
+    let server_path = daemon_get_setting(&state.http_client, tok_ref, "llama_cli_path")
+        .await
         .unwrap_or_default();
-    let model_path = queries::get_setting(db, "embedding_model_path")
-        .await?
+    let model_path = daemon_get_setting(&state.http_client, tok_ref, "embedding_model_path")
+        .await
         .unwrap_or_default();
     if server_path.is_empty() {
         return Err(AppError::AI("尚未設定 llama-server 執行檔路徑".to_string()));
@@ -643,14 +658,20 @@ pub(crate) async fn ensure_embedding_server_running(
 
 /// App 啟動時預熱 embedding-server（若已設定模型）
 pub async fn warmup_embedding_server(state: &AppState, app: &AppHandle) {
-    let configured = matches!(
-        queries::get_setting(&state.db, "llama_cli_path").await,
-        Ok(Some(ref p)) if !p.is_empty()
-    ) && matches!(
-        queries::get_setting(&state.db, "embedding_model_path").await,
-        Ok(Some(ref p)) if !p.is_empty()
-    );
-    if !configured { return; }
+    let tok = {
+        let t = state.get_auth_token().await;
+        if t.is_empty() { None } else { Some(t) }
+    };
+    let tok_ref = tok.as_deref();
+    let cli_ok = daemon_get_setting(&state.http_client, tok_ref, "llama_cli_path")
+        .await
+        .map(|p| !p.is_empty())
+        .unwrap_or(false);
+    let model_ok = daemon_get_setting(&state.http_client, tok_ref, "embedding_model_path")
+        .await
+        .map(|p| !p.is_empty())
+        .unwrap_or(false);
+    if !cli_ok || !model_ok { return; }
     if let Err(e) = ensure_embedding_server_running(state, app).await {
         let _ = app.emit("llm:stderr", format!("[embed:error] {}", e));
     }

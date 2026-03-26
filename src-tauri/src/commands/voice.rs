@@ -1,4 +1,4 @@
-use crate::{db::queries, error::AppError, state::AppState};
+use crate::{api_client::daemon_get_setting, error::AppError, state::AppState};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -23,25 +23,26 @@ fn find_free_port(preferred: u16) -> u16 {
     preferred
 }
 
-/// 從 DB 讀取 whisper-server 路徑、模型路徑、threads（port 由執行時自動分配）
+/// 從 daemon 讀取 whisper-server 路徑、模型路徑、threads（port 由執行時自動分配）
 async fn resolve_whisper_server_config(
     state: &AppState,
 ) -> Result<(PathBuf, String, u32), AppError> {
-    let pool = &state.db;
+    let tok_owned = state.get_auth_token().await;
+    let tok: Option<&str> = if tok_owned.is_empty() { None } else { Some(&tok_owned) };
 
-    let server_path = queries::get_setting(pool, "whisper_cli_path")
-        .await?
+    let server_path = daemon_get_setting(&state.http_client, tok, "whisper_cli_path")
+        .await
         .unwrap_or_default();
     // Trim whitespace and surrounding quotes (users sometimes paste quoted paths from terminal)
     let server_path = server_path.trim().trim_matches('"').trim_matches('\'').to_string();
 
-    let model_path = queries::get_setting(pool, "whisper_model_path")
-        .await?
+    let model_path = daemon_get_setting(&state.http_client, tok, "whisper_model_path")
+        .await
         .unwrap_or_default();
     let model_path = model_path.trim().trim_matches('"').trim_matches('\'').to_string();
 
-    let threads: u32 = queries::get_setting(pool, "whisper_threads")
-        .await?
+    let threads: u32 = daemon_get_setting(&state.http_client, tok, "whisper_threads")
+        .await
         .unwrap_or_default()
         .parse()
         .unwrap_or(4);
@@ -296,10 +297,11 @@ pub async fn transcribe_audio(
     pcm_data: Vec<f32>,
     sample_rate: u32,
 ) -> Result<TranscribeResult, AppError> {
-    let pool = &state.db;
+    let tok_owned = state.get_auth_token().await;
+    let tok: Option<&str> = if tok_owned.is_empty() { None } else { Some(&tok_owned) };
 
-    let model_path = queries::get_setting(pool, "whisper_model_path")
-        .await?
+    let model_path = daemon_get_setting(&state.http_client, tok, "whisper_model_path")
+        .await
         .unwrap_or_default();
     if model_path.is_empty() {
         return Err(AppError::Voice(
@@ -307,8 +309,8 @@ pub async fn transcribe_audio(
         ));
     }
 
-    let lang = queries::get_setting(pool, "whisper_language")
-        .await?
+    let lang = daemon_get_setting(&state.http_client, tok, "whisper_language")
+        .await
         .unwrap_or_else(|| "auto".to_string());
 
     // zh-TW / zh-CN 都使用 whisper 的 "zh" 語言代碼，
@@ -438,9 +440,11 @@ fn is_whisper_hallucination(text: &str) -> bool {
 /// App 啟動時呼叫：若已設定路徑則背景預熱 whisper-server 並送出靜音推論
 /// 不阻塞啟動流程；設定錯誤（路徑不存在等）會透過 whisper:stderr 事件通知前端
 pub async fn warmup_whisper_server(state: &AppState, app: &AppHandle) {
+    let tok_owned = state.get_auth_token().await;
+    let tok: Option<&str> = if tok_owned.is_empty() { None } else { Some(&tok_owned) };
     let configured = matches!(
-        queries::get_setting(&state.db, "whisper_cli_path").await,
-        Ok(Some(ref p)) if !p.is_empty()
+        daemon_get_setting(&state.http_client, tok, "whisper_cli_path").await,
+        Some(ref p) if !p.is_empty()
     );
     if !configured {
         return; // 未設定是正常情況，靜默跳過

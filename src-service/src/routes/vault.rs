@@ -1,10 +1,11 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
 use chrono::Utc;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::Path as FsPath;
 use uuid::Uuid;
@@ -18,6 +19,9 @@ pub fn router() -> Router<ApiState> {
         .route("/vaults", get(list_vaults).post(register_vault))
         .route("/vaults/:vault_id/structure", get(vault_structure))
         .route("/vaults/:vault_id/scan", post(scan_vault))
+        .route("/vaults/:vault_id/graph", get(get_graph))
+        .route("/vaults/:vault_id/backlinks", get(get_backlinks))
+        .route("/vaults/:vault_id/stats", get(get_vault_stats))
 }
 
 async fn list_vaults(
@@ -51,9 +55,21 @@ async fn register_vault(
         .unwrap_or("")
         .to_string();
 
-    let vault_id = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp();
 
+    // Check if vault with this path already exists — return existing vault_id if so
+    let mut check = state
+        .db
+        .query("SELECT vault_id FROM vaults WHERE path = $path LIMIT 1")
+        .bind(("path", path.clone()))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let existing: Vec<Value> = check.take(0).unwrap_or_default();
+    if let Some(existing_id) = existing.first().and_then(|r| r["vault_id"].as_str()) {
+        return Ok(Json(json!({ "vault_id": existing_id })));
+    }
+
+    let vault_id = Uuid::new_v4().to_string();
     state
         .db
         .query("INSERT INTO vaults (vault_id, path, account, created_at) VALUES ($vid, $path, $account, $now)")
@@ -215,10 +231,222 @@ async fn scan_vault(
             }
         }
 
+        // Extract and store wiki-links for this file
+        {
+            let wiki_links = extract_wiki_links(&content);
+            let _ = state
+                .db
+                .query("DELETE FROM links WHERE vault_id = $vid AND source_path = $path")
+                .bind(("vid", vault_id.clone()))
+                .bind(("path", rel_path.clone()))
+                .await;
+            for (target_title, raw_text, line_number) in wiki_links {
+                let link_id = Uuid::new_v4().to_string();
+                let _ = state
+                    .db
+                    .query(
+                        "INSERT INTO links (link_id, vault_id, source_path, target_title, \
+                         link_type, raw_text, line_number) \
+                         VALUES ($lid, $vid, $src, $title, 'wiki', $raw, $line)",
+                    )
+                    .bind(("lid", link_id))
+                    .bind(("vid", vault_id.clone()))
+                    .bind(("src", rel_path.clone()))
+                    .bind(("title", target_title))
+                    .bind(("raw", raw_text))
+                    .bind(("line", line_number))
+                    .await;
+            }
+        }
+
         indexed += 1;
     }
 
     Ok(Json(json!({ "ok": true, "indexed": indexed })))
+}
+
+/// Extract [[wiki-links]] from markdown content.
+/// Returns Vec<(target_title, raw_text, line_number)>
+fn extract_wiki_links(content: &str) -> Vec<(String, String, i64)> {
+    use once_cell::sync::Lazy;
+    use regex::Regex;
+    static RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"\[\[([^\]\[]+)\]\]").unwrap()
+    });
+    let mut results = Vec::new();
+    for (line_idx, line) in content.lines().enumerate() {
+        for cap in RE.captures_iter(line) {
+            let inner = &cap[1];
+            // Strip alias (|) and heading (#)
+            let target = inner.split('|').next()
+                .and_then(|s| s.split('#').next())
+                .unwrap_or("").trim().to_string();
+            if !target.is_empty() {
+                results.push((target, cap[0].to_string(), line_idx as i64 + 1));
+            }
+        }
+    }
+    results
+}
+
+// ── Graph ──────────────────────────────────────────────────────────────────
+
+async fn get_graph(
+    State(state): State<ApiState>,
+    Path(vault_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // Nodes: all notes in the vault
+    let mut resp = state
+        .db
+        .query("SELECT path, title, word_count FROM notes WHERE vault_id = $vid ORDER BY modified_at DESC")
+        .bind(("vid", vault_id.clone()))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    #[derive(serde::Deserialize)]
+    struct NoteRow { path: String, title: String, word_count: i64 }
+    let notes: Vec<NoteRow> = resp.take(0).unwrap_or_default();
+
+    let nodes: Vec<Value> = notes
+        .iter()
+        .map(|n| json!({
+            "id": n.path,
+            "node_type": "note",
+            "label": n.title,
+            "file_path": n.path,
+            "url": null,
+            "link_count": 0,
+        }))
+        .collect();
+
+    // Edges: all wiki-links in the vault (source_path → target note)
+    let mut lresp = state
+        .db
+        .query(
+            "SELECT source_path, target_title FROM links WHERE vault_id = $vid",
+        )
+        .bind(("vid", vault_id.clone()))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    #[derive(serde::Deserialize)]
+    struct LinkRow { source_path: String, target_title: String }
+    let links: Vec<LinkRow> = lresp.take(0).unwrap_or_default();
+
+    // Build title→path map for resolving target
+    let title_to_path: std::collections::HashMap<String, String> = notes
+        .iter()
+        .map(|n| (n.title.to_lowercase(), n.path.clone()))
+        .collect();
+
+    let edges: Vec<Value> = links
+        .iter()
+        .filter_map(|l| {
+            let target_path = title_to_path.get(&l.target_title.to_lowercase())?;
+            Some(json!({
+                "source_id": l.source_path,
+                "target_id": target_path,
+                "edge_type": "wiki_link",
+                "weight": 1.0,
+            }))
+        })
+        .collect();
+
+    Ok(Json(json!({ "nodes": nodes, "edges": edges })))
+}
+
+// ── Backlinks ────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct BacklinksQuery {
+    title: Option<String>,
+    path: Option<String>,
+}
+
+async fn get_backlinks(
+    State(state): State<ApiState>,
+    Path(vault_id): Path<String>,
+    Query(q): Query<BacklinksQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let target_title = q.title.unwrap_or_default();
+    let target_path = q.path.unwrap_or_default();
+
+    if target_title.is_empty() && target_path.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Missing title or path query param".to_string()));
+    }
+
+    // Find links where target_title matches (case-insensitive) OR target_path matches source_path
+    let mut qb = if !target_title.is_empty() {
+        state
+            .db
+            .query(
+                "SELECT * FROM links WHERE vault_id = $vid \
+                 AND string::lowercase(target_title) = string::lowercase($title)",
+            )
+            .bind(("vid", vault_id))
+            .bind(("title", target_title))
+    } else {
+        // Find notes that link to the given path (file name without extension as title)
+        let fname = std::path::Path::new(&target_path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or(target_path.clone());
+        state
+            .db
+            .query(
+                "SELECT * FROM links WHERE vault_id = $vid \
+                 AND string::lowercase(target_title) = string::lowercase($title)",
+            )
+            .bind(("vid", vault_id))
+            .bind(("title", fname)            )
+    };
+
+    let mut resp = qb
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let rows: Vec<Value> = resp.take(0).unwrap_or_default();
+    Ok(Json(json!(rows)))
+}
+
+// ── Stats ─────────────────────────────────────────────────────────────────────
+
+async fn get_vault_stats(
+    State(state): State<ApiState>,
+    Path(vault_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    #[derive(serde::Deserialize)]
+    struct CountRow { count: i64 }
+
+    let mut r1 = state.db
+        .query("SELECT count() AS count FROM notes WHERE vault_id = $vid GROUP ALL")
+        .bind(("vid", vault_id.clone()))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let total_notes: i64 = r1.take::<Vec<CountRow>>(0).unwrap_or_default()
+        .into_iter().next().map(|r| r.count).unwrap_or(0);
+
+    let mut r2 = state.db
+        .query("SELECT count() AS count FROM chunks WHERE vault_id = $vid GROUP ALL")
+        .bind(("vid", vault_id.clone()))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let total_chunks: i64 = r2.take::<Vec<CountRow>>(0).unwrap_or_default()
+        .into_iter().next().map(|r| r.count).unwrap_or(0);
+
+    let mut r3 = state.db
+        .query("SELECT count() AS count FROM chunks WHERE vault_id = $vid AND embedding IS NOT NONE GROUP ALL")
+        .bind(("vid", vault_id.clone()))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let embedded_chunks: i64 = r3.take::<Vec<CountRow>>(0).unwrap_or_default()
+        .into_iter().next().map(|r| r.count).unwrap_or(0);
+
+    Ok(Json(json!({
+        "total": total_notes,
+        "chunked": total_chunks,
+        "embedded": embedded_chunks,
+    })))
 }
 
 pub async fn get_vault_path(

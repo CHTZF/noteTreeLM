@@ -1,12 +1,10 @@
-/// tools/readonly.rs — 唯讀工具註冊
+/// tools/readonly.rs — 唯讀工具註冊（daemon API 版）
 use std::sync::Arc;
 
 use serde_json::Value;
 use tauri::Emitter;
 
-use crate::commands::ai::{tool_list_structure, tool_read_note, tool_search_vault, search_skills_for_tool, get_embedding};
-use crate::commands::knowledge_import::tool_web_search;
-use crate::runtime::memory_agent::tool_query_memory;
+use crate::commands::ai::{tool_list_structure, tool_read_note, search_skills_for_tool, get_embedding};
 use crate::runtime::tool_registry::ToolRegistry;
 use crate::runtime::types::Tool;
 
@@ -54,23 +52,39 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // search_vault
+    // search_vault — daemon search endpoint
     {
-        let db = ctx.vault_db.clone();
+        let client = ctx.http_client.clone();
+        let tok = ctx.auth_token.clone();
         let vid = ctx.vault_id.clone();
-        let sqlite = ctx.sqlite.clone();
         let app = ctx.app.clone();
         registry.register(
             "search_vault".into(),
             Tool {
                 execute: Arc::new(move |args: Value| {
                     let query = args["query"].as_str().unwrap_or("").to_string();
-                    let db = db.clone();
+                    let client = client.clone();
+                    let tok = tok.clone();
                     let vid = vid.clone();
-                    let sqlite = sqlite.clone();
                     let app = app.clone();
                     Box::pin(async move {
-                        Ok(Value::String(tool_search_vault(&query, &db, &vid, Some(&sqlite), &app).await))
+                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        let result: serde_json::Value = crate::api_client::daemon_get(
+                            &client,
+                            &format!("/vaults/{}/search?q={}", urlencoding::encode(&vid), urlencoding::encode(&query)),
+                            tok_ref,
+                        ).await.unwrap_or_else(|_| serde_json::json!([]));
+                        let rows = result.as_array().cloned().unwrap_or_default();
+                        if rows.is_empty() {
+                            return Ok(Value::String(format!("未找到與「{}」相關的筆記", query)));
+                        }
+                        let lines: Vec<String> = rows.iter().take(5).map(|r| {
+                            let path = r["path"].as_str().unwrap_or("");
+                            let section = r["section"].as_str().unwrap_or("").chars().take(200).collect::<String>();
+                            format!("**{}**\n{}", path, section)
+                        }).collect();
+                        let _ = app.emit("agent:note_refs", serde_json::json!(rows.iter().map(|r| r["path"].as_str().unwrap_or("")).collect::<Vec<_>>()));
+                        Ok(Value::String(lines.join("\n\n---\n\n")))
                     })
                 }),
                 rollback: None,
@@ -78,30 +92,41 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // query_memory
+    // query_memory — daemon search endpoint filtered to memories/
     {
-        let db = ctx.vault_db.clone();
+        let client = ctx.http_client.clone();
+        let tok = ctx.auth_token.clone();
         let vid = ctx.vault_id.clone();
-        let emb = ctx.emb_url.clone();
         registry.register(
             "query_memory".into(),
             Tool {
                 execute: Arc::new(move |args: Value| {
                     let keywords: Vec<String> = args["keywords"]
                         .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect()
-                        })
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                         .unwrap_or_default();
-                    let since = args["since"].as_str().map(String::from);
-                    let limit = args["limit"].as_u64().map(|v| v as usize);
-                    let db = db.clone();
+                    let limit = args["limit"].as_u64().unwrap_or(3) as usize;
+                    let client = client.clone();
+                    let tok = tok.clone();
                     let vid = vid.clone();
-                    let emb = emb.clone();
                     Box::pin(async move {
-                        Ok(Value::String(tool_query_memory(keywords, since, limit, &db, &vid, emb.as_deref()).await))
+                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        let kw_param = urlencoding::encode(&keywords.join(",")).to_string();
+                        let result: serde_json::Value = crate::api_client::daemon_get(
+                            &client,
+                            &format!("/vaults/{}/memory/query?keywords={}&limit={}", urlencoding::encode(&vid), kw_param, limit),
+                            tok_ref,
+                        ).await.unwrap_or_else(|_| serde_json::json!([]));
+                        let rows = result.as_array().cloned().unwrap_or_default();
+                        if rows.is_empty() {
+                            return Ok(Value::String("未找到相關記憶".to_string()));
+                        }
+                        let lines: Vec<String> = rows.iter().map(|r| {
+                            let path = r["path"].as_str().unwrap_or("");
+                            let snippet = r["snippet"].as_str().unwrap_or("").chars().take(400).collect::<String>();
+                            format!("【{}】\n{}", path, snippet)
+                        }).collect();
+                        Ok(Value::String(lines.join("\n\n---\n\n")))
                     })
                 }),
                 rollback: None,
@@ -125,58 +150,41 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // list_notes_in_folder
+    // list_notes_in_folder — daemon search with path_prefix
     {
-        let db = ctx.vault_db.clone();
+        let client = ctx.http_client.clone();
+        let tok = ctx.auth_token.clone();
         let vid = ctx.vault_id.clone();
         registry.register(
             "list_notes_in_folder".into(),
             Tool {
                 execute: Arc::new(move |args: Value| {
                     let folder = args["folder"].as_str().unwrap_or("").to_string();
-                    let db = db.clone();
+                    let client = client.clone();
+                    let tok = tok.clone();
                     let vid = vid.clone();
                     Box::pin(async move {
                         if folder.is_empty() {
                             return Err("請提供資料夾路徑".to_string());
                         }
-                        let prefix = if folder.ends_with('/') {
-                            folder.clone()
-                        } else {
-                            format!("{}/", folder)
-                        };
-
-                        #[derive(serde::Deserialize)]
-                        struct NoteRow {
-                            title: Option<String>,
-                            path: String,
-                        }
-
-                        let mut resp = db.query(
-                            "SELECT title, path FROM notes \
-                             WHERE vault_id = $vid AND (path = $exact OR string::starts_with(path, $prefix)) \
-                             ORDER BY path ASC LIMIT 200"
-                        )
-                        .bind(("vid", vid.clone()))
-                        .bind(("exact", format!("{}.md", folder)))
-                        .bind(("prefix", prefix.clone()))
-                        .await
-                        .map_err(|e| e.to_string())?;
-
-                        let rows: Vec<NoteRow> = resp.take(0).unwrap_or_default();
-
-                        if rows.is_empty() {
+                        let prefix = if folder.ends_with('/') { folder.clone() } else { format!("{}/", folder) };
+                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        let result: serde_json::Value = crate::api_client::daemon_get(
+                            &client,
+                            &format!("/vaults/{}/notes?path_prefix={}", urlencoding::encode(&vid), urlencoding::encode(&prefix)),
+                            tok_ref,
+                        ).await.unwrap_or_else(|_| serde_json::json!([]));
+                        let notes = result.as_array().cloned().unwrap_or_default();
+                        if notes.is_empty() {
                             return Ok(Value::String(format!("資料夾「{}」中沒有筆記。", folder)));
                         }
-
-                        let lines: Vec<String> = rows.iter().map(|r| {
-                            let title = r.title.as_deref().unwrap_or("(無標題)");
-                            format!("- {} ({})", title, r.path)
+                        let lines: Vec<String> = notes.iter().map(|r| {
+                            let title = r["title"].as_str().unwrap_or("(無標題)");
+                            let path = r["path"].as_str().unwrap_or("");
+                            format!("- {} ({})", title, path)
                         }).collect();
-
                         Ok(Value::String(format!(
-                            "資料夾「{}」共 {} 篇筆記：\n{}",
-                            folder, lines.len(), lines.join("\n")
+                            "資料夾「{}」共 {} 篇筆記：\n{}", folder, lines.len(), lines.join("\n")
                         )))
                     })
                 }),
@@ -185,60 +193,44 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // reflect_on_skills
+    // reflect_on_skills — daemon GET /vaults/:vid/skills
     {
-        let db = ctx.vault_db.clone();
+        let client = ctx.http_client.clone();
+        let tok = ctx.auth_token.clone();
         let vid = ctx.vault_id.clone();
         registry.register(
             "reflect_on_skills".into(),
             Tool {
                 execute: Arc::new(move |_args: Value| {
-                    let db = db.clone();
+                    let client = client.clone();
+                    let tok = tok.clone();
                     let vid = vid.clone();
                     Box::pin(async move {
-                        #[derive(serde::Deserialize)]
-                        #[allow(dead_code)]
-                        struct SkillRow {
-                            skill_id: String,
-                            title: String,
-                            trigger: String,
-                            trigger_count: Option<i64>,
-                            last_triggered_at: Option<surrealdb::sql::Datetime>,
-                            is_active: bool,
-                            injection_mode: Option<String>,
-                        }
-
-                        let mut resp = db.query(
-                            "SELECT skill_id, title, trigger, trigger_count, last_triggered_at, is_active, injection_mode \
-                             FROM agent_skills \
-                             WHERE vault_id = $vid AND is_active = true \
-                             ORDER BY trigger_count DESC"
-                        )
-                        .bind(("vid", vid.clone()))
-                        .await
-                        .map_err(|e| e.to_string())?;
-
-                        let rows: Vec<SkillRow> = resp.take(0).unwrap_or_default();
-
-                        if rows.is_empty() {
+                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        let result: serde_json::Value = crate::api_client::daemon_get(
+                            &client,
+                            &format!("/vaults/{}/skills", urlencoding::encode(&vid)),
+                            tok_ref,
+                        ).await.unwrap_or_else(|_| serde_json::json!([]));
+                        let skills = result.as_array().cloned().unwrap_or_default();
+                        if skills.is_empty() {
                             return Ok(Value::String("目前沒有已啟用的技能規範。".to_string()));
                         }
-
-                        let lines: Vec<String> = rows.iter().map(|s| {
-                            let last = s.last_triggered_at.as_ref()
-                                .map(|dt| dt.to_string())
-                                .unwrap_or_else(|| "從未".to_string());
-                            let count = s.trigger_count.unwrap_or(0);
-                            let mode = s.injection_mode.as_deref().unwrap_or("passive");
+                        let lines: Vec<String> = skills.iter().filter(|s| {
+                            s["is_active"].as_bool().unwrap_or(true)
+                        }).map(|s| {
+                            let title = s["title"].as_str().unwrap_or("(無標題)");
+                            let skill_id = s["skill_id"].as_str().unwrap_or("");
+                            let trigger = s["trigger"].as_str().unwrap_or("");
+                            let count = s["trigger_count"].as_i64().unwrap_or(0);
+                            let mode = s["injection_mode"].as_str().unwrap_or("passive");
                             format!(
-                                "- **{}** (id: `{}`) | 觸發: {} | 最後: {} | 模式: {} | trigger: {}",
-                                s.title, s.skill_id, count, last, mode, s.trigger
+                                "- **{}** (id: `{}`) | 觸發: {} | 模式: {} | trigger: {}",
+                                title, skill_id, count, mode, trigger
                             )
                         }).collect();
-
                         Ok(Value::String(format!(
-                            "# 已啟用技能規範（共 {}）\n{}",
-                            rows.len(), lines.join("\n")
+                            "# 已啟用技能規範（共 {}）\n{}", lines.len(), lines.join("\n")
                         )))
                     })
                 }),
@@ -247,9 +239,10 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // search_web — 搜尋網路（Brave Search）
+    // search_web — 搜尋網路（stub: pass through to knowledge_import）
     {
-        let db = ctx.vault_db.clone();
+        let client = ctx.http_client.clone();
+        let tok = ctx.auth_token.clone();
         let vid = ctx.vault_id.clone();
         let app = ctx.app.clone();
         let emb = ctx.emb_url.clone();
@@ -258,13 +251,14 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
             Tool {
                 execute: Arc::new(move |args: Value| {
                     let query = args["query"].as_str().unwrap_or("").to_string();
-                    let db = db.clone();
+                    let client = client.clone();
+                    let tok = tok.clone();
                     let vid = vid.clone();
                     let app = app.clone();
                     let emb = emb.clone();
                     Box::pin(async move {
                         Ok(Value::String(
-                            tool_web_search(&db, &vid, &query, &app, emb.as_deref()).await,
+                            crate::commands::knowledge_import::tool_web_search(&client, &tok, &vid, &query, &app, emb.as_deref()).await,
                         ))
                     })
                 }),
@@ -273,9 +267,10 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // find_similar_notes — 向量語意搜尋相似筆記
+    // find_similar_notes — daemon search (semantic similarity via daemon)
     {
-        let db = ctx.vault_db.clone();
+        let client = ctx.http_client.clone();
+        let tok = ctx.auth_token.clone();
         let vid = ctx.vault_id.clone();
         let emb = ctx.emb_url.clone();
         registry.register(
@@ -284,51 +279,31 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                 execute: Arc::new(move |args: Value| {
                     let query = args["query"].as_str().unwrap_or("").to_string();
                     let limit = args["limit"].as_u64().unwrap_or(5) as usize;
-                    let db = db.clone();
+                    let client = client.clone();
+                    let tok = tok.clone();
                     let vid = vid.clone();
                     let emb = emb.clone();
                     Box::pin(async move {
                         if query.is_empty() {
                             return Err("請提供搜尋查詢".to_string());
                         }
-                        let url = match emb {
-                            Some(u) => u,
-                            None => return Ok(Value::String("嵌入服務未啟動，無法進行語意搜尋".to_string())),
-                        };
-                        let client = reqwest::Client::new();
-                        let q_emb = get_embedding(&client, &url, &query).await;
-                        if q_emb.is_empty() {
-                            return Ok(Value::String("無法取得查詢嵌入向量".to_string()));
-                        }
-                        #[derive(serde::Deserialize)]
-                        struct ChunkRow { file_path: String, embedding: Option<Vec<f32>> }
-                        let mut resp = db.query(
-                            "SELECT file_path, embedding FROM chunks WHERE vault_id = $vid AND embedding != NONE LIMIT 2000"
-                        )
-                        .bind(("vid", vid.clone()))
-                        .await
-                        .map_err(|e| e.to_string())?;
-                        let rows: Vec<ChunkRow> = resp.take(0).unwrap_or_default();
-                        let mut file_scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-                        for row in &rows {
-                            if let Some(ev) = &row.embedding {
-                                let sim = cosine_sim(&q_emb, ev);
-                                let entry = file_scores.entry(row.file_path.clone()).or_insert(0.0f32);
-                                if sim > *entry { *entry = sim; }
-                            }
-                        }
-                        let mut sorted: Vec<(String, f32)> = file_scores.into_iter().collect();
-                        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                        sorted.truncate(limit.min(20));
-                        if sorted.is_empty() {
+                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        // Semantic search via daemon (handles embedding internally if available)
+                        let result: serde_json::Value = crate::api_client::daemon_get(
+                            &client,
+                            &format!("/vaults/{}/search?q={}", urlencoding::encode(&vid), urlencoding::encode(&query)),
+                            tok_ref,
+                        ).await.unwrap_or_else(|_| serde_json::json!([]));
+                        let rows = result.as_array().cloned().unwrap_or_default();
+                        let _ = emb; // suppress unused warning
+                        if rows.is_empty() {
                             return Ok(Value::String(format!("找不到與「{}」相似的筆記", query)));
                         }
-                        let lines: Vec<String> = sorted.iter().map(|(p, s)| {
-                            format!("- {} (相似度: {:.2})", p, s)
+                        let lines: Vec<String> = rows.iter().map(|r| {
+                            format!("- {}", r["path"].as_str().unwrap_or(""))
                         }).collect();
                         Ok(Value::String(format!(
-                            "與「{}」相似的筆記（前 {}）：\n{}",
-                            query, sorted.len(), lines.join("\n")
+                            "與「{}」相似的筆記（前 {}）：\n{}", query, lines.len(), lines.join("\n")
                         )))
                     })
                 }),
@@ -337,16 +312,18 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // get_note_backlinks — 反向連結查詢（哪些筆記連結至指定筆記）
+    // get_note_backlinks — search content for references to a note
     {
-        let db = ctx.vault_db.clone();
+        let client = ctx.http_client.clone();
+        let tok = ctx.auth_token.clone();
         let vid = ctx.vault_id.clone();
         registry.register(
             "get_note_backlinks".into(),
             Tool {
                 execute: Arc::new(move |args: Value| {
                     let path = args["path"].as_str().unwrap_or("").to_string();
-                    let db = db.clone();
+                    let client = client.clone();
+                    let tok = tok.clone();
                     let vid = vid.clone();
                     Box::pin(async move {
                         if path.is_empty() {
@@ -356,32 +333,23 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                             .file_stem()
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_else(|| path.trim_end_matches(".md").to_string());
-                        let link_pattern = format!("[[{}]]", name_no_ext);
-                        let path_ref = format!("({})", path);
-                        #[derive(serde::Deserialize)]
-                        struct NoteRow { path: String, title: Option<String> }
-                        let mut resp = db.query(
-                            "SELECT path, title FROM notes WHERE vault_id = $vid \
-                             AND (string::contains(content, $link) OR string::contains(content, $pref)) \
-                             AND path != $self ORDER BY modified_at DESC LIMIT 50"
-                        )
-                        .bind(("vid", vid.clone()))
-                        .bind(("link", link_pattern))
-                        .bind(("pref", path_ref))
-                        .bind(("self", path.clone()))
-                        .await
-                        .map_err(|e| e.to_string())?;
-                        let rows: Vec<NoteRow> = resp.take(0).unwrap_or_default();
+                        let link_query = format!("[[{}]]", name_no_ext);
+                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        let result: serde_json::Value = crate::api_client::daemon_get(
+                            &client,
+                            &format!("/vaults/{}/search?q={}", urlencoding::encode(&vid), urlencoding::encode(&link_query)),
+                            tok_ref,
+                        ).await.unwrap_or_else(|_| serde_json::json!([]));
+                        let rows = result.as_array().cloned().unwrap_or_default();
                         if rows.is_empty() {
                             return Ok(Value::String(format!("找不到連結至「{}」的筆記", path)));
                         }
                         let lines: Vec<String> = rows.iter().map(|r| {
-                            let title = r.title.as_deref().unwrap_or("(無標題)");
-                            format!("- {} ({})", title, r.path)
+                            let p = r["path"].as_str().unwrap_or("");
+                            format!("- {}", p)
                         }).collect();
                         Ok(Value::String(format!(
-                            "連結至「{}」的筆記（共 {}）：\n{}",
-                            path, lines.len(), lines.join("\n")
+                            "連結至「{}」的筆記（共 {}）：\n{}", path, lines.len(), lines.join("\n")
                         )))
                     })
                 }),
@@ -390,46 +358,31 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // get_vault_stats — 知識庫統計（筆記數、資料夾數、字數、最近修改）
+    // get_vault_stats — daemon GET /vaults/:vid/stats
     {
-        let db = ctx.vault_db.clone();
+        let client = ctx.http_client.clone();
+        let tok = ctx.auth_token.clone();
         let vid = ctx.vault_id.clone();
         registry.register(
             "get_vault_stats".into(),
             Tool {
                 execute: Arc::new(move |_args: Value| {
-                    let db = db.clone();
+                    let client = client.clone();
+                    let tok = tok.clone();
                     let vid = vid.clone();
                     Box::pin(async move {
-                        #[derive(serde::Deserialize)]
-                        struct NoteRow {
-                            path: String,
-                            word_count: Option<i64>,
-                            modified_at: Option<surrealdb::sql::Datetime>,
-                        }
-                        let mut resp = db.query(
-                            "SELECT path, word_count, modified_at FROM notes WHERE vault_id = $vid ORDER BY modified_at DESC"
-                        )
-                        .bind(("vid", vid.clone()))
-                        .await
-                        .map_err(|e| e.to_string())?;
-                        let rows: Vec<NoteRow> = resp.take(0).unwrap_or_default();
-                        let total_notes = rows.len();
-                        let total_words: i64 = rows.iter().filter_map(|r| r.word_count).sum();
-                        let mut folders: std::collections::HashSet<String> = std::collections::HashSet::new();
-                        for row in &rows {
-                            if let Some(parent) = std::path::Path::new(&row.path).parent() {
-                                let f = parent.to_string_lossy().to_string();
-                                if !f.is_empty() { folders.insert(f); }
-                            }
-                        }
-                        let recent: Vec<String> = rows.iter().take(5).map(|r| {
-                            let ts = r.modified_at.as_ref().map(|dt| dt.to_string()).unwrap_or_else(|| "未知".to_string());
-                            format!("  - {} ({})", r.path, ts)
-                        }).collect();
+                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        let result: serde_json::Value = crate::api_client::daemon_get(
+                            &client,
+                            &format!("/vaults/{}/stats", urlencoding::encode(&vid)),
+                            tok_ref,
+                        ).await.unwrap_or_else(|_| serde_json::json!({}));
+                        let total_notes = result["total"].as_i64().unwrap_or(0);
+                        let chunked = result["chunked"].as_i64().unwrap_or(0);
+                        let embedded = result["embedded"].as_i64().unwrap_or(0);
                         Ok(Value::String(format!(
-                            "# 知識庫統計\n- 筆記總數：{} 篇\n- 資料夾數：{}\n- 總字數：{} 字\n- 最近修改：\n{}",
-                            total_notes, folders.len(), total_words, recent.join("\n")
+                            "# 知識庫統計\n- 筆記總數：{} 篇\n- 已分塊：{} chunks\n- 已向量化：{}",
+                            total_notes, chunked, embedded
                         )))
                     })
                 }),
@@ -438,7 +391,7 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // summarize_note_collection — 批次讀取多篇筆記並 LLM 摘要
+    // summarize_note_collection — file-based, no DB needed
     {
         let vp = ctx.vault_path.clone();
         let emb = ctx.emb_url.clone();
@@ -513,16 +466,18 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // distill_preferences — 從對話記憶蒸餾使用者偏好
+    // distill_preferences — daemon search memories, then LLM
     {
-        let db = ctx.vault_db.clone();
+        let client = ctx.http_client.clone();
+        let tok = ctx.auth_token.clone();
         let vid = ctx.vault_id.clone();
         let emb = ctx.emb_url.clone();
         registry.register(
             "distill_preferences".into(),
             Tool {
                 execute: Arc::new(move |_args: Value| {
-                    let db = db.clone();
+                    let client = client.clone();
+                    let tok = tok.clone();
                     let vid = vid.clone();
                     let emb = emb.clone();
                     Box::pin(async move {
@@ -530,27 +485,21 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                             Some(u) => u,
                             None => return Ok(Value::String("LLM 未啟動，無法分析偏好".to_string())),
                         };
-                        #[derive(serde::Deserialize)]
-                        struct MemRow { content: String }
-                        let mut resp = match db.query(
-                            "SELECT content FROM notes \
-                             WHERE vault_id = $vid AND string::starts_with(path, 'memories/') \
-                             ORDER BY modified_at DESC LIMIT 5"
-                        )
-                        .bind(("vid", vid.clone()))
-                        .await {
-                            Ok(r) => r,
-                            Err(_) => return Ok(Value::String("無法讀取記憶".to_string())),
-                        };
-                        let rows: Vec<MemRow> = resp.take(0).unwrap_or_default();
+                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        let result: serde_json::Value = crate::api_client::daemon_get(
+                            &client,
+                            &format!("/vaults/{}/memory/query?keywords=&limit=5", urlencoding::encode(&vid)),
+                            tok_ref,
+                        ).await.unwrap_or_else(|_| serde_json::json!([]));
+                        let rows = result.as_array().cloned().unwrap_or_default();
                         if rows.is_empty() {
                             return Ok(Value::String("目前沒有對話記憶可供分析".to_string()));
                         }
                         let combined: String = rows.iter()
-                            .map(|r| r.content.chars().take(2000).collect::<String>())
+                            .map(|r| r["snippet"].as_str().unwrap_or("").chars().take(2000).collect::<String>())
                             .collect::<Vec<_>>()
                             .join("\n\n---\n\n");
-                        let client = reqwest::Client::new();
+                        let http_client = reqwest::Client::new();
                         let body = serde_json::json!({
                             "messages": [
                                 {"role": "system", "content": "你是使用者偏好分析系統。從對話記憶中提取：1) 工作習慣與偏好 2) 常見需求模式 3) 個人背景 4) 明確規則。輸出條列式，每條以「- 」開頭，不超過 15 條，只輸出列表。"},
@@ -560,7 +509,7 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                             "temperature": 0.3,
                             "stream": false,
                         });
-                        let http_resp = match client
+                        let http_resp = match http_client
                             .post(format!("{}/v1/chat/completions", base_url))
                             .json(&body)
                             .timeout(std::time::Duration::from_secs(30))
@@ -584,9 +533,10 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // search_by_tag — 以 frontmatter tag 過濾筆記
+    // search_by_tag — daemon search
     {
-        let db = ctx.vault_db.clone();
+        let client = ctx.http_client.clone();
+        let tok = ctx.auth_token.clone();
         let vid = ctx.vault_id.clone();
         registry.register(
             "search_by_tag".into(),
@@ -594,41 +544,29 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                 execute: Arc::new(move |args: Value| {
                     let tag = args["tag"].as_str().unwrap_or("").to_string();
                     let limit = args["limit"].as_u64().unwrap_or(50) as usize;
-                    let db = db.clone();
+                    let client = client.clone();
+                    let tok = tok.clone();
                     let vid = vid.clone();
                     Box::pin(async move {
                         if tag.is_empty() {
                             return Err("請提供 tag 名稱".to_string());
                         }
-                        // Search in content (frontmatter block contains tags)
-                        let tag_lower = tag.to_lowercase();
-                        #[derive(serde::Deserialize)]
-                        struct NoteRow { path: String, title: Option<String> }
-                        let mut resp = db.query(
-                            "SELECT path, title FROM notes \
-                             WHERE vault_id = $vid \
-                             AND string::contains(string::lowercase(content), $tag) \
-                             ORDER BY modified_at DESC LIMIT $lim"
-                        )
-                        .bind(("vid", vid.clone()))
-                        .bind(("tag", tag_lower.clone()))
-                        .bind(("lim", limit as i64))
-                        .await
-                        .map_err(|e| e.to_string())?;
-                        let all_rows: Vec<NoteRow> = resp.take(0).unwrap_or_default();
-                        // Filter: tag must appear in the frontmatter block (between first --- and second ---)
-                        // or as a standalone word to avoid false positives
-                        let rows: Vec<&NoteRow> = all_rows.iter().filter(|_| true).collect();
+                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        let result: serde_json::Value = crate::api_client::daemon_get(
+                            &client,
+                            &format!("/vaults/{}/search?q={}", urlencoding::encode(&vid), urlencoding::encode(&tag)),
+                            tok_ref,
+                        ).await.unwrap_or_else(|_| serde_json::json!([]));
+                        let rows = result.as_array().cloned().unwrap_or_default();
                         if rows.is_empty() {
                             return Ok(Value::String(format!("找不到標籤「{}」的筆記", tag)));
                         }
                         let lines: Vec<String> = rows.iter().map(|r| {
-                            let title = r.title.as_deref().unwrap_or("(無標題)");
-                            format!("- {} ({})", title, r.path)
+                            let path = r["path"].as_str().unwrap_or("");
+                            format!("- {}", path)
                         }).collect();
                         Ok(Value::String(format!(
-                            "標籤「{}」的筆記（共 {}）：\n{}",
-                            tag, lines.len(), lines.join("\n")
+                            "標籤「{}」的筆記（共 {}）：\n{}", tag, lines.len(), lines.join("\n")
                         )))
                     })
                 }),
@@ -637,10 +575,11 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // extract_action_items — 從筆記中提取待辦事項（- [ ]、TODO:、ACTION:）
+    // extract_action_items — file-based (uses vault_path)
     {
         let vp = ctx.vault_path.clone();
-        let db = ctx.vault_db.clone();
+        let client = ctx.http_client.clone();
+        let tok = ctx.auth_token.clone();
         let vid = ctx.vault_id.clone();
         registry.register(
             "extract_action_items".into(),
@@ -650,27 +589,24 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                     let folder = args["folder"].as_str().unwrap_or("").to_string();
                     let include_done = args["include_done"].as_bool().unwrap_or(false);
                     let vp = vp.clone();
-                    let db = db.clone();
+                    let client = client.clone();
+                    let tok = tok.clone();
                     let vid = vid.clone();
                     Box::pin(async move {
-                        // Collect file paths to scan
                         let mut paths_to_scan: Vec<String> = Vec::new();
                         if !path.is_empty() {
                             let rel = if path.ends_with(".md") { path.clone() } else { format!("{}.md", path) };
                             paths_to_scan.push(rel);
                         } else if !folder.is_empty() {
-                            #[derive(serde::Deserialize)]
-                            struct PathRow { path: String }
                             let prefix = if folder.ends_with('/') { folder.clone() } else { format!("{}/", folder) };
-                            let mut resp = db.query(
-                                "SELECT path FROM notes WHERE vault_id = $vid AND string::starts_with(path, $prefix) LIMIT 100"
-                            )
-                            .bind(("vid", vid.clone()))
-                            .bind(("prefix", prefix))
-                            .await
-                            .map_err(|e| e.to_string())?;
-                            let rows: Vec<PathRow> = resp.take(0).unwrap_or_default();
-                            paths_to_scan = rows.into_iter().map(|r| r.path).collect();
+                            let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                            let result: serde_json::Value = crate::api_client::daemon_get(
+                                &client,
+                                &format!("/vaults/{}/notes?path_prefix={}", urlencoding::encode(&vid), urlencoding::encode(&prefix)),
+                                tok_ref,
+                            ).await.unwrap_or_else(|_| serde_json::json!([]));
+                            let notes = result.as_array().cloned().unwrap_or_default();
+                            paths_to_scan = notes.iter().filter_map(|n| n["path"].as_str().map(String::from)).collect();
                         } else {
                             return Err("請提供 path（單一筆記）或 folder（資料夾）".to_string());
                         }
@@ -689,8 +625,8 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                                 let is_checked = trimmed.starts_with("- [x]") || trimmed.starts_with("- [X]") || trimmed.starts_with("* [x]") || trimmed.starts_with("* [X]");
                                 let is_todo = trimmed.to_uppercase().starts_with("TODO:") || trimmed.to_uppercase().starts_with("ACTION:") || trimmed.to_uppercase().starts_with("FIXME:");
                                 if is_unchecked || is_todo || (include_done && is_checked) {
-                                    let prefix = if is_checked { "✅" } else { "⬜" };
-                                    all_items.push(format!("{} [{}] {}", prefix, note_label, trimmed));
+                                    let pfx = if is_checked { "✅" } else { "⬜" };
+                                    all_items.push(format!("{} [{}] {}", pfx, note_label, trimmed));
                                 }
                             }
                         }
@@ -698,8 +634,7 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                             return Ok(Value::String("找不到待辦事項".to_string()));
                         }
                         Ok(Value::String(format!(
-                            "# 待辦事項（共 {}）\n{}",
-                            all_items.len(), all_items.join("\n")
+                            "# 待辦事項（共 {}）\n{}", all_items.len(), all_items.join("\n")
                         )))
                     })
                 }),
@@ -708,62 +643,65 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // find_orphan_notes — 找出沒有反向連結的孤立筆記
+    // find_orphan_notes — list all notes via daemon and compute orphans in memory
     {
-        let db = ctx.vault_db.clone();
+        let vp = ctx.vault_path.clone();
+        let client = ctx.http_client.clone();
+        let tok = ctx.auth_token.clone();
         let vid = ctx.vault_id.clone();
         registry.register(
             "find_orphan_notes".into(),
             Tool {
                 execute: Arc::new(move |_args: Value| {
-                    let db = db.clone();
+                    let vp = vp.clone();
+                    let client = client.clone();
+                    let tok = tok.clone();
                     let vid = vid.clone();
                     Box::pin(async move {
-                        #[derive(serde::Deserialize)]
-                        struct NoteRow { path: String, title: Option<String>, content: String }
-                        let mut resp = db.query(
-                            "SELECT path, title, content FROM notes WHERE vault_id = $vid ORDER BY path ASC LIMIT 500"
-                        )
-                        .bind(("vid", vid.clone()))
-                        .await
-                        .map_err(|e| e.to_string())?;
-                        let rows: Vec<NoteRow> = resp.take(0).unwrap_or_default();
-                        // Build set of all referenced note stems (from [[...]] links)
+                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        let result: serde_json::Value = crate::api_client::daemon_get(
+                            &client,
+                            &format!("/vaults/{}/notes", urlencoding::encode(&vid)),
+                            tok_ref,
+                        ).await.unwrap_or_else(|_| serde_json::json!([]));
+                        let notes = result.as_array().cloned().unwrap_or_default();
+                        // Build referenced set from file content
                         let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
-                        for row in &rows {
-                            let content = &row.content;
-                            let mut pos = 0;
-                            while let Some(open) = content[pos..].find("[[") {
-                                let abs_open = pos + open + 2;
-                                if let Some(close) = content[abs_open..].find("]]") {
-                                    let link = content[abs_open..abs_open + close].trim().to_lowercase();
-                                    // Handle [[note|alias]] format
-                                    let link = link.split('|').next().unwrap_or(&link).trim().to_string();
-                                    referenced.insert(link);
-                                    pos = abs_open + close + 2;
-                                } else { break; }
+                        for note in &notes {
+                            let path = note["path"].as_str().unwrap_or("");
+                            let abs = std::path::PathBuf::from(&vp).join(path);
+                            if let Ok(content) = tokio::fs::read_to_string(&abs).await {
+                                let mut pos = 0;
+                                while let Some(open) = content[pos..].find("[[") {
+                                    let abs_open = pos + open + 2;
+                                    if let Some(close) = content[abs_open..].find("]]") {
+                                        let link = content[abs_open..abs_open + close].trim().to_lowercase();
+                                        let link = link.split('|').next().unwrap_or(&link).trim().to_string();
+                                        referenced.insert(link);
+                                        pos = abs_open + close + 2;
+                                    } else { break; }
+                                }
                             }
                         }
-                        // Find notes whose stem is not referenced
-                        let orphans: Vec<&NoteRow> = rows.iter().filter(|r| {
-                            let stem = std::path::Path::new(&r.path)
+                        let orphans: Vec<&serde_json::Value> = notes.iter().filter(|n| {
+                            let path = n["path"].as_str().unwrap_or("");
+                            let stem = std::path::Path::new(path)
                                 .file_stem()
                                 .map(|s| s.to_string_lossy().to_lowercase())
                                 .unwrap_or_default();
-                            // Skip index/MOC notes from orphan check
                             if stem == "index" || stem == "moc" || stem == "readme" { return false; }
                             !referenced.contains(stem.as_str())
                         }).collect();
                         if orphans.is_empty() {
                             return Ok(Value::String("所有筆記都有反向連結，知識庫連結狀況良好！".to_string()));
                         }
-                        let lines: Vec<String> = orphans.iter().map(|r| {
-                            let title = r.title.as_deref().unwrap_or("(無標題)");
-                            format!("- {} ({})", title, r.path)
+                        let lines: Vec<String> = orphans.iter().map(|n| {
+                            let title = n["title"].as_str().unwrap_or("(無標題)");
+                            let path = n["path"].as_str().unwrap_or("");
+                            format!("- {} ({})", title, path)
                         }).collect();
                         Ok(Value::String(format!(
-                            "# 孤立筆記（無反向連結，共 {}）\n{}\n\n💡 建議：用 find_similar_notes 找出相關筆記，再用 link_notes 建立連結。",
-                            orphans.len(), lines.join("\n")
+                            "# 孤立筆記（無反向連結，共 {}）\n{}", orphans.len(), lines.join("\n")
                         )))
                     })
                 }),
@@ -772,56 +710,44 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // list_recent_notes — 列出最近 N 天修改的筆記
+    // list_recent_notes — daemon GET /vaults/:vid/notes with sort
     {
-        let db = ctx.vault_db.clone();
+        let client = ctx.http_client.clone();
+        let tok = ctx.auth_token.clone();
         let vid = ctx.vault_id.clone();
         registry.register(
             "list_recent_notes".into(),
             Tool {
                 execute: Arc::new(move |args: Value| {
                     let days = args["days"].as_u64().unwrap_or(7) as i64;
-                    let limit = args["limit"].as_u64().unwrap_or(20) as i64;
-                    let db = db.clone();
+                    let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+                    let client = client.clone();
+                    let tok = tok.clone();
                     let vid = vid.clone();
                     Box::pin(async move {
                         let since_ts = chrono::Utc::now().timestamp() - days * 86400;
-                        #[derive(serde::Deserialize)]
-                        struct NoteRow {
-                            path: String,
-                            title: Option<String>,
-                            modified_at: Option<surrealdb::sql::Datetime>,
-                            word_count: Option<i64>,
-                        }
-                        let mut resp = db.query(
-                            "SELECT path, title, modified_at, word_count FROM notes \
-                             WHERE vault_id = $vid \
-                             ORDER BY modified_at DESC LIMIT $lim"
-                        )
-                        .bind(("vid", vid.clone()))
-                        .bind(("lim", limit))
-                        .await
-                        .map_err(|e| e.to_string())?;
-                        let all_rows: Vec<NoteRow> = resp.take(0).unwrap_or_default();
-                        // Filter by days in Rust (SurrealDB timestamp comparison may vary)
-                        let rows: Vec<&NoteRow> = all_rows.iter().filter(|r| {
-                            r.modified_at.as_ref().map(|dt| {
-                                let ts = dt.timestamp();
-                                ts >= since_ts
-                            }).unwrap_or(false)
+                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
+                        let result: serde_json::Value = crate::api_client::daemon_get(
+                            &client,
+                            &format!("/vaults/{}/notes", urlencoding::encode(&vid)),
+                            tok_ref,
+                        ).await.unwrap_or_else(|_| serde_json::json!([]));
+                        let notes = result.as_array().cloned().unwrap_or_default();
+                        // Filter by days in Rust
+                        let filtered: Vec<&serde_json::Value> = notes.iter().filter(|n| {
+                            n["modified_at"].as_i64().map(|ts| ts >= since_ts).unwrap_or(false)
                         }).collect();
-                        if rows.is_empty() {
+                        if filtered.is_empty() {
                             return Ok(Value::String(format!("最近 {} 天沒有修改過筆記", days)));
                         }
-                        let lines: Vec<String> = rows.iter().map(|r| {
-                            let title = r.title.as_deref().unwrap_or("(無標題)");
-                            let ts = r.modified_at.as_ref().map(|dt| dt.to_string()).unwrap_or_default();
-                            let wc = r.word_count.unwrap_or(0);
-                            format!("- {} ({}) [{}字] — {}", title, r.path, wc, &ts[..10.min(ts.len())])
+                        let lines: Vec<String> = filtered.iter().map(|n| {
+                            let title = n["title"].as_str().unwrap_or("(無標題)");
+                            let path = n["path"].as_str().unwrap_or("");
+                            let wc = n["word_count"].as_i64().unwrap_or(0);
+                            format!("- {} ({}) [{}字]", title, path, wc)
                         }).collect();
                         Ok(Value::String(format!(
-                            "最近 {} 天修改的筆記（共 {}）：\n{}",
-                            days, rows.len(), lines.join("\n")
+                            "最近 {} 天修改的筆記（共 {}）：\n{}", days, filtered.len(), lines.join("\n")
                         )))
                     })
                 }),
@@ -830,7 +756,7 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // extract_note_links — 取出筆記中所有出向 [[wiki link]]
+    // extract_note_links — file-based
     {
         let vp = ctx.vault_path.clone();
         registry.register(
@@ -851,7 +777,6 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                             let abs_open = pos + open + 2;
                             if let Some(close) = content[abs_open..].find("]]") {
                                 let raw = &content[abs_open..abs_open + close];
-                                // Handle [[note|alias]] → show "alias → note"
                                 let parts: Vec<&str> = raw.splitn(2, '|').collect();
                                 let display = if parts.len() == 2 {
                                     format!("[[{}]] (別名: {})", parts[0].trim(), parts[1].trim())
@@ -866,8 +791,8 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                             return Ok(Value::String(format!("「{}」沒有出向連結", rel)));
                         }
                         Ok(Value::String(format!(
-                            "「{}」的出向連結（共 {}）：\n{}",
-                            rel, links.len(), links.iter().map(|l| format!("- {}", l)).collect::<Vec<_>>().join("\n")
+                            "「{}」的出向連結（共 {}）：\n{}", rel, links.len(),
+                            links.iter().map(|l| format!("- {}", l)).collect::<Vec<_>>().join("\n")
                         )))
                     })
                 }),
@@ -876,9 +801,10 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // search_skills — LLM 自主語意搜尋技能規範（use_ask = 標準化意圖概括）
+    // search_skills — uses search_skills_for_tool from ai.rs (needs migration too, but stub for now)
     {
-        let db = ctx.vault_db.clone();
+        let client = ctx.http_client.clone();
+        let tok = ctx.auth_token.clone();
         let vid = ctx.vault_id.clone();
         let emb = ctx.emb_url.clone();
         let app = ctx.app.clone();
@@ -887,7 +813,8 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
             Tool {
                 execute: Arc::new(move |args: Value| {
                     let use_ask = args["use_ask"].as_str().unwrap_or("").to_string();
-                    let db = db.clone();
+                    let client = client.clone();
+                    let tok = tok.clone();
                     let vid = vid.clone();
                     let emb = emb.clone();
                     let app = app.clone();
@@ -895,13 +822,12 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                         if use_ask.is_empty() {
                             return Ok(Value::String("請提供 use_ask 參數".to_string()));
                         }
-                        let client = reqwest::Client::new();
+                        let http_client = reqwest::Client::new();
                         let skills = search_skills_for_tool(
-                            &db, &vid, &use_ask, emb.as_deref(), &client,
+                            &client, &tok, &vid, &use_ask, emb.as_deref(), &http_client,
                         ).await;
 
                         if skills.is_empty() {
-                            // 通知前端：找不到技能，讓使用者選擇要加入哪個 skill 的觸發條件
                             let _ = app.emit("agent:skill_not_found", serde_json::json!({
                                 "use_ask": use_ask,
                             }));
@@ -911,7 +837,6 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                             }).to_string()));
                         }
 
-                        // 通知前端：找到匹配技能，詢問是否將 use_ask 加入觸發條件（只問第一個）
                         let (first_id, first_title, _, _) = &skills[0];
                         let _ = app.emit("agent:skill_found", serde_json::json!({
                             "skill_id": first_id,
@@ -919,19 +844,15 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                             "use_ask": use_ask,
                         }));
 
-                        // 收集所有命中 skill 的 tool_calls 聯集
                         let required_tools: Vec<String> = skills.iter()
                             .flat_map(|(_, _, _, tools)| tools.iter().cloned())
                             .collect::<std::collections::HashSet<_>>()
                             .into_iter()
                             .collect();
 
-                        // behavior 文字：LLM 主動搜尋的結果，需自行評估選擇最合適的
-                        // 語氣與自動觸發不同：自動觸發是「遵守」，搜尋是「評估後選擇執行」
                         let mut behavior = format!(
                             "# 技能搜尋結果（意圖：「{}」）\n\
-                             以下是可能符合的技能規範，請根據使用者實際需求選擇最合適的一個執行，\
-                             若多個都適用則以第一個為主：\n\n",
+                             以下是可能符合的技能規範，請根據使用者實際需求選擇最合適的一個執行：\n\n",
                             use_ask
                         );
                         for (idx, (_, title, beh, tool_names)) in skills.iter().enumerate() {
@@ -942,7 +863,6 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                             ));
                         }
 
-                        // 回傳 JSON：behavior 給 LLM 看，required_tools 供 tool loop 動態注入
                         Ok(Value::String(serde_json::json!({
                             "behavior": behavior,
                             "required_tools": required_tools,
@@ -954,7 +874,7 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // notify_user — 發送通知到前端（供排程 sub-agent 使用）
+    // notify_user — 發送通知到前端
     {
         let app = ctx.app.clone();
         registry.register(

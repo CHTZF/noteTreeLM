@@ -17,7 +17,6 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 
 use crate::commands::agent_def::find_agent_definition;
-use crate::db::surreal::SurrealDb;
 use crate::runtime::tool_registry::ToolRegistry;
 use crate::runtime::types::{ConfirmWriteFn, EmitEventFn, LlmFn, SummarizeFn};
 
@@ -67,16 +66,18 @@ pub struct AgentRequest {
 
 #[derive(Clone)]
 pub struct SystemAgentService {
-    db: SurrealDb,
+    http_client: reqwest::Client,
+    auth_token: Arc<RwLock<String>>,
     vault_id: Arc<RwLock<String>>,
     /// 本次 session 的 ephemeral agents（供 UI 顯示）
     pub ephemeral: Arc<RwLock<Vec<EphemeralAgent>>>,
 }
 
 impl SystemAgentService {
-    pub fn new(db: SurrealDb) -> Self {
+    pub fn new(http_client: reqwest::Client, auth_token: Arc<RwLock<String>>) -> Self {
         Self {
-            db,
+            http_client,
+            auth_token,
             vault_id: Arc::new(RwLock::new(String::new())),
             ephemeral: Arc::new(RwLock::new(Vec::new())),
         }
@@ -111,10 +112,13 @@ impl SystemAgentService {
         summarize_fn: Option<SummarizeFn>,
     ) -> String {
         let vault_id = self.vault_id.read().await.clone();
+        let auth_val = self.auth_token.read().await.clone();
+        let tok_opt: Option<String> = if auth_val.is_empty() { None } else { Some(auth_val) };
+        let tok = tok_opt.as_deref();
 
         // ── 1. 找 definition（name 模糊匹配 → embedding fallback，含 sleep agent）──
         let def = {
-            let by_name = find_agent_definition(&self.db, &vault_id, &request.target).await;
+            let by_name = find_agent_definition(&self.http_client, tok, &vault_id, &request.target).await;
             if by_name.is_some() {
                 by_name
             } else if let Some(url) = emb_url {
@@ -123,7 +127,7 @@ impl SystemAgentService {
                     &client, url, &request.target).await;
                 if !target_emb.is_empty() {
                     crate::commands::agent_def::find_matching_agent_definition(
-                        &self.db, &vault_id, &target_emb, 0.55, false,
+                        &self.http_client, tok, &vault_id, &target_emb, 0.55, false,
                     ).await
                 } else { None }
             } else { None }
@@ -185,26 +189,24 @@ impl SystemAgentService {
             let client = reqwest::Client::new();
             let task_emb = crate::commands::ai::get_embedding(&client, url, &request.task).await;
             if !task_emb.is_empty() {
-                #[derive(serde::Deserialize)]
-                struct SkillEmbRow { skill_id: String, trigger_embedding: Vec<f32> }
-                let mut resp = self.db.query(
-                    "SELECT skill_id, trigger_embedding FROM agent_skills \
-                     WHERE vault_id = $vid AND is_active = true \
-                       AND (agent_scope = 'all' OR agent_scope = 'sub') \
-                       AND trigger_embedding != NONE"
-                )
-                .bind(("vid", vault_id.clone()))
-                .await.ok();
-                if let Some(ref mut r) = resp {
-                    if let Ok(rows) = r.take::<Vec<SkillEmbRow>>(0) {
-                        for row in rows {
-                            if skill_ids.contains(&row.skill_id) { continue; }
-                            let sim = crate::commands::agent_def::cosine_similarity(
-                                &task_emb, &row.trigger_embedding);
-                            if sim >= 0.60 {
-                                skill_ids.push(row.skill_id);
-                            }
-                        }
+                let skill_rows: Vec<serde_json::Value> = crate::api_client::daemon_get(
+                    &self.http_client,
+                    &format!("/vaults/{}/skills", urlencoding::encode(&vault_id)),
+                    tok,
+                ).await.unwrap_or_default();
+                for row in &skill_rows {
+                    if !row["is_active"].as_bool().unwrap_or(true) { continue; }
+                    let scope = row["agent_scope"].as_str().unwrap_or("all");
+                    if scope != "all" && scope != "sub" { continue; }
+                    let sid = row["skill_id"].as_str().unwrap_or("");
+                    if sid.is_empty() || skill_ids.iter().any(|s| s == sid) { continue; }
+                    let emb: Vec<f32> = row["trigger_embedding"].as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect())
+                        .unwrap_or_default();
+                    if emb.is_empty() { continue; }
+                    let sim = crate::commands::agent_def::cosine_similarity(&task_emb, &emb);
+                    if sim >= 0.60 {
+                        skill_ids.push(sid.to_string());
                     }
                 }
             }
@@ -281,6 +283,7 @@ impl SystemAgentService {
         );
 
         // ── 6. 執行 sub-agent ─────────────────────────────────────────────────
+        let sub_auth_token = self.auth_token.read().await.clone();
         let result = run_sub_agent_with_system(
             sub_session_id.clone(),
             request.caller_session_id,
@@ -297,7 +300,8 @@ impl SystemAgentService {
             confirm_write,
             request.vault_path,
             request.conversation_id,
-            self.db.clone(),
+            self.http_client.clone(),
+            sub_auth_token,
             embed_fn,
             summarize_fn,
         )
@@ -320,7 +324,7 @@ impl SystemAgentService {
         // 記錄使用（use_count+1, last_used_at=now, 若 sleep 自動 wake）
         // 只對有 DB definition 的 agent 記錄（ephemeral fallback 的 def_id 以 "ephemeral-" 開頭）
         if !def_id.starts_with("ephemeral-") {
-            crate::commands::agent_def::record_agent_usage(&self.db, &vault_id, &def_id).await;
+            crate::commands::agent_def::record_agent_usage(&self.http_client, tok, &vault_id, &def_id).await;
         }
 
         // Emit updated ephemeral list to frontend
@@ -356,6 +360,9 @@ impl SystemAgentService {
         if vault_id.is_empty() {
             return Err("Vault 未設定".to_string());
         }
+        let auth_val = self.auth_token.read().await.clone();
+        let tok_opt: Option<String> = if auth_val.is_empty() { None } else { Some(auth_val) };
+        let tok = tok_opt.as_deref();
 
         // 1. 用 user_ask embedding 比對現有 agent（閾值 0.75，包含 sleep agent）
         if let Some(url) = emb_url {
@@ -363,7 +370,7 @@ impl SystemAgentService {
             let ask_emb = crate::commands::ai::get_embedding(&client, url, user_ask).await;
             if !ask_emb.is_empty() {
                 if let Some(existing) = crate::commands::agent_def::find_matching_agent_definition(
-                    &self.db, &vault_id, &ask_emb, 0.75, false,
+                    &self.http_client, tok, &vault_id, &ask_emb, 0.75, false,
                 ).await {
                     return Ok(existing);
                 }
@@ -392,6 +399,9 @@ impl SystemAgentService {
             return Err("Vault 未設定，無法建立 Agent".to_string());
         }
         let client = reqwest::Client::new();
+        let auth_val = self.auth_token.read().await.clone();
+        let tok_opt: Option<String> = if auth_val.is_empty() { None } else { Some(auth_val) };
+        let tok = tok_opt.as_deref();
 
         // ── 0a. 計算 trigger embedding（後續 dedup 用）─────────────────
         let trigger_emb_for_dedup: Vec<f32> = if let Some(url) = emb_url {
@@ -403,7 +413,7 @@ impl SystemAgentService {
         // ── 0b. Embedding dedup：語意相似度 > 0.85 → 複用現有 agent ──
         if !trigger_emb_for_dedup.is_empty() {
             if let Some(existing) = crate::commands::agent_def::find_matching_agent_definition(
-                &self.db, &vault_id, &trigger_emb_for_dedup, 0.85, false,
+                &self.http_client, tok, &vault_id, &trigger_emb_for_dedup, 0.85, false,
             ).await {
                 emit(
                     "system_agent:agent_created".into(),
@@ -415,7 +425,7 @@ impl SystemAgentService {
 
         // ── 0c. 同名 dedup：直接複用，不報錯 ────────────────────────
         if let Some(existing) = crate::commands::agent_def::find_agent_definition(
-            &self.db, &vault_id, &name,
+            &self.http_client, tok, &vault_id, &name,
         ).await {
             emit(
                 "system_agent:agent_created".into(),
@@ -428,7 +438,7 @@ impl SystemAgentService {
         let mut skill_ids: Vec<String> = Vec::new();
         for spec in &skills {
             let sid = self
-                .find_or_create_skill(spec, &vault_id, emb_url, &client)
+                .find_or_create_skill(spec, &vault_id, emb_url, &client, tok)
                 .await
                 .map_err(|e| format!("skill '{}' 建立失敗: {}", spec.title, e))?;
             skill_ids.push(sid);
@@ -436,24 +446,20 @@ impl SystemAgentService {
 
         // ── 1b. 注入全域 active skills（injection_mode='active', agent_scope∈{all,sub}）──
         {
-            #[derive(serde::Deserialize)]
-            struct GlobalSkillId { skill_id: String }
-            let mut resp = self.db.query(
-                "SELECT skill_id FROM agent_skills \
-                 WHERE vault_id = $vid \
-                   AND is_active = true \
-                   AND injection_mode = 'active' \
-                   AND (agent_scope = 'all' OR agent_scope = 'sub')"
-            )
-            .bind(("vid", vault_id.clone()))
-            .await;
-            if let Ok(ref mut r) = resp {
-                if let Ok(rows) = r.take::<Vec<GlobalSkillId>>(0) {
-                    for row in rows {
-                        if !skill_ids.contains(&row.skill_id) {
-                            skill_ids.push(row.skill_id);
-                        }
-                    }
+            let global_rows: Vec<serde_json::Value> = crate::api_client::daemon_get(
+                &self.http_client,
+                &format!("/vaults/{}/skills", urlencoding::encode(&vault_id)),
+                tok,
+            ).await.unwrap_or_default();
+            for row in &global_rows {
+                if !row["is_active"].as_bool().unwrap_or(true) { continue; }
+                let mode = row["injection_mode"].as_str().unwrap_or("");
+                if mode != "active" { continue; }
+                let scope = row["agent_scope"].as_str().unwrap_or("all");
+                if scope != "all" && scope != "sub" { continue; }
+                let sid = row["skill_id"].as_str().unwrap_or("").to_string();
+                if !sid.is_empty() && !skill_ids.contains(&sid) {
+                    skill_ids.push(sid);
                 }
             }
         }
@@ -465,54 +471,35 @@ impl SystemAgentService {
             Some(trigger_emb_for_dedup)
         };
 
-        // ── 3. INSERT agent_definition ───────────────────────────────
-        let def_id = uuid::Uuid::new_v4().to_string();
+        // ── 3. POST agent_definition to daemon ───────────────────────
         let rounds = max_rounds.max(1).min(20);
 
-        self.db.query(
-            "INSERT INTO agent_definitions \
-             (def_id, vault_id, name, description, kind, skill_ids, tool_names, \
-              system_prompt, max_rounds, is_active, is_builtin, trigger, trigger_embedding, created_at) \
-             VALUES ($did, $vid, $name, $desc, 'sub', $skills, $tools, \
-                     $sys, $rounds, true, false, $trigger, $temb, time::now())"
-        )
-        .bind(("did",     def_id.clone()))
-        .bind(("vid",     vault_id.clone()))
-        .bind(("name",    name.clone()))
-        .bind(("desc",    description.clone()))
-        .bind(("tools",   tool_names.clone()))
-        .bind(("skills",  skill_ids.clone()))
-        .bind(("sys",     system_prompt.clone()))
-        .bind(("rounds",  rounds))
-        .bind(("trigger", trigger.clone()))
-        .bind(("temb",    trigger_embedding))
-        .await
-        .map_err(|e| format!("INSERT agent_definitions 失敗: {e}"))?;
+        let created: serde_json::Value = crate::api_client::daemon_post(
+            &self.http_client,
+            &format!("/vaults/{}/agents", urlencoding::encode(&vault_id)),
+            &serde_json::json!({
+                "name": name,
+                "description": description,
+                "kind": "sub",
+                "skill_ids": skill_ids,
+                "tool_names": tool_names,
+                "system_prompt": system_prompt,
+                "max_rounds": rounds,
+                "trigger": trigger,
+                "trigger_embedding": trigger_embedding,
+                "is_builtin": false,
+            }),
+            tok,
+        ).await.map_err(|e| format!("POST agent_definitions 失敗: {e}"))?;
+
+        let def_id = created["def_id"].as_str().unwrap_or("").to_string();
 
         emit(
             "system_agent:agent_created".into(),
             serde_json::json!({ "def_id": def_id, "name": name }),
         );
 
-        Ok(crate::commands::agent_def::AgentDefinition {
-            def_id,
-            vault_id,
-            name,
-            description,
-            kind: "sub".to_string(),
-            skill_ids,
-            tool_names,
-            system_prompt,
-            max_rounds: rounds,
-            is_active: true,
-            is_builtin: false,
-            trigger,
-            created_at: chrono::Utc::now().timestamp_millis(),
-            status: "active".to_string(),
-            slept_at: None,
-            use_count: 0,
-            last_used_at: None,
-        })
+        Ok(crate::commands::agent_def::agent_from_json(&created))
     }
 
     /// 依 title 精確匹配尋找既有 skill；找不到則建立新 skill（含 trigger_embedding）。
@@ -523,25 +510,22 @@ impl SystemAgentService {
         vault_id: &str,
         emb_url: Option<&str>,
         client: &reqwest::Client,
+        tok: Option<&str>,
     ) -> Result<String, String> {
-        #[derive(serde::Deserialize)]
-        struct SkillIdRow { skill_id: String }
-
         // 先找 title 完全匹配（不分大小寫）
-        let mut resp = self.db.query(
-            "SELECT skill_id FROM agent_skills \
-             WHERE vault_id = $vid \
-               AND string::lowercase(title) = string::lowercase($title) \
-             LIMIT 1"
-        )
-        .bind(("vid",   vault_id.to_string()))
-        .bind(("title", spec.title.clone()))
-        .await
-        .map_err(|e| e.to_string())?;
+        let skill_rows: Vec<serde_json::Value> = crate::api_client::daemon_get(
+            &self.http_client,
+            &format!("/vaults/{}/skills", urlencoding::encode(vault_id)),
+            tok,
+        ).await.unwrap_or_default();
 
-        let existing: Vec<SkillIdRow> = resp.take(0).unwrap_or_default();
-        if let Some(row) = existing.into_iter().next() {
-            return Ok(row.skill_id);
+        let title_lower = spec.title.to_lowercase();
+        if let Some(row) = skill_rows.iter().find(|r| {
+            r["title"].as_str().unwrap_or("").to_lowercase() == title_lower
+        }) {
+            if let Some(sid) = row["skill_id"].as_str() {
+                return Ok(sid.to_string());
+            }
         }
 
         // 建立新 skill（含 trigger_embedding）
@@ -555,61 +539,61 @@ impl SystemAgentService {
 
         let mode = if spec.injection_mode == "active" { "active" } else { "passive" };
 
-        self.db.query(
-            "INSERT INTO agent_skills \
-             (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
-              injection_mode, is_active, trigger_embedding, tool_calls, agent_scope, created_at) \
-             VALUES ($id, $vid, '', $title, $trigger, $behavior, \
-                     $mode, true, $temb, [], 'all', time::now())"
-        )
-        .bind(("id",      skill_id.clone()))
-        .bind(("vid",     vault_id.to_string()))
-        .bind(("title",   spec.title.clone()))
-        .bind(("trigger", spec.trigger.clone()))
-        .bind(("behavior", spec.behavior.clone()))
-        .bind(("mode",    mode.to_string()))
-        .bind(("temb",    trigger_embedding))
-        .await
-        .map_err(|e| format!("INSERT agent_skills 失敗: {e}"))?;
+        let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
+            &self.http_client,
+            &format!("/vaults/{}/skills", urlencoding::encode(vault_id)),
+            &serde_json::json!({
+                "skill_id": skill_id,
+                "knowledge_item_id": "",
+                "title": spec.title,
+                "trigger": spec.trigger,
+                "behavior": spec.behavior,
+                "injection_mode": mode,
+                "is_active": true,
+                "trigger_embedding": trigger_embedding,
+                "tool_calls": [],
+                "agent_scope": "all",
+            }),
+            tok,
+        ).await.map_err(|e| format!("POST agent_skills 失敗: {e}"))?;
 
         Ok(skill_id)
     }
 
-    /// 從 DB 載入 skill_ids 對應的 behavior 文字，組成注入區塊。
+    /// 從 daemon 載入 skill_ids 對應的 behavior 文字，組成注入區塊。
     async fn build_skill_section(&self, skill_ids: &[String], vault_id: &str) -> String {
         if skill_ids.is_empty() {
             return String::new();
         }
 
-        #[derive(serde::Deserialize)]
-        struct SkillBehavior {
-            title: String,
-            trigger: String,
-            behavior: String,
-        }
+        let auth_val = self.auth_token.read().await.clone();
+        let tok_opt: Option<String> = if auth_val.is_empty() { None } else { Some(auth_val) };
+        let tok = tok_opt.as_deref();
 
-        let mut resp = self.db.query(
-            "SELECT title, trigger, behavior FROM agent_skills \
-             WHERE vault_id = $vid AND skill_id INSIDE $ids AND is_active = true"
-        )
-        .bind(("vid", vault_id.to_string()))
-        .bind(("ids", skill_ids.to_vec()))
-        .await.ok();
+        let skill_rows: Vec<serde_json::Value> = crate::api_client::daemon_get(
+            &self.http_client,
+            &format!("/vaults/{}/skills", urlencoding::encode(vault_id)),
+            tok,
+        ).await.unwrap_or_default();
 
-        let skills: Vec<SkillBehavior> = resp
-            .as_mut()
-            .and_then(|r| r.take::<Vec<SkillBehavior>>(0).ok())
-            .unwrap_or_default();
+        let matching: Vec<&serde_json::Value> = skill_rows.iter().filter(|r| {
+            if !r["is_active"].as_bool().unwrap_or(true) { return false; }
+            let sid = r["skill_id"].as_str().unwrap_or("");
+            skill_ids.iter().any(|id| id == sid)
+        }).collect();
 
-        if skills.is_empty() {
+        if matching.is_empty() {
             return String::new();
         }
 
         let mut section = String::from("# 使用者技能規範\n");
-        for s in &skills {
+        for r in &matching {
+            let title = r["title"].as_str().unwrap_or("");
+            let trigger = r["trigger"].as_str().unwrap_or("");
+            let behavior = r["behavior"].as_str().unwrap_or("");
             section.push_str(&format!(
                 "## {}\n觸發條件：{}\n行為規範：{}\n\n",
-                s.title, s.trigger, s.behavior
+                title, trigger, behavior
             ));
         }
         section
@@ -684,7 +668,8 @@ async fn run_sub_agent_with_system(
     confirm_write: ConfirmWriteFn,
     vault_path: String,
     conversation_id: Option<String>,
-    db: crate::db::surreal::SurrealDb,
+    http_client: reqwest::Client,
+    auth_token: String,
     embed_fn: Option<crate::runtime::types::EmbedFn>,
     summarize_fn: Option<SummarizeFn>,
 ) -> String {
@@ -791,7 +776,8 @@ async fn run_sub_agent_with_system(
                         args: args.clone(),
                     })
                     .collect();
-                let _ = save_pending_plan(&db, conv_id, &deferred).await;
+                let tok = if auth_token.is_empty() { None } else { Some(auth_token.as_str()) };
+                let _ = save_pending_plan(&http_client, tok, conv_id, &deferred).await;
 
                 // 讓 LLM 知道寫入被暫緩，並傳達確認訊息給使用者
                 let confirm_prompt = format!(
@@ -915,7 +901,8 @@ async fn run_sub_agent_with_system(
                 name: "__open_note__".into(),
                 args: serde_json::json!({ "paths": all_note_refs }),
             }];
-            let _ = save_pending_plan(&db, conv_id, &deferred).await;
+            let tok = if auth_token.is_empty() { None } else { Some(auth_token.as_str()) };
+            let _ = save_pending_plan(&http_client, tok, conv_id, &deferred).await;
         }
     }
 

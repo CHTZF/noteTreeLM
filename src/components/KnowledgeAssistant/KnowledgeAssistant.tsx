@@ -7,6 +7,7 @@ import { faSpinner, faPaperPlane, faBook, faFileLines, faShieldHalved, faChevron
 import { type KnowledgeRef } from '../../stores/knowledgeChatStore'
 import ConversationList from '../Chat/ConversationList'
 import { useAuthStore } from '../../stores/authStore'
+import { useSettingsStore } from '../../stores/settingsStore'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -38,6 +39,7 @@ const KB_MODE = 'kb_assist' as const
 // ── Main Component ─────────────────────────────────────────────────────────────
 
 export default function KnowledgeAssistant({ onOpenNote }: Props) {
+  const currentVaultId = useSettingsStore(s => s.currentVaultId)
   const [messages, setMessages] = useState<KBAssistMessage[]>([])
   const [input, setInput] = useState('')
   const [isQuerying, setIsQuerying] = useState(false)
@@ -85,17 +87,19 @@ export default function KnowledgeAssistant({ onOpenNote }: Props) {
 
   const createNewConversation = useCallback(async (): Promise<string> => {
     const username = useAuthStore.getState().session?.username ?? ''
-    const result = await api.createConversation({ username, mode: KB_MODE })
+    const vaultId = await invoke<string>('get_vault_uuid')
+    const result = await api.createConversation({ account_id: username, mode: KB_MODE, vault_id: vaultId })
     return result.id
   }, [])
 
   // ── Mount: restore last KB conversation ───────────────────────────────────
 
   useEffect(() => {
-    (async () => {
+    if (!currentVaultId) return
+    ;(async () => {
       try {
         const username = useAuthStore.getState().session?.username ?? ''
-        const lastId = await api.getLastModeConversationId(username, KB_MODE as string).catch(() => null)
+        const lastId = await api.getLastModeConversationId(`${username}_${currentVaultId}`, KB_MODE as string).catch(() => null)
         if (lastId) {
           const msgs = await loadConversationMessages(lastId)
           if (msgs.length > 0) {
@@ -111,7 +115,7 @@ export default function KnowledgeAssistant({ onOpenNote }: Props) {
       } catch { /* start empty */ }
     })()
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [currentVaultId])
 
   // ── Conversation list handlers ────────────────────────────────────────────
 
@@ -121,8 +125,10 @@ export default function KnowledgeAssistant({ onOpenNote }: Props) {
     const msgs = await loadConversationMessages(id)
     setConversationId(id)
     setMessages(msgs)
-    const username = useAuthStore.getState().session?.username ?? ''
-    api.setLastModeConversationId(username, KB_MODE as string, id).catch(() => {})
+    invoke<string>('get_vault_uuid').then(vaultId => {
+      const username = useAuthStore.getState().session?.username ?? ''
+      api.setLastModeConversationId(`${username}_${vaultId}`, KB_MODE as string, id).catch(() => {})
+    }).catch(() => {})
   }, [conversationId, saveCurrentConversation, loadConversationMessages])
 
   const handleNewConversation = useCallback(async (id: string) => {
@@ -133,8 +139,10 @@ export default function KnowledgeAssistant({ onOpenNote }: Props) {
     }
     setConversationId(id)
     setMessages([])
-    const username = useAuthStore.getState().session?.username ?? ''
-    api.setLastModeConversationId(username, KB_MODE as string, id).catch(() => {})
+    invoke<string>('get_vault_uuid').then(vaultId => {
+      const username = useAuthStore.getState().session?.username ?? ''
+      api.setLastModeConversationId(`${username}_${vaultId}`, KB_MODE as string, id).catch(() => {})
+    }).catch(() => {})
   }, [conversationId, saveCurrentConversation, createNewConversation])
 
   // ── Query ─────────────────────────────────────────────────────────────────
@@ -199,7 +207,7 @@ export default function KnowledgeAssistant({ onOpenNote }: Props) {
     })
 
     try {
-      await api.queryKb({ queryId, question: q })
+      await invoke('query_kb', { queryId, question: q })
     } catch (e: unknown) {
       const msg = fmtError(e)
       setMessages(prev => prev.map(m =>

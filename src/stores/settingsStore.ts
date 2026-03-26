@@ -14,6 +14,7 @@ interface SettingsStore {
   settings: Settings
   isLoaded: boolean
   systemSettings: SystemSettings | null
+  currentVaultId: string
   load: () => Promise<void>
   loadSystem: () => Promise<void>
   savePersonal: (partial: Partial<Settings>) => Promise<void>
@@ -26,10 +27,16 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   settings: DEFAULT_SETTINGS,
   isLoaded: false,
   systemSettings: null,
+  currentVaultId: '',
 
   load: async () => {
     try {
-      const raw = await api.getSettings()
+      // Merge global settings (system) + user settings (personal) in that order
+      const [globalRaw, userRaw] = await Promise.all([
+        api.getSettings().catch(() => ({} as Record<string, string>)),
+        api.getUserSettings().catch(() => ({} as Record<string, string>)),
+      ])
+      const raw = { ...globalRaw, ...userRaw }
       const settings: Settings = {
         ...DEFAULT_SETTINGS,
         ...raw,
@@ -38,6 +45,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           : (raw.sort_orders ?? {}),
       }
       set({ settings, isLoaded: true })
+      // Fetch vault UUID and keep it reactive in the store
+      const { invoke } = await import('@tauri-apps/api/core')
+      const vaultId = await invoke<string>('get_vault_uuid').catch(() => '')
+      set({ currentVaultId: vaultId })
     } catch (err) {
       console.error('載入設定失敗：', err)
       set({ isLoaded: true })
@@ -78,8 +89,15 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         await get().loadSystem()
       }
       const merged = { ...(get().systemSettings ?? {} as SystemSettings), ...partial } as SystemSettings
-      await api.saveSettings(merged)
-      set({ systemSettings: merged })
+      const { invoke } = await import('@tauri-apps/api/core')
+      // Use Tauri command (not daemon REST directly) so handle_vault_switch runs and AppState.vault_uuid is updated
+      await invoke('save_system_settings', { settings: merged })
+      set({ systemSettings: merged, settings: { ...get().settings, ...partial } })
+      // Refresh reactive vault UUID after vault switch
+      if (partial.system_current_vault_path) {
+        const vaultId = await invoke<string>('get_vault_uuid').catch(() => '')
+        set({ currentVaultId: vaultId })
+      }
     } catch (err) {
       console.error('儲存系統設定失敗：', err)
       throw err

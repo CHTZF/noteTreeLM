@@ -1,12 +1,13 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use crate::api_state::ApiState;
 use crate::routes::vault::get_vault_path;
@@ -18,6 +19,10 @@ pub fn router() -> Router<ApiState> {
             get(list_notes).post(create_note).put(update_note).delete(delete_note),
         )
         .route("/vaults/:vault_id/notes/read", get(read_note))
+        .route("/vaults/:vault_id/notes/trash", delete(trash_note_handler))
+        .route("/vaults/:vault_id/notes/status", patch(set_note_status_handler))
+        .route("/vaults/:vault_id/trash", delete(delete_trash_items_handler))
+        .route("/vaults/:vault_id/assets", delete(delete_asset_handler))
 }
 
 #[derive(Deserialize)]
@@ -25,20 +30,34 @@ struct PathQuery {
     path: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ListNotesQuery {
+    path_prefix: Option<String>,
+}
+
 async fn list_notes(
     State(state): State<ApiState>,
     Path(vault_id): Path<String>,
+    Query(q): Query<ListNotesQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let mut resp = state
-        .db
-        .query("SELECT vault_id, path, title, word_count, modified_at FROM notes WHERE vault_id = $vid ORDER BY modified_at DESC")
-        .bind(("vid", vault_id))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let rows: Vec<Value> = resp
-        .take(0)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let rows: Vec<Value> = if let Some(prefix) = q.path_prefix.filter(|s| !s.is_empty()) {
+        let mut resp = state
+            .db
+            .query("SELECT vault_id, path, title, word_count, modified_at FROM notes WHERE vault_id = $vid AND string::starts_with(path, $prefix) ORDER BY modified_at DESC")
+            .bind(("vid", vault_id))
+            .bind(("prefix", prefix))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        resp.take(0).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else {
+        let mut resp = state
+            .db
+            .query("SELECT vault_id, path, title, word_count, modified_at FROM notes WHERE vault_id = $vid ORDER BY modified_at DESC")
+            .bind(("vid", vault_id))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        resp.take(0).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
 
     Ok(Json(json!(rows)))
 }
@@ -322,6 +341,229 @@ async fn index_note_chunks(state: &ApiState, vault_id: &str, rel_path: &str, con
         }
     }
 }
+
+// ── Trash handlers ───────────────────────────────────────────────────────────
+
+async fn trash_note_handler(
+    State(state): State<ApiState>,
+    Path(vault_id): Path<String>,
+    Query(q): Query<PathQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let rel_path = q.path.ok_or((StatusCode::BAD_REQUEST, "Missing path".to_string()))?;
+    if rel_path.contains("..") {
+        return Err((StatusCode::BAD_REQUEST, "Invalid path".to_string()));
+    }
+
+    let vault_path = get_vault_path(&state, &vault_id).await?;
+    let abs_path = std::path::Path::new(&vault_path).join(&rel_path);
+
+    let trash_dir = std::path::PathBuf::from(&vault_path).join(".trash");
+    std::fs::create_dir_all(&trash_dir)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let filename = std::path::Path::new(&rel_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "note.md".to_string());
+
+    let title = if abs_path.exists() {
+        std::fs::read_to_string(&abs_path)
+            .ok()
+            .and_then(|c| {
+                c.lines()
+                    .find(|l| l.trim_start().starts_with("# "))
+                    .map(|l| l.trim_start_matches('#').trim().to_string())
+            })
+            .unwrap_or_else(|| filename.trim_end_matches(".md").to_string())
+    } else {
+        filename.trim_end_matches(".md").to_string()
+    };
+
+    // Avoid filename conflict in .trash/
+    let trash_filename = if trash_dir.join(&filename).exists() {
+        let stem = std::path::Path::new(&filename)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let ext = std::path::Path::new(&filename)
+            .extension()
+            .map(|e| e.to_string_lossy().to_string())
+            .unwrap_or_else(|| "md".to_string());
+        format!("{}_{}.{}", stem, Utc::now().timestamp_millis(), ext)
+    } else {
+        filename.clone()
+    };
+
+    if abs_path.exists() {
+        std::fs::rename(&abs_path, trash_dir.join(&trash_filename))
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Move to trash failed: {}", e)))?;
+    }
+
+    // Write JSON sidecar (.trash/<trash_filename>.meta.json)
+    let item_id = Uuid::new_v4().to_string();
+    let now_ms = Utc::now().timestamp_millis();
+    let meta = serde_json::json!({
+        "id": item_id,
+        "original_path": rel_path,
+        "name": filename,
+        "title": title,
+        "trash_filename": trash_filename,
+        "deleted_at": now_ms,
+    });
+    let meta_path = trash_dir.join(format!("{}.meta.json", trash_filename));
+    let _ = std::fs::write(&meta_path, meta.to_string());
+
+    // Remove from DB
+    let _ = state.db
+        .query("DELETE FROM notes WHERE vault_id = $vid AND path = $path")
+        .bind(("vid", vault_id.clone()))
+        .bind(("path", rel_path.clone()))
+        .await;
+    let _ = state.db
+        .query("DELETE FROM chunks WHERE vault_id = $vid AND file_path = $fp")
+        .bind(("vid", vault_id.clone()))
+        .bind(("fp", rel_path.clone()))
+        .await;
+
+    // SQLite FTS delete (best-effort)
+    {
+        let sqlite = state.daemon.sqlite.clone();
+        let vid = vault_id.clone();
+        let fp = rel_path.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(conn) = sqlite.lock() {
+                let _ = crate::db::sqlite::fts_delete_file(&conn, &vid, &fp);
+            }
+        });
+    }
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct DeleteTrashBody {
+    item_ids: Vec<String>,
+}
+
+async fn delete_trash_items_handler(
+    State(state): State<ApiState>,
+    Path(vault_id): Path<String>,
+    Json(body): Json<DeleteTrashBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let vault_path = get_vault_path(&state, &vault_id).await?;
+    let trash_dir = std::path::PathBuf::from(&vault_path).join(".trash");
+
+    for id in &body.item_ids {
+        // Scan .meta.json sidecars to find the matching item by id
+        if let Ok(entries) = std::fs::read_dir(&trash_dir) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name().to_string_lossy().to_string();
+                if fname.ends_with(".meta.json") {
+                    if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                        if let Ok(meta) = serde_json::from_str::<Value>(&content) {
+                            if meta["id"].as_str() == Some(id.as_str()) {
+                                let trash_filename = meta["trash_filename"].as_str().unwrap_or("");
+                                let _ = std::fs::remove_file(trash_dir.join(trash_filename));
+                                let _ = std::fs::remove_file(entry.path());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct SetStatusBody {
+    path: String,
+    status: String,
+}
+
+async fn set_note_status_handler(
+    State(state): State<ApiState>,
+    Path(vault_id): Path<String>,
+    Json(body): Json<SetStatusBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let vault_path = get_vault_path(&state, &vault_id).await?;
+    let abs_path = std::path::Path::new(&vault_path).join(&body.path);
+
+    let content = std::fs::read_to_string(&abs_path)
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("Cannot read file: {}", e)))?;
+
+    let updated = update_frontmatter_field(&content, "status", &body.status);
+
+    std::fs::write(&abs_path, &updated)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Update DB record
+    let now = Utc::now().timestamp();
+    let title = extract_title_from_content(&updated, &body.path);
+    let word_count = updated.split_whitespace().count() as i64;
+    let _ = state.db
+        .query("UPDATE notes SET title = $title, content = $content, word_count = $wc, modified_at = $now WHERE vault_id = $vid AND path = $path")
+        .bind(("title", title))
+        .bind(("content", updated.clone()))
+        .bind(("wc", word_count))
+        .bind(("now", now))
+        .bind(("vid", vault_id.clone()))
+        .bind(("path", body.path.clone()))
+        .await;
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Update or insert a key: value field in YAML frontmatter.
+fn update_frontmatter_field(content: &str, key: &str, value: &str) -> String {
+    if let Some(rest) = content.strip_prefix("---") {
+        if let Some(fm_end) = rest.find("\n---") {
+            let frontmatter = &rest[..fm_end];
+            let after = &rest[fm_end + 4..]; // skip "\n---"
+            let key_prefix = format!("{}:", key);
+            let updated_fm = if frontmatter.lines().any(|l| l.trim_start().starts_with(&key_prefix)) {
+                frontmatter.lines()
+                    .map(|l| {
+                        if l.trim_start().starts_with(&key_prefix) {
+                            format!("{}: {}", key, value)
+                        } else {
+                            l.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                format!("{}\n{}: {}", frontmatter.trim_end(), key, value)
+            };
+            return format!("---{}---{}", updated_fm, after);
+        }
+    }
+    // No frontmatter — prepend one
+    format!("---\n{}: {}\n---\n\n{}", key, value, content)
+}
+
+// ── Asset handler ─────────────────────────────────────────────────────────────
+
+async fn delete_asset_handler(
+    State(state): State<ApiState>,
+    Path(vault_id): Path<String>,
+    Query(q): Query<PathQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let rel_path = q.path.ok_or((StatusCode::BAD_REQUEST, "Missing path".to_string()))?;
+    if rel_path.contains("..") {
+        return Err((StatusCode::BAD_REQUEST, "Invalid path".to_string()));
+    }
+    let vault_path = get_vault_path(&state, &vault_id).await?;
+    let abs_path = std::path::Path::new(&vault_path).join(&rel_path);
+    if abs_path.exists() {
+        std::fs::remove_file(&abs_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// ── Title / content helpers ───────────────────────────────────────────────────
 
 fn extract_title_from_content(content: &str, fallback_path: &str) -> String {
     for line in content.lines() {

@@ -3,6 +3,7 @@ import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
 import { faPlus, faTrash, faClock } from '@fortawesome/free-solid-svg-icons'
 import { toast } from '../common/Toast'
 import { useAuthStore } from '../../stores/authStore'
+import { useSettingsStore } from '../../stores/settingsStore'
 import { api } from '../../lib/api'
 
 export interface ConversationSummary {
@@ -48,13 +49,15 @@ export default function ConversationList({ mode, selectedId, onSelect, onNew }: 
   const [hasMore, setHasMore] = useState(false)
   const [loading, setLoading] = useState(true)
   const loadingRef = useRef(false)
+  const vaultId = useSettingsStore(s => s.currentVaultId)
+  const username = useAuthStore(s => s.session?.username ?? '')
 
   const loadConvs = async (reset = false) => {
     if (loadingRef.current) return
     loadingRef.current = true
     setLoading(true)
     try {
-      const list = await api.listConversations(undefined, mode) as ConversationSummary[]
+      const list = await api.listConversations(vaultId || undefined, mode, username || undefined) as ConversationSummary[]
       setConvs(prev => reset ? list : [...prev, ...list])
       setHasMore(list.length === PAGE_SIZE)
       console.log(`[ConversationList][${mode}] loaded ${list.length} conversations:`, list.map(c => ({ id: c.id, title: c.title, updated_at: new Date(c.updated_at * 1000).toLocaleString() })))
@@ -66,16 +69,16 @@ export default function ConversationList({ mode, selectedId, onSelect, onNew }: 
     }
   }
 
-  // Always reload from DB on mount — no loadedRef guard
+  // Reload when mode, vaultId, or username changes
   useEffect(() => {
+    if (!vaultId) return
     loadConvs(true)
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode])
+  }, [mode, vaultId, username])
 
   const handleNew = async () => {
     try {
-      const username = useAuthStore.getState().session?.username ?? ''
-      const result = await api.createConversation({ username, mode })
+      const result = await api.createConversation({ account_id: username, mode, vault_id: vaultId })
       const id: string = result.id
       setConvs(prev => [{ id, mode, title: '新對話', updated_at: Date.now() / 1000, has_pending_plan: false }, ...prev])
       onNew(id)
