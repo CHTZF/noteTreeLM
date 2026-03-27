@@ -110,8 +110,8 @@ const SKILLS: &[BuiltinSkill] = &[
         id: "builtin_web_search",
         title: "網路搜尋/外部資訊",
         trigger: "搜尋網路、查最新資訊、Google 一下、查新聞、找外部資料、搜網路、最新消息、web search、search the web、look it up online、查天氣、今天天氣、現在幾度、股價、最新匯率、即時資訊、查一下網路、幫我搜尋、去網路上找、外部資訊、最新動態、新聞、時事、最近發生什麼",
-        behavior: "步驟1：呼叫 web_search（query 填具體搜尋關鍵字），取得最新網路資訊。步驟2：根據搜尋結果摘要回答使用者。步驟3（可選）：若需要更深入分析，呼叫 call_external_ai（query 填完整問題）補充回答。",
-        tools: &["web_search", "call_external_ai"],
+        behavior: "步驟1：呼叫 web_search（query 填具體搜尋關鍵字），取得最新網路資訊。步驟2：根據搜尋結果摘要回答使用者。",
+        tools: &["web_search"],
     },
     BuiltinSkill {
         id: "builtin_create_skill",

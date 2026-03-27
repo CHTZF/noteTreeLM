@@ -239,34 +239,6 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // search_web — 搜尋網路（stub: pass through to knowledge_import）
-    {
-        let client = ctx.http_client.clone();
-        let tok = ctx.auth_token.clone();
-        let vid = ctx.vault_id.clone();
-        let app = ctx.app.clone();
-        let emb = ctx.emb_url.clone();
-        registry.register(
-            "search_web".into(),
-            Tool {
-                execute: Arc::new(move |args: Value| {
-                    let query = args["query"].as_str().unwrap_or("").to_string();
-                    let client = client.clone();
-                    let tok = tok.clone();
-                    let vid = vid.clone();
-                    let app = app.clone();
-                    let emb = emb.clone();
-                    Box::pin(async move {
-                        Ok(Value::String(
-                            crate::commands::knowledge_import::tool_web_search(&client, &tok, &vid, &query, &app, emb.as_deref()).await,
-                        ))
-                    })
-                }),
-                rollback: None,
-            },
-        );
-    }
-
     // find_similar_notes — daemon search (semantic similarity via daemon)
     {
         let client = ctx.http_client.clone();

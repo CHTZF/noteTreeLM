@@ -7,7 +7,6 @@ use tauri::{Emitter, Manager};
 use crate::commands::ai::{
     tool_list_recent_conversations, vault_tools,
 };
-use crate::commands::external_ai::call_external_ai_via_client;
 use crate::commands::knowledge_import::tool_web_search;
 use crate::runtime::system_agent::{AgentRequest, NewSkillSpec};
 use crate::runtime::tool_registry::ToolRegistry;
@@ -108,56 +107,6 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                                 rel
                             )),
                         }
-                    })
-                }),
-                rollback: None,
-            },
-        );
-    }
-
-    // call_external_ai — 呼叫前暫停，等待前端選擇搜尋方式
-    {
-        let http_client = ctx.http_client.clone();
-        let auth_token = ctx.auth_token.clone();
-        let vid = ctx.vault_id.clone();
-        let app = ctx.app.clone();
-        let emb = ctx.emb_url.clone();
-        let tx = ctx.search_method_tx.clone();
-        let cache = Arc::clone(&ctx.api_key_cache);
-        let scache = Arc::clone(&ctx.settings_cache);
-        registry.register(
-            "call_external_ai".into(),
-            Tool {
-                execute: Arc::new(move |args: Value| {
-                    let query = args["query"].as_str().unwrap_or("").to_string();
-                    let http_client = http_client.clone();
-                    let auth_token = auth_token.clone();
-                    let vid = vid.clone();
-                    let app = app.clone();
-                    let emb = emb.clone();
-                    let tx = tx.clone();
-                    let cache = Arc::clone(&cache);
-                    let scache = Arc::clone(&scache);
-                    Box::pin(async move {
-                        let _ = app.emit("agent:search_method_request", serde_json::json!({ "query": query }));
-                        let method = {
-                            let (ch_tx, ch_rx) = tokio::sync::oneshot::channel::<String>();
-                            *tx.lock().await = Some(ch_tx);
-                            tokio::time::timeout(std::time::Duration::from_secs(60), ch_rx)
-                                .await
-                                .unwrap_or(Ok("call_external_ai".to_string()))
-                                .unwrap_or_else(|_| "call_external_ai".to_string())
-                        };
-                        let tok = if auth_token.is_empty() { None } else { Some(auth_token.as_str()) };
-                        let result = if method == "web_search" {
-                            tool_web_search(&http_client, &auth_token, &vid, &query, &app, emb.as_deref()).await
-                        } else {
-                            let _ = app.emit("agent:web_refs", serde_json::json!([
-                                {"path": "", "title": query, "excerpt": ""}
-                            ]));
-                            call_external_ai_via_client(&query, &http_client, tok, &app, &cache, &scache).await
-                        };
-                        Ok(Value::String(result))
                     })
                 }),
                 rollback: None,

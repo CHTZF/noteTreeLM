@@ -23,7 +23,7 @@ const MAX_ROUNDS: usize = 5;
 pub enum SubAgentKind {
     Search,   // 搜尋型：search_vault, read_note, list_structure, query_memory
     Write,    // 寫入型：create_note, update_note, create_folder
-    Research, // 研究型：web_search, call_external_ai, search_vault
+    Research, // 研究型：web_search, search_vault
     Memory,   // 記憶型：query_memory, list_recent_conversations
     Custom,   // 自訂：不過濾，使用全部工具
 }
@@ -44,7 +44,7 @@ impl SubAgentKind {
         match self {
             Self::Search   => Some(&["search_vault", "read_note", "open_note", "list_structure", "query_memory"]),
             Self::Write    => Some(&["create_note", "update_note", "create_folder"]),
-            Self::Research => Some(&["web_search", "call_external_ai", "search_vault", "read_note"]),
+            Self::Research => Some(&["web_search", "search_vault", "read_note"]),
             Self::Memory   => Some(&["query_memory", "list_recent_conversations"]),
             Self::Custom   => None,
         }

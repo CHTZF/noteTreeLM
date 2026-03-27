@@ -35,7 +35,6 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const useNoteContext = !!settings.chat_auto_include_note
   const writeConfirmMode = (settings.write_confirm_mode ?? 'always') as 'always' | 'once' | 'never'
   const [pendingWriteDisplay, setPendingWriteDisplay] = useState<string | null>(null)
-  const [pendingSearchMethod, setPendingSearchMethod] = useState<{ query: string } | null>(null)
   const [pendingSkillFound, setPendingSkillFound] = useState<{ skill_id: string; skill_title: string; use_ask: string } | null>(null)
   const [pendingSkillNotFound, setPendingSkillNotFound] = useState<{ use_ask: string } | null>(null)
   const [skillsForPicker, setSkillsForPicker] = useState<AgentSkill[]>([])
@@ -397,11 +396,6 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     await invoke('confirm_write_tool', { approved })
   }, [writeConfirmMode])
 
-  const handleSearchMethodChoice = useCallback(async (method: string) => {
-    setPendingSearchMethod(null)
-    await invoke('confirm_search_method', { method })
-  }, [])
-
   const send = useCallback(async () => {
     const text = input.trim()
     // isStreamingRef 做同步 guard，防止 React state 非同步導致快速雙擊穿透
@@ -436,7 +430,6 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     let unlistenWriteReq: (() => void) = () => {}
     let unlistenNoteRefs: (() => void) = () => {}
     let unlistenOpenNote: (() => void) = () => {}
-    let unlistenSearchMethod: (() => void) = () => {}
     let unlistenWebRefs: (() => void) = () => {}
     let unlistenSkillsActivated: (() => void) = () => {}
     let unlistenSkillSuggestion: (() => void) = () => {}
@@ -478,7 +471,6 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         unlistenNoteRefs,
         unlistenOpenNote,
         unlistenWriteReq,
-        unlistenSearchMethod,
         unlistenToken,
         unlistenDone,
         unlistenWebRefs,
@@ -524,9 +516,6 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
             return
           }
           setPendingWriteDisplay(display)
-        }),
-        listen<{ query: string }>('agent:search_method_request', (event) => {
-          setPendingSearchMethod(event.payload)
         }),
         listen<string>('llm:token', (event) => {
           streamingRef.current += event.payload
@@ -653,7 +642,6 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       unlistenWriteReq()
       unlistenNoteRefs()
       unlistenOpenNote()
-      unlistenSearchMethod()
       unlistenWebRefs()
       unlistenSkillsActivated()
       unlistenSkillSuggestion()
@@ -661,7 +649,6 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       unlistenSkillFound()
       unlistenSkillNotFound()
       setPendingWriteDisplay(null)
-      setPendingSearchMethod(null)
       setIsStreaming(false)
       isStreamingRef.current = false
       setStreamingText('')
@@ -1138,32 +1125,6 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
                 {note.label}
               </button>
             ))}
-          </div>
-        )}
-
-        {/* 搜尋方式選擇 Bubble */}
-        {pendingSearchMethod && (
-          <div style={{
-            margin: '0 8px 8px', padding: '10px 14px', borderRadius: '8px',
-            background: 'var(--color-bg-elevated)', border: '1px solid var(--color-accent)',
-            fontSize: '13px', flexShrink: 0,
-          }}>
-            <div style={{ marginBottom: '6px', color: 'var(--color-text-secondary)', fontSize: '12px' }}>
-              請選擇搜尋方式
-            </div>
-            <div style={{ marginBottom: '8px', color: 'var(--color-text-primary)', fontSize: '12px', fontFamily: 'var(--font-mono, monospace)' }}>
-              查詢：{pendingSearchMethod.query}
-            </div>
-            <div style={{ display: 'flex', gap: '6px' }}>
-              <button
-                onClick={() => handleSearchMethodChoice('web_search')}
-                style={{ padding: '4px 12px', borderRadius: '4px', background: 'var(--color-accent)', color: '#fff', border: 'none', cursor: 'pointer', fontSize: '12px' }}
-              >網路搜尋</button>
-              <button
-                onClick={() => handleSearchMethodChoice('call_external_ai')}
-                style={{ padding: '4px 12px', borderRadius: '4px', background: 'transparent', color: 'var(--color-text-secondary)', border: '1px solid var(--color-border)', cursor: 'pointer', fontSize: '12px' }}
-              >外部 AI</button>
-            </div>
           </div>
         )}
 

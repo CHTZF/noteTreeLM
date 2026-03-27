@@ -1925,7 +1925,7 @@ pub async fn save_agent_skill(
         "search_vault", "read_note", "list_structure", "list_notes_in_folder",
         "open_note", "create_note", "update_note", "append_to_note",
         "delete_note", "delete_folder", "move_note", "create_folder",
-        "plan_announce", "query_memory", "web_search", "call_external_ai",
+        "plan_announce", "query_memory", "web_search",
         "get_current_datetime", "show_toast",
     ];
     let safe_tools: Vec<String> = tool_calls.into_iter()

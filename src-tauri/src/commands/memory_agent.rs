@@ -504,13 +504,10 @@ pub async fn run_scheduled_agent(
                 ma_auth_token,
                 app.clone(),
                 Some(base_url_for_registry),
-                Arc::clone(&state.search_method_tx),
                 crate::tools::make_late_llm_fn(),
                 Arc::new(tokio::sync::Mutex::new(None)),
                 Arc::clone(&state.system_agent),
                 Some(cancel),
-                Arc::clone(&state.api_key_cache),
-                Arc::clone(&state.settings_cache),
             );
 
             let emit: crate::runtime::types::EmitEventFn = Arc::new(|_, _| {});

@@ -42,7 +42,7 @@ interface EphemeralAgent {
 const ALL_TOOLS = [
   'search_vault', 'read_note', 'open_note', 'list_structure', 'query_memory',
   'create_note', 'update_note', 'create_folder',
-  'call_external_ai', 'list_recent_conversations', 'create_agent_skill',
+  'web_search', 'list_recent_conversations', 'create_agent_skill',
 ]
 
 // ── AgentsPage ────────────────────────────────────────────────────────────────

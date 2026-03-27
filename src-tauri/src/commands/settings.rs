@@ -196,14 +196,6 @@ pub async fn save_system_settings(
     daemon_post::<_, serde_json::Value>(&state.http_client, "/settings", &map, tok)
         .await.map_err(|e| AppError::Settings(e))?;
 
-    // 失效 AI 設定快取
-    {
-        let mut sc = state.settings_cache.lock().await;
-        sc.remove("ai_provider");
-        sc.remove("ai_model");
-        sc.remove("ai_base_url");
-    }
-
     if !settings.system_current_vault_path.is_empty() {
         handle_vault_switch(app, state.inner().clone(), settings.system_current_vault_path).await;
     }

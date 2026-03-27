@@ -22,11 +22,8 @@ pub use super::server::{
 pub(crate) use super::server::ensure_server_running;
 pub use super::external_ai::{
     stream_chat_external, process_with_llm,
-    call_external_ai_tool, ExtAiConfig,
 };
-pub(crate) use super::external_ai::{
-    read_api_key, get_cached_setting,
-};
+pub(crate) use super::external_ai::read_api_key;
 pub use super::memory::{
     add_memory_rule, get_memory_rules, delete_memory_rule,
     save_memory_session, query_memory,
@@ -75,13 +72,13 @@ async fn generate_agent_spec(
   ]\n\
 }\n\
 \n\
-可用 tool_names：search_vault, read_note, open_note, list_structure, create_note, update_note, create_folder, query_memory, call_external_ai, list_recent_conversations\n\
+可用 tool_names：search_vault, read_note, open_note, list_structure, create_note, update_note, create_folder, query_memory, web_search, list_recent_conversations\n\
 選擇原則：\n\
 - 筆記查詢/搜尋 → [\"search_vault\"]\n\
 - 筆記打開（讓使用者在編輯器中查看）→ [\"search_vault\",\"open_note\"]\n\
 - 筆記閱讀/分析內容 → [\"search_vault\",\"read_note\"]\n\
 - 筆記寫入/更新 → [\"create_note\",\"update_note\",\"create_folder\"]\n\
-- 外部資訊/網路查詢 → [\"call_external_ai\"]\n\
+- 外部資訊/網路查詢 → [\"web_search\"]\n\
 - 記憶查詢 → [\"query_memory\"]\n\
 - 複合任務 → 組合上述\n\
 \n\
@@ -279,18 +276,6 @@ pub(crate) async fn send_streaming_request(
         tool_call_chunks,
     })
 }
-/// 前端選擇搜尋方式後呼叫（解除 call_external_ai 工具的暫停狀態）
-#[tauri::command]
-pub async fn confirm_search_method(
-    state: State<'_, AppState>,
-    method: String,
-) -> Result<(), AppError> {
-    if let Some(tx) = state.search_method_tx.lock().await.take() {
-        let _ = tx.send(method);
-    }
-    Ok(())
-}
-
 /// 取消正在進行的 Agent 串流（設定取消旗標，同時拒絕待確認的寫入工具）
 #[tauri::command]
 pub async fn cancel_agent(state: State<'_, AppState>) -> Result<(), AppError> {
@@ -392,7 +377,6 @@ pub async fn invoke_agent(
     // 使用 llama-server 處理所有 agent trigger embedding（chat 就緒時必然可用）
     let reg_emb_url: Option<String> = Some(base_url.clone());
     let skill_emb_url = reg_emb_url.clone(); // 保留一份給 skill pre-pass 使用
-    let search_method_tx = Arc::clone(&state.search_method_tx);
 
     // 延遲繫結 handle（供 spawn_sub_agent 工具使用）
     let llm_fn_late = crate::tools::make_late_llm_fn();
@@ -407,13 +391,10 @@ pub async fn invoke_agent(
             auth_token.clone(),
             app.clone(),
             reg_emb_url.clone(),
-            search_method_tx,
             Arc::clone(&llm_fn_late),
             Arc::clone(&registry_late),
             Arc::clone(&state.system_agent),
             Some(Arc::clone(&state.agent_cancel)),
-            Arc::clone(&state.api_key_cache),
-            Arc::clone(&state.settings_cache),
         )
     } else {
         Arc::new(ToolRegistry::new())
@@ -1003,7 +984,6 @@ live_respond 規則：\
     );
 
     // 5. 建立 ToolRegistry
-    let search_method_tx = Arc::clone(&state.search_method_tx);
     let llm_fn_late = crate::tools::make_late_llm_fn();
     let registry_late: Arc<tokio::sync::Mutex<Option<Arc<ToolRegistry>>>> =
         Arc::new(tokio::sync::Mutex::new(None));
@@ -1016,13 +996,10 @@ live_respond 規則：\
             auth_token_lc.clone(),
             app.clone(),
             Some(base_url.clone()),
-            search_method_tx,
             Arc::clone(&llm_fn_late),
             Arc::clone(&registry_late),
             Arc::clone(&state.system_agent),
             Some(Arc::clone(&state.agent_cancel)),
-            Arc::clone(&state.api_key_cache),
-            Arc::clone(&state.settings_cache),
         )
     } else {
         Arc::new(ToolRegistry::new())
@@ -1473,25 +1450,6 @@ pub fn vault_tools() -> serde_json::Value {
                         "path": { "type": "string", "description": "新資料夾的相對路徑" }
                     },
                     "required": ["path"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "call_external_ai",
-                "description": "呼叫外部 AI 服務（如 OpenAI / Anthropic）獲取即時資訊或當前事件。\
-僅在問題需要本地模型不具備的最新外部資料時使用（例如今日新聞、即時排行、最新活動等）。\
-不用於查詢 Vault 筆記或歷史對話（那些請用 search_vault）。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "發送給外部 AI 的完整問題或指令"
-                        }
-                    },
-                    "required": ["query"]
                 }
             }
         },
@@ -2689,14 +2647,7 @@ async fn execute_vault_tool(
     args: &serde_json::Value,
     vault_path: &str,
     app: &AppHandle,
-    ext_config: &ExtAiConfig,
 ) -> String {
-    // call_external_ai 不依賴 vault，可在 vault 未設定時使用
-    if name == "call_external_ai" {
-        let query = args["query"].as_str().unwrap_or("");
-        return call_external_ai_tool(query, ext_config, app).await;
-    }
-
     if vault_path.is_empty() {
         return "Vault 未設定，無法執行 Vault 操作".to_string();
     }
@@ -2970,20 +2921,6 @@ pub async fn run_tool_pipeline(
         "tools": all_tool_names,
     }));
 
-    // 只有 call_external_ai 需要 ext_config，避免不必要的 keychain 存取
-    let needs_ext = steps.iter().any(|s| s.name == "call_external_ai");
-    let ext_config = if needs_ext {
-        let tok_ec = state.get_auth_token().await;
-        let tok_ec_ref = if tok_ec.is_empty() { None } else { Some(tok_ec.as_str()) };
-        let ext_provider = get_cached_setting(&state.settings_cache, &state.http_client, tok_ec_ref, "ai_provider", "").await;
-        let ext_base_url = get_cached_setting(&state.settings_cache, &state.http_client, tok_ec_ref, "ai_base_url", "https://api.openai.com/v1").await;
-        let ext_model = get_cached_setting(&state.settings_cache, &state.http_client, tok_ec_ref, "ai_model", "gpt-4o").await;
-        let ext_api_key = read_api_key(&state.api_key_cache, &state.http_client, tok_ec_ref, &ext_provider).await;
-        ExtAiConfig { provider: ext_provider, base_url: ext_base_url, model: ext_model, api_key: ext_api_key }
-    } else {
-        ExtAiConfig { provider: String::new(), base_url: String::new(), model: String::new(), api_key: String::new() }
-    };
-
     let order = topo_sort_indices(&steps);
     let mut results: Vec<PipelineStepResult> = Vec::with_capacity(steps.len());
     let mut executed_names: Vec<String> = Vec::new();
@@ -3012,7 +2949,6 @@ pub async fn run_tool_pipeline(
             &step.args,
             &vault_path,
             &app,
-            &ext_config,
         ).await;
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -3088,25 +3024,11 @@ pub async fn test_vault_tool(
         "tools": [tool_name.clone()],
     }));
 
-    // Only build ext_config for call_external_ai — other tools ignore it entirely.
-    let ext_config = if tool_name == "call_external_ai" {
-        let tok_ec2 = state.get_auth_token().await;
-        let tok_ec2_ref = if tok_ec2.is_empty() { None } else { Some(tok_ec2.as_str()) };
-        let ext_provider = get_cached_setting(&state.settings_cache, &state.http_client, tok_ec2_ref, "ai_provider", "").await;
-        let ext_base_url = get_cached_setting(&state.settings_cache, &state.http_client, tok_ec2_ref, "ai_base_url", "https://api.openai.com/v1").await;
-        let ext_model = get_cached_setting(&state.settings_cache, &state.http_client, tok_ec2_ref, "ai_model", "gpt-4o").await;
-        let ext_api_key = read_api_key(&state.api_key_cache, &state.http_client, tok_ec2_ref, &ext_provider).await;
-        ExtAiConfig { provider: ext_provider, base_url: ext_base_url, model: ext_model, api_key: ext_api_key }
-    } else {
-        ExtAiConfig { provider: String::new(), base_url: String::new(), model: String::new(), api_key: String::new() }
-    };
-
     let result = execute_vault_tool(
         &tool_name,
         &args,
         &vault_path,
         &app,
-        &ext_config,
     ).await;
 
     // ── Emit commit 或 cancel ────────────────────────────────────────────────

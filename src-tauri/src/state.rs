@@ -47,14 +47,10 @@ pub struct AppState {
     pub agent_session: Arc<Mutex<Option<String>>>,
     /// 工具測試台取消旗標：設為 true 時 run_tool_pipeline 的步驟迴圈中止
     pub tool_test_cancel: Arc<AtomicBool>,
-    /// 搜尋方式選擇通道（call_external_ai 工具暫停，等待前端選擇 web_search 或 call_external_ai）
-    pub search_method_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     /// System Agent Service — rule-based broker，負責路由 call_agent 請求
     pub system_agent: Arc<SystemAgentService>,
     /// API key 記憶體快取：provider → key，避免重複呼叫 keychain
     pub api_key_cache: Arc<Mutex<HashMap<String, String>>>,
-    /// 外部 AI 設定快取：key → value（ai_provider / ai_base_url / ai_model），使用者儲存後失效
-    pub settings_cache: Arc<Mutex<HashMap<String, String>>>,
     /// 共用 HTTP client（所有 LLM / embedding 呼叫共用，避免重複建立 connection pool）
     pub http_client: reqwest::Client,
     /// Intent centroid 快取（confirm / cancel / interrupt 三組固定詞組的 embedding 平均值）
@@ -100,9 +96,7 @@ impl AppState {
             agent_cancel: Arc::new(AtomicBool::new(false)),
             agent_session: Arc::new(Mutex::new(None)),
             tool_test_cancel: Arc::new(AtomicBool::new(false)),
-            search_method_tx: Arc::new(Mutex::new(None)),
             api_key_cache: Arc::new(Mutex::new(HashMap::new())),
-            settings_cache: Arc::new(Mutex::new(HashMap::new())),
             http_client,
             intent_centroids: Arc::new(Mutex::new(None)),
             titled_convs: Arc::new(Mutex::new(HashSet::new())),

@@ -5,7 +5,6 @@
 /// - `readonly`  — 唯讀工具（list_structure / read_note / search_vault / query_memory 等）
 /// - `write`     — 寫入工具（含 rollback）及副作用工具
 /// - `agent`     — Agent 路由工具（call_agent / touch_agent / create_agent 等）
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -28,13 +27,10 @@ pub(crate) struct BuildCtx {
     pub auth_token: String,
     pub app: AppHandle,
     pub emb_url: Option<String>,
-    pub search_method_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     pub llm_fn_late: Arc<Mutex<Option<LlmFn>>>,
     pub registry_late: Arc<Mutex<Option<Arc<ToolRegistry>>>>,
     pub system_agent_svc: Arc<SystemAgentService>,
     pub cancel: Option<Arc<AtomicBool>>,
-    pub api_key_cache: Arc<Mutex<HashMap<String, String>>>,
-    pub settings_cache: Arc<Mutex<HashMap<String, String>>>,
 }
 
 /// 建立包含所有 vault 工具的 ToolRegistry。
@@ -45,13 +41,10 @@ pub fn build_vault_registry(
     auth_token: String,
     app: AppHandle,
     emb_url: Option<String>,
-    search_method_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     llm_fn_late: Arc<Mutex<Option<LlmFn>>>,
     registry_late: Arc<Mutex<Option<Arc<ToolRegistry>>>>,
     system_agent_svc: Arc<SystemAgentService>,
     cancel: Option<Arc<AtomicBool>>,
-    api_key_cache: Arc<Mutex<HashMap<String, String>>>,
-    settings_cache: Arc<Mutex<HashMap<String, String>>>,
 ) -> Arc<ToolRegistry> {
     let ctx = BuildCtx {
         vault_path,
@@ -60,13 +53,10 @@ pub fn build_vault_registry(
         auth_token,
         app,
         emb_url,
-        search_method_tx,
         llm_fn_late,
         registry_late,
         system_agent_svc,
         cancel,
-        api_key_cache,
-        settings_cache,
     };
 
     let mut registry = ToolRegistry::new();

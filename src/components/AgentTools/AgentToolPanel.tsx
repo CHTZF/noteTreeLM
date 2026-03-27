@@ -88,14 +88,6 @@ const TOOLS: ToolDef[] = [
     ],
   },
   {
-    name: 'call_external_ai',
-    label: '🌐 call_external_ai',
-    description: '呼叫外部 AI 服務（如 OpenAI / Anthropic）獲取即時資訊',
-    params: [
-      { key: 'query', label: '問題 (query)', type: 'text', placeholder: '今天的天氣如何？', required: true },
-    ],
-  },
-  {
     name: 'open_note',
     label: '🗂 open_note',
     description: '在筆記編輯器中打開（切換至）指定筆記',
