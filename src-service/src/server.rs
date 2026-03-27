@@ -1,14 +1,17 @@
 use axum::{
+    body::Body,
     extract::State,
+    http::Request,
     middleware,
     routing::{delete, get, post},
     Json, Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
 use serde_json::json;
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
+use tracing::Span;
 use crate::api_state::ApiState;
 use crate::auth::{handlers, middleware::auth_middleware, store::AuthStore};
 use crate::db::SurrealDb;
@@ -31,6 +34,7 @@ pub fn build_api_router(app_state: ApiState) -> Router {
     let device_routes = Router::new()
         .route("/auth/devices", get(handlers::list_devices))
         .route("/auth/devices/:id", delete(handlers::revoke_device))
+        .route("/auth/generate-pairing-code", post(handlers::generate_pairing_code))
         .layer(middleware::from_fn_with_state(auth_store.clone(), auth_middleware))
         .with_state(auth_store);
 
@@ -53,6 +57,7 @@ pub fn build_api_router(app_state: ApiState) -> Router {
         .merge(crate::routes::agents::router())
         .merge(crate::routes::memory::router())
         .merge(crate::routes::scheduled::router())
+        .route("/pairing-info", get(pairing_info_handler))
         .with_state(app_state);
 
     let cors = CorsLayer::new()
@@ -66,7 +71,19 @@ pub fn build_api_router(app_state: ApiState) -> Router {
         .merge(device_routes)
         .merge(admin_routes)
         .layer(cors)
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &Request<Body>| {
+                    tracing::info_span!(
+                        "http_request",
+                        method = %request.method(),
+                        uri = %request.uri(),
+                    )
+                })
+                .on_failure(|error: tower_http::classify::ServerErrorsFailureClass, latency: Duration, _span: &Span| {
+                    tracing::error!("HTTP 500: {:?} latency={:?}", error, latency);
+                })
+        )
 }
 
 /// Plain HTTP server on localhost :7787 (no TLS)
@@ -154,4 +171,16 @@ async fn db_repair_handler(
         Ok(_) => Json(json!({ "ok": true, "message": "Migrations re-applied successfully" })),
         Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
     }
+}
+
+/// Return tunnel URL and local URL for mobile pairing QR code.
+/// Called by the desktop frontend; token is presented by the caller.
+async fn pairing_info_handler(
+    State(state): State<ApiState>,
+) -> Json<serde_json::Value> {
+    let tunnel_url = state.daemon.tunnel_url.read().await.clone();
+    Json(json!({
+        "tunnel_url": tunnel_url,
+        "local_url": "http://127.0.0.1:7787",
+    }))
 }

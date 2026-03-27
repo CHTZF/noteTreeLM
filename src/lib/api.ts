@@ -194,7 +194,46 @@ export const api = {
   getKbChatMessages: (sessionId: string) =>
     request<string | null>('GET', `/conversations/kb/${encodeURIComponent(sessionId)}/messages`),
 
-  // Notes extras
+  listFolders: (vaultId: string) =>
+    request<string[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/folders/list`),
+  listAssets: (vaultId: string) =>
+    request<string[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/assets/list`),
+  trashFolder: async (folderPath: string) => {
+    const vaultId = await getVaultId()
+    return request<{ ok: boolean; count: number }>('DELETE', `/vaults/${encodeURIComponent(vaultId)}/folders/trash?path=${encodeURIComponent(folderPath)}`)
+  },
+  importAsset: async (filename: string, contentBase64: string, folder?: string | null, newName?: string | null) => {
+    const vaultId = await getVaultId()
+    return request<{ rel_path: string }>('POST', `/vaults/${encodeURIComponent(vaultId)}/assets/import`, {
+      filename, content_base64: contentBase64, folder: folder ?? '', new_name: newName ?? '',
+    })
+  },
+  renameAsset: async (path: string, newName: string) => {
+    const vaultId = await getVaultId()
+    return request<{ new_path: string }>('POST', `/vaults/${encodeURIComponent(vaultId)}/assets/rename`, { path, new_name: newName })
+  },
+
+  // Notes extras — file operations
+  renameNote: async (oldPath: string, newTitle: string) => {
+    const vaultId = await getVaultId()
+    return request<{ new_path: string }>('POST', `/vaults/${encodeURIComponent(vaultId)}/notes/rename`, { old_path: oldPath, new_title: newTitle })
+  },
+  listTrash: async () => {
+    const vaultId = await getVaultId()
+    return request<unknown[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/trash`)
+  },
+  restoreTrashItem: async (id: string, targetFolder: string) => {
+    const vaultId = await getVaultId()
+    return request<{ new_path: string }>('POST', `/vaults/${encodeURIComponent(vaultId)}/trash/restore`, { id, target_folder: targetFolder })
+  },
+  createFolder: async (folderPath: string) => {
+    const vaultId = await getVaultId()
+    return request<{ ok: boolean }>('POST', `/vaults/${encodeURIComponent(vaultId)}/folders`, { folder_path: folderPath })
+  },
+  renameFolder: async (folderPath: string, newName: string) => {
+    const vaultId = await getVaultId()
+    return request<{ new_folder_path: string }>('POST', `/vaults/${encodeURIComponent(vaultId)}/folders/rename`, { folder_path: folderPath, new_name: newName })
+  },
   setNoteStatus: async (path: string, status: string) => {
     const vaultId = await getVaultId()
     return request<{ ok: boolean }>('PATCH', `/vaults/${encodeURIComponent(vaultId)}/notes/status`, { path, status })
@@ -281,6 +320,10 @@ export const api = {
   },
   setVaultLastNote: (vaultPath: string, notePath: string) =>
     request<{ ok: boolean }>('POST', '/settings/user', { [`vault_last_note_${vaultPath}`]: notePath }),
+
+  // Mobile pairing
+  pairingInfo: () => request<{ tunnel_url: string | null; local_url: string }>('GET', '/pairing-info'),
+  generatePairingCode: () => request<{ pairing_code: string; expires_in: number }>('POST', '/auth/generate-pairing-code'),
 
   // Health
   health: () => fetch('http://127.0.0.1:7787/health').then(r => r.ok),

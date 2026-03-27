@@ -37,6 +37,7 @@ pub fn router() -> Router<ApiState> {
         .route("/auth/logout", post(logout))
         .route("/auth/session", get(session))
         .route("/auth/register", post(register))
+        .route("/auth/google-upsert", post(google_upsert))
         .route("/auth/change-password", post(change_password))
 }
 
@@ -66,7 +67,11 @@ async fn login(
         .next()
         .ok_or((StatusCode::UNAUTHORIZED, "Invalid credentials".to_string()))?;
 
-    let valid = verify(&req.password, &user.password_hash)
+    let pw = req.password.clone();
+    let hash_str = user.password_hash.clone();
+    let valid = tokio::task::spawn_blocking(move || verify(&pw, &hash_str))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn: {e}")))?
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !valid {
         return Err((StatusCode::UNAUTHORIZED, "Invalid credentials".to_string()));
@@ -78,9 +83,9 @@ async fn login(
 
     state
         .db
-        .query("INSERT INTO sessions (token, username, expires_at, auth_provider, created_at) VALUES ($token, $username, $expires_at, 'local', $now)")
-        .bind(("token", token.clone()))
-        .bind(("username", user.username.clone()))
+        .query("INSERT INTO sessions (token, username, expires_at, auth_provider, created_at) VALUES ($tok, $uname, $expires_at, 'local', $now)")
+        .bind(("tok", token.clone()))
+        .bind(("uname", user.username.clone()))
         .bind(("expires_at", expires_at))
         .bind(("now", now))
         .await
@@ -174,7 +179,10 @@ async fn register(
         return Err((StatusCode::CONFLICT, "Username already exists".to_string()));
     }
 
-    let password_hash = hash(&req.password, DEFAULT_COST)
+    let pw = req.password.clone();
+    let password_hash = tokio::task::spawn_blocking(move || hash(&pw, DEFAULT_COST))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn: {e}")))?
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let now = Utc::now().timestamp();
 
@@ -185,9 +193,99 @@ async fn register(
         .bind(("ph", password_hash))
         .bind(("now", now))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!("register INSERT failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
 
     Ok(Json(json!({ "ok": true, "username": req.username })))
+}
+
+/// Google OAuth upsert: create or update user by email, using sub as stable credential.
+/// No bcrypt verification — caller (Tauri desktop) already verified with Google.
+async fn google_upsert(
+    State(state): State<ApiState>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let username = req["username"].as_str()
+        .ok_or((StatusCode::BAD_REQUEST, "Missing username".to_string()))?
+        .to_string();
+    let sub = req["sub"].as_str()
+        .ok_or((StatusCode::BAD_REQUEST, "Missing sub".to_string()))?;
+
+    // bcrypt is CPU-bound; run in blocking thread to avoid blocking the tokio executor
+    let sub_owned = sub.to_string();
+    let password_hash = tokio::task::spawn_blocking(move || hash(&sub_owned, DEFAULT_COST))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn_blocking: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("bcrypt: {e}")))?;
+
+    let now = Utc::now().timestamp();
+
+    // Check if user already exists
+    #[derive(serde::Deserialize)]
+    struct UserRow { username: String }
+    let mut check = state
+        .db
+        .query("SELECT username FROM users WHERE username = $u LIMIT 1")
+        .bind(("u", username.clone()))
+        .await
+        .map_err(|e| {
+            tracing::error!("google_upsert SELECT failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
+    let existing: Vec<UserRow> = check.take(0).unwrap_or_default();
+
+    if existing.is_empty() {
+        // First Google login — insert user
+        state
+            .db
+            .query("INSERT INTO users (username, password_hash, created_at) VALUES ($u, $ph, $now)")
+            .bind(("u", username.clone()))
+            .bind(("ph", password_hash.clone()))
+            .bind(("now", now))
+            .await
+            .map_err(|e| {
+                tracing::error!("google_upsert INSERT user failed: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            })?;
+    } else {
+        // Subsequent login — update password_hash (sub is stable, but keeps hash current)
+        state
+            .db
+            .query("UPDATE users SET password_hash = $ph WHERE username = $u")
+            .bind(("ph", password_hash.clone()))
+            .bind(("u", username.clone()))
+            .await
+            .map_err(|e| {
+                tracing::error!("google_upsert UPDATE user failed: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            })?;
+    }
+
+    // Create session
+    let token = Uuid::new_v4().to_string();
+    let expires_at = now + 86400 * 30;
+
+    state
+        .db
+        .query("INSERT INTO sessions (token, username, expires_at, auth_provider, created_at) VALUES ($tok, $uname, $expires_at, 'google', $now)")
+        .bind(("tok", token.clone()))
+        .bind(("uname", username.clone()))
+        .bind(("expires_at", expires_at))
+        .bind(("now", now))
+        .await
+        .map_err(|e| {
+            tracing::error!("google_upsert INSERT session failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
+
+    tracing::info!("google_upsert: session created for {}", username);
+    Ok(Json(json!({
+        "token": token,
+        "username": username,
+        "expires_at": expires_at,
+    })))
 }
 
 #[derive(serde::Deserialize)]

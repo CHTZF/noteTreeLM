@@ -18,6 +18,11 @@ fn get_data_dir() -> std::path::PathBuf {
 
 #[tokio::main]
 async fn main() {
+    // rustls 0.23 requires an explicit crypto provider; install ring before any TLS usage
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

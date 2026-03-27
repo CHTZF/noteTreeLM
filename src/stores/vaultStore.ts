@@ -42,11 +42,14 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
   scanCount: 0,
 
   loadNotes: async () => {
-    const [notes, extraFolders, assets] = await Promise.all([
-      invoke<Note[]>('list_notes', {}),
-      invoke<string[]>('list_folders').catch(() => [] as string[]),
-      invoke<string[]>('list_assets').catch(() => [] as string[]),
-    ])
+    const vaultId = await invoke<string>('get_vault_uuid').catch(() => '')
+    const [notes, extraFolders, assets] = vaultId
+      ? await Promise.all([
+          api.listNotes(vaultId) as Promise<Note[]>,
+          api.listFolders(vaultId).catch(() => [] as string[]),
+          api.listAssets(vaultId).catch(() => [] as string[]),
+        ])
+      : [[] as Note[], [] as string[], [] as string[]]
     const { settings } = useSettingsStore.getState()
     const fileTree = get().buildFileTree(notes, extraFolders, assets, settings.sort_orders)
     set({ notes, assets, fileTree })
@@ -74,7 +77,9 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
   },
 
   readNote: async (path) => {
-    return invoke<Note>('read_note', { path })
+    const vaultId = await invoke<string>('get_vault_uuid').catch(() => '')
+    if (!vaultId) return invoke<Note>('read_note', { path })
+    return api.readNote(vaultId, path) as Promise<Note>
   },
 
   updateNote: async (path, content) => {
@@ -94,33 +99,35 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
   },
 
   renameNote: async (path, newTitle) => {
-    const result = await invoke<RenameResult>('rename_note', { path, newTitle })
+    const { new_path } = await api.renameNote(path, newTitle)
     await get().loadNotes()
-    return result
+    return { new_path, updated_files: [] } as RenameResult
   },
 
   createFolder: async (folderPath) => {
-    await invoke('create_folder', { folderPath })
+    await api.createFolder(folderPath)
     await get().loadNotes()
   },
 
   renameFolder: async (folderPath, newName) => {
-    const newPath = await invoke<string>('rename_folder', { folderPath, newName })
+    const { new_folder_path } = await api.renameFolder(folderPath, newName)
     await get().loadNotes()
-    return newPath
+    return new_folder_path
   },
 
   // 軟刪除資料夾：所有筆記移至垃圾桶，實體目錄刪除
   deleteFolder: async (folderPath) => {
-    const count = await invoke<number>('trash_folder', { folderPath })
+    const { count } = await api.trashFolder(folderPath)
     await get().loadNotes()
     return count
   },
 
   importImage: async (sourcePath, folder) => {
-    const relPath = await invoke<string>('import_image', { sourcePath, folder })
+    const filename = sourcePath.split('/').pop() ?? sourcePath.split('\\').pop() ?? 'file'
+    const contentBase64 = await invoke<string>('read_file_base64', { path: sourcePath })
+    const { rel_path } = await api.importAsset(filename, contentBase64, folder ?? null, null)
     await get().loadNotes()
-    return relPath
+    return rel_path
   },
 
   deleteAsset: async (path) => {
@@ -129,9 +136,9 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
   },
 
   renameAsset: async (path, newName) => {
-    const newPath = await invoke<string>('rename_asset', { path, newName })
+    const { new_path } = await api.renameAsset(path, newName)
     await get().loadNotes()
-    return newPath
+    return new_path
   },
 
   openPathExternally: async (path) => {
@@ -140,11 +147,11 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
 
   // ── Trash ──────────────────────────────────────────────────────────────────
   listTrash: async () => {
-    return invoke<TrashItem[]>('list_trash')
+    return api.listTrash() as Promise<TrashItem[]>
   },
 
   restoreTrashItem: async (id, targetFolder) => {
-    const newPath = await invoke<string>('restore_trash_item', { id, targetFolder })
+    const { new_path: newPath } = await api.restoreTrashItem(id, targetFolder)
     // 復原後置頂於目標資料夾的排序
     const store = useSettingsStore.getState()
     const orders = { ...(store.settings.sort_orders || {}) }

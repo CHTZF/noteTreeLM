@@ -298,14 +298,20 @@ async fn get_graph(
     // Nodes: all notes in the vault
     let mut resp = state
         .db
-        .query("SELECT path, title, word_count FROM notes WHERE vault_id = $vid ORDER BY modified_at DESC")
+        .query("SELECT path, title FROM notes WHERE vault_id = $vid")
         .bind(("vid", vault_id.clone()))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!("get_graph notes query failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
 
     #[derive(serde::Deserialize)]
-    struct NoteRow { path: String, title: String, word_count: i64 }
-    let notes: Vec<NoteRow> = resp.take(0).unwrap_or_default();
+    struct NoteRow { path: String, title: String }
+    let notes: Vec<NoteRow> = resp.take(0).map_err(|e| {
+        tracing::error!("get_graph notes take failed: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
 
     let nodes: Vec<Value> = notes
         .iter()
@@ -322,16 +328,20 @@ async fn get_graph(
     // Edges: all wiki-links in the vault (source_path → target note)
     let mut lresp = state
         .db
-        .query(
-            "SELECT source_path, target_title FROM links WHERE vault_id = $vid",
-        )
+        .query("SELECT source_path, target_title FROM links WHERE vault_id = $vid")
         .bind(("vid", vault_id.clone()))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!("get_graph links query failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
 
     #[derive(serde::Deserialize)]
     struct LinkRow { source_path: String, target_title: String }
-    let links: Vec<LinkRow> = lresp.take(0).unwrap_or_default();
+    let links: Vec<LinkRow> = lresp.take(0).map_err(|e| {
+        tracing::error!("get_graph links take failed: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
 
     // Build title→path map for resolving target
     let title_to_path: std::collections::HashMap<String, String> = notes

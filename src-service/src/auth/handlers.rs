@@ -4,11 +4,14 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+
 use super::{store::AuthStore, Scope};
 
 #[derive(Deserialize)]
 pub struct PairRequest {
-    pub master_token: String,
+    /// Permanent master token OR short-lived pairing code (one of the two is required)
+    pub master_token: Option<String>,
+    pub pairing_code: Option<String>,
     pub device_name: String,
     #[serde(default = "default_scope")]
     pub scope: Scope,
@@ -38,7 +41,12 @@ pub async fn pair(
     State(store): State<AuthStore>,
     Json(req): Json<PairRequest>,
 ) -> Result<Json<TokenResponse>, StatusCode> {
-    if !store.verify_master_token(&req.master_token).await {
+    let authorized = match (&req.master_token, &req.pairing_code) {
+        (Some(tok), _) => store.verify_master_token(tok).await,
+        (_, Some(code)) => store.consume_pairing_code(code).await,
+        _ => false,
+    };
+    if !authorized {
         return Err(StatusCode::UNAUTHORIZED);
     }
     let (access, refresh) = store.create_device_token(req.device_name, req.scope).await;
@@ -47,6 +55,16 @@ pub async fn pair(
         refresh_token: refresh,
         expires_in: 3600,
         device_id: None,
+    }))
+}
+
+pub async fn generate_pairing_code(
+    State(store): State<AuthStore>,
+) -> Json<serde_json::Value> {
+    let code = store.generate_pairing_code().await;
+    Json(serde_json::json!({
+        "pairing_code": code,
+        "expires_in": 300,
     }))
 }
 

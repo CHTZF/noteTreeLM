@@ -33,7 +33,7 @@ async fn get_settings(
 
     let mut resp = state
         .db
-        .query("SELECT key, value FROM settings")
+        .query("SELECT `key`, `value` FROM `settings`")
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -55,14 +55,8 @@ async fn save_settings(
             Value::String(s) => s,
             other => other.to_string(),
         };
-        state
-            .db
-            .query("INSERT INTO settings (key, value, updated_at) VALUES ($k, $v, $now) ON DUPLICATE KEY UPDATE value = $v, updated_at = $now")
-            .bind(("k", key))
-            .bind(("v", value_str))
-            .bind(("now", now))
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        upsert_setting(&state, key, value_str, now).await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     }
     Ok(Json(json!({ "ok": true })))
 }
@@ -81,7 +75,7 @@ async fn get_user_settings(
 
     let mut resp = state
         .db
-        .query("SELECT key, value FROM user_settings WHERE username = $u")
+        .query("SELECT `key`, `value` FROM user_settings WHERE username = $u")
         .bind(("u", username))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -107,15 +101,8 @@ async fn save_user_settings(
             Value::String(s) => s,
             other => other.to_string(),
         };
-        state
-            .db
-            .query("INSERT INTO user_settings (username, key, value, updated_at) VALUES ($u, $k, $v, $now) ON DUPLICATE KEY UPDATE value = $v, updated_at = $now")
-            .bind(("u", username.clone()))
-            .bind(("k", key))
-            .bind(("v", value_str))
-            .bind(("now", now))
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        upsert_user_setting(&state, username.clone(), key, value_str, now).await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     }
     Ok(Json(json!({ "ok": true })))
 }
@@ -131,14 +118,20 @@ async fn get_setting_by_key(
 
     let mut resp = state
         .db
-        .query("SELECT value FROM settings WHERE key = $k LIMIT 1")
-        .bind(("k", key))
+        .query("SELECT `value` FROM `settings` WHERE `key` = $k LIMIT 1")
+        .bind(("k", key.clone()))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!("get_setting_by_key query failed key={}: {}", key, e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
 
     let rows: Vec<Row> = resp
         .take(0)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!("get_setting_by_key take failed key={}: {}", key, e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
 
     match rows.into_iter().next() {
         Some(r) => Ok(Json(json!({ "value": r.value }))),
@@ -160,7 +153,7 @@ async fn get_user_setting_by_key(
 
     let mut resp = state
         .db
-        .query("SELECT value FROM user_settings WHERE username = $u AND key = $k LIMIT 1")
+        .query("SELECT `value` FROM user_settings WHERE username = $u AND `key` = $k LIMIT 1")
         .bind(("u", username))
         .bind(("k", key))
         .await
@@ -207,6 +200,87 @@ async fn get_username_from_token(
         .ok_or((StatusCode::UNAUTHORIZED, "Invalid or expired token".to_string()))
 }
 
+// ── Upsert helpers ─────────────────────────────────────────────────────────────
+
+/// Explicit SELECT + INSERT/UPDATE to avoid ON DUPLICATE KEY syntax issues with
+/// SurrealDB reserved keywords (`key`, `value`, `settings`).
+async fn upsert_setting(
+    state: &ApiState,
+    key: String,
+    value: String,
+    now: i64,
+) -> Result<(), String> {
+    #[derive(serde::Deserialize)]
+    struct IdRow { id: surrealdb::RecordId }
+
+    let mut check = state.db
+        .query("SELECT id FROM `settings` WHERE `key` = $k LIMIT 1")
+        .bind(("k", key.clone()))
+        .await
+        .map_err(|e| e.to_string())?;
+    let existing: Vec<IdRow> = check.take(0).unwrap_or_default();
+
+    if existing.is_empty() {
+        state.db
+            .query("INSERT INTO `settings` (`key`, `value`, updated_at) VALUES ($k, $v, $now)")
+            .bind(("k", key))
+            .bind(("v", value))
+            .bind(("now", now))
+            .await
+            .map_err(|e| e.to_string())?;
+    } else {
+        let id = existing.into_iter().next().unwrap().id;
+        state.db
+            .query("UPDATE $id SET `value` = $v, updated_at = $now")
+            .bind(("id", id))
+            .bind(("v", value))
+            .bind(("now", now))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+async fn upsert_user_setting(
+    state: &ApiState,
+    username: String,
+    key: String,
+    value: String,
+    now: i64,
+) -> Result<(), String> {
+    #[derive(serde::Deserialize)]
+    struct IdRow { id: surrealdb::RecordId }
+
+    let mut check = state.db
+        .query("SELECT id FROM user_settings WHERE username = $u AND `key` = $k LIMIT 1")
+        .bind(("u", username.clone()))
+        .bind(("k", key.clone()))
+        .await
+        .map_err(|e| e.to_string())?;
+    let existing: Vec<IdRow> = check.take(0).unwrap_or_default();
+
+    if existing.is_empty() {
+        state.db
+            .query("INSERT INTO user_settings (username, `key`, `value`, updated_at) VALUES ($u, $k, $v, $now)")
+            .bind(("u", username))
+            .bind(("k", key))
+            .bind(("v", value))
+            .bind(("now", now))
+            .await
+            .map_err(|e| e.to_string())?;
+    } else {
+        let id = existing.into_iter().next().unwrap().id;
+        state.db
+            .query("UPDATE $id SET `value` = $v, updated_at = $now")
+            .bind(("id", id))
+            .bind(("v", value))
+            .bind(("now", now))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 // ── API Key endpoints ──────────────────────────────────────────────────────────
 
 async fn get_api_key(
@@ -219,11 +293,17 @@ async fn get_api_key(
     struct Row { value: String }
 
     let mut resp = state.db
-        .query("SELECT value FROM settings WHERE key = $k LIMIT 1")
-        .bind(("k", db_key))
+        .query("SELECT `value` FROM `settings` WHERE `key` = $k LIMIT 1")
+        .bind(("k", db_key.clone()))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let rows: Vec<Row> = resp.take(0).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!("get_api_key query failed key={}: {}", db_key, e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
+    let rows: Vec<Row> = resp.take(0).map_err(|e| {
+        tracing::error!("get_api_key take failed key={}: {}", db_key, e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
     let key = rows.into_iter().next().map(|r| r.value).filter(|v| !v.is_empty());
     Ok(Json(json!({ "key": key })))
 }
@@ -238,13 +318,8 @@ async fn set_api_key(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let db_key = format!("api_key_{}", provider);
     let now = Utc::now().timestamp();
-    state.db
-        .query("INSERT INTO settings (key, value, updated_at) VALUES ($k, $v, $now) ON DUPLICATE KEY UPDATE value = $v, updated_at = $now")
-        .bind(("k", db_key))
-        .bind(("v", body.key))
-        .bind(("now", now))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    upsert_setting(&state, db_key, body.key, now).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -256,11 +331,7 @@ async fn set_brave_key_id(
     Json(body): Json<BraveKeyIdBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let now = Utc::now().timestamp();
-    state.db
-        .query("INSERT INTO settings (key, value, updated_at) VALUES ('brave_key_id', $v, $now) ON DUPLICATE KEY UPDATE value = $v, updated_at = $now")
-        .bind(("v", body.key_id))
-        .bind(("now", now))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    upsert_setting(&state, "brave_key_id".to_string(), body.key_id, now).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(json!({ "ok": true })))
 }

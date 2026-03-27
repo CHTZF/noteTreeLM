@@ -15,6 +15,7 @@ struct AuthStoreInner {
     jwt_secret: String,
     master_token_hash: String,
     devices: HashMap<String, DeviceToken>, // device_id -> DeviceToken
+    pairing_codes: HashMap<String, i64>,   // code -> expires_at (unix ts)
 }
 
 impl AuthStore {
@@ -34,7 +35,31 @@ impl AuthStore {
                 jwt_secret,
                 master_token_hash,
                 devices: HashMap::new(),
+                pairing_codes: HashMap::new(),
             })),
+        }
+    }
+
+    /// Generate a short-lived one-time pairing code (valid 5 minutes).
+    pub async fn generate_pairing_code(&self) -> String {
+        let code = generate_random_token(6); // 12 hex chars
+        let expires_at = Utc::now().timestamp() + 300; // 5 min
+        let mut inner = self.inner.write().await;
+        // Clean up expired codes
+        inner.pairing_codes.retain(|_, &mut exp| exp > Utc::now().timestamp());
+        inner.pairing_codes.insert(code.clone(), expires_at);
+        code
+    }
+
+    /// Consume a pairing code (one-time use). Returns true if valid and not expired.
+    pub async fn consume_pairing_code(&self, code: &str) -> bool {
+        let mut inner = self.inner.write().await;
+        let now = Utc::now().timestamp();
+        if let Some(&expires_at) = inner.pairing_codes.get(code) {
+            inner.pairing_codes.remove(code);
+            expires_at > now
+        } else {
+            false
         }
     }
 

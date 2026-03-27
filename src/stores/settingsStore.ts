@@ -23,6 +23,41 @@ interface SettingsStore {
   setApiKey: (provider: string, key: string) => Promise<void>
 }
 
+/**
+ * Coerce a raw Record<string, string> from the DB back into typed Settings.
+ * Uses DEFAULT_SETTINGS as the type oracle: if the default is a number/boolean/array/object,
+ * parse the string value accordingly.
+ */
+function coerceSettings(raw: Record<string, unknown>): Settings {
+  const result: Record<string, unknown> = { ...DEFAULT_SETTINGS }
+  for (const key of Object.keys(DEFAULT_SETTINGS) as (keyof Settings)[]) {
+    const rawVal = raw[key]
+    if (rawVal === undefined || rawVal === null) continue
+    const defaultVal = DEFAULT_SETTINGS[key]
+    if (typeof defaultVal === 'boolean') {
+      result[key] = rawVal === 'true' || rawVal === true
+    } else if (typeof defaultVal === 'number') {
+      const n = Number(rawVal)
+      result[key] = isNaN(n) ? defaultVal : n
+    } else if (Array.isArray(defaultVal)) {
+      if (typeof rawVal === 'string') {
+        try { result[key] = JSON.parse(rawVal) } catch { result[key] = defaultVal }
+      } else {
+        result[key] = rawVal
+      }
+    } else if (typeof defaultVal === 'object' && defaultVal !== null) {
+      if (typeof rawVal === 'string') {
+        try { result[key] = JSON.parse(rawVal) } catch { result[key] = defaultVal }
+      } else {
+        result[key] = rawVal
+      }
+    } else {
+      result[key] = rawVal
+    }
+  }
+  return result as unknown as Settings
+}
+
 export const useSettingsStore = create<SettingsStore>((set, get) => ({
   settings: DEFAULT_SETTINGS,
   isLoaded: false,
@@ -37,13 +72,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         api.getUserSettings().catch(() => ({} as Record<string, string>)),
       ])
       const raw = { ...globalRaw, ...userRaw }
-      const settings: Settings = {
-        ...DEFAULT_SETTINGS,
-        ...raw,
-        sort_orders: typeof raw.sort_orders === 'string'
-          ? JSON.parse(raw.sort_orders || '{}')
-          : (raw.sort_orders ?? {}),
-      }
+      const settings: Settings = coerceSettings(raw)
       set({ settings, isLoaded: true })
       // Fetch vault UUID and keep it reactive in the store
       const { invoke } = await import('@tauri-apps/api/core')

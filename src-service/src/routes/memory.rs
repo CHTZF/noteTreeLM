@@ -52,7 +52,7 @@ async fn list_memory_rules(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let mut resp = state
         .db
-        .query("SELECT rule_id, vault_id, pattern_type, pattern, value, created_at FROM memory_rules WHERE vault_id = $vid ORDER BY created_at DESC")
+        .query("SELECT rule_id, vault_id, pattern_type, pattern, `value`, created_at FROM memory_rules WHERE vault_id = $vid ORDER BY created_at DESC")
         .bind(("vid", vault_id))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -89,7 +89,7 @@ async fn create_memory_rule(
 
     state
         .db
-        .query("INSERT INTO memory_rules (rule_id, vault_id, pattern_type, pattern, value, created_at) VALUES ($rid, $vid, $ptype, $pat, $val, $now)")
+        .query("INSERT INTO memory_rules (rule_id, vault_id, pattern_type, pattern, `value`, created_at) VALUES ($rid, $vid, $ptype, $pat, $val, $now)")
         .bind(("rid", rule_id.clone()))
         .bind(("vid", vault_id))
         .bind(("ptype", pattern_type))

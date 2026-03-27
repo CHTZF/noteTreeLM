@@ -27,9 +27,9 @@ async fn run_migrations(db: &SurrealDb) -> Result<(), surrealdb::Error> {
     let stmts: &[&str] = &[
         // ── daemon infra ────────────────────────────────────────────────────
         "DEFINE TABLE IF NOT EXISTS daemon_secrets SCHEMAFULL;",
-        "DEFINE FIELD IF NOT EXISTS key   ON daemon_secrets TYPE string;",
-        "DEFINE FIELD IF NOT EXISTS value ON daemon_secrets TYPE string;",
-        "DEFINE INDEX IF NOT EXISTS idx_ds_key ON daemon_secrets FIELDS key UNIQUE;",
+        "DEFINE FIELD IF NOT EXISTS `key`   ON daemon_secrets TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS `value` ON daemon_secrets TYPE string;",
+        "DEFINE INDEX IF NOT EXISTS idx_ds_key ON daemon_secrets FIELDS `key` UNIQUE;",
 
         "DEFINE TABLE IF NOT EXISTS device_tokens SCHEMAFULL;",
         "DEFINE FIELD IF NOT EXISTS device_id          ON device_tokens TYPE string;",
@@ -71,18 +71,18 @@ async fn run_migrations(db: &SurrealDb) -> Result<(), surrealdb::Error> {
         "DEFINE INDEX IF NOT EXISTS idx_sessions_token ON sessions FIELDS token UNIQUE;",
 
         // ── settings ─────────────────────────────────────────────────────────
-        "DEFINE TABLE IF NOT EXISTS settings SCHEMALESS;",
-        "DEFINE FIELD IF NOT EXISTS key        ON settings TYPE string;",
-        "DEFINE FIELD IF NOT EXISTS value      ON settings TYPE string;",
-        "DEFINE FIELD IF NOT EXISTS updated_at ON settings TYPE int DEFAULT 0;",
-        "DEFINE INDEX IF NOT EXISTS idx_settings_key ON settings FIELDS key UNIQUE;",
+        "DEFINE TABLE IF NOT EXISTS `settings` SCHEMALESS;",
+        "DEFINE FIELD IF NOT EXISTS `key`      ON `settings` TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS `value`    ON `settings` TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS updated_at ON `settings` TYPE int DEFAULT 0;",
+        "DEFINE INDEX IF NOT EXISTS idx_settings_key ON `settings` FIELDS `key` UNIQUE;",
 
         "DEFINE TABLE IF NOT EXISTS user_settings SCHEMALESS;",
         "DEFINE FIELD IF NOT EXISTS username   ON user_settings TYPE string;",
-        "DEFINE FIELD IF NOT EXISTS key        ON user_settings TYPE string;",
-        "DEFINE FIELD IF NOT EXISTS value      ON user_settings TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS `key`      ON user_settings TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS `value`    ON user_settings TYPE string;",
         "DEFINE FIELD IF NOT EXISTS updated_at ON user_settings TYPE int DEFAULT 0;",
-        "DEFINE INDEX IF NOT EXISTS idx_user_settings_uk ON user_settings FIELDS username, key UNIQUE;",
+        "DEFINE INDEX IF NOT EXISTS idx_user_settings_uk ON user_settings FIELDS username, `key` UNIQUE;",
 
         // ── vault states & vaults ────────────────────────────────────────────
         "DEFINE TABLE IF NOT EXISTS vault_states SCHEMALESS;",
@@ -286,7 +286,7 @@ async fn run_migrations(db: &SurrealDb) -> Result<(), surrealdb::Error> {
         "DEFINE FIELD IF NOT EXISTS vault_id     ON memory_rules TYPE string;",
         "DEFINE FIELD IF NOT EXISTS pattern_type ON memory_rules TYPE string;",
         "DEFINE FIELD IF NOT EXISTS pattern      ON memory_rules TYPE string;",
-        "DEFINE FIELD IF NOT EXISTS value        ON memory_rules TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS `value`      ON memory_rules TYPE string;",
         "DEFINE FIELD IF NOT EXISTS created_at   ON memory_rules TYPE int DEFAULT 0;",
 
         // ── assets ───────────────────────────────────────────────────────────

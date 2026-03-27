@@ -22,12 +22,13 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # TLS
 rcgen = "0.13"
-rustls = "0.23"
+rustls = { version = "0.23", features = ["ring"] }
 
 # mDNS
 mdns-sd = "0.18"
 
 # Utilities
+base64 = "0.22"
 sha2 = "0.10"
 hex = "0.4"
 uuid = { version = "1", features = ["v4"] }

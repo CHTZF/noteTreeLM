@@ -24,6 +24,7 @@ fn build_plist(binary_path: &std::path::Path) -> String {
         .map(|h| h.join("Library/Logs/noteTreeLM"))
         .unwrap_or_else(|| PathBuf::from("/tmp"));
 
+    // Include common Homebrew/system paths so cloudflared is found by the daemon
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -46,6 +47,8 @@ fn build_plist(binary_path: &std::path::Path) -> String {
     <dict>
         <key>RUST_LOG</key>
         <string>info</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
 </dict>
 </plist>"#,

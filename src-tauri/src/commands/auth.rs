@@ -234,23 +234,20 @@ pub async fn start_google_oauth(app: tauri::AppHandle, state: tauri::State<'_, A
         .json::<serde_json::Value>().await.map_err(|e| format!("UserInfo 解析失敗: {e}"))?;
 
     let email    = userinfo["email"].as_str().ok_or("無法取得 Email")?;
-    let name     = userinfo["name"].as_str().unwrap_or(email);
-    let username = name.to_string();
+    // Use email as username (unique across Google accounts)
+    let username = email.to_string();
+    // Use stable Google sub as credential — never changes between sessions
+    let sub = userinfo["sub"].as_str().ok_or("無法取得 Google sub")?;
 
-    // 用 daemon register (upsert) + login 取得 token
-    let _ = state.http_client
-        .post(format!("{}/auth/register", DAEMON_BASE))
-        .json(&serde_json::json!({"username": username, "password": access_token, "auth_provider": "google"}))
-        .send().await;
-
+    // Single-step upsert: creates or updates user + returns session token
     #[derive(Deserialize)]
     struct LoginResp { token: String, username: String, expires_at: i64 }
     let resp = daemon_post::<_, LoginResp>(
         &state.http_client,
-        "/auth/login",
-        &serde_json::json!({"username": username, "password": access_token}),
+        "/auth/google-upsert",
+        &serde_json::json!({"username": username, "sub": sub}),
         None,
-    ).await.map_err(|e| format!("登入失敗：{}", e))?;
+    ).await.map_err(|e| format!("Google 登入失敗：{e}"))?;
 
     state.set_auth_token(resp.token.clone()).await;
     state.set_username(resp.username.clone()).await;

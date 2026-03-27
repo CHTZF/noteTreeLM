@@ -182,7 +182,7 @@ export default function AgentsPage() {
                 <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-primary)', flex: 1 }}>{def.name}</span>
                 {def.slept_at && (
                   <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>
-                    休眠於 {new Date(def.slept_at).toLocaleDateString()}
+                    休眠於 {new Date(def.slept_at * 1000).toLocaleDateString()}
                   </span>
                 )}
                 <button

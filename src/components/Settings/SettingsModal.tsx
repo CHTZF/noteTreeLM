@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
+import { QRCodeSVG } from 'qrcode.react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { api } from '../../lib/api'
@@ -37,7 +38,7 @@ interface MemoryRuleEntry {
   created_at: number
 }
 
-type Tab = 'account' | 'general' | 'ai' | 'voice' | 'local' | 'advanced' | 'raw' | 'memory'
+type Tab = 'account' | 'general' | 'ai' | 'voice' | 'local' | 'advanced' | 'raw' | 'memory' | 'mobile'
 type ServerStatus = 'unknown' | 'running' | 'loading' | 'stopped'
 
 // Provider → 預設模型清單
@@ -148,6 +149,27 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
   const [newRulePattern, setNewRulePattern] = useState('')
   const [newRuleValue, setNewRuleValue] = useState('')
 
+  // Mobile tab state
+  const [mobileTunnelUrl, setMobileTunnelUrl] = useState<string | null>(null)
+  const [mobileLoading, setMobileLoading] = useState(false)
+  const [mobilePairingCode, setMobilePairingCode] = useState<string | null>(null)
+
+  const fetchPairingInfo = useCallback(async () => {
+    setMobileLoading(true)
+    try {
+      const [info, codeResp] = await Promise.all([
+        api.pairingInfo(),
+        api.generatePairingCode().catch(() => null),
+      ])
+      setMobileTunnelUrl(info.tunnel_url ?? null)
+      setMobilePairingCode(codeResp?.pairing_code ?? null)
+    } catch {
+      setMobileTunnelUrl(null)
+    } finally {
+      setMobileLoading(false)
+    }
+  }, [])
+
   // Account tab state
   const [currentPassword, setCurrentPassword] = useState('')
   const [newPassword, setNewPassword] = useState('')
@@ -169,6 +191,11 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
   useEffect(() => {
     if (mode === 'system') loadSystem()
   }, [mode])
+
+  // Auto-fetch pairing info when mobile tab is opened
+  useEffect(() => {
+    if (tab === 'mobile') fetchPairingInfo()
+  }, [tab])
 
   useEffect(() => {
     if (mode === 'system' && systemSettings)
@@ -581,7 +608,7 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
 
   const tabs: [Tab, string][] = mode === 'system'
     ? [['ai', t('settings.tab.ai')], ['voice', t('settings.tab.voice')], ['local', t('settings.tab.local')], ['advanced', t('settings.tab.advanced')], ['raw', t('settings.tab.raw')]]
-    : [['account', t('settings.tab.account')], ['general', t('settings.tab.general')], ['advanced', t('settings.tab.advanced')], ['memory', t('settings.tab.memory')], ['raw', t('settings.tab.raw')]]
+    : [['account', t('settings.tab.account')], ['general', t('settings.tab.general')], ['advanced', t('settings.tab.advanced')], ['memory', t('settings.tab.memory')], ['mobile', 'Mobile'], ['raw', t('settings.tab.raw')]]
 
   const handleChangePassword = async () => {
     if (!newPassword || newPassword !== confirmPassword) {
@@ -1800,6 +1827,67 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                 </div>
               )
             })()}
+
+          {/* ── Mobile tab ── */}
+          {tab === 'mobile' && (
+            <div style={{ padding: '24px 28px', overflowY: 'auto', flex: 1 }}>
+              <div style={{ fontWeight: 600, fontSize: '14px', marginBottom: '16px' }}>Mobile 配對</div>
+
+              <p style={{ fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '20px', lineHeight: 1.6 }}>
+                掃描 QR code 讓手機 app 連接你的電腦。服務啟動時會自動下載{' '}
+                <code style={{ background: 'var(--color-bg-base)', padding: '1px 4px', borderRadius: '3px' }}>cloudflared</code>
+                建立安全通道。配對碼為一次性使用，5 分鐘內有效。
+              </p>
+
+              {/* Tunnel status row */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '24px' }}>
+                <div style={{
+                  width: '8px', height: '8px', borderRadius: '50%', flexShrink: 0,
+                  background: mobileTunnelUrl ? '#4caf50' : 'var(--color-border)',
+                }} />
+                <span style={{ fontSize: '12px', color: 'var(--color-text-secondary)', wordBreak: 'break-all' }}>
+                  {mobileLoading
+                    ? '檢查中…'
+                    : mobileTunnelUrl
+                      ? `Tunnel 啟動：${mobileTunnelUrl}`
+                      : 'Tunnel 未啟動（cloudflared 未偵測到）'}
+                </span>
+                <button
+                  onClick={fetchPairingInfo}
+                  disabled={mobileLoading}
+                  style={{ marginLeft: 'auto', flexShrink: 0, padding: '4px 12px', borderRadius: '6px', fontSize: '12px', border: '1px solid var(--color-border)', background: 'transparent', color: 'var(--color-text-secondary)', cursor: 'pointer' }}
+                >重新整理</button>
+              </div>
+
+              {/* QR code */}
+              {mobileTunnelUrl && mobilePairingCode ? (
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px' }}>
+                  <div style={{ padding: '16px', background: '#ffffff', borderRadius: '12px', display: 'inline-block' }}>
+                    <QRCodeSVG
+                      value={JSON.stringify({ url: mobileTunnelUrl, pairing_code: mobilePairingCode })}
+                      size={200}
+                      level="M"
+                    />
+                  </div>
+                  <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', textAlign: 'center', maxWidth: '280px', lineHeight: 1.6 }}>
+                    此配對碼 5 分鐘內有效且只能使用一次。點選「重新整理」取得新的配對碼。
+                  </p>
+                  <button
+                    onClick={() => {
+                      navigator.clipboard.writeText(
+                        JSON.stringify({ url: mobileTunnelUrl, pairing_code: mobilePairingCode })
+                      ).catch(() => {})
+                    }}
+                    style={{ padding: '5px 14px', borderRadius: '6px', fontSize: '12px', border: '1px solid var(--color-border)', background: 'transparent', color: 'var(--color-text-secondary)', cursor: 'pointer' }}
+                  >複製配對資訊</button>
+                </div>
+              ) : !mobileLoading && (
+                <div style={{ textAlign: 'center', color: 'var(--color-text-muted)', fontSize: '12px', padding: '40px 0' }}>
+                  安裝 cloudflared 後點選「重新整理」
+                </div>
+              )}
+            </div>
+          )}
 
           </div>
         </div>
