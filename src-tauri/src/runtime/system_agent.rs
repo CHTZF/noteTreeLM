@@ -29,6 +29,10 @@ pub struct NewSkillSpec {
     pub behavior: String,
     #[serde(default = "default_passive")]
     pub injection_mode: String,
+    #[serde(default)]
+    pub need_tool_chain: bool,
+    #[serde(default)]
+    pub tool_chain_order: Vec<String>,
 }
 
 fn default_passive() -> String { "passive".to_string() }
@@ -553,6 +557,8 @@ impl SystemAgentService {
                 "trigger_embedding": trigger_embedding,
                 "tool_calls": [],
                 "agent_scope": "all",
+                "need_tool_chain": spec.need_tool_chain,
+                "tool_chain_order": spec.tool_chain_order,
             }),
             tok,
         ).await.map_err(|e| format!("POST agent_skills 失敗: {e}"))?;
@@ -591,10 +597,25 @@ impl SystemAgentService {
             let title = r["title"].as_str().unwrap_or("");
             let trigger = r["trigger"].as_str().unwrap_or("");
             let behavior = r["behavior"].as_str().unwrap_or("");
-            section.push_str(&format!(
-                "## {}\n觸發條件：{}\n行為規範：{}\n\n",
-                title, trigger, behavior
-            ));
+            let need_chain = r["need_tool_chain"].as_bool().unwrap_or(false);
+            let chain_order: Vec<&str> = if need_chain {
+                r["tool_chain_order"].as_array()
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            };
+            if need_chain && !chain_order.is_empty() {
+                section.push_str(&format!(
+                    "## {}\n觸發條件：{}\n行為規範：{}\n工具執行順序：{}\n\n",
+                    title, trigger, behavior, chain_order.join(" → ")
+                ));
+            } else {
+                section.push_str(&format!(
+                    "## {}\n觸發條件：{}\n行為規範：{}\n\n",
+                    title, trigger, behavior
+                ));
+            }
         }
         section
     }

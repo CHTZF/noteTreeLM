@@ -605,21 +605,27 @@ pub async fn invoke_agent(
                 } else {
                     // 收集 behavior 文字（注入 system prompt）
                     let skill_text = matched.iter()
-                        .filter(|(_, _, beh, _)| !beh.is_empty())
-                        .map(|(_, title, beh, _)| format!("[技能：{}]\n{}", title, beh))
+                        .filter(|(_, _, beh, _, _, _)| !beh.is_empty())
+                        .map(|(_, title, beh, _, need_chain, chain_order)| {
+                            if *need_chain && !chain_order.is_empty() {
+                                format!("[技能：{}]\n{}\n工具執行順序：{}", title, beh, chain_order.join(" → "))
+                            } else {
+                                format!("[技能：{}]\n{}", title, beh)
+                            }
+                        })
                         .collect::<Vec<_>>().join("\n\n");
                     let skill_titles: Vec<String> = matched.iter()
-                        .map(|(_, t, _, _)| t.clone())
+                        .map(|(_, t, _, _, _, _)| t.clone())
                         .collect();
                     // 合併所有 skill 的 tool_calls，去重
                     let mut required_tools: Vec<String> = matched.iter()
-                        .flat_map(|(_, _, _, tc)| tc.clone())
+                        .flat_map(|(_, _, _, tc, _, _)| tc.clone())
                         .collect::<std::collections::HashSet<_>>()
                         .into_iter()
                         .collect();
                     required_tools.sort();
                     // 非同步 bump trigger_count（不阻塞主流程）
-                    for (skill_id, _, _, _) in &matched {
+                    for (skill_id, _, _, _, _, _) in &matched {
                         let sid = skill_id.clone();
                         let hc = client.clone();
                         let at = auth_token.clone();
@@ -1565,6 +1571,15 @@ pub fn vault_tools() -> serde_json::Value {
                             "type": "string",
                             "enum": ["passive", "active"],
                             "description": "passive=語意相似時注入；active=永遠注入"
+                        },
+                        "need_tool_chain": {
+                            "type": "boolean",
+                            "description": "工具是否需要嚴格依序執行（有前置條件時設為 true）"
+                        },
+                        "tool_chain_order": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "工具執行順序（need_tool_chain=true 時填入），例如 [\"search_vault\", \"read_note\", \"update_note\"]"
                         }
                     },
                     "required": ["title", "trigger", "behavior"]
@@ -3068,7 +3083,7 @@ fn detect_response_framework(text: &str) -> bool {
 }
 
 /// 工具用：根據 use_ask 語意搜尋最相似的技能規範（daemon 版）。
-/// 回傳 Vec<(skill_id, title, behavior, tool_calls)>。
+/// 回傳 Vec<(skill_id, title, behavior, tool_calls, need_tool_chain, tool_chain_order)>。
 pub(crate) async fn search_skills_for_tool(
     http_client: &reqwest::Client,
     auth_token: &str,
@@ -3076,7 +3091,7 @@ pub(crate) async fn search_skills_for_tool(
     use_ask: &str,
     _emb_url: Option<&str>,
     _llama_client: &reqwest::Client,
-) -> Vec<(String, String, String, Vec<String>)> {
+) -> Vec<(String, String, String, Vec<String>, bool, Vec<String>)> {
     let tok = if auth_token.is_empty() { None } else { Some(auth_token) };
     // daemon 的 GET /vaults/:vid/skills 直接回傳 JSON array（非 {"skills":[...]}）
     let result: serde_json::Value = crate::api_client::daemon_get(
@@ -3111,7 +3126,13 @@ pub(crate) async fn search_skills_for_tool(
         } else {
             vec![]
         };
-        (skill_id, title, behavior, tool_calls)
+        let need_tool_chain = s["need_tool_chain"].as_bool().unwrap_or(false);
+        let tool_chain_order: Vec<String> = if let Some(arr) = s["tool_chain_order"].as_array() {
+            arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+        } else {
+            vec![]
+        };
+        (skill_id, title, behavior, tool_calls, need_tool_chain, tool_chain_order)
     }).collect()
 }
 

@@ -1388,6 +1388,10 @@ pub struct AgentSkillSuggestion {
     pub injection_mode: String,   // "passive"（embedding 比對）或 "active"（永遠注入）
     #[serde(default = "default_scope_all")]
     pub agent_scope: String,      // "all" | "main" | "search" | "write" | "research" | "memory"
+    #[serde(default)]
+    pub need_tool_chain: bool,    // 需要嚴格依序執行工具時為 true
+    #[serde(default)]
+    pub tool_chain_order: Vec<String>, // 工具執行順序（need_tool_chain=true 時有效）
 }
 
 fn default_passive() -> String { "passive".to_string() }
@@ -1413,6 +1417,8 @@ pub struct AgentSkillRecord {
     pub is_active: bool,
     pub injection_mode: String,   // "passive" | "active"
     pub agent_scope: String,      // "all" | "main" | "search" | "write" | "research" | "memory"
+    pub need_tool_chain: bool,
+    pub tool_chain_order: Vec<String>,
     pub trigger_count: i64,
     pub last_triggered_at: Option<i64>, // ms timestamp，None = 從未觸發
     pub created_at: i64,
@@ -1915,6 +1921,8 @@ pub async fn save_agent_skill(
     tool_calls: Vec<String>,
     injection_mode: Option<String>,
     agent_scope: Option<String>,
+    need_tool_chain: Option<bool>,
+    tool_chain_order: Option<Vec<String>>,
 ) -> Result<AgentSkillRecord, AppError> {
     let vault_id = state.get_vault_id().await?;
     let skill_id = uuid::Uuid::new_v4().to_string();
@@ -1929,6 +1937,10 @@ pub async fn save_agent_skill(
         "get_current_datetime", "show_toast",
     ];
     let safe_tools: Vec<String> = tool_calls.into_iter()
+        .filter(|t| allowed.contains(&t.as_str()))
+        .collect();
+    let need_chain = need_tool_chain.unwrap_or(false);
+    let safe_chain: Vec<String> = tool_chain_order.unwrap_or_default().into_iter()
         .filter(|t| allowed.contains(&t.as_str()))
         .collect();
     let created_at = chrono::Utc::now().timestamp_millis();
@@ -1949,6 +1961,8 @@ pub async fn save_agent_skill(
             "is_active": true,
             "injection_mode": mode,
             "agent_scope": scope,
+            "need_tool_chain": need_chain,
+            "tool_chain_order": safe_chain,
             "trigger_count": 0,
             "created_at": created_at,
         }),
@@ -1965,6 +1979,8 @@ pub async fn save_agent_skill(
         is_active: true,
         injection_mode: mode.to_string(),
         agent_scope: scope,
+        need_tool_chain: need_chain,
+        tool_chain_order: safe_chain,
         trigger_count: 0,
         last_triggered_at: None,
         created_at,
@@ -2181,9 +2197,16 @@ fn parse_agent_skill(v: &serde_json::Value) -> Option<AgentSkillRecord> {
     } else {
         vec![]
     };
+    let need_tool_chain = v["need_tool_chain"].as_bool().unwrap_or(false);
+    let tool_chain_order: Vec<String> = if let Some(arr) = v["tool_chain_order"].as_array() {
+        arr.iter().filter_map(|t| t.as_str().map(|s| s.to_string())).collect()
+    } else {
+        vec![]
+    };
     Some(AgentSkillRecord {
         skill_id, vault_id, knowledge_item_id, title, trigger, behavior,
         tool_calls, is_active, injection_mode, agent_scope,
+        need_tool_chain, tool_chain_order,
         trigger_count, last_triggered_at, created_at,
     })
 }
@@ -2355,6 +2378,8 @@ pub async fn generate_skills_via_tool_call(
             is_active: false,
             injection_mode: mode.to_string(),
             agent_scope: scope,
+            need_tool_chain: false,
+            tool_chain_order: vec![],
             trigger_count: 0,
             last_triggered_at: None,
             created_at: now_ms,
