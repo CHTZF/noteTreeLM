@@ -8,7 +8,7 @@ mod state;
 pub mod tools;
 mod vault;
 
-use commands::auth::{login, logout, get_session, get_auth_token, change_password, start_google_oauth};
+use commands::auth::{login, logout, get_session, change_password, start_google_oauth};
 use commands::{
     ai::{stream_chat_external, process_with_llm, stop_llama_server, warmup_llama_server,
          get_llama_server_status, start_llama_server, restart_llama_server,
@@ -158,15 +158,6 @@ pub fn run() {
             });
 
             app_handle.manage(state);
-
-            // 從 session.json 恢復 auth token（若存在且未過期）
-            {
-                let ah = app_handle.clone();
-                let st = app_handle.state::<AppState>();
-                tauri::async_runtime::block_on(
-                    commands::auth::restore_session(&ah, &st)
-                );
-            }
 
             // 若偵測到損壞，延遲 1.5s（等前端 ready）後 emit 通知
             if let Some(reason) = corruption_msg {
@@ -332,7 +323,6 @@ pub fn run() {
             login,
             logout,
             get_session,
-            get_auth_token,
             change_password,
             start_google_oauth,
             // Settings

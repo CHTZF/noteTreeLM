@@ -6,35 +6,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::state::AppState;
 use crate::api_client::{daemon_get, daemon_post, DAEMON_BASE};
 
-fn session_path(app: &tauri::AppHandle) -> std::path::PathBuf {
-    app.path().app_data_dir().expect("app_data_dir").join("session.json")
-}
-
-async fn write_session(app: &tauri::AppHandle, info: &SessionInfo) {
-    if let Ok(json) = serde_json::to_string(info) {
-        let _ = tokio::fs::write(session_path(app), json).await;
-    }
-}
-
-async fn delete_session(app: &tauri::AppHandle) {
-    let _ = tokio::fs::remove_file(session_path(app)).await;
-}
-
-/// 啟動時從 session.json 恢復 auth token（若存在且未過期）。
-pub async fn restore_session(app: &tauri::AppHandle, state: &AppState) {
-    let path = session_path(app);
-    let Ok(bytes) = tokio::fs::read(&path).await else { return };
-    let Ok(info) = serde_json::from_slice::<SessionInfo>(&bytes) else { return };
-    let now = chrono::Utc::now().timestamp();
-    if info.expires_at > now && !info.token.is_empty() {
-        state.set_auth_token(info.token).await;
-        state.set_username(info.username).await;
-    } else {
-        // 過期，清掉
-        let _ = tokio::fs::remove_file(&path).await;
-    }
-}
-
 // ── Google OAuth 2.0 憑證（桌面應用程式類型）────────────────────────────────
 const GOOGLE_OAUTH_JSON: &str = include_str!("../../google-oauth.json");
 
@@ -60,7 +31,6 @@ fn default_auth_provider() -> String { "local".to_string() }
 
 #[tauri::command]
 pub async fn login(
-    app: tauri::AppHandle,
     username: String,
     password: String,
     state: tauri::State<'_, AppState>,
@@ -93,13 +63,11 @@ pub async fn login(
         }
     }
 
-    let info = SessionInfo { token: resp.token, username: resp.username, expires_at: resp.expires_at, auth_provider: "local".to_string() };
-    write_session(&app, &info).await;
-    Ok(info)
+    Ok(SessionInfo { token: resp.token, username: resp.username, expires_at: resp.expires_at, auth_provider: "local".to_string() })
 }
 
 #[tauri::command]
-pub async fn logout(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+pub async fn logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let token = state.get_auth_token().await;
     if !token.is_empty() {
         let _ = daemon_post::<_, serde_json::Value>(
@@ -112,14 +80,7 @@ pub async fn logout(app: tauri::AppHandle, state: tauri::State<'_, AppState>) ->
     state.clear_auth_token().await;
     state.set_username(String::new()).await;
     state.set_vault_uuid(String::new()).await;
-    delete_session(&app).await;
     Ok(())
-}
-
-/// 前端取得目前 auth token（不經過 localStorage）。
-#[tauri::command]
-pub async fn get_auth_token(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    Ok(state.get_auth_token().await)
 }
 
 #[tauri::command]
@@ -305,9 +266,7 @@ pub async fn start_google_oauth(app: tauri::AppHandle, state: tauri::State<'_, A
         }
     }
 
-    let info = SessionInfo { token: resp.token, username: resp.username, expires_at: resp.expires_at, auth_provider: "google".to_string() };
-    write_session(&app, &info).await;
-    Ok(info)
+    Ok(SessionInfo { token: resp.token, username: resp.username, expires_at: resp.expires_at, auth_provider: "google".to_string() })
 }
 
 async fn send_html_response(stream: &mut tokio::net::TcpStream, success: bool) -> std::io::Result<()> {
