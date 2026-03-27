@@ -1,26 +1,36 @@
 const BASE = 'http://127.0.0.1:7787/api/v1'
 
-// Auth token management
-let _token: string | null = localStorage.getItem('daemon_token')
+// Auth token — only in memory, never in localStorage.
+// Populated at startup via initToken() which calls Rust get_auth_token.
+let _token: string | null = null
+
+async function rustInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const { invoke } = await import('@tauri-apps/api/core')
+  return invoke<T>(cmd, args)
+}
 
 // Helper: resolve vault UUID from Tauri AppState (daemon-generated)
-// invoke is imported lazily to avoid bundler issues
 async function getVaultId(): Promise<string> {
   try {
-    const { invoke } = await import('@tauri-apps/api/core')
-    return await invoke<string>('get_vault_uuid')
+    return await rustInvoke<string>('get_vault_uuid')
   } catch {
     return ''
   }
 }
 
+/** 啟動時由 authStore 呼叫一次，從 Rust AppState 取得持久化的 token。 */
+export async function initToken(): Promise<void> {
+  try {
+    const t = await rustInvoke<string>('get_auth_token')
+    _token = t || null
+  } catch {
+    _token = null
+  }
+}
+
+/** 登入/登出後由 authStore 呼叫，只更新 memory。Rust 已負責持久化。 */
 export function setToken(t: string | null) {
   _token = t
-  if (t) {
-    localStorage.setItem('daemon_token', t)
-  } else {
-    localStorage.removeItem('daemon_token')
-  }
 }
 
 export function getToken() {

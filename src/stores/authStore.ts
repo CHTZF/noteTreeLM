@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { invoke } from '@tauri-apps/api/core'
-import { api, setToken } from '../lib/api'
+import { api, setToken, initToken } from '../lib/api'
 
 export interface SessionInfo {
   token: string
@@ -29,6 +29,8 @@ export const useAuthStore = create<AuthStore>((set) => ({
   checkSession: async () => {
     set({ isLoading: true })
     try {
+      // 從 Rust AppState 取得持久化的 token（不依賴 localStorage）
+      await initToken()
       const raw = await api.getSession()
       const session: SessionInfo | null = raw ? {
         token: raw.token,
@@ -36,6 +38,7 @@ export const useAuthStore = create<AuthStore>((set) => ({
         expires_at: raw.expires_at,
         auth_provider: (raw as SessionInfo).auth_provider ?? 'local',
       } : null
+      if (session) setToken(session.token)
       set({ session, isLoading: false })
     } catch {
       set({ session: null, isLoading: false })
@@ -45,15 +48,10 @@ export const useAuthStore = create<AuthStore>((set) => ({
   login: async (username: string, password: string) => {
     set({ isLoading: true, error: null })
     try {
-      const raw = await api.login(username, password)
-      if (raw.token) setToken(raw.token)
-      const session: SessionInfo = {
-        token: raw.token,
-        username: raw.username,
-        expires_at: raw.expires_at,
-        auth_provider: (raw as unknown as SessionInfo).auth_provider ?? 'local',
-      }
-      set({ session, isLoading: false })
+      // login 透過 Tauri invoke，Rust 負責持久化 session.json
+      const raw = await invoke<SessionInfo>('login', { username, password })
+      setToken(raw.token)
+      set({ session: raw, isLoading: false })
     } catch (e: any) {
       set({ isLoading: false, error: typeof e === 'string' ? e : '登入失敗' })
       throw e
@@ -74,9 +72,9 @@ export const useAuthStore = create<AuthStore>((set) => ({
   },
 
   logout: async () => {
-    await api.logout()
+    // logout 透過 Tauri invoke，Rust 負責刪除 session.json
+    await invoke('logout')
     setToken(null)
-    localStorage.removeItem('auth_token')
     set({ session: null })
   },
 
