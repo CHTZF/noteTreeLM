@@ -621,9 +621,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
           .filter(m => m.role === 'user' || m.role === 'assistant')
           .map(m => ({ role: m.role, content: m.content }))
         if (snapshotMsgs.length >= 2) {
-          api.saveMemorySession(snapshotMsgs).catch(() => {})
           lastExtractedMsgCountRef.current = snapshotMsgs.length
-          invoke('extract_memory_facts', { messages: snapshotMsgs }).catch(() => {})
+          invoke('extract_memory_facts', { messages: snapshotMsgs, conversationId: conversationId ?? null }).catch(() => {})
         }
       }
     } catch (e: unknown) {
@@ -671,10 +670,9 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       // 若 auto-save 距今不足 4 條新訊息則跳過 extract（避免重複萃取同份資料）
       const newSinceLastExtract = chatMessages.length - lastExtractedMsgCountRef.current
       const extractOp = newSinceLastExtract >= 4
-        ? invoke('extract_memory_facts', { messages: chatMessages }).catch(() => {})
+        ? invoke('extract_memory_facts', { messages: chatMessages, conversationId: conversationId ?? null }).catch(() => {})
         : Promise.resolve()
       Promise.all([
-        api.saveMemorySession(chatMessages).catch(() => {}),
         extractOp,
         invoke('distill_preferences').catch(() => {}),
         invoke('analyze_tool_patterns').catch(() => {}),

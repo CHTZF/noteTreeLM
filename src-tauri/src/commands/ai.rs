@@ -20,13 +20,11 @@ pub use super::server::{
     start_embedding_server, stop_embedding_server, restart_embedding_server,
 };
 pub(crate) use super::server::ensure_server_running;
-pub use super::external_ai::{
-    stream_chat_external, process_with_llm,
-};
+pub use super::external_ai::process_with_llm;
 pub(crate) use super::external_ai::read_api_key;
 pub use super::memory::{
     add_memory_rule, get_memory_rules, delete_memory_rule,
-    save_memory_session, query_memory,
+    query_memory,
     distill_preferences, extract_memory_facts,
     rate_response, get_conversation_ratings, analyze_tool_patterns,
 };

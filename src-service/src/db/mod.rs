@@ -12,7 +12,7 @@ pub async fn init_db(data_dir: &PathBuf) -> Result<SurrealDb, surrealdb::Error> 
     let connection_str = format!("surrealkv://{}", db_path.display());
 
     let db = surrealdb::engine::any::connect(connection_str).await?;
-    db.use_ns("notetreetlm").use_db("service").await?;
+    db.use_ns("notetreelm").use_db("service").await?;
 
     run_migrations(&db).await?;
     tracing::info!("SurrealDB initialized at {}", db_path.display());
@@ -331,6 +331,18 @@ async fn run_migrations(db: &SurrealDb) -> Result<(), surrealdb::Error> {
         "DEFINE FIELD IF NOT EXISTS reason        ON kb_suggestions TYPE string;",
         "DEFINE FIELD IF NOT EXISTS created_at    ON kb_suggestions TYPE int DEFAULT 0;",
         "DEFINE INDEX IF NOT EXISTS idx_kb_suggestions_id ON kb_suggestions FIELDS suggestion_id UNIQUE;",
+
+        // ── memory facts ─────────────────────────────────────────────────────
+        "DEFINE TABLE IF NOT EXISTS memory_facts SCHEMALESS;",
+        "DEFINE FIELD IF NOT EXISTS fact_id    ON memory_facts TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS vault_id   ON memory_facts TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS conv_id    ON memory_facts TYPE option<string>;",
+        "DEFINE FIELD IF NOT EXISTS content    ON memory_facts TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS category   ON memory_facts TYPE string DEFAULT 'general';",
+        "DEFINE FIELD IF NOT EXISTS expires_at ON memory_facts TYPE int DEFAULT 0;",
+        "DEFINE FIELD IF NOT EXISTS created_at ON memory_facts TYPE int DEFAULT 0;",
+        "DEFINE INDEX IF NOT EXISTS idx_memory_facts_id ON memory_facts FIELDS fact_id UNIQUE;",
+        "DEFINE INDEX IF NOT EXISTS idx_memory_facts_fts ON memory_facts FIELDS content SEARCH ANALYZER noteanalyzer BM25;",
 
         // ── response ratings ─────────────────────────────────────────────────
         "DEFINE TABLE IF NOT EXISTS response_ratings SCHEMALESS;",

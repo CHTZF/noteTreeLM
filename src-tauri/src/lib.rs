@@ -10,11 +10,11 @@ mod vault;
 
 use commands::auth::{login, logout, get_session, change_password, start_google_oauth};
 use commands::{
-    ai::{stream_chat_external, process_with_llm, stop_llama_server, warmup_llama_server,
+    ai::{process_with_llm, stop_llama_server, warmup_llama_server,
          get_llama_server_status, start_llama_server, restart_llama_server,
          warmup_embedding_server, get_embedding_server_status, start_embedding_server,
          stop_embedding_server, restart_embedding_server, check_embedding_endpoint,
-         save_memory_session, query_memory, distill_preferences, analyze_tool_patterns, extract_memory_facts, rate_response, get_conversation_ratings, add_memory_rule,
+         query_memory, distill_preferences, analyze_tool_patterns, extract_memory_facts, rate_response, get_conversation_ratings, add_memory_rule,
          get_memory_rules, delete_memory_rule, confirm_write_tool,
          test_vault_tool, run_tool_pipeline, cancel_tool_test, cancel_agent, invoke_agent, invoke_live_chat,
          set_note_status,
@@ -68,6 +68,73 @@ fn open_devtools(window: tauri::WebviewWindow) {
 #[tauri::command]
 fn is_app_ready(state: tauri::State<AppState>) -> bool {
     state.app_ready.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Subscribe to the notetreelm-service SSE stream and re-emit each event as a Tauri event.
+/// Reconnects automatically on disconnect (up to every 5 seconds).
+async fn subscribe_service_events(app_handle: tauri::AppHandle) {
+    use futures_util::StreamExt;
+
+    loop {
+        let client = match reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        let resp = client
+            .get("http://127.0.0.1:7787/api/v1/events")
+            .header("Accept", "text/event-stream")
+            .send()
+            .await;
+
+        let response = match resp {
+            Ok(r) if r.status().is_success() => r,
+            _ => {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+
+        let mut stream = response.bytes_stream();
+        let mut event_name = String::new();
+        let mut data_buf = String::new();
+
+        while let Some(chunk) = stream.next().await {
+            let bytes = match chunk {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+            let text = match std::str::from_utf8(&bytes) {
+                Ok(t) => t.to_string(),
+                Err(_) => break,
+            };
+
+            // Parse SSE lines
+            for line in text.lines() {
+                if line.starts_with("event:") {
+                    event_name = line["event:".len()..].trim().to_string();
+                } else if line.starts_with("data:") {
+                    data_buf = line["data:".len()..].trim().to_string();
+                } else if line.is_empty() && !event_name.is_empty() {
+                    // Dispatch event
+                    let payload: serde_json::Value = serde_json::from_str(&data_buf)
+                        .unwrap_or(serde_json::json!({}));
+                    let _ = app_handle.emit(&format!("service:{}", event_name), payload);
+                    event_name.clear();
+                    data_buf.clear();
+                }
+            }
+        }
+
+        // Connection dropped — reconnect after 5s
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
 }
 
 /// POST server info to daemon's /servers/register (loopback, ignore errors)
@@ -239,23 +306,17 @@ pub fn run() {
                 let tok_ref2: Option<&str> = if auth_tok2.is_empty() { None } else { Some(&auth_tok2) };
                 crate::crypto::init_encryption_key_daemon(&state.http_client, tok_ref2).await;
 
-                // 預載 API key 進記憶體快取（via daemon API）
-                let auth_tok3 = state.get_auth_token().await;
-                let tok_ref3: Option<&str> = if auth_tok3.is_empty() { None } else { Some(&auth_tok3) };
-                if let Some(provider) = crate::api_client::daemon_get_setting(&state.http_client, tok_ref3, "ai_provider").await {
-                    if !provider.is_empty() {
-                        let db_key = format!("api_key_{}", provider);
-                        let plain = crate::api_client::daemon_get_setting(&state.http_client, tok_ref3, &db_key)
-                            .await
-                            .map(|enc| crate::crypto::decrypt_api_key(&enc))
-                            .unwrap_or_default();
-                        state.api_key_cache.lock().await.insert(provider, plain);
-                    }
-                }
-
                 // 標記 app 初始化完成，通知前端（不等 server warmup）
                 state.app_ready.store(true, std::sync::atomic::Ordering::Relaxed);
                 let _ = app_handle.emit("app:ready", serde_json::json!({}));
+
+                // 訂閱 notetreelm-service SSE 事件，轉發為 Tauri emit
+                {
+                    let ah = app_handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        subscribe_service_events(ah).await;
+                    });
+                }
 
                 // 以下為背景任務，不阻塞 app 載入
 
@@ -428,7 +489,6 @@ pub fn run() {
             start_whisper_server,
             restart_whisper_server,
             // AI / LLM
-            stream_chat_external,
             process_with_llm,
             confirm_write_tool,
             test_vault_tool,
@@ -443,7 +503,6 @@ pub fn run() {
             stop_embedding_server,
             restart_embedding_server,
             check_embedding_endpoint,
-            save_memory_session,
             query_memory,
             distill_preferences,
             analyze_tool_patterns,

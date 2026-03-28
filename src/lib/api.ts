@@ -252,10 +252,6 @@ export const api = {
   },
 
   // Memory
-  saveMemorySession: async (messages: unknown[]) => {
-    const vaultId = await getVaultId()
-    return request<{ ok: boolean }>('POST', `/vaults/${encodeURIComponent(vaultId)}/memory/session`, { messages })
-  },
   queryMemory: async (keywords: string[], limit: number) => {
     const vaultId = await getVaultId()
     return request<unknown[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/memory/query?keywords=${encodeURIComponent(keywords.join(','))}&limit=${limit}`)

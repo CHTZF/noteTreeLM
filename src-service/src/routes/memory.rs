@@ -10,7 +10,6 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::api_state::ApiState;
-use crate::routes::vault::get_vault_path;
 
 pub fn router() -> Router<ApiState> {
     Router::new()
@@ -43,7 +42,7 @@ pub fn router() -> Router<ApiState> {
             get(get_conversation_ratings).post(create_rating),
         )
         .route("/vaults/:vault_id/memory/query", get(query_memory))
-        .route("/vaults/:vault_id/memory/session", post(save_memory_session))
+        .route("/vaults/:vault_id/memory/facts", post(store_facts))
 }
 
 async fn list_memory_rules(
@@ -317,7 +316,7 @@ async fn create_rating(
 #[derive(Deserialize)]
 struct MemoryQueryParams {
     keywords: Option<String>,
-    since: Option<String>,
+    category: Option<String>,
     limit: Option<i64>,
 }
 
@@ -327,13 +326,7 @@ async fn query_memory(
     Query(params): Query<MemoryQueryParams>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(10).min(50);
-    let since_ts: i64 = params.since
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-        .and_then(|d| d.and_hms_opt(0, 0, 0))
-        .map(|dt| dt.and_utc().timestamp())
-        .unwrap_or(0);
+    let now_ts = Utc::now().timestamp();
 
     let keywords: Vec<String> = params.keywords
         .as_deref()
@@ -341,87 +334,137 @@ async fn query_memory(
         .map(|s| s.split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect())
         .unwrap_or_default();
 
-    let rows: Vec<Value> = if keywords.is_empty() {
-        let mut resp = state
-            .db
-            .query("SELECT path, title, modified_at AS created_at, string::slice(content, 0, 200) AS snippet FROM notes WHERE vault_id = $vid AND string::contains(path, 'memories/ai_memory_') AND modified_at >= $since ORDER BY modified_at DESC LIMIT $limit")
+    let categories: Vec<String> = params.category
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect())
+        .unwrap_or_default();
+
+    let rows: Vec<Value> = if keywords.is_empty() && categories.is_empty() {
+        let mut resp = state.db
+            .query("SELECT fact_id, content, category, created_at FROM memory_facts WHERE vault_id = $vid AND expires_at > $now ORDER BY created_at DESC LIMIT $limit")
             .bind(("vid", vault_id))
-            .bind(("since", since_ts))
+            .bind(("now", now_ts))
             .bind(("limit", limit))
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         resp.take(0).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    } else {
+    } else if !keywords.is_empty() && categories.is_empty() {
         let kw = keywords[0].to_lowercase();
-        let mut resp = state
-            .db
-            .query("SELECT path, title, modified_at AS created_at, string::slice(content, 0, 200) AS snippet FROM notes WHERE vault_id = $vid AND string::contains(path, 'memories/ai_memory_') AND string::contains(string::lowercase(content), $kw) AND modified_at >= $since ORDER BY modified_at DESC LIMIT $limit")
+        let mut resp = state.db
+            .query("SELECT fact_id, content, category, created_at FROM memory_facts WHERE vault_id = $vid AND expires_at > $now AND string::contains(string::lowercase(content), $kw) ORDER BY created_at DESC LIMIT $limit")
             .bind(("vid", vault_id))
+            .bind(("now", now_ts))
             .bind(("kw", kw))
-            .bind(("since", since_ts))
             .bind(("limit", limit))
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        resp.take(0).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else if keywords.is_empty() && !categories.is_empty() {
+        // category filter only — SurrealDB doesn't support IN with bind arrays cleanly, use OR
+        let cat_cond = categories.iter().enumerate()
+            .map(|(i, _)| format!("category = $cat{}", i))
+            .collect::<Vec<_>>().join(" OR ");
+        let mut qb = state.db
+            .query(format!("SELECT fact_id, content, category, created_at FROM memory_facts WHERE vault_id = $vid AND expires_at > $now AND ({}) ORDER BY created_at DESC LIMIT $limit", cat_cond))
+            .bind(("vid", vault_id))
+            .bind(("now", now_ts))
+            .bind(("limit", limit));
+        for (i, cat) in categories.iter().enumerate() {
+            qb = qb.bind((format!("cat{}", i), cat.clone()));
+        }
+        let mut resp = qb.await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        resp.take(0).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else {
+        let kw = keywords[0].to_lowercase();
+        let cat_cond = categories.iter().enumerate()
+            .map(|(i, _)| format!("category = $cat{}", i))
+            .collect::<Vec<_>>().join(" OR ");
+        let mut qb = state.db
+            .query(format!("SELECT fact_id, content, category, created_at FROM memory_facts WHERE vault_id = $vid AND expires_at > $now AND string::contains(string::lowercase(content), $kw) AND ({}) ORDER BY created_at DESC LIMIT $limit", cat_cond))
+            .bind(("vid", vault_id))
+            .bind(("now", now_ts))
+            .bind(("kw", kw))
+            .bind(("limit", limit));
+        for (i, cat) in categories.iter().enumerate() {
+            qb = qb.bind((format!("cat{}", i), cat.clone()));
+        }
+        let mut resp = qb.await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         resp.take(0).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
 
     Ok(Json(json!(rows)))
 }
 
-// ── Memory Session ─────────────────────────────────────────────────────────────
+// ── Store Facts ────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
-struct SaveMemorySessionBody {
-    messages: Vec<Value>,
+struct FactInput {
+    content: String,
+    category: Option<String>,
+    conv_id: Option<String>,
 }
 
-async fn save_memory_session(
+#[derive(Deserialize)]
+struct StoreFactsBody {
+    facts: Vec<FactInput>,
+}
+
+async fn store_facts(
     State(state): State<ApiState>,
     Path(vault_id): Path<String>,
-    Json(body): Json<SaveMemorySessionBody>,
+    Json(body): Json<StoreFactsBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let vault_path = get_vault_path(&state, &vault_id).await?;
+    let now_ts = Utc::now().timestamp();
+    let mut inserted = 0u32;
 
-    let now = chrono::Local::now();
-    let timestamp = now.format("%Y%m%d_%H%M%S").to_string();
-    let display_time = now.format("%Y-%m-%d %H:%M:%S").to_string();
-    let title = format!("AI 對話記憶 — {}", display_time);
-    let rel_path = format!("memories/ai_memory_{}.md", timestamp);
+    for fact in body.facts {
+        let content = fact.content.trim().to_string();
+        if content.is_empty() { continue; }
 
-    // Build markdown content
-    let mut content = format!(
-        "---\ncreated: {}\nmessage_count: {}\n---\n\n# {}\n\n",
-        now.to_rfc3339(),
-        body.messages.iter().filter(|m| m["role"].as_str().unwrap_or("") != "tool").count(),
-        title
-    );
-    for msg in &body.messages {
-        match msg["role"].as_str().unwrap_or("") {
-            "user"      => content.push_str(&format!("**使用者**\n\n{}\n\n---\n\n", msg["content"].as_str().unwrap_or(""))),
-            "assistant" => content.push_str(&format!("**助手**\n\n{}\n\n---\n\n", msg["content"].as_str().unwrap_or(""))),
-            _ => {}
+        let category = fact.category.as_deref().unwrap_or("general").to_string();
+
+        // expires_at: personal/rule → 365 days, others → 90 days
+        let days = if category == "personal" || category == "rule" { 365i64 } else { 90 };
+        let expires_at = now_ts + days * 86400;
+
+        // Dedup: check if a non-expired fact with same prefix (first 40 chars) already exists
+        let prefix: String = content.chars().take(40).collect::<String>().to_lowercase();
+        let mut check = state.db
+            .query("SELECT fact_id FROM memory_facts WHERE vault_id = $vid AND string::startsWith(string::lowercase(content), $prefix) AND expires_at > $now LIMIT 1")
+            .bind(("vid", vault_id.clone()))
+            .bind(("prefix", prefix))
+            .bind(("now", now_ts))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let existing: Vec<Value> = check.take(0)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        if !existing.is_empty() {
+            // Refresh expires_at on existing fact
+            let fact_id = existing[0]["fact_id"].as_str().unwrap_or("").to_string();
+            let _ = state.db
+                .query("UPDATE memory_facts SET expires_at = $exp WHERE fact_id = $fid")
+                .bind(("exp", expires_at))
+                .bind(("fid", fact_id))
+                .await;
+            continue;
         }
+
+        let fact_id = Uuid::new_v4().to_string();
+        state.db
+            .query("INSERT INTO memory_facts (fact_id, vault_id, conv_id, content, category, expires_at, created_at) VALUES ($fid, $vid, $cid, $content, $cat, $exp, $now)")
+            .bind(("fid", fact_id))
+            .bind(("vid", vault_id.clone()))
+            .bind(("cid", fact.conv_id.unwrap_or_default()))
+            .bind(("content", content))
+            .bind(("cat", category))
+            .bind(("exp", expires_at))
+            .bind(("now", now_ts))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        inserted += 1;
     }
 
-    // Write to disk
-    let abs_path = std::path::Path::new(&vault_path).join(&rel_path);
-    if let Some(parent) = abs_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    }
-    std::fs::write(&abs_path, &content).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Index in DB
-    let word_count = content.split_whitespace().count() as i64;
-    let ts = Utc::now().timestamp();
-    let _ = state.db
-        .query("INSERT INTO notes (vault_id, path, title, content, word_count, created_at, modified_at) VALUES ($vid, $path, $title, $content, $wc, $now, $now) ON DUPLICATE KEY UPDATE title = $title, content = $content, word_count = $wc, modified_at = $now")
-        .bind(("vid", vault_id))
-        .bind(("path", rel_path.clone()))
-        .bind(("title", title))
-        .bind(("content", content))
-        .bind(("wc", word_count))
-        .bind(("now", ts))
-        .await;
-
-    Ok(Json(json!({ "ok": true, "path": rel_path })))
+    Ok(Json(json!({ "inserted": inserted })))
 }

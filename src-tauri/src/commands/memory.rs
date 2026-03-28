@@ -1,7 +1,6 @@
 use crate::{api_client::{daemon_delete, daemon_get, daemon_post}, error::AppError, state::AppState};
 use chrono::Local;
 use serde::Serialize;
-use std::path::PathBuf;
 use tauri::State;
 
 use super::ai::ChatMessage;
@@ -77,62 +76,6 @@ pub async fn delete_memory_rule(state: State<'_, AppState>, id: i64) -> Result<(
     Ok(())
 }
 
-// ─── Memory Session ────────────────────────────────────────────────────────────
-
-/// Agent 工具：查詢記憶筆記（回傳格式化純文字，供 LLM 直接使用）
-/// 將當前對話原文儲存為記憶筆記（memories/ai_memory_[timestamp].md）
-/// 返回建立的筆記相對路徑
-#[tauri::command]
-pub async fn save_memory_session(
-    state: State<'_, AppState>,
-    messages: Vec<ChatMessage>,
-) -> Result<String, AppError> {
-    let vault_path = state.get_vault_path().await;
-    if vault_path.is_empty() {
-        return Err(AppError::Vault("未設定 Vault 路徑".to_string()));
-    }
-
-    let now = Local::now();
-    let timestamp = now.format("%Y%m%d_%H%M%S").to_string();
-    let display_time = now.format("%Y-%m-%d %H:%M:%S").to_string();
-    let title = format!("AI 對話記憶 — {}", display_time);
-    let rel_path = format!("memories/ai_memory_{}.md", timestamp);
-
-    let vault_id = state.get_vault_id().await?;
-    let token = state.get_auth_token().await;
-    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
-
-    let memories_dir = PathBuf::from(&vault_path).join("memories");
-    tokio::fs::create_dir_all(&memories_dir).await
-        .map_err(|e| AppError::Vault(format!("建立 memories 資料夾失敗：{}", e)))?;
-
-    let mut content = format!(
-        "---\ncreated: {}\nmessage_count: {}\n---\n\n# {}\n\n",
-        now.to_rfc3339(),
-        messages.iter().filter(|m| m.role != "tool").count(),
-        title
-    );
-    for msg in &messages {
-        match msg.role.as_str() {
-            "user"      => content.push_str(&format!("**使用者**\n\n{}\n\n---\n\n", msg.content)),
-            "assistant" => content.push_str(&format!("**助手**\n\n{}\n\n---\n\n", msg.content)),
-            _ => {}
-        }
-    }
-
-    let abs_path = PathBuf::from(&vault_path).join(&rel_path);
-    tokio::fs::write(&abs_path, &content).await
-        .map_err(|e| AppError::Vault(format!("寫入記憶筆記失敗：{}", e)))?;
-
-    daemon_post::<_, serde_json::Value>(
-        &state.http_client,
-        &format!("/vaults/{}/notes", urlencoding::encode(&vault_id)),
-        &serde_json::json!({"path": rel_path, "title": title, "content": content}),
-        tok,
-    ).await.ok();
-
-    Ok(rel_path)
-}
 
 // ─── Memory Query ──────────────────────────────────────────────────────────────
 
@@ -183,14 +126,13 @@ pub async fn query_memory(
 
 // ─── Preference Distillation ──────────────────────────────────────────────────
 
-/// 從最近對話記憶中蒸餾使用者偏好，寫入 preferences/user_prefs.md 並注入為 active skill
+/// 從 memory_facts 蒸餾使用者偏好，upsert 為特殊 agent_skill（pure DB，不寫 disk）
 #[tauri::command]
 pub async fn distill_preferences(state: State<'_, AppState>) -> Result<(), AppError> {
     let vault_id = match state.get_vault_id().await {
         Ok(vid) => vid,
         Err(_) => return Ok(()),
     };
-    let vault_path = state.get_vault_path().await;
 
     let base_url = {
         let port = *state.llama_actual_port.lock().await;
@@ -200,38 +142,36 @@ pub async fn distill_preferences(state: State<'_, AppState>) -> Result<(), AppEr
         }
     };
 
-    // Query recent memory notes from vault filesystem
-    let memories_dir = std::path::PathBuf::from(&vault_path).join("memories");
-    let mut memory_contents: Vec<String> = Vec::new();
-    if let Ok(mut entries) = tokio::fs::read_dir(&memories_dir).await {
-        let mut paths: Vec<std::path::PathBuf> = Vec::new();
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                paths.push(path);
-            }
-        }
-        // Sort by filename descending (timestamps in filename)
-        paths.sort_by(|a, b| b.cmp(a));
-        for path in paths.into_iter().take(5) {
-            if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                memory_contents.push(content.chars().take(2000).collect());
-            }
-        }
-    }
-    if memory_contents.is_empty() { return Ok(()); }
-    let combined: String = memory_contents.join("\n\n---\n\n");
+    let token = state.get_auth_token().await;
+    let tok: Option<&str> = if token.is_empty() { None } else { Some(token.as_str()) };
 
-    let client = state.http_client.clone();
+    // Read recent personal/preference/rule facts from daemon
+    let url = format!(
+        "/vaults/{}/memory/query?category=personal,preference,rule&limit=30",
+        urlencoding::encode(&vault_id)
+    );
+    let facts: Vec<serde_json::Value> = daemon_get(&state.http_client, &url, tok)
+        .await.unwrap_or_default();
+
+    if facts.is_empty() { return Ok(()); }
+
+    let combined = facts.iter()
+        .filter_map(|f| {
+            let cat = f["category"].as_str().unwrap_or("general");
+            let content = f["content"].as_str()?;
+            Some(format!("[{}] {}", cat, content))
+        })
+        .collect::<Vec<_>>().join("\n");
+
     let body = serde_json::json!({
         "messages": [
             {
                 "role": "system",
-                "content": "你是一個使用者偏好分析系統。從以下對話記憶中，提取使用者的：\n1. 工作習慣與偏好（如回答風格、語言偏好）\n2. 常見需求模式\n3. 個人背景資訊（如果有）\n4. 重要規則（使用者明確表達的規定）\n\n輸出格式：條列式，每條以「- 」開頭，簡潔描述。不超過 15 條。只輸出偏好列表，不要說明或解釋。"
+                "content": "你是使用者偏好分析系統。從以下記憶事實中，整理出使用者的偏好規則。\n輸出格式：條列式，每條以「- 」開頭，簡潔描述。不超過 15 條。只輸出列表，不要說明。"
             },
             {
                 "role": "user",
-                "content": format!("以下是最近的對話記憶，請提取使用者偏好：\n\n{}", combined)
+                "content": format!("記憶事實：\n{}", combined)
             }
         ],
         "max_tokens": 512,
@@ -239,12 +179,11 @@ pub async fn distill_preferences(state: State<'_, AppState>) -> Result<(), AppEr
         "stream": false,
     });
 
-    let http_resp = match client
+    let http_resp = match state.http_client
         .post(format!("{}/v1/chat/completions", base_url))
         .json(&body)
         .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
+        .send().await
     {
         Ok(r) if r.status().is_success() => r,
         _ => return Ok(()),
@@ -261,28 +200,22 @@ pub async fn distill_preferences(state: State<'_, AppState>) -> Result<(), AppEr
     };
 
     let now = Local::now();
-    let content = format!(
-        "---\ncreated: {}\n---\n\n# 使用者偏好（自動蒸餾）\n\n更新時間：{}\n\n{}\n",
-        now.to_rfc3339(),
-        now.format("%Y-%m-%d %H:%M"),
-        prefs
+    let behavior = format!(
+        "更新時間：{}\n\n{}", now.format("%Y-%m-%d %H:%M"), prefs
     );
 
-    if !vault_path.is_empty() {
-        let prefs_dir = std::path::PathBuf::from(&vault_path).join("preferences");
-        tokio::fs::create_dir_all(&prefs_dir).await.ok();
-        let abs_path = prefs_dir.join("user_prefs.md");
-        tokio::fs::write(&abs_path, &content).await.ok();
-    }
-
-    // Post to daemon so it can index the preferences note
-    let token = state.get_auth_token().await;
-    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
-    let rel_path = "preferences/user_prefs.md".to_string();
+    // Upsert as a special agent_skill so it gets auto-injected as context
     daemon_post::<_, serde_json::Value>(
         &state.http_client,
-        &format!("/vaults/{}/notes", urlencoding::encode(&vault_id)),
-        &serde_json::json!({"path": rel_path, "title": "使用者偏好（自動蒸餾）", "content": content}),
+        &format!("/vaults/{}/skills", urlencoding::encode(&vault_id)),
+        &serde_json::json!({
+            "skill_id": "distilled_user_prefs",
+            "title": "使用者偏好（自動蒸餾）",
+            "trigger": "__auto_injected__",
+            "behavior": behavior,
+            "is_active": true,
+            "injection_mode": "system",
+        }),
         tok,
     ).await.ok();
 
@@ -366,11 +299,12 @@ pub async fn analyze_tool_patterns(state: State<'_, AppState>) -> Result<u32, Ap
 
 // ─── Memory Fact Extraction ────────────────────────────────────────────────────
 
-/// 從對話中萃取離散記憶事實，儲存為記憶筆記片段供未來查詢
+/// 從對話中萃取帶分類的記憶事實，存入 memory_facts DB（不寫 disk）
 #[tauri::command]
 pub async fn extract_memory_facts(
     state: State<'_, AppState>,
     messages: Vec<ChatMessage>,
+    conversation_id: Option<String>,
 ) -> Result<u32, AppError> {
     if messages.is_empty() { return Ok(0); }
 
@@ -382,23 +316,61 @@ pub async fn extract_memory_facts(
         }
     };
 
-    // Build conversation text
+    let vault_id = match state.get_vault_id().await {
+        Ok(v) if !v.is_empty() => v,
+        _ => return Ok(0),
+    };
+    let token = state.get_auth_token().await;
+    let tok: Option<&str> = if token.is_empty() { None } else { Some(token.as_str()) };
+
+    // Fetch existing recent facts for dedup context (pass to LLM)
+    let existing_url = format!(
+        "/vaults/{}/memory/query?limit=20",
+        urlencoding::encode(&vault_id)
+    );
+    let existing_facts: Vec<serde_json::Value> = daemon_get(
+        &state.http_client, &existing_url, tok,
+    ).await.unwrap_or_default();
+    let existing_summary = existing_facts.iter()
+        .filter_map(|f| {
+            let cat = f["category"].as_str().unwrap_or("general");
+            let content = f["content"].as_str()?;
+            Some(format!("[{}] {}", cat, content))
+        })
+        .collect::<Vec<_>>().join("\n");
+
+    // Build conversation text (truncate each message)
     let conv_text: String = messages.iter()
         .filter(|m| m.role == "user" || m.role == "assistant")
-        .map(|m| format!("[{}]: {}", m.role, &m.content.chars().take(500).collect::<String>()))
+        .map(|m| format!("[{}]: {}", m.role, m.content.chars().take(500).collect::<String>()))
         .collect::<Vec<_>>().join("\n");
+
+    let existing_section = if existing_summary.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n已知事實（不要重複）：\n{}", existing_summary)
+    };
+
+    let system_prompt = format!(
+        "從以下對話中萃取 3-5 條具體記憶事實。每條格式：`[category] 事實內容`\n\
+         category 必須是以下其中一個：\n\
+         - personal（個人資訊：姓名、地點、職業等）\n\
+         - preference（偏好風格：回答方式、語言、習慣等）\n\
+         - project（進行中專案或工作）\n\
+         - rule（使用者明確要求的規則）\n\
+         - general（其他值得記住的事實）\n\
+         {}\n\n只輸出事實列表，每行一條，不需說明或編號。",
+        existing_section
+    );
 
     let body = serde_json::json!({
         "messages": [
-            {
-                "role": "system",
-                "content": "從以下對話中萃取 3-5 條具體的、可獨立理解的記憶事實。\n每條以「-」開頭，格式：「- [事實]」。只輸出事實列表，不需說明。",
-            },
+            { "role": "system", "content": system_prompt },
             { "role": "user", "content": conv_text },
         ],
         "stream": false,
         "temperature": 0.1,
-        "max_tokens": 300,
+        "max_tokens": 400,
     });
 
     let client = &state.http_client;
@@ -411,40 +383,41 @@ pub async fn extract_memory_facts(
 
     let Ok(json) = resp.json::<serde_json::Value>().await else { return Ok(0); };
     let facts_text = json["choices"][0]["message"]["content"].as_str().unwrap_or("");
-    let facts: Vec<&str> = facts_text.lines()
-        .filter(|l| l.trim().starts_with('-'))
-        .collect();
-    let count = facts.len() as u32;
 
-    if count > 0 {
-        // Append facts as a note fragment to the latest memory session if vault is set
-        let vault_path = state.get_vault_path().await;
-        if !vault_path.is_empty() {
-            let now = Local::now();
-            let timestamp = now.format("%Y%m%d_%H%M%S").to_string();
-            let rel_path = format!("memories/facts_{}.md", timestamp);
-            let content = format!(
-                "---\ncreated: {}\ntags: [memory-facts]\n---\n\n# 記憶事實片段\n\n{}\n",
-                now.to_rfc3339(), facts_text
-            );
-            let abs_path = PathBuf::from(&vault_path).join(&rel_path);
-            tokio::fs::create_dir_all(abs_path.parent().unwrap_or(&abs_path)).await.ok();
-            tokio::fs::write(&abs_path, &content).await.ok();
-            // Sync to daemon (no file watcher in daemon)
-            if let Ok(vid) = state.get_vault_id().await {
-                if !vid.is_empty() {
-                    let token2 = state.get_auth_token().await;
-                    let tok2: Option<&str> = if token2.is_empty() { None } else { Some(token2.as_str()) };
-                    daemon_post::<_, serde_json::Value>(
-                        &state.http_client,
-                        &format!("/vaults/{}/notes", urlencoding::encode(&vid)),
-                        &serde_json::json!({"path": rel_path, "content": content}),
-                        tok2,
-                    ).await.ok();
-                }
-            }
-        }
-    }
+    // Parse `[category] content` lines
+    let facts: Vec<serde_json::Value> = facts_text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            // Accept lines starting with optional "- " then "[category]"
+            let line = line.trim_start_matches("- ").trim_start_matches("* ");
+            if !line.starts_with('[') { return None; }
+            let close = line.find(']')?;
+            let category = line[1..close].trim().to_lowercase();
+            let valid_cats = ["personal", "preference", "project", "rule", "general"];
+            let cat = if valid_cats.contains(&category.as_str()) {
+                category
+            } else {
+                "general".to_string()
+            };
+            let content = line[close + 1..].trim().to_string();
+            if content.is_empty() { return None; }
+            Some(serde_json::json!({
+                "content": content,
+                "category": cat,
+                "conv_id": conversation_id,
+            }))
+        })
+        .collect();
+
+    let count = facts.len() as u32;
+    if count == 0 { return Ok(0); }
+
+    daemon_post::<_, serde_json::Value>(
+        &state.http_client,
+        &format!("/vaults/{}/memory/facts", urlencoding::encode(&vault_id)),
+        &serde_json::json!({ "facts": facts }),
+        tok,
+    ).await.ok();
 
     Ok(count)
 }
