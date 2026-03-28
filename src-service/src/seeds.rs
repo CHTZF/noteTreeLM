@@ -17,6 +17,7 @@ struct BuiltinSkill {
     tools: &'static [&'static str],
     need_tool_chain: bool,
     tool_chain_order: &'static [&'static str],
+    injection_mode: &'static str,
 }
 
 struct BuiltinAgent {
@@ -39,6 +40,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["search_vault", "open_note"],
         need_tool_chain: true,
         tool_chain_order: &["search_vault", "open_note"],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_edit_note",
@@ -48,6 +50,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["search_vault", "read_note", "update_note", "plan_announce"],
         need_tool_chain: true,
         tool_chain_order: &["search_vault", "read_note", "update_note"],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_create_note",
@@ -57,6 +60,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["list_structure", "create_note", "plan_announce"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_append_note",
@@ -66,6 +70,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["search_vault", "append_to_note", "plan_announce"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_search_note",
@@ -75,6 +80,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["search_vault", "read_note", "open_note"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_summarize_notes",
@@ -84,6 +90,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["search_vault", "list_notes_in_folder", "read_note", "create_note", "update_note", "plan_announce"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_browse_structure",
@@ -93,6 +100,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["list_structure", "list_notes_in_folder"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_delete_note",
@@ -102,6 +110,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["search_vault", "delete_note", "plan_announce"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_move_note",
@@ -111,6 +120,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["search_vault", "move_note", "plan_announce"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_organize_folders",
@@ -120,6 +130,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["list_structure", "create_folder", "move_note", "plan_announce"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_query_memory",
@@ -129,6 +140,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["query_memory"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_web_search",
@@ -138,6 +150,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["web_search"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_create_skill",
@@ -147,6 +160,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["create_agent_skill"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_suggest_note_cards",
@@ -156,6 +170,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["search_vault", "read_note", "create_note", "plan_announce"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_schedule_task",
@@ -165,6 +180,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["get_current_datetime", "schedule_task"],
         need_tool_chain: true,
         tool_chain_order: &["get_current_datetime", "schedule_task"],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_save_knowledge",
@@ -174,6 +190,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["compress_to_knowledge", "find_similar_notes"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_deep_research",
@@ -183,6 +200,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["search_vault", "find_similar_notes", "summarize_note_collection", "read_note"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_personal_insight",
@@ -192,6 +210,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["get_vault_stats", "distill_preferences", "get_note_backlinks", "find_similar_notes"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_update_metadata",
@@ -201,6 +220,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["search_vault", "update_note_frontmatter"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_knowledge_graph",
@@ -210,6 +230,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["search_vault", "get_note_backlinks", "extract_note_links", "find_similar_notes", "link_notes"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_tag_browse",
@@ -219,6 +240,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["search_by_tag", "read_note", "open_note"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_task_extraction",
@@ -228,6 +250,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["extract_action_items", "list_structure", "get_current_datetime", "schedule_task"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_vault_health",
@@ -237,6 +260,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["get_vault_stats", "find_orphan_notes", "find_similar_notes", "link_notes"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_generate_index",
@@ -246,6 +270,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["list_structure", "generate_moc"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_recent_activity",
@@ -255,6 +280,7 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["list_recent_notes", "open_note", "read_note"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
     },
     BuiltinSkill {
         id: "builtin_link_builder",
@@ -264,6 +290,17 @@ const SKILLS: &[BuiltinSkill] = &[
         tools: &["search_vault", "extract_note_links", "link_notes"],
         need_tool_chain: false,
         tool_chain_order: &[],
+        injection_mode: "passive",
+    },
+    BuiltinSkill {
+        id: "builtin_proactive_memory",
+        title: "主動記憶注入",
+        trigger: "__proactive__",
+        behavior: "在每次對話開始時，自動根據使用者訊息的主題從記憶庫中擷取相關事實，靜默注入為背景知識，無需使用者主動詢問。",
+        tools: &["prefetch_memory"],
+        need_tool_chain: true,
+        tool_chain_order: &["prefetch_memory"],
+        injection_mode: "proactive",
     },
 ];
 
@@ -370,7 +407,7 @@ pub async fn seed_builtins(db: &SurrealDb, vault_id: &str) {
               tool_calls, is_active, injection_mode, agent_scope, \
               need_tool_chain, tool_chain_order, trigger_count, created_at) \
              VALUES ($sid, $vid, '__builtin__', $title, $trigger, $behavior, \
-                     $tools, true, 'passive', 'all', \
+                     $tools, true, $imode, 'all', \
                      $need_chain, $chain_order, 0, $now)"
         )
         .bind(("sid",         s.id.to_string()))
@@ -379,6 +416,7 @@ pub async fn seed_builtins(db: &SurrealDb, vault_id: &str) {
         .bind(("trigger",     s.trigger.to_string()))
         .bind(("behavior",    s.behavior.to_string()))
         .bind(("tools",       tools_json))
+        .bind(("imode",       s.injection_mode.to_string()))
         .bind(("need_chain",  s.need_tool_chain))
         .bind(("chain_order", chain_order_json))
         .bind(("now",         now))

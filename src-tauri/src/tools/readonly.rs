@@ -809,7 +809,7 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                             }).to_string()));
                         }
 
-                        let (first_id, first_title, _, _, _, _) = &skills[0];
+                        let (first_id, first_title, _, _, _, _, _) = &skills[0];
                         let _ = app.emit("agent:skill_found", serde_json::json!({
                             "skill_id": first_id,
                             "skill_title": first_title,
@@ -817,7 +817,7 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                         }));
 
                         let required_tools: Vec<String> = skills.iter()
-                            .flat_map(|(_, _, _, tools, _, _)| tools.iter().cloned())
+                            .flat_map(|(_, _, _, tools, _, _, _)| tools.iter().cloned())
                             .collect::<std::collections::HashSet<_>>()
                             .into_iter()
                             .collect();
@@ -827,7 +827,7 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                              以下是可能符合的技能規範，請根據使用者實際需求選擇最合適的一個執行：\n\n",
                             use_ask
                         );
-                        for (idx, (_, title, beh, tool_names, need_chain, chain_order)) in skills.iter().enumerate() {
+                        for (idx, (_, title, beh, tool_names, need_chain, chain_order, _)) in skills.iter().enumerate() {
                             let chain_hint = if *need_chain && !chain_order.is_empty() {
                                 format!("\n**工具執行順序**：{}", chain_order.join(" → "))
                             } else {

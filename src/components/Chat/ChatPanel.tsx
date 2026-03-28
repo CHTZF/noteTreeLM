@@ -675,6 +675,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       Promise.all([
         extractOp,
         invoke('distill_preferences').catch(() => {}),
+        invoke('condense_memory_facts').catch(() => {}),
         invoke('analyze_tool_patterns').catch(() => {}),
       ]).catch(() => {})
       lastExtractedMsgCountRef.current = 0

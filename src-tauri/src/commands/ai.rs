@@ -25,7 +25,7 @@ pub(crate) use super::external_ai::read_api_key;
 pub use super::memory::{
     add_memory_rule, get_memory_rules, delete_memory_rule,
     query_memory,
-    distill_preferences, extract_memory_facts,
+    distill_preferences, extract_memory_facts, condense_memory_facts,
     rate_response, get_conversation_ratings, analyze_tool_patterns,
 };
 pub(crate) use super::memory::retrieve_relevant_facts;
@@ -587,7 +587,7 @@ pub async fn invoke_agent(
         ]);
 
         let tools = if let Some(ref _vid) = vault_id_opt {
-            if let Some((skill_text, skill_titles, required_tools)) = {
+            if let Some((skill_text, skill_titles, required_tools, proactive_context)) = {
                 // Skill pre-pass：透過 daemon API 搜尋匹配的 skills
                 let vid = vault_id_opt.as_deref().unwrap_or("");
                 let matched = search_skills_for_tool(
@@ -602,9 +602,39 @@ pub async fn invoke_agent(
                     None
                 } else {
                     // 收集 behavior 文字（注入 system prompt）
+                    // Proactive skills: execute tool chain before LLM call
+                    let proactive_context = {
+                        let mut parts: Vec<String> = vec![];
+                        for (_, _, _, _, need_chain, chain_order, mode) in &matched {
+                            if mode != "proactive" || !need_chain { continue; }
+                            for tool_name in chain_order {
+                                if tool_name == "prefetch_memory" {
+                                    let tok2 = if auth_token.is_empty() { None } else { Some(auth_token.as_str()) };
+                                    let url = format!(
+                                        "/vaults/{}/memory/query?keywords={}&limit=8",
+                                        urlencoding::encode(vid),
+                                        urlencoding::encode(input.chars().take(60).collect::<String>().trim()),
+                                    );
+                                    if let Ok(results) = crate::api_client::daemon_get::<serde_json::Value>(&client, &url, tok2).await {
+                                        let arr = results.as_array().cloned().unwrap_or_default();
+                                        if !arr.is_empty() {
+                                            let lines: Vec<String> = arr.iter().map(|r| {
+                                                let cat = r["category"].as_str().unwrap_or("general");
+                                                let content = r["content"].as_str().unwrap_or("");
+                                                format!("[{}] {}", cat, content)
+                                            }).collect();
+                                            parts.push(format!("## 相關記憶\n{}", lines.join("\n")));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        parts.join("\n\n")
+                    };
+
                     let skill_text = matched.iter()
-                        .filter(|(_, _, beh, _, _, _)| !beh.is_empty())
-                        .map(|(_, title, beh, _, need_chain, chain_order)| {
+                        .filter(|(_, _, beh, _, _, _, mode)| !beh.is_empty() && mode != "proactive")
+                        .map(|(_, title, beh, _, need_chain, chain_order, _)| {
                             if *need_chain && !chain_order.is_empty() {
                                 format!("[技能：{}]\n{}\n工具執行順序：{}", title, beh, chain_order.join(" → "))
                             } else {
@@ -613,17 +643,17 @@ pub async fn invoke_agent(
                         })
                         .collect::<Vec<_>>().join("\n\n");
                     let skill_titles: Vec<String> = matched.iter()
-                        .map(|(_, t, _, _, _, _)| t.clone())
+                        .map(|(_, t, _, _, _, _, _)| t.clone())
                         .collect();
                     // 合併所有 skill 的 tool_calls，去重
                     let mut required_tools: Vec<String> = matched.iter()
-                        .flat_map(|(_, _, _, tc, _, _)| tc.clone())
+                        .flat_map(|(_, _, _, tc, _, _, _)| tc.clone())
                         .collect::<std::collections::HashSet<_>>()
                         .into_iter()
                         .collect();
                     required_tools.sort();
                     // 非同步 bump trigger_count（不阻塞主流程）
-                    for (skill_id, _, _, _, _, _) in &matched {
+                    for (skill_id, _, _, _, _, _, _) in &matched {
                         let sid = skill_id.clone();
                         let hc = client.clone();
                         let at = auth_token.clone();
@@ -638,19 +668,24 @@ pub async fn invoke_agent(
                             ).await;
                         });
                     }
-                    if skill_text.is_empty() && required_tools.is_empty() {
+                    if skill_text.is_empty() && required_tools.is_empty() && proactive_context.is_empty() {
                         None
                     } else {
-                        Some((skill_text, skill_titles, required_tools))
+                        Some((skill_text, skill_titles, required_tools, proactive_context))
                     }
                 }
             } {
                 if let Some(sys) = msgs.first_mut() {
                     if sys["role"].as_str() == Some("system") {
                         let existing = sys["content"].as_str().unwrap_or("").to_string();
-                        // 技能文字上限 1500 chars（防止過多 active skills 撐爆 context）
-                        let skill_snippet: String = skill_text.chars().take(1500).collect();
-                        *sys = serde_json::json!({"role": "system", "content": format!("{}\n\n{}", existing, skill_snippet)});
+                        let mut injections = vec![existing];
+                        if !proactive_context.is_empty() {
+                            injections.push(proactive_context.chars().take(1000).collect());
+                        }
+                        if !skill_text.is_empty() {
+                            injections.push(skill_text.chars().take(1500).collect());
+                        }
+                        *sys = serde_json::json!({"role": "system", "content": injections.join("\n\n")});
                     }
                 }
                 // 技能觸發提示（前端顯示 ⚡ 套用技能：...）
@@ -1694,6 +1729,23 @@ pub fn vault_tools() -> serde_json::Value {
                         }
                     },
                     "required": ["keywords"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "prefetch_memory",
+                "description": "根據當前對話主題，自動擷取最相關的記憶事實並注入為背景知識。通常由系統自動呼叫，不需手動使用。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "context": {
+                            "type": "string",
+                            "description": "當前對話的關鍵詞或主題描述（可選，留空則取最新記憶）"
+                        }
+                    },
+                    "required": []
                 }
             }
         },
@@ -2800,6 +2852,42 @@ async fn execute_vault_tool(
                 Err(_) => "記憶查詢失敗，請稍後再試。".to_string(),
             }
         }
+        "prefetch_memory" => {
+            let context = args["context"].as_str().unwrap_or("").to_string();
+            let state = app.state::<crate::state::AppState>();
+            let token = state.get_auth_token().await;
+            let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+            let vault_id = state.get_vault_uuid().await;
+            if vault_id.is_empty() {
+                return "記憶預取失敗：未設定 Vault".to_string();
+            }
+            // Extract keywords from context (simple: split whitespace, take CJK bigrams)
+            let kw_param = if context.is_empty() {
+                String::new()
+            } else {
+                urlencoding::encode(context.chars().take(60).collect::<String>().trim()).to_string()
+            };
+            let url = format!(
+                "/vaults/{}/memory/query?keywords={}&limit=8",
+                urlencoding::encode(&vault_id), kw_param
+            );
+            match crate::api_client::daemon_get::<serde_json::Value>(&state.http_client, &url, tok).await {
+                Ok(results) => {
+                    let arr = results.as_array().cloned().unwrap_or_default();
+                    if arr.is_empty() {
+                        String::new()
+                    } else {
+                        let lines: Vec<String> = arr.iter().map(|r| {
+                            let cat = r["category"].as_str().unwrap_or("general");
+                            let content = r["content"].as_str().unwrap_or("");
+                            format!("[{}] {}", cat, content)
+                        }).collect();
+                        format!("## 相關記憶\n{}", lines.join("\n"))
+                    }
+                }
+                Err(_) => String::new(),
+            }
+        }
         "open_note" => {
             let path = ensure_md(args["path"].as_str().unwrap_or(""));
             if path.is_empty() {
@@ -3081,7 +3169,7 @@ fn detect_response_framework(text: &str) -> bool {
 }
 
 /// 工具用：根據 use_ask 語意搜尋最相似的技能規範（daemon 版）。
-/// 回傳 Vec<(skill_id, title, behavior, tool_calls, need_tool_chain, tool_chain_order)>。
+/// 回傳 Vec<(skill_id, title, behavior, tool_calls, need_tool_chain, tool_chain_order, injection_mode)>。
 pub(crate) async fn search_skills_for_tool(
     http_client: &reqwest::Client,
     auth_token: &str,
@@ -3089,7 +3177,7 @@ pub(crate) async fn search_skills_for_tool(
     use_ask: &str,
     _emb_url: Option<&str>,
     _llama_client: &reqwest::Client,
-) -> Vec<(String, String, String, Vec<String>, bool, Vec<String>)> {
+) -> Vec<(String, String, String, Vec<String>, bool, Vec<String>, String)> {
     let tok = if auth_token.is_empty() { None } else { Some(auth_token) };
     // daemon 的 GET /vaults/:vid/skills 直接回傳 JSON array（非 {"skills":[...]}）
     let result: serde_json::Value = crate::api_client::daemon_get(
@@ -3107,7 +3195,7 @@ pub(crate) async fn search_skills_for_tool(
         let trigger = s["trigger"].as_str().unwrap_or("").to_lowercase();
         let mode = s["injection_mode"].as_str().unwrap_or("passive");
         if !is_active { return false; }
-        if mode == "active" { return true; }
+        if mode == "active" || mode == "proactive" { return true; }
         trigger.split(['、', ',', '，']).any(|kw| {
             let kw = kw.trim();
             !kw.is_empty() && use_ask_lower.contains(kw)
@@ -3130,7 +3218,8 @@ pub(crate) async fn search_skills_for_tool(
         } else {
             vec![]
         };
-        (skill_id, title, behavior, tool_calls, need_tool_chain, tool_chain_order)
+        let injection_mode = s["injection_mode"].as_str().unwrap_or("passive").to_string();
+        (skill_id, title, behavior, tool_calls, need_tool_chain, tool_chain_order, injection_mode)
     }).collect()
 }
 

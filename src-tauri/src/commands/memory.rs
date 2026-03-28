@@ -451,6 +451,97 @@ pub(crate) async fn retrieve_relevant_facts(
     }).collect::<Vec<_>>().join("\n")
 }
 
+// ─── Progressive Distillation ──────────────────────────────────────────────────
+
+/// 當某個 category 的 facts 超過 CONDENSE_THRESHOLD 時，呼叫 LLM 聚合成高階摘要，
+/// 再呼叫 daemon /memory/distill 刪除原始 facts 並寫入摘要。
+const CONDENSE_THRESHOLD: usize = 8;
+
+#[tauri::command]
+pub async fn condense_memory_facts(state: State<'_, AppState>) -> Result<u32, AppError> {
+    let vault_id = match state.get_vault_id().await {
+        Ok(v) if !v.is_empty() => v,
+        _ => return Ok(0),
+    };
+    let base_url = {
+        let port = *state.llama_actual_port.lock().await;
+        match port {
+            Some(p) => format!("http://127.0.0.1:{}", p),
+            None => return Ok(0),
+        }
+    };
+    let token = state.get_auth_token().await;
+    let tok: Option<&str> = if token.is_empty() { None } else { Some(token.as_str()) };
+
+    let categories = ["personal", "preference", "project", "rule", "general"];
+    let mut condensed = 0u32;
+
+    for cat in &categories {
+        // Fetch all non-expired facts in this category
+        let url = format!(
+            "/vaults/{}/memory/query?category={}&limit=50",
+            urlencoding::encode(&vault_id), cat
+        );
+        let facts: Vec<serde_json::Value> = daemon_get(&state.http_client, &url, tok)
+            .await.unwrap_or_default();
+
+        if facts.len() < CONDENSE_THRESHOLD { continue; }
+
+        let source_ids: Vec<String> = facts.iter()
+            .filter_map(|f| f["fact_id"].as_str().map(String::from))
+            .collect();
+        let facts_text = facts.iter()
+            .filter_map(|f| f["content"].as_str())
+            .enumerate()
+            .map(|(i, c)| format!("{}. {}", i + 1, c))
+            .collect::<Vec<_>>().join("\n");
+
+        let body = serde_json::json!({
+            "messages": [
+                {
+                    "role": "system",
+                    "content": format!(
+                        "你是記憶壓縮系統。以下是類別「{}」的記憶事實列表，請將它們整合成 2-4 條精煉的高階摘要，\
+                         保留最重要的資訊，去除重複和過時內容。\
+                         輸出格式：每條以「- 」開頭，不加編號，不加解釋。", cat
+                    )
+                },
+                { "role": "user", "content": facts_text },
+            ],
+            "stream": false,
+            "temperature": 0.1,
+            "max_tokens": 300,
+        });
+
+        let Ok(resp) = state.http_client
+            .post(format!("{}/v1/chat/completions", base_url))
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(30))
+            .send().await
+        else { continue; };
+
+        let Ok(json) = resp.json::<serde_json::Value>().await else { continue; };
+        let summary = json["choices"][0]["message"]["content"].as_str().unwrap_or("");
+        if summary.is_empty() { continue; }
+
+        // POST distill to daemon
+        if daemon_post::<_, serde_json::Value>(
+            &state.http_client,
+            &format!("/vaults/{}/memory/distill", urlencoding::encode(&vault_id)),
+            &serde_json::json!({
+                "category": cat,
+                "source_ids": source_ids,
+                "summary": summary,
+            }),
+            tok,
+        ).await.is_ok() {
+            condensed += 1;
+        }
+    }
+
+    Ok(condensed)
+}
+
 fn extract_cjk_keywords(text: &str, max: usize) -> Vec<String> {
     const STOPS: &[char] = &[
         '你','我','他','她','它','的','了','嗎','是','有','在','說','道','記',

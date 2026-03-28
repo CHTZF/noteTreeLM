@@ -43,6 +43,7 @@ pub fn router() -> Router<ApiState> {
         )
         .route("/vaults/:vault_id/memory/query", get(query_memory))
         .route("/vaults/:vault_id/memory/facts", post(store_facts))
+        .route("/vaults/:vault_id/memory/distill", post(distill_facts))
 }
 
 async fn list_memory_rules(
@@ -467,4 +468,57 @@ async fn store_facts(
     }
 
     Ok(Json(json!({ "inserted": inserted })))
+}
+
+// ── Distill Facts ──────────────────────────────────────────────────────────────
+// Called by Tauri after LLM distillation. Replaces old facts in a category
+// with a single high-level summary fact.
+
+#[derive(Deserialize)]
+struct DistillFactsBody {
+    category: String,
+    /// fact_ids to delete (the ones that were distilled)
+    source_ids: Vec<String>,
+    /// the new summary content produced by LLM
+    summary: String,
+}
+
+async fn distill_facts(
+    State(state): State<ApiState>,
+    Path(vault_id): Path<String>,
+    Json(body): Json<DistillFactsBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if body.source_ids.is_empty() || body.summary.trim().is_empty() {
+        return Ok(Json(json!({ "ok": false, "reason": "empty input" })));
+    }
+
+    let now_ts = Utc::now().timestamp();
+    // personal/rule summaries last 365 days, others 180 days (longer than raw facts)
+    let days = if body.category == "personal" || body.category == "rule" { 365i64 } else { 180 };
+    let expires_at = now_ts + days * 86400;
+
+    // Delete source facts
+    for fid in &body.source_ids {
+        let _ = state.db
+            .query("DELETE memory_facts WHERE fact_id = $fid AND vault_id = $vid")
+            .bind(("fid", fid.clone()))
+            .bind(("vid", vault_id.clone()))
+            .await;
+    }
+
+    // Insert summary fact
+    let fact_id = uuid::Uuid::new_v4().to_string();
+    state.db
+        .query("INSERT INTO memory_facts (fact_id, vault_id, conv_id, content, category, expires_at, created_at) VALUES ($fid, $vid, $cid, $content, $cat, $exp, $now)")
+        .bind(("fid", fact_id.clone()))
+        .bind(("vid", vault_id))
+        .bind(("cid", Option::<String>::None))
+        .bind(("content", body.summary.trim().to_string()))
+        .bind(("cat", body.category))
+        .bind(("exp", expires_at))
+        .bind(("now", now_ts))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({ "ok": true, "fact_id": fact_id, "replaced": body.source_ids.len() })))
 }

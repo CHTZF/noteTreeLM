@@ -505,6 +505,7 @@ pub fn run() {
             check_embedding_endpoint,
             query_memory,
             distill_preferences,
+            condense_memory_facts,
             analyze_tool_patterns,
             extract_memory_facts,
             rate_response,
