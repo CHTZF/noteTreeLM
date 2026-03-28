@@ -22,17 +22,20 @@ const FOCUSED_RING  = '#ffffff'
 
 const ANIM_MS = 350
 const DELAY_MS = 120
+const DMN_TOP_N = 5
+const DMN_BREATHE_MS = 2800  // full breath cycle (in → out)
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface MemoryNode {
-  node_id:    string
-  node_type:  'memory_fact' | 'note'
-  label:      string
-  category?:  string
-  content?:   string
-  fact_id?:   string
-  file_path?: string
+  node_id:      string
+  node_type:    'memory_fact' | 'note'
+  label:        string
+  category?:    string
+  content?:     string
+  fact_id?:     string
+  file_path?:   string
+  inject_count?: number
 }
 interface MemoryEdge {
   source_id: string
@@ -46,10 +49,13 @@ interface Props {
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export default function MemoryLinksView({ onOpenNote }: Props) {
-  const containerRef  = useRef<HTMLDivElement>(null)
-  const cyRef         = useRef<Core | null>(null)
-  const focusedRef    = useRef<Set<string>>(new Set())   // currently focused node_ids
-  const { settings }  = useSettingsStore()
+  const containerRef   = useRef<HTMLDivElement>(null)
+  const cyRef          = useRef<Core | null>(null)
+  const focusedRef     = useRef<Set<string>>(new Set())   // currently focused node_ids
+  const dmnIdsRef      = useRef<string[]>([])             // top-N by inject_count
+  const dmnTimerRef    = useRef<ReturnType<typeof setInterval> | null>(null)
+  const dmnPhaseRef    = useRef<0 | 1>(0)                 // 0=exhale(dim), 1=inhale(bright)
+  const { settings }   = useSettingsStore()
 
   // ── Build Cytoscape elements from API data ──────────────────────────────
   const buildElements = (nodes: MemoryNode[], edges: MemoryEdge[]): cytoscape.ElementDefinition[] => [
@@ -73,6 +79,41 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
     })),
   ]
 
+  // ── DMN: breathing pulse on top-N most injected nodes during standby ────
+  const stopDMN = useCallback(() => {
+    if (dmnTimerRef.current) {
+      clearInterval(dmnTimerRef.current)
+      dmnTimerRef.current = null
+    }
+  }, [])
+
+  const startDMN = useCallback(() => {
+    stopDMN()
+    const cy = cyRef.current
+    if (!cy || dmnIdsRef.current.length === 0) return
+
+    dmnPhaseRef.current = 1
+    dmnTimerRef.current = setInterval(() => {
+      const cy2 = cyRef.current
+      if (!cy2) return
+      // Only run when nothing is focused (standby state)
+      if (focusedRef.current.size > 0) return
+
+      dmnPhaseRef.current = dmnPhaseRef.current === 0 ? 1 : 0
+      const opacity = dmnPhaseRef.current === 1 ? 0.5 : 0.2
+
+      dmnIdsRef.current.forEach(id => {
+        const node = cy2.getElementById(id)
+        if (node.length === 0) return
+        const cat = node.data('category') as string
+        const color = CATEGORY_COLORS[cat] ?? FOCUSED_RING
+        ;(node as any).animate({
+          style: { opacity, 'background-color': color, 'width': 10, 'height': 10 },
+        }, { duration: DMN_BREATHE_MS / 2 })
+      })
+    }, DMN_BREATHE_MS / 2)
+  }, [stopDMN])
+
   // ── Apply focused / neighbor / dimmed styles with animation ─────────────
   const applyFocus = useCallback((
     newFocusedIds: Set<string>,
@@ -80,6 +121,11 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
   ) => {
     const cy = cyRef.current
     if (!cy) return
+
+    // Stop DMN when entering focused state, restart when returning to standby
+    if (newFocusedIds.size > 0) {
+      stopDMN()
+    }
 
     const oldFocused = focusedRef.current
     focusedRef.current = newFocusedIds
@@ -153,6 +199,11 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
       }
     })
 
+    // Return to DMN standby if no focus
+    if (newFocusedIds.size === 0) {
+      setTimeout(() => startDMN(), animate ? ANIM_MS + 100 : 0)
+    }
+
     // Pan & zoom to focused + neighbors after animation
     if (newFocusedIds.size > 0) {
       const idsToFit = [...newFocusedIds, ...neighborIds]
@@ -169,7 +220,7 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
         }, animate ? DELAY_MS : 0)
       }
     }
-  }, [])
+  }, [stopDMN, startDMN])
 
   // ── Initialise Cytoscape ────────────────────────────────────────────────
   useEffect(() => {
@@ -233,7 +284,7 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
     })
 
     cyRef.current = cy
-    return () => { cy.destroy(); cyRef.current = null }
+    return () => { stopDMN(); cy.destroy(); cyRef.current = null }
   }, [settings.theme, applyFocus, onOpenNote])
 
   // ── Load graph data on mount ─────────────────────────────────────────────
@@ -246,10 +297,19 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
       const elems = buildElements(nodes, edges)
       cy.add(elems)
       cy.layout({ name: 'fcose', animate: false } as any).run()
-      // Start all dimmed
+
+      // Compute DMN: top-N memory_fact nodes by inject_count
+      const topN = nodes
+        .filter(n => n.node_type === 'memory_fact' && (n.inject_count ?? 0) > 0)
+        .sort((a, b) => (b.inject_count ?? 0) - (a.inject_count ?? 0))
+        .slice(0, DMN_TOP_N)
+        .map(n => n.node_id)
+      dmnIdsRef.current = topN
+
+      // Start all dimmed, then begin DMN breathing
       applyFocus(new Set(), false)
     }).catch(() => {})
-  }, [applyFocus])
+  }, [applyFocus, startDMN])
 
   // ── Listen for memory:prefetched events ──────────────────────────────────
   useEffect(() => {
@@ -276,6 +336,13 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
             cy.add(newElems)
             cy.layout({ name: 'fcose', animate: false, randomize: false } as any).run()
           }
+          // Refresh DMN top-N after new data
+          const topN = nodes
+            .filter(n => n.node_type === 'memory_fact' && (n.inject_count ?? 0) > 0)
+            .sort((a, b) => (b.inject_count ?? 0) - (a.inject_count ?? 0))
+            .slice(0, DMN_TOP_N)
+            .map(n => n.node_id)
+          dmnIdsRef.current = topN
         } catch { /* best-effort */ }
       }
 

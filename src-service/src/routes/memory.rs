@@ -437,6 +437,16 @@ async fn query_memory(
         resp.take(0).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
 
+    // Increment inject_count for each returned fact (best-effort, non-blocking)
+    for row in &rows {
+        if let Some(fid) = row["fact_id"].as_str() {
+            let _ = state.db
+                .query("UPDATE memory_facts SET inject_count = (inject_count ?? 0) + 1 WHERE fact_id = $fid")
+                .bind(("fid", fid.to_string()))
+                .await;
+        }
+    }
+
     Ok(Json(json!(rows)))
 }
 
@@ -622,9 +632,10 @@ async fn memory_graph(
         content: String,
         category: String,
         expires_at: i64,
+        inject_count: Option<i64>,
     }
     let mut resp = state.db
-        .query("SELECT fact_id, content, category, expires_at FROM memory_facts WHERE vault_id = $vid AND expires_at > $now ORDER BY created_at DESC")
+        .query("SELECT fact_id, content, category, expires_at, inject_count FROM memory_facts WHERE vault_id = $vid AND expires_at > $now ORDER BY created_at DESC")
         .bind(("vid", vault_id.clone()))
         .bind(("now", now_ts))
         .await
@@ -677,6 +688,7 @@ async fn memory_graph(
             "content": f.content,
             "category": f.category,
             "expires_at": f.expires_at,
+            "inject_count": f.inject_count.unwrap_or(0),
         })
     }).collect();
 
