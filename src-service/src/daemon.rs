@@ -23,39 +23,46 @@ pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let auth_store = AuthStore::new();
     let daemon_state = DaemonState::new_with_data_dir(&data_dir);
 
+    // Graceful shutdown coordination
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+    let https_handle = axum_server::Handle::new();
+
     // Spawn scheduler loop
     {
         let sched_db = db.clone();
+        let sched_event_tx = daemon_state.event_tx.clone();
         tokio::spawn(async move {
-            run_scheduler(sched_db).await;
+            run_scheduler(sched_db, sched_event_tx).await;
         });
     }
 
     // HTTP localhost server (no TLS) on :7787
-    {
+    let http_task = {
         let api_state = ApiState::new(auth_store.clone(), db.clone(), daemon_state.clone());
+        let rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
-            if let Err(e) = crate::server::run_http_server(7787, api_state).await {
+            if let Err(e) = crate::server::run_http_server(7787, api_state, rx).await {
                 tracing::error!("HTTP server error: {}", e);
             }
-        });
-    }
+        })
+    };
 
     // HTTPS external server (TLS) on :7788
-    {
+    let https_task = {
         let cert_pem = tls.cert_pem.clone();
         let key_pem = tls.key_pem.clone();
         let store_clone = auth_store.clone();
         let db_clone = db.clone();
         let daemon_state_clone = daemon_state.clone();
+        let handle = https_handle.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::server::run_https_server(
-                cert_pem, key_pem, 7788, store_clone, db_clone, daemon_state_clone,
+                cert_pem, key_pem, 7788, store_clone, db_clone, daemon_state_clone, handle,
             ).await {
                 tracing::error!("HTTPS server error: {}", e);
             }
-        });
-    }
+        })
+    };
 
     // Spawn cloudflared tunnel (best-effort; silently skipped if binary not found)
     {
@@ -67,11 +74,25 @@ pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Service ready — HTTP http://127.0.0.1:7787 | HTTPS https://0.0.0.0:7788");
     shutdown_signal().await;
-    tracing::info!("Service shutting down...");
+    tracing::info!("Service shutting down gracefully — waiting for in-flight requests...");
+
+    // Signal both servers to stop accepting new connections.
+    // In-flight requests (e.g. scan_vault) are allowed to complete so that
+    // SurrealDB transactions are committed rather than dropped mid-flight.
+    let _ = shutdown_tx.send(());
+    https_handle.graceful_shutdown(Some(std::time::Duration::from_secs(15)));
+
+    // Wait for both servers to drain, up to 15 seconds
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        async { let _ = tokio::join!(http_task, https_task); },
+    ).await;
+
+    tracing::info!("Service shutdown complete");
     Ok(())
 }
 
-async fn run_scheduler(db: SurrealDb) {
+async fn run_scheduler(db: SurrealDb, event_tx: tokio::sync::broadcast::Sender<crate::state::ServiceEvent>) {
     tracing::info!("Scheduler started");
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
@@ -108,6 +129,15 @@ async fn run_scheduler(db: SurrealDb) {
                 "Scheduled task due: {} (vault={}, type={:?})",
                 task.description, task.vault_id, task.agent_type
             );
+
+            let _ = event_tx.send(crate::state::ServiceEvent {
+                event: "schedule:triggered".to_string(),
+                payload: serde_json::json!({
+                    "task_id": task.task_id,
+                    "vault_id": task.vault_id,
+                    "description": task.description,
+                }),
+            });
 
             if task.repeat_interval_secs > 0 {
                 let next_ts = now_ts + task.repeat_interval_secs;
@@ -181,7 +211,7 @@ fn cloudflared_release() -> Option<CloudflaredRelease> {
 fn cloudflared_cache_path() -> PathBuf {
     let base = dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from(std::env::temp_dir()))
-        .join("notetreetlm");
+        .join("notetreelm");
 
     #[cfg(target_os = "windows")]
     return base.join("cloudflared.exe");

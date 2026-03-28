@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "vite:dev": "vite",
     "vite:build": "tsc && vite build",
-    "service": "cargo run --manifest-path src-service/Cargo.toml"
+    "service": "cargo run --manifest-path src-service/Cargo.toml",
+    "reset_data": "rm -rf ~/Library/WebKit/com.notetreelm.app && rm -rf ~/Library/Application\\ Support/com.notetreelm.app/surrealdb && rm -f ~/Library/Application\\ Support/com.notetreelm.app/schema_version && rm -f ~/Library/Application\\ Support/com.notetreelm.app/session.json && rm -f ~/Library/Application\\ Support/com.notetreelm.app/notetreelm.db* && rm -f ~/Library/Application\\ Support/com.notetreelm.app/search.db* && rm -f ~/Library/Application\\ Support/com.notetreelm.app/settings.db"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.18.6",

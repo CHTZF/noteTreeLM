@@ -262,6 +262,11 @@ async fn scan_vault(
         indexed += 1;
     }
 
+    state.daemon.emit("vault:changed", serde_json::json!({
+        "vault_id": vault_id,
+        "indexed": indexed,
+    }));
+
     Ok(Json(json!({ "ok": true, "indexed": indexed })))
 }
 

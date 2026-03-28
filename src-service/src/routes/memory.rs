@@ -38,6 +38,10 @@ pub fn router() -> Router<ApiState> {
             post(set_pattern_intent).patch(set_pattern_intent),
         )
         .route(
+            "/vaults/:vault_id/activity-patterns/skill-candidates",
+            get(list_skill_candidates),
+        )
+        .route(
             "/vaults/:vault_id/ratings",
             get(get_conversation_ratings).post(create_rating),
         )
@@ -243,6 +247,43 @@ async fn set_pattern_intent(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(json!({ "ok": true })))
+}
+
+// ── Skill Candidates ──────────────────────────────────────────────────────────
+
+async fn list_skill_candidates(
+    State(state): State<ApiState>,
+    Path(vault_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // Patterns with score >= 0.7, not deprecated, with semantic_intent set
+    let mut resp = state.db
+        .query("SELECT signature, score, trigger_count, speak_count, semantic_intent FROM activity_patterns WHERE vault_id = $vid AND deprecated = false AND score >= 0.7 AND semantic_intent != NONE ORDER BY score DESC LIMIT 10")
+        .bind(("vid", vault_id.clone()))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let patterns: Vec<Value> = resp.take(0)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Exclude patterns that already have a matching skill (by trigger keyword overlap)
+    let mut skill_resp = state.db
+        .query("SELECT trigger FROM agent_skills WHERE vault_id = $vid AND is_active = true")
+        .bind(("vid", vault_id))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let skills: Vec<Value> = skill_resp.take(0)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let existing_triggers: Vec<String> = skills.iter()
+        .filter_map(|s| s["trigger"].as_str().map(|t| t.to_lowercase()))
+        .collect();
+
+    let candidates: Vec<Value> = patterns.into_iter().filter(|p| {
+        let intent = p["semantic_intent"].as_str().unwrap_or("").to_lowercase();
+        if intent.is_empty() { return false; }
+        // Skip if any existing skill trigger contains the intent as a keyword
+        !existing_triggers.iter().any(|t| t.contains(&intent) || intent.contains(t.as_str()))
+    }).collect();
+
+    Ok(Json(json!(candidates)))
 }
 
 // ── Response Ratings ──────────────────────────────────────────────────────────

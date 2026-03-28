@@ -2,7 +2,7 @@ import { create } from 'zustand'
 import { Settings, DEFAULT_SETTINGS } from '../types/settings'
 import { api } from '../lib/api'
 
-export const SYSTEM_KEYS = ['system_current_vault_path', 'ai_provider', 'ai_model', 'ai_base_url',
+export const SYSTEM_KEYS = ['system_current_vault_path',
   'ai_enable_topics', 'ai_enable_summary', 'ai_enable_vision',
   'whisper_cli_path', 'whisper_model_path', 'whisper_language', 'whisper_threads', 'whisper_auto_insert',
   'llm_model_path', 'llama_cli_path', 'embedding_model_path'] as const

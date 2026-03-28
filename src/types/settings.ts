@@ -11,9 +11,6 @@ export interface Settings {
   whisper_auto_insert: boolean
   import_max_depth: number
   import_max_pages: number
-  ai_provider: string
-  ai_model: string
-  ai_base_url: string
   ai_enable_topics: boolean
   ai_enable_summary: boolean
   ai_enable_vision: boolean
@@ -47,6 +44,12 @@ export interface Settings {
   avatar_color: string
   avatar_image: string
   show_agent_tools: boolean
+  show_spotlight: boolean
+  show_graph: boolean
+  show_agents: boolean
+  show_skills: boolean
+  show_kb_assist: boolean
+  show_import: boolean
   file_sort_type: 'none' | 'asc' | 'desc'
   hotkey_toggle_view: string
   hotkey_save: string
@@ -67,9 +70,6 @@ export const DEFAULT_SETTINGS: Settings = {
   whisper_auto_insert: true,
   import_max_depth: 3,
   import_max_pages: 50,
-  ai_provider: '',
-  ai_model: 'gpt-4o',
-  ai_base_url: 'https://api.openai.com/v1',
   ai_enable_topics: true,
   ai_enable_summary: true,
   ai_enable_vision: true,
@@ -103,6 +103,12 @@ export const DEFAULT_SETTINGS: Settings = {
   avatar_color: '#0a84ff',
   avatar_image: '',
   show_agent_tools: false,
+  show_spotlight: true,
+  show_graph: false,
+  show_agents: false,
+  show_skills: false,
+  show_kb_assist: false,
+  show_import: false,
   file_sort_type: 'none',
   hotkey_toggle_view: 'mod+e',
   hotkey_save: 'mod+s',

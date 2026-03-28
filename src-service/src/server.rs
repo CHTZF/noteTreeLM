@@ -57,6 +57,7 @@ pub fn build_api_router(app_state: ApiState) -> Router {
         .merge(crate::routes::agents::router())
         .merge(crate::routes::memory::router())
         .merge(crate::routes::scheduled::router())
+        .merge(crate::routes::events::router())
         .route("/pairing-info", get(pairing_info_handler))
         .with_state(app_state);
 
@@ -90,6 +91,7 @@ pub fn build_api_router(app_state: ApiState) -> Router {
 pub async fn run_http_server(
     port: u16,
     app_state: ApiState,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let app = build_api_router(app_state);
 
@@ -98,7 +100,9 @@ pub async fn run_http_server(
     tracing::info!("HTTP server listening on http://127.0.0.1:{}", port);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app.into_make_service()).await?;
+    axum::serve(listener, app.into_make_service())
+        .with_graceful_shutdown(async move { let _ = shutdown_rx.recv().await; })
+        .await?;
 
     Ok(())
 }
@@ -111,6 +115,7 @@ pub async fn run_https_server(
     auth_store: AuthStore,
     db: SurrealDb,
     daemon_state: DaemonState,
+    handle: axum_server::Handle,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let tls_config = RustlsConfig::from_pem(
         cert_pem.into_bytes(),
@@ -124,6 +129,7 @@ pub async fn run_https_server(
     tracing::info!("HTTPS server listening on https://0.0.0.0:{}", port);
 
     axum_server::bind_rustls(addr, tls_config)
+        .handle(handle)
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
 
@@ -133,7 +139,7 @@ pub async fn run_https_server(
 async fn health_handler() -> Json<serde_json::Value> {
     Json(json!({
         "status": "ok",
-        "service": "notetreetlm-service",
+        "service": "notetreelm-service",
         "version": env!("CARGO_PKG_VERSION"),
     }))
 }

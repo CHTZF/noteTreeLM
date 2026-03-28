@@ -1,4 +1,4 @@
-use crate::{api_client::{daemon_delete, daemon_get, daemon_patch, daemon_post, daemon_put}, commands::ai::{ensure_server_running, read_api_key}, error::AppError, state::AppState};
+use crate::{api_client::{daemon_delete, daemon_get, daemon_patch, daemon_post, daemon_put}, commands::ai::ensure_server_running, error::AppError, state::AppState};
 use chrono::Datelike as _;
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
@@ -1245,80 +1245,26 @@ async fn run_knowledge_query(
         )
     };
 
-    // 5. Read AI provider config
-    let ki_tok = app_state.get_auth_token().await;
-    let ki_tok_ref = if ki_tok.is_empty() { None } else { Some(ki_tok.as_str()) };
-    let provider = crate::api_client::daemon_get_setting(&app_state.http_client, ki_tok_ref, "ai_provider")
-        .await.unwrap_or_default();
-    let model = crate::api_client::daemon_get_setting(&app_state.http_client, ki_tok_ref, "ai_model")
-        .await.unwrap_or_default();
-    let api_key = read_api_key(&app_state.api_key_cache, &app_state.http_client, ki_tok_ref, &provider).await;
-
-    // 6. Stream tokens via appropriate provider
+    // 5. Stream tokens via local llama-server
     let client = reqwest::Client::new();
-
-    let response = if provider == "anthropic" {
-        // Anthropic Messages API
-        let body = serde_json::json!({
-            "model": if model.is_empty() { "claude-3-5-haiku-20241022".to_string() } else { model },
-            "max_tokens": 1024,
-            "system": system,
-            "stream": true,
-            "messages": [{ "role": "user", "content": question }],
-        });
-        client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(120))
-            .send()
-            .await
-            .map_err(|e| AppError::AI(format!("Anthropic 請求失敗：{}", e)))?
-    } else if !provider.is_empty() {
-        // OpenAI-compatible external provider
-        let base_url = crate::api_client::daemon_get_setting(&app_state.http_client, ki_tok_ref, "ai_base_url")
-            .await
-            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-        let body = serde_json::json!({
-            "model": if model.is_empty() { "gpt-4o".to_string() } else { model },
-            "messages": [
-                { "role": "system", "content": system },
-                { "role": "user", "content": question }
-            ],
-            "stream": true,
-            "temperature": 0.3,
-            "max_tokens": 1024,
-        });
-        let mut req = client
-            .post(format!("{}/chat/completions", base_url.trim_end_matches('/')))
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(120));
-        if !api_key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", api_key));
-        }
-        req.send().await.map_err(|e| AppError::AI(format!("外部 AI 請求失敗：{}", e)))?
-    } else {
-        // Local llama-server
-        let base_url = ensure_server_running(app_state, app).await?;
-        let body = serde_json::json!({
-            "model": "local",
-            "messages": [
-                { "role": "system", "content": system },
-                { "role": "user", "content": question }
-            ],
-            "stream": true,
-            "temperature": 0.3,
-            "max_tokens": 1024,
-        });
-        client
-            .post(format!("{}/v1/chat/completions", base_url))
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(120))
-            .send()
-            .await
-            .map_err(|e| AppError::AI(format!("請求 LLM 失敗：{}", e)))?
-    };
+    let base_url = ensure_server_running(app_state, app).await?;
+    let body = serde_json::json!({
+        "model": "local",
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": question }
+        ],
+        "stream": true,
+        "temperature": 0.3,
+        "max_tokens": 1024,
+    });
+    let response = client
+        .post(format!("{}/v1/chat/completions", base_url))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| AppError::AI(format!("請求 LLM 失敗：{}", e)))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -1328,7 +1274,6 @@ async fn run_knowledge_query(
 
     let mut stream = response.bytes_stream();
     let mut sse_buf = String::new();
-    let is_anthropic = provider == "anthropic";
 
     while let Some(item) = stream.next().await {
         let bytes = item.map_err(|e| AppError::AI(e.to_string()))?;
@@ -1341,13 +1286,7 @@ async fn run_knowledge_query(
                 if let Some(data) = line.strip_prefix("data: ") {
                     if data.trim() == "[DONE]" { continue; }
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                        let content = if is_anthropic {
-                            if json["type"] == "content_block_delta" {
-                                json["delta"]["text"].as_str().map(|s| s.to_string())
-                            } else { None }
-                        } else {
-                            json["choices"][0]["delta"]["content"].as_str().map(|s| s.to_string())
-                        };
+                        let content = json["choices"][0]["delta"]["content"].as_str().map(|s| s.to_string());
                         if let Some(text) = content {
                             if !text.is_empty() {
                                 let _ = app.emit("knowledge:token", serde_json::json!({

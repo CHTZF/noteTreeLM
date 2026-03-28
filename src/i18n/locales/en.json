@@ -105,7 +105,6 @@
     "tab": {
       "account": "Account",
       "general": "General",
-      "ai": "External AI",
       "voice": "Whisper",
       "local": "Local LLM",
       "advanced": "Advanced",
@@ -129,19 +128,6 @@
       "memory_threshold_desc": "Number of messages before saving to memory",
       "sidebar_width": "Sidebar Width",
       "save": "Save Settings"
-    },
-    "ai": {
-      "provider": "Provider",
-      "api_key": "API Key",
-      "api_key_placeholder": "Enter API Key",
-      "model": "Model",
-      "model_placeholder": "Model name",
-      "base_url": "Base URL",
-      "base_url_placeholder": "https://api.openai.com/v1",
-      "save": "Save AI Settings",
-      "test": "Test Connection",
-      "test_success": "Connection successful",
-      "test_fail": "Connection failed"
     },
     "voice": {
       "whisper_model": "Whisper Model",

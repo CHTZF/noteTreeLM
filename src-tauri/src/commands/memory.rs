@@ -451,6 +451,106 @@ pub(crate) async fn retrieve_relevant_facts(
     }).collect::<Vec<_>>().join("\n")
 }
 
+// ─── Activity Pattern → Skill Suggestion ──────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct SkillSuggestion {
+    pub signature: String,
+    pub score: f64,
+    pub intent: String,
+    pub suggested_title: String,
+    pub suggested_trigger: String,
+    pub suggested_behavior: String,
+}
+
+/// 從高分 activity_patterns 自動建議可轉成 skill 的候選，
+/// 用 LLM 生成 title/trigger/behavior，回傳給前端顯示通知。
+#[tauri::command]
+pub async fn suggest_skills_from_patterns(state: State<'_, AppState>) -> Result<Vec<SkillSuggestion>, AppError> {
+    let vault_id = match state.get_vault_id().await {
+        Ok(v) if !v.is_empty() => v,
+        _ => return Ok(vec![]),
+    };
+    let base_url = {
+        let port = *state.llama_actual_port.lock().await;
+        match port {
+            Some(p) => format!("http://127.0.0.1:{}", p),
+            None => return Ok(vec![]),
+        }
+    };
+    let token = state.get_auth_token().await;
+    let tok: Option<&str> = if token.is_empty() { None } else { Some(token.as_str()) };
+
+    // Fetch skill candidates from daemon
+    let candidates: Vec<serde_json::Value> = daemon_get(
+        &state.http_client,
+        &format!("/vaults/{}/activity-patterns/skill-candidates", urlencoding::encode(&vault_id)),
+        tok,
+    ).await.unwrap_or_default();
+
+    if candidates.is_empty() { return Ok(vec![]); }
+
+    // Take top 3 candidates to avoid LLM overload
+    let mut suggestions = Vec::new();
+    for candidate in candidates.into_iter().take(3) {
+        let signature = candidate["signature"].as_str().unwrap_or("").to_string();
+        let intent = candidate["semantic_intent"].as_str().unwrap_or("").to_string();
+        let score = candidate["score"].as_f64().unwrap_or(0.0);
+        if intent.is_empty() { continue; }
+
+        let body = serde_json::json!({
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你是 AI 技能設計師。根據使用者的行為意圖，生成一個 agent skill 的設計。\n\
+                                輸出 JSON，格式：{\"title\": \"技能標題\", \"trigger\": \"觸發關鍵字（逗號分隔，5-10個）\", \"behavior\": \"步驟式行為描述\"}\n\
+                                只輸出 JSON，不加說明。"
+                },
+                {
+                    "role": "user",
+                    "content": format!("使用者行為意圖：{}", intent)
+                }
+            ],
+            "stream": false,
+            "temperature": 0.2,
+            "max_tokens": 300,
+        });
+
+        let Ok(resp) = state.http_client
+            .post(format!("{}/v1/chat/completions", base_url))
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(20))
+            .send().await
+        else { continue; };
+
+        let Ok(json) = resp.json::<serde_json::Value>().await else { continue; };
+        let content = json["choices"][0]["message"]["content"].as_str().unwrap_or("");
+
+        // Parse JSON output from LLM
+        let parsed: serde_json::Value = if let Some(start) = content.find('{') {
+            let snippet = &content[start..];
+            let end = snippet.rfind('}').map(|i| i + 1).unwrap_or(snippet.len());
+            serde_json::from_str(&snippet[..end]).unwrap_or_default()
+        } else { continue; };
+
+        let title = parsed["title"].as_str().unwrap_or("").to_string();
+        let trigger = parsed["trigger"].as_str().unwrap_or("").to_string();
+        let behavior = parsed["behavior"].as_str().unwrap_or("").to_string();
+        if title.is_empty() || trigger.is_empty() { continue; }
+
+        suggestions.push(SkillSuggestion {
+            signature,
+            score,
+            intent,
+            suggested_title: title,
+            suggested_trigger: trigger,
+            suggested_behavior: behavior,
+        });
+    }
+
+    Ok(suggestions)
+}
+
 // ─── Progressive Distillation ──────────────────────────────────────────────────
 
 /// 當某個 category 的 facts 超過 CONDENSE_THRESHOLD 時，呼叫 LLM 聚合成高階摘要，

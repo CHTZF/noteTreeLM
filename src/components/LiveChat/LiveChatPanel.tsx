@@ -409,12 +409,16 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
     const unlistenDone = await listen('llm:done', () => {
       llmDone = true
       flushBuffer(true)
-      unlistenToken()
-      unlistenToolCall()
-      unlistenWriteReq()
-      unlistenNoteRefs()
-      unlistenOpenNote()
-      unlistenDone()
+      // Defer unlisten to avoid calling it from within an active event handler,
+      // which can cause Tauri's "listeners[eventId].handlerId" crash.
+      setTimeout(() => {
+        unlistenToken()
+        unlistenToolCall()
+        unlistenWriteReq()
+        unlistenNoteRefs()
+        unlistenOpenNote()
+        unlistenDone()
+      }, 0)
       // If TTS queue is empty and nothing is playing, transition now
       if (!ttsActive && ttsQueue.length === 0) {
         if (fullResponse) {

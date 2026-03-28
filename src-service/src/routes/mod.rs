@@ -8,3 +8,4 @@ pub mod agents;
 pub mod search;
 pub mod memory;
 pub mod scheduled;
+pub mod events;

@@ -105,7 +105,6 @@
     "tab": {
       "account": "帳號",
       "general": "一般",
-      "ai": "外部 AI",
       "voice": "Whisper",
       "local": "Local LLM",
       "advanced": "進階",
@@ -129,19 +128,6 @@
       "memory_threshold_desc": "幾則訊息後儲存到記憶",
       "sidebar_width": "側邊欄寬度",
       "save": "儲存設定"
-    },
-    "ai": {
-      "provider": "服務商",
-      "api_key": "API 金鑰",
-      "api_key_placeholder": "輸入 API 金鑰",
-      "model": "模型",
-      "model_placeholder": "模型名稱",
-      "base_url": "Base URL",
-      "base_url_placeholder": "https://api.openai.com/v1",
-      "save": "儲存 AI 設定",
-      "test": "測試連線",
-      "test_success": "連線成功",
-      "test_fail": "連線失敗"
     },
     "voice": {
       "whisper_model": "Whisper 模型",

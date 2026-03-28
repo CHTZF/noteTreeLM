@@ -38,23 +38,9 @@ interface MemoryRuleEntry {
   created_at: number
 }
 
-type Tab = 'account' | 'general' | 'ai' | 'voice' | 'local' | 'advanced' | 'raw' | 'memory' | 'mobile'
+type Tab = 'account' | 'general' | 'sidebar' | 'voice' | 'local' | 'advanced' | 'raw' | 'memory' | 'mobile'
 type ServerStatus = 'unknown' | 'running' | 'loading' | 'stopped'
 
-// Provider → 預設模型清單
-const MODEL_OPTIONS: Record<string, string[]> = {
-  openai:    ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-4', 'gpt-3.5-turbo'],
-  anthropic: ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'],
-  ollama:    ['llama3.2', 'llama3.1', 'mistral', 'codestral', 'gemma2', 'phi3'],
-}
-const DEFAULT_MODEL: Record<string, string> = {
-  openai: 'gpt-4o', anthropic: 'claude-sonnet-4-6', ollama: 'llama3.2',
-}
-const DEFAULT_BASE_URL: Record<string, string> = {
-  openai: 'https://api.openai.com/v1',
-  anthropic: 'https://api.anthropic.com/v1',
-  ollama: 'http://localhost:11434/v1',
-}
 
 const labelStyle: React.CSSProperties = {
   display: 'block', fontSize: '12px', color: 'var(--color-text-secondary)', marginBottom: '6px',
@@ -74,7 +60,7 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
   const { settings, savePersonal, saveSystem, loadSystem, systemSettings, getApiKey, setApiKey } = useSettingsStore()
   const { session } = useAuthStore()
 
-  const [tab, setTab] = useState<Tab>(mode === 'system' ? 'ai' : 'general')
+  const [tab, setTab] = useState<Tab>(mode === 'system' ? 'voice' : 'general')
   const [repairLogs, setRepairLogs] = useState<RepairLog[]>([])
   const [expandedLog, setExpandedLog] = useState<string | null>(null)
   const [draft, setDraft] = useState<Settings>(() =>
@@ -82,8 +68,6 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
       ? { ...DEFAULT_SETTINGS, ...(systemSettings ?? {}) }
       : { ...settings }
   )
-  const [apiKey, setApiKeyLocal] = useState('')
-  const [apiKeySaved, setApiKeySaved] = useState(false)
   const [braveApiKey, setBraveApiKey] = useState('')
   const [braveApiKeySaved, setBraveApiKeySaved] = useState(false)
   const [braveUsage, setBraveUsage] = useState<{ used: number; limit: number; reset_label: string } | null>(null)
@@ -201,13 +185,6 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
     if (mode === 'system' && systemSettings)
       setDraft(prev => ({ ...prev, ...systemSettings }))
   }, [systemSettings])
-
-  useEffect(() => {
-    if (draft.ai_provider)
-      getApiKey(draft.ai_provider).then((k) => setApiKeyLocal(k || ''))
-    else
-      setApiKeyLocal('')
-  }, [draft.ai_provider])
 
   useEffect(() => {
     getApiKey('brave_search').then((k) => setBraveApiKey(k || ''))
@@ -405,14 +382,6 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
 
   const up = (partial: Partial<Settings>) => setDraft((d) => ({ ...d, ...partial }))
 
-  const handleProviderChange = (provider: string) => {
-    up({
-      ai_provider: provider,
-      ai_model: DEFAULT_MODEL[provider] ?? '',
-      ai_base_url: DEFAULT_BASE_URL[provider] ?? '',
-    })
-  }
-
   const handleRepair = async () => {
     const confirmed = await ask(
       '此操作將備份設定、帳號、技能、Agent 定義及對話紀錄，\n然後在重啟時重建資料庫並自動還原。\n\n重啟後搜尋索引需重新執行 reindex。\n\n確定要繼續嗎？',
@@ -473,12 +442,6 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
       sidebar_width: settings.sidebar_width,
       graph_panel_width: settings.graph_panel_width,
     })
-  }
-
-  const handleSaveApiKey = async () => {
-    await setApiKey(draft.ai_provider, apiKey)
-    setApiKeySaved(true)
-    setTimeout(() => setApiKeySaved(false), 2000)
   }
 
   const handleSaveBraveApiKey = async () => {
@@ -601,14 +564,9 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
 
   // ── Render ───────────────────────────────────────────────────────
 
-  const hasProvider = !!draft.ai_provider
-  const modelOptions = MODEL_OPTIONS[draft.ai_provider] ?? []
-  const modelIsCustom = hasProvider && !modelOptions.includes(draft.ai_model) && draft.ai_model
-
-
   const tabs: [Tab, string][] = mode === 'system'
-    ? [['ai', t('settings.tab.ai')], ['voice', t('settings.tab.voice')], ['local', t('settings.tab.local')], ['advanced', t('settings.tab.advanced')], ['raw', t('settings.tab.raw')]]
-    : [['account', t('settings.tab.account')], ['general', t('settings.tab.general')], ['advanced', t('settings.tab.advanced')], ['memory', t('settings.tab.memory')], ['mobile', 'Mobile'], ['raw', t('settings.tab.raw')]]
+    ? [['voice', t('settings.tab.voice')], ['local', t('settings.tab.local')], ['advanced', t('settings.tab.advanced')], ['raw', t('settings.tab.raw')]]
+    : [['account', t('settings.tab.account')], ['general', t('settings.tab.general')], ['sidebar', '左側選單'], ['advanced', t('settings.tab.advanced')], ['memory', t('settings.tab.memory')], ['mobile', 'Mobile'], ['raw', t('settings.tab.raw')]]
 
   const handleChangePassword = async () => {
     if (!newPassword || newPassword !== confirmPassword) {
@@ -913,15 +871,6 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                 </select>
               </div>
 
-              {/* ── Chat 功能 ────────────────────────────────────────────────── */}
-              <SectionDivider />
-              <SectionHeader label="Chat 功能" />
-              <ToggleRow label="啟用 Chat 功能" value={draft.enable_chat} onChange={(v) => up({ enable_chat: v })} />
-              {draft.enable_chat && (
-                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 16px 0', lineHeight: 1.5 }}>
-                  開啟後右側面板會新增 Chat 分頁，可與本地 llama LLM 進行對話。需先至系統設定設定 llama 執行檔路徑。
-                </p>
-              )}
               <ToggleRow label="Chat 自動帶入當前筆記" value={draft.chat_auto_include_note} onChange={(v) => up({ chat_auto_include_note: v })} />
               {draft.chat_auto_include_note && (
                 <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 16px 0', lineHeight: 1.5 }}>
@@ -1041,79 +990,6 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                   </div>
                 )
               })}
-            </>}
-
-            {tab === 'ai' && <>
-              <div style={fieldStyle}>
-                <label style={labelStyle}>外部 AI 提供商</label>
-                <select value={draft.ai_provider} onChange={(e) => handleProviderChange(e.target.value)} style={inputStyle}>
-                  <option value="">未設定</option>
-                  <option value="openai">OpenAI</option>
-                  <option value="anthropic">Anthropic</option>
-                  <option value="ollama">Ollama（本地 API）</option>
-                </select>
-                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '5px 0 0', lineHeight: 1.5 }}>
-                  當本地工具（記憶查詢、主題分析等）無法回答時，Chat 會透過此提供商發送請求作為外部輔助。本地 LLM 路徑與模型請至「Local LLM」頁面設定。
-                </p>
-              </div>
-
-              {/* 提供商欄位：未選擇時隱藏 */}
-              {draft.ai_provider && <>
-                {/* 模型 — 下拉選單（依提供商），Ollama 用文字輸入 */}
-                <div style={fieldStyle}>
-                  <label style={labelStyle}>模型</label>
-                  {!hasProvider ? (
-                    <input disabled value="" placeholder="請先選擇 AI 提供商" style={disabledStyle} />
-                  ) : draft.ai_provider === 'ollama' ? (
-                    <input value={draft.ai_model} onChange={(e) => up({ ai_model: e.target.value })}
-                      placeholder="llama3.2" style={inputStyle} />
-                  ) : (
-                    <select value={draft.ai_model} onChange={(e) => up({ ai_model: e.target.value })} style={inputStyle}>
-                      {modelOptions.map((m) => <option key={m} value={m}>{m}</option>)}
-                      {modelIsCustom && <option value={draft.ai_model}>{draft.ai_model}（自訂）</option>}
-                    </select>
-                  )}
-                </div>
-
-                {/* API Base URL */}
-                <div style={fieldStyle}>
-                  <label style={labelStyle}>API Base URL</label>
-                  <input
-                    value={draft.ai_base_url}
-                    disabled={!hasProvider}
-                    onChange={(e) => up({ ai_base_url: e.target.value })}
-                    placeholder="https://api.openai.com/v1"
-                    style={hasProvider ? inputStyle : disabledStyle}
-                  />
-                </div>
-
-                {/* API Key */}
-                <div style={fieldStyle}>
-                  <label style={labelStyle}>API Key</label>
-                  <div style={{ display: 'flex', gap: '8px' }}>
-                    <input
-                      type="password"
-                      value={apiKey}
-                      disabled={!hasProvider}
-                      onChange={(e) => setApiKeyLocal(e.target.value)}
-                      placeholder={hasProvider ? 'sk-…' : '請先選擇 AI 提供商'}
-                      style={{ ...(hasProvider ? inputStyle : disabledStyle), flex: 1 }}
-                    />
-                    <button
-                      onClick={handleSaveApiKey}
-                      disabled={!hasProvider}
-                      style={{
-                        height: '32px', padding: '0 14px', borderRadius: '6px',
-                        background: !hasProvider ? 'var(--color-bg-overlay)' : apiKeySaved ? 'var(--color-success)' : 'var(--color-accent)',
-                        color: !hasProvider ? 'var(--color-text-muted)' : '#fff',
-                        fontSize: '13px', flexShrink: 0, transition: 'background 0.2s',
-                        cursor: hasProvider ? 'pointer' : 'not-allowed',
-                      }}
-                    >{apiKeySaved ? '已儲存 ✓' : '儲存 Key'}</button>
-                  </div>
-                </div>
-              </>}
-
             </>}
 
             {tab === 'voice' && <>
@@ -1585,6 +1461,33 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
               />
             </>}
 
+            {tab === 'sidebar' && <>
+              <SectionHeader label="搜尋 Spotlight" />
+              <ToggleRow label="顯示 Spotlight 按鈕" value={draft.show_spotlight ?? true} onChange={(v) => up({ show_spotlight: v })} />
+              <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 16px 0', lineHeight: 1.5 }}>
+                顯示 Spotlight 搜尋按鈕（⌘K），可搜尋功能與筆記
+              </p>
+              <SectionDivider />
+              <SectionHeader label="功能頁籤" />
+              <ToggleRow label="知識圖譜" value={draft.show_graph} onChange={(v) => up({ show_graph: v })} />
+              <ToggleRow label="Agent 管理" value={draft.show_agents} onChange={(v) => up({ show_agents: v })} />
+              <ToggleRow label="技能規範" value={draft.show_skills} onChange={(v) => up({ show_skills: v })} />
+              <ToggleRow label="知識助理" value={draft.show_kb_assist} onChange={(v) => up({ show_kb_assist: v })} />
+              <ToggleRow label="匯入中心" value={draft.show_import} onChange={(v) => up({ show_import: v })} />
+              <SectionDivider />
+              <SectionHeader label="開發工具" />
+              <ToggleRow label="Agent tool 測試" value={draft.show_agent_tools ?? false} onChange={(v) => up({ show_agent_tools: v })} />
+              <ToggleRow label="Debug 模式" value={draft.debug_mode} onChange={(v) => up({ debug_mode: v })} />
+              <SectionDivider />
+              <SectionHeader label="Chat 功能" />
+              <ToggleRow label="啟用 Chat 功能" value={draft.enable_chat} onChange={(v) => up({ enable_chat: v })} />
+              {draft.enable_chat && (
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 16px 0', lineHeight: 1.5 }}>
+                  開啟後右側面板會新增 Chat 分頁，可與本地 llama LLM 進行對話。需先至系統設定設定 llama 執行檔路徑。
+                </p>
+              )}
+            </>}
+
             {tab === 'advanced' && <>
               {mode === 'system' && (
                 <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px', marginTop: '8px' }}>
@@ -1607,29 +1510,6 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                   </button>
                 </div>
               )}
-              {mode === 'personal' && (
-              <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px', marginTop: '8px' }}>
-                <ToggleRow
-                  label="Agent tool 測試"
-                  value={draft.show_agent_tools ?? true}
-                  onChange={(v) => up({ show_agent_tools: v })}
-                />
-                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 16px 0', lineHeight: 1.5 }}>
-                  控制側欄是否顯示「Agent Tool 測試台」按鈕。
-                </p>
-                <ToggleRow
-                  label="Debug 模式"
-                  value={draft.debug_mode}
-                  onChange={(v) => up({ debug_mode: v })}
-                />
-                {draft.debug_mode && (
-                  <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 16px 0', lineHeight: 1.5 }}>
-                    開啟後右側面板會新增 Debug 分頁，顯示語音錄音的詳細事件日誌。
-                  </p>
-                )}
-              </div>
-              )}
-
               {/* 資料庫修復紀錄 */}
               <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px', marginTop: '8px' }}>
                 <p style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)', margin: '0 0 10px' }}>

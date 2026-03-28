@@ -2,7 +2,7 @@ use mdns_sd::{ServiceDaemon, ServiceInfo};
 use std::collections::HashMap;
 
 pub const SERVICE_PORT: u16 = 7788;
-const SERVICE_TYPE: &str = "_notetreetlm._tcp.local.";
+const SERVICE_TYPE: &str = "_notetreelm._tcp.local.";
 
 pub fn start_mdns_broadcast(
     spki_pin: &str,
@@ -11,7 +11,7 @@ pub fn start_mdns_broadcast(
 
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "notetreetlm-host".to_string());
+        .unwrap_or_else(|_| "notetreelm-host".to_string());
 
     // instance name：讓使用者看得懂
     let instance_name = format!("noteTreeLM on {}", hostname);

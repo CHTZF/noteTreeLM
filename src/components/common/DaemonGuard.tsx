@@ -27,7 +27,7 @@ export default function DaemonGuard({ children }: { children: React.ReactNode })
   if (status === 'offline') return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', background: 'var(--color-bg-base)', flexDirection: 'column', gap: 16, padding: 32 }}>
       <div style={{ fontSize: 48 }}>⚠️</div>
-      <h2 style={{ color: 'var(--color-text-primary)', margin: 0, fontSize: 18 }}>notetreetlm-service 未啟動</h2>
+      <h2 style={{ color: 'var(--color-text-primary)', margin: 0, fontSize: 18 }}>notetreelm-service 未啟動</h2>
       <p style={{ color: 'var(--color-text-muted)', fontSize: 13, textAlign: 'center', maxWidth: 400, lineHeight: 1.6, margin: 0 }}>
         請先啟動背景服務後再使用 noteTreeLM：
       </p>

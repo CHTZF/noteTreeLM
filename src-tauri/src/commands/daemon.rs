@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-const PLIST_LABEL: &str = "com.notetreetlm.service";
+const PLIST_LABEL: &str = "com.notetreelm.service";
 
 fn plist_path() -> PathBuf {
     let home = dirs::home_dir().expect("Cannot find home dir");
@@ -16,7 +16,7 @@ fn daemon_binary_path() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_default();
     exe.parent()
         .unwrap_or_else(|| std::path::Path::new("."))
-        .join("notetreetlm-service")
+        .join("notetreelm-service")
 }
 
 fn build_plist(binary_path: &std::path::Path) -> String {

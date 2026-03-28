@@ -105,7 +105,6 @@
     "tab": {
       "account": "アカウント",
       "general": "一般",
-      "ai": "外部 AI",
       "voice": "Whisper",
       "local": "ローカル LLM",
       "advanced": "詳細",
@@ -130,7 +129,6 @@
       "sidebar_width": "サイドバー幅",
       "save": "設定を保存"
     },
-    "ai": { "provider": "プロバイダー", "api_key": "API キー", "api_key_placeholder": "API キーを入力", "model": "モデル", "model_placeholder": "モデル名", "base_url": "Base URL", "base_url_placeholder": "https://api.openai.com/v1", "save": "AI 設定を保存", "test": "接続テスト", "test_success": "接続成功", "test_fail": "接続失敗" },
     "voice": { "whisper_model": "Whisper モデル", "whisper_model_path": "モデルパス", "language": "認識言語", "noise_suppression": "ノイズ抑制", "voice_process_mode": "後処理モード", "process_none": "なし", "process_format": "フォーマット", "process_summary": "要約", "server_status": "Whisper サーバー状態", "server_port": "サーバーポート", "start_server": "サーバー起動", "stop_server": "サーバー停止" },
     "local": { "llama_model": "LLM モデル", "llama_port": "LLM ポート", "embedding_model": "埋め込みモデル", "embedding_port": "埋め込みポート", "llm_status": "LLM サーバー状態", "embedding_status": "埋め込みサーバー状態", "start": "起動", "stop": "停止", "restart": "再起動" },
     "account": { "title": "アカウント", "logged_in_as": "ログイン中", "logout": "ログアウト", "login": "ログイン", "signup": "登録" },

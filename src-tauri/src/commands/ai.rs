@@ -25,7 +25,7 @@ pub(crate) use super::external_ai::read_api_key;
 pub use super::memory::{
     add_memory_rule, get_memory_rules, delete_memory_rule,
     query_memory,
-    distill_preferences, extract_memory_facts, condense_memory_facts,
+    distill_preferences, extract_memory_facts, condense_memory_facts, suggest_skills_from_patterns,
     rate_response, get_conversation_ratings, analyze_tool_patterns,
 };
 pub(crate) use super::memory::retrieve_relevant_facts;

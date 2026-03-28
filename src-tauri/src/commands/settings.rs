@@ -18,9 +18,6 @@ pub struct Settings {
     pub whisper_auto_insert: bool,
     pub import_max_depth: u32,
     pub import_max_pages: u32,
-    pub ai_provider: String,
-    pub ai_model: String,
-    pub ai_base_url: String,
     pub ai_enable_topics: bool,
     pub ai_enable_summary: bool,
     pub ai_enable_vision: bool,
@@ -90,9 +87,6 @@ pub async fn get_settings(state: State<'_, AppState>, username: String) -> Resul
         whisper_auto_insert: b(&sys, "whisper_auto_insert", true),
         import_max_depth: u(&usr, "import_max_depth", 3),
         import_max_pages: u(&usr, "import_max_pages", 50),
-        ai_provider: s(&sys, "ai_provider", ""),
-        ai_model: s(&sys, "ai_model", "gpt-4o"),
-        ai_base_url: s(&sys, "ai_base_url", "https://api.openai.com/v1"),
         ai_enable_topics: b(&sys, "ai_enable_topics", true),
         ai_enable_summary: b(&sys, "ai_enable_summary", true),
         ai_enable_vision: b(&sys, "ai_enable_vision", true),
@@ -126,9 +120,6 @@ pub async fn get_settings(state: State<'_, AppState>, username: String) -> Resul
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SystemSettings {
     pub system_current_vault_path: String,
-    pub ai_provider: String,
-    pub ai_model: String,
-    pub ai_base_url: String,
     pub ai_enable_topics: bool,
     pub ai_enable_summary: bool,
     pub ai_enable_vision: bool,
@@ -150,9 +141,6 @@ pub async fn get_system_settings(state: State<'_, AppState>) -> Result<SystemSet
         .await.unwrap_or_default();
     Ok(SystemSettings {
         system_current_vault_path: s(&sys, "system_current_vault_path", ""),
-        ai_provider: s(&sys, "ai_provider", ""),
-        ai_model: s(&sys, "ai_model", "gpt-4o"),
-        ai_base_url: s(&sys, "ai_base_url", "https://api.openai.com/v1"),
         ai_enable_topics: b(&sys, "ai_enable_topics", true),
         ai_enable_summary: b(&sys, "ai_enable_summary", true),
         ai_enable_vision: b(&sys, "ai_enable_vision", true),
@@ -178,9 +166,6 @@ pub async fn save_system_settings(
 
     let mut map = HashMap::new();
     map.insert("system_current_vault_path", settings.system_current_vault_path.clone());
-    map.insert("ai_provider", settings.ai_provider.clone());
-    map.insert("ai_model", settings.ai_model.clone());
-    map.insert("ai_base_url", settings.ai_base_url.clone());
     map.insert("ai_enable_topics", settings.ai_enable_topics.to_string());
     map.insert("ai_enable_summary", settings.ai_enable_summary.to_string());
     map.insert("ai_enable_vision", settings.ai_enable_vision.to_string());

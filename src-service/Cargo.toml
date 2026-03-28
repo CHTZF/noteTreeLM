@@ -1,10 +1,10 @@
 [package]
-name = "notetreetlm-service"
+name = "notetreelm-service"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "notetreetlm-service"
+name = "notetreelm-service"
 path = "src/main.rs"
 
 [dependencies]
@@ -52,3 +52,7 @@ reqwest = { version = "0.12", features = ["json"] }
 # Regex (markdown cleaning)
 regex = "1"
 once_cell = "1"
+
+# SSE event streaming
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"

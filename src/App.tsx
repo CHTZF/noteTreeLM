@@ -31,6 +31,7 @@ import LiveChatPanel from './components/LiveChat/LiveChatPanel'
 import LiveChatSheet from './components/LiveChat/LiveChatSheet'
 import NoteStatusBadge from './components/Editor/NoteStatusBadge'
 import QuickOpen from './components/QuickOpen/QuickOpen'
+import Spotlight, { type SpotlightFeature } from './components/Spotlight/Spotlight'
 import SettingsModal from './components/Settings/SettingsModal'
 import { AgentToolContent } from './components/AgentTools/AgentToolPanel'
 import TrashPanel from './components/Trash/TrashPanel'
@@ -64,6 +65,7 @@ const IMPORT_TAB = '__import__'
 const KB_ASSIST_TAB = '__kb_assist__'
 const SKILLS_TAB = '__skills__'
 const AGENTS_TAB = '__agents__'
+const DEBUG_TAB = '__debug__'
 
 // ─── Pane tree types ───────────────────────────────────────────────────────
 interface PaneLeaf {
@@ -198,7 +200,7 @@ function AppMain() {
   const { t } = useTranslation()
   const { session, logout: authLogout } = useAuthStore()
   const { load: loadSettings, settings, savePersonal: saveSettings, saveSystem } = useSettingsStore()
-  const { scanVault, setupWatchers, readNote } = useVaultStore()
+  const { scanVault, setupWatchers, readNote, loadNotes } = useVaultStore()
   const { load: loadGraph } = useGraphStore()
   const { currentPath, pendingAnchor } = useEditorStore()
   const { push: navPush, back: navBack, forward: navForward, canGoBack, canGoForward } = useNavigationStore()
@@ -209,17 +211,13 @@ function AppMain() {
   const [showSetupWizard, setShowSetupWizard] = useState(false)
   const [showVaultManager, setShowVaultManager] = useState(false)
   const [showQuickOpen, setShowQuickOpen] = useState(false)
+  const [showSpotlight, setShowSpotlight] = useState(false)
   const [liveChatSheetOpen, setLiveChatSheetOpen] = useState(false)
   const [showVcredistWarning, setShowVcredistWarning] = useState(false)
   const [userMenuOpen, setUserMenuOpen] = useState(false)
   const userMenuRef = useRef<HTMLDivElement>(null)
   const [sidebarWidth, setSidebarWidth] = useState(240)
-  const [leftPanel, setLeftPanel] = useState<'files' | 'search' | 'debug' | null>('files')
-
-  // Auto-close debug panel when debug_mode is turned off
-  useEffect(() => {
-    if (!settings.debug_mode && leftPanel === 'debug') setLeftPanel('files')
-  }, [settings.debug_mode])
+  const [leftPanel, setLeftPanel] = useState<'files' | 'search' | null>('files')
 
   // Windows: check VC++ Redist and show warning if missing
   useEffect(() => {
@@ -364,9 +362,12 @@ function AppMain() {
     initialLeafIdRef.current = newLeafId
     setPaneRoot({ kind: 'leaf', id: newLeafId, tabs: [], activeTabId: null })
     setFocusedPaneId(newLeafId)
-    await scanVault()
-    await loadGraph()
-    const lastNote = await api.getVaultLastNote(newVaultPath).catch(() => null)
+    // Fast path: load notes from existing daemon index + graph in parallel
+    const [lastNote] = await Promise.all([
+      api.getVaultLastNote(newVaultPath).catch(() => null),
+      loadNotes(),
+      loadGraph(),
+    ])
     if (lastNote) {
       const tabId = crypto.randomUUID()
       setPaneRoot({ kind: 'leaf', id: newLeafId, tabs: [{ id: tabId, path: lastNote }], activeTabId: tabId })
@@ -375,7 +376,9 @@ function AppMain() {
     }
     setShowVaultManager(false)
     setAppReady(true)
-  }, [saveSettings, scanVault, loadGraph, navPush])
+    // Background: re-index any files added outside the app (non-blocking)
+    scanVault().catch(() => {})
+  }, [saveSettings, scanVault, loadNotes, loadGraph, navPush])
 
   // ─── Save last open note ───────────────────────────────────────────────
   useEffect(() => {
@@ -524,6 +527,7 @@ function AppMain() {
     const handler = (e: KeyboardEvent) => {
       const meta = e.metaKey || e.ctrlKey
       if (meta && e.key === 'p' && !e.shiftKey) { e.preventDefault(); setShowQuickOpen(true) }
+      if (meta && e.key === 'k' && !e.shiftKey) { e.preventDefault(); setShowSpotlight(true) }
       if (meta && e.key === ',') { e.preventDefault(); openNote(SETTINGS_TAB) }
       if (meta && e.altKey && e.key.toLowerCase() === 'i') { e.preventDefault(); setLiveChatSheetOpen(v => !v) }
       if (meta && e.key === '[') {
@@ -780,6 +784,20 @@ function AppMain() {
 
   const openGraphTab = useCallback(() => openNote(GRAPH_TAB), [openNote])
 
+  // ─── Spotlight features list ───────────────────────────────────────────
+  const spotlightFeatures: SpotlightFeature[] = [
+    { id: 'graph', label: '知識圖譜', icon: '🕸️', action: () => openNote(GRAPH_TAB) },
+    { id: 'agents', label: 'Agent 管理', icon: '⚡', action: () => openNote(AGENTS_TAB) },
+    { id: 'skills', label: '技能規範', icon: '🎚️', action: () => openNote(SKILLS_TAB) },
+    { id: 'kb_assist', label: '知識助理', icon: '🛡️', action: () => openNote(KB_ASSIST_TAB) },
+    { id: 'import', label: '匯入中心', icon: '📥', action: () => openNote(IMPORT_TAB) },
+    { id: 'chat', label: 'Chat 對話', icon: '💬', action: () => openNote(CHAT_TAB) },
+    { id: 'settings', label: '個人設定', icon: '👤', action: () => openNote(SETTINGS_TAB) },
+    { id: 'system_settings', label: '系統設定', icon: '⚙️', action: () => openNote(SYSTEM_SETTINGS_TAB) },
+    { id: 'trash', label: '垃圾桶', icon: '🗑️', action: () => openNote(TRASH_TAB) },
+    { id: 'help', label: '說明', icon: '❓', action: () => openNote(HELP_TAB) },
+    { id: 'search', label: '語義搜尋', icon: '🔎', action: () => setLeftPanel('search') },
+  ]
 
   // ─── Sidebar resize ────────────────────────────────────────────────────
   const onLeftDividerMouseDown = () => { isDraggingLeft.current = true }
@@ -993,6 +1011,11 @@ function AppMain() {
     if (activePath === TRASH_TAB) return (
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         <TrashPanel inline />
+      </div>
+    )
+    if (activePath === DEBUG_TAB) return (
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        <DebugPanel />
       </div>
     )
     if (!/\.(md|markdown|mdx)$/i.test(activePath)) return <FileViewer path={activePath} />
@@ -1209,54 +1232,71 @@ function AppMain() {
             title={t('sidebar.search')}
             onClick={() => setLeftPanel(p => p === 'search' ? null : 'search')}
           ><FontAwesomeIcon icon={faMagnifyingGlass} /></button>
+          {(settings.show_spotlight ?? true) && (
+            <button
+              className="icon-menubar-btn"
+              title="Spotlight 搜尋 (⌘K)"
+              onClick={() => setShowSpotlight(true)}
+            >⌘</button>
+          )}
           {settings.debug_mode && (
             <button
-              className={`icon-menubar-btn${leftPanel === 'debug' ? ' active' : ''}`}
+              className={`icon-menubar-btn${currentPath === DEBUG_TAB ? ' active' : ''}`}
               title="Debug"
-              onClick={() => setLeftPanel(p => p === 'debug' ? null : 'debug')}
+              onClick={() => openNote(DEBUG_TAB)}
             ><FontAwesomeIcon icon={faBug} /></button>
           )}
 
           <div className="icon-menubar-sep" />
 
           {/* 特殊頁籤：圖譜 / Agent / Chat / Live Chat */}
-          <button
-            className={`icon-menubar-btn${currentPath === GRAPH_TAB ? ' active' : ''}`}
-            title={t('tabs.graph')}
-            onClick={openGraphTab}
-          ><FontAwesomeIcon icon={faSitemap} /></button>
+          {settings.show_graph && (
+            <button
+              className={`icon-menubar-btn${currentPath === GRAPH_TAB ? ' active' : ''}`}
+              title={t('tabs.graph')}
+              onClick={openGraphTab}
+            ><FontAwesomeIcon icon={faSitemap} /></button>
+          )}
 
-          {(settings.show_agent_tools ?? true) && (
+          {settings.show_agents && (
+            <button
+              className={`icon-menubar-btn${currentPath === AGENTS_TAB ? ' active' : ''}`}
+              title={t('tabs.agents')}
+              onClick={() => openNote(AGENTS_TAB)}
+            ><FontAwesomeIcon icon={faBolt} /></button>
+          )}
+
+          {settings.show_skills && (
+            <button
+              className={`icon-menubar-btn${currentPath === SKILLS_TAB ? ' active' : ''}`}
+              title={t('tabs.skills')}
+              onClick={() => openNote(SKILLS_TAB)}
+            ><FontAwesomeIcon icon={faSliders} /></button>
+          )}
+
+          {settings.show_kb_assist && (
+            <button
+              className={`icon-menubar-btn${currentPath === KB_ASSIST_TAB ? ' active' : ''}`}
+              title={t('tabs.kb_assist')}
+              onClick={() => openNote(KB_ASSIST_TAB)}
+            ><FontAwesomeIcon icon={faShieldHalved} /></button>
+          )}
+
+          {settings.show_import && (
+            <button
+              className={`icon-menubar-btn${currentPath === IMPORT_TAB ? ' active' : ''}`}
+              title={t('tabs.import')}
+              onClick={() => openNote(IMPORT_TAB)}
+            ><FontAwesomeIcon icon={faFileImport} /></button>
+          )}
+
+          {settings.show_agent_tools && (
             <button
               className={`icon-menubar-btn${currentPath === AGENT_TOOLS_TAB ? ' active' : ''}`}
               title={t('tabs.agent_tools')}
               onClick={() => openNote(AGENT_TOOLS_TAB)}
             ><FontAwesomeIcon icon={faBolt} /></button>
           )}
-
-          <button
-            className={`icon-menubar-btn${currentPath === IMPORT_TAB ? ' active' : ''}`}
-            title={t('tabs.import')}
-            onClick={() => openNote(IMPORT_TAB)}
-          ><FontAwesomeIcon icon={faFileImport} /></button>
-
-          <button
-            className={`icon-menubar-btn${currentPath === KB_ASSIST_TAB ? ' active' : ''}`}
-            title={t('tabs.kb_assist')}
-            onClick={() => openNote(KB_ASSIST_TAB)}
-          ><FontAwesomeIcon icon={faShieldHalved} /></button>
-
-          <button
-            className={`icon-menubar-btn${currentPath === SKILLS_TAB ? ' active' : ''}`}
-            title={t('tabs.skills')}
-            onClick={() => openNote(SKILLS_TAB)}
-          ><FontAwesomeIcon icon={faSliders} /></button>
-
-          <button
-            className={`icon-menubar-btn${currentPath === AGENTS_TAB ? ' active' : ''}`}
-            title={t('tabs.agents')}
-            onClick={() => openNote(AGENTS_TAB)}
-          ><FontAwesomeIcon icon={faBolt} /></button>
 
           {settings.enable_chat && <>
             <button
@@ -1389,9 +1429,6 @@ function AppMain() {
           <div style={{ display: leftPanel === 'search' ? 'flex' : 'none', flex: 1, flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
             <SemanticSearchPanel onOpenNote={openNoteFromChat} />
           </div>
-          <div style={{ display: leftPanel === 'debug' ? 'flex' : 'none', flex: 1, flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-            <DebugPanel />
-          </div>
           <ServerStatusBar onOpenSettings={() => openNote(SYSTEM_SETTINGS_TAB)} />
         </aside>
 
@@ -1425,6 +1462,15 @@ function AppMain() {
         <QuickOpen
           onSelect={path => { openNote(path, { source: 'quickopen' }); setShowQuickOpen(false) }}
           onClose={() => setShowQuickOpen(false)}
+        />
+      )}
+
+      {/* Spotlight */}
+      {showSpotlight && (
+        <Spotlight
+          features={spotlightFeatures}
+          onSelectNote={path => { openNote(path, { source: 'quickopen' }); setShowSpotlight(false) }}
+          onClose={() => setShowSpotlight(false)}
         />
       )}
 

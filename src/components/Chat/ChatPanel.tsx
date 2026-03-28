@@ -677,6 +677,16 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         invoke('distill_preferences').catch(() => {}),
         invoke('condense_memory_facts').catch(() => {}),
         invoke('analyze_tool_patterns').catch(() => {}),
+        invoke<Array<{ signature: string; suggested_title: string; suggested_trigger: string; suggested_behavior: string }>>('suggest_skills_from_patterns')
+          .then(suggestions => {
+            if (suggestions.length > 0) {
+              const s = suggestions[0]
+              setMessages(prev => [...prev, {
+                role: 'notice' as const,
+                content: `💡 根據你的使用習慣，建議建立技能「**${s.suggested_title}**」。觸發詞：${s.suggested_trigger}`,
+              }])
+            }
+          }).catch(() => {}),
       ]).catch(() => {})
       lastExtractedMsgCountRef.current = 0
     }

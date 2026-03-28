@@ -442,11 +442,15 @@ fn is_whisper_hallucination(text: &str) -> bool {
 pub async fn warmup_whisper_server(state: &AppState, app: &AppHandle) {
     let tok_owned = state.get_auth_token().await;
     let tok: Option<&str> = if tok_owned.is_empty() { None } else { Some(&tok_owned) };
-    let configured = matches!(
+    let cli_configured = matches!(
         daemon_get_setting(&state.http_client, tok, "whisper_cli_path").await,
         Some(ref p) if !p.is_empty()
     );
-    if !configured {
+    let model_configured = matches!(
+        daemon_get_setting(&state.http_client, tok, "whisper_model_path").await,
+        Some(ref p) if !p.is_empty()
+    );
+    if !cli_configured || !model_configured {
         return; // 未設定是正常情況，靜默跳過
     }
     match ensure_whisper_server_running(state, app).await {
