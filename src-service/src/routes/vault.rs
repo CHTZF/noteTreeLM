@@ -20,6 +20,7 @@ pub fn router() -> Router<ApiState> {
         .route("/vaults/:vault_id/structure", get(vault_structure))
         .route("/vaults/:vault_id/scan", post(scan_vault))
         .route("/vaults/:vault_id/graph", get(get_graph))
+        .route("/vaults/:vault_id/graph/related", get(get_graph_related))
         .route("/vaults/:vault_id/backlinks", get(get_backlinks))
         .route("/vaults/:vault_id/stats", get(get_vault_stats))
 }
@@ -102,6 +103,7 @@ async fn scan_vault(
     let md_files = collect_md_files(root);
     let now = Utc::now().timestamp();
     let mut indexed = 0usize;
+    let mut indexed_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Get embedding URL once for the whole scan
     let emb_url = state.daemon.embedding_url.read().await.clone();
@@ -259,7 +261,110 @@ async fn scan_vault(
             }
         }
 
+        // Upsert graph node for this note
+        {
+            let node_id = format!("{}:{}", vault_id, rel_path);
+            let note_title = extract_title(&content, &rel_path);
+            let _ = state
+                .db
+                .query(
+                    "INSERT INTO graph_nodes (vault_id, node_id, node_type, label, file_path, created_at) \
+                     VALUES ($vid, $nid, 'note', $label, $fp, $now) \
+                     ON DUPLICATE KEY UPDATE label = $label, file_path = $fp",
+                )
+                .bind(("vid", vault_id.clone()))
+                .bind(("nid", node_id))
+                .bind(("label", note_title))
+                .bind(("fp", rel_path.clone()))
+                .bind(("now", now))
+                .await;
+        }
+
+        indexed_paths.insert(rel_path.clone());
         indexed += 1;
+    }
+
+    // Rebuild graph edges from links table (resolve target_title → file_path via notes)
+    {
+        // Load all notes title→node_id map
+        #[derive(serde::Deserialize)]
+        struct NoteRow { title: String, path: String }
+        let notes_res: surrealdb::Result<Vec<NoteRow>> = state
+            .db
+            .query("SELECT title, path FROM notes WHERE vault_id = $vid")
+            .bind(("vid", vault_id.clone()))
+            .await
+            .and_then(|mut r| r.take(0));
+
+        if let Ok(note_rows) = notes_res {
+            let title_to_node: std::collections::HashMap<String, String> = note_rows
+                .into_iter()
+                .map(|n| (n.title.to_lowercase(), format!("{}:{}", vault_id, n.path)))
+                .collect();
+
+            // Delete existing wiki_link edges for this vault
+            let _ = state
+                .db
+                .query("DELETE FROM graph_edges WHERE vault_id = $vid AND edge_type = 'wiki_link'")
+                .bind(("vid", vault_id.clone()))
+                .await;
+
+            // Fetch all links for this vault
+            #[derive(serde::Deserialize)]
+            struct LinkRow { source_path: String, target_title: String }
+            let links_res: surrealdb::Result<Vec<LinkRow>> = state
+                .db
+                .query("SELECT source_path, target_title FROM links WHERE vault_id = $vid")
+                .bind(("vid", vault_id.clone()))
+                .await
+                .and_then(|mut r| r.take(0));
+
+            if let Ok(link_rows) = links_res {
+                for link in link_rows {
+                    let source_id = format!("{}:{}", vault_id, link.source_path);
+                    let target_key = link.target_title.to_lowercase();
+                    if let Some(target_id) = title_to_node.get(&target_key) {
+                        let edge_id = Uuid::new_v4().to_string();
+                        let _ = state
+                            .db
+                            .query(
+                                "INSERT INTO graph_edges (edge_id, vault_id, source_id, target_id, edge_type, weight) \
+                                 VALUES ($eid, $vid, $src, $tgt, 'wiki_link', 1.0)",
+                            )
+                            .bind(("eid", edge_id))
+                            .bind(("vid", vault_id.clone()))
+                            .bind(("src", source_id))
+                            .bind(("tgt", target_id.clone()))
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+
+    // Prune orphan note graph_nodes (deleted files no longer in notes table)
+    {
+        #[derive(serde::Deserialize)]
+        struct NodeRow { node_id: String, file_path: Option<String> }
+        let existing_nodes: Vec<NodeRow> = state
+            .db
+            .query("SELECT node_id, file_path FROM graph_nodes WHERE vault_id = $vid AND node_type = 'note'")
+            .bind(("vid", vault_id.clone()))
+            .await
+            .and_then(|mut r| r.take(0))
+            .unwrap_or_default();
+
+        for node in existing_nodes {
+            let fp = node.file_path.unwrap_or_default();
+            // indexed_paths contains all rel_paths that still exist on disk
+            if !indexed_paths.contains(&fp) {
+                let _ = state
+                    .db
+                    .query("DELETE FROM graph_nodes WHERE node_id = $nid")
+                    .bind(("nid", node.node_id))
+                    .await;
+            }
+        }
     }
 
     state.daemon.emit("vault:changed", serde_json::json!({
@@ -368,6 +473,155 @@ async fn get_graph(
         .collect();
 
     Ok(Json(json!({ "nodes": nodes, "edges": edges })))
+}
+
+// ── Graph Related ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct GraphRelatedQuery {
+    path: String,
+    depth: Option<u32>,
+    limit: Option<usize>,
+}
+
+async fn get_graph_related(
+    State(state): State<ApiState>,
+    Path(vault_id): Path<String>,
+    Query(q): Query<GraphRelatedQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let depth = q.depth.unwrap_or(1).min(2);
+    let limit = q.limit.unwrap_or(10).min(30);
+    let start_path = q.path;
+
+    // Load all notes → title / path for resolution
+    #[derive(serde::Deserialize)]
+    struct NoteRow { path: String, title: String }
+    let mut resp = state
+        .db
+        .query("SELECT path, title FROM notes WHERE vault_id = $vid")
+        .bind(("vid", vault_id.clone()))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let note_rows: Vec<NoteRow> = resp.take(0).unwrap_or_default();
+
+    let title_to_path: std::collections::HashMap<String, String> = note_rows
+        .iter()
+        .map(|n| (n.title.to_lowercase(), n.path.clone()))
+        .collect();
+    let path_to_title: std::collections::HashMap<String, String> = note_rows
+        .iter()
+        .map(|n| (n.path.clone(), n.title.clone()))
+        .collect();
+
+    // Load all links for the vault
+    #[derive(serde::Deserialize)]
+    struct LinkRow { source_path: String, target_title: String }
+    let mut lresp = state
+        .db
+        .query("SELECT source_path, target_title FROM links WHERE vault_id = $vid")
+        .bind(("vid", vault_id.clone()))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let link_rows: Vec<LinkRow> = lresp.take(0).unwrap_or_default();
+
+    // Load graph_edges (includes fact_source, wiki_link edges)
+    #[derive(serde::Deserialize)]
+    struct EdgeRow { source_id: String, target_id: String, edge_type: String }
+    let node_prefix = format!("{}:", vault_id);
+    let mut eresp = state
+        .db
+        .query("SELECT source_id, target_id, edge_type FROM graph_edges WHERE vault_id = $vid")
+        .bind(("vid", vault_id.clone()))
+        .await;
+    let edge_rows: Vec<EdgeRow> = eresp.ok()
+        .and_then(|mut r| r.take::<Vec<EdgeRow>>(0).ok())
+        .unwrap_or_default();
+
+    // Build adjacency: node_key → set of (neighbour_key, relation)
+    // node_key for notes = rel_path; for memory_facts = "memory:vault_id:fact_id"
+    let mut adj: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+
+    // wiki-links via links table (path-based)
+    for l in &link_rows {
+        if let Some(target_path) = title_to_path.get(&l.target_title.to_lowercase()) {
+            adj.entry(l.source_path.clone())
+                .or_default()
+                .push((target_path.clone(), "outgoing".to_string()));
+            adj.entry(target_path.clone())
+                .or_default()
+                .push((l.source_path.clone(), "backlink".to_string()));
+        }
+    }
+
+    // graph_edges (fact_source and others): node_ids use "vault_id:rel_path" or "memory:vault_id:fact_id"
+    // Normalize: strip "vault_id:" prefix to get rel_path for note nodes
+    let strip_prefix = |s: &str| -> String {
+        if s.starts_with(&node_prefix) {
+            s[node_prefix.len()..].to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    for e in &edge_rows {
+        let src_key = strip_prefix(&e.source_id);
+        let tgt_key = strip_prefix(&e.target_id);
+        let rel = e.edge_type.clone();
+        adj.entry(src_key.clone())
+            .or_default()
+            .push((tgt_key.clone(), rel.clone()));
+        adj.entry(tgt_key)
+            .or_default()
+            .push((src_key, format!("←{}", rel)));
+    }
+
+    // BFS up to `depth` hops from start_path
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    visited.insert(start_path.clone());
+    let mut frontier: Vec<String> = vec![start_path.clone()];
+    let mut result_nodes: Vec<serde_json::Value> = Vec::new();
+    let mut result_relations: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    for _ in 0..depth {
+        let mut next_frontier: Vec<String> = Vec::new();
+        for node in &frontier {
+            if let Some(neighbors) = adj.get(node) {
+                for (nbr, rel) in neighbors {
+                    if !visited.contains(nbr) {
+                        visited.insert(nbr.clone());
+                        next_frontier.push(nbr.clone());
+                        result_relations.insert(nbr.clone(), rel.clone());
+                    }
+                }
+            }
+        }
+        frontier = next_frontier;
+        if frontier.is_empty() { break; }
+    }
+
+    // Build result (excluding start node)
+    for node_key in visited.iter().filter(|p| *p != &start_path).take(limit) {
+        // node_key is either a rel_path (note) or "memory:vault_id:fact_id" (memory fact)
+        let is_memory = node_key.starts_with("memory:");
+        let label = if is_memory {
+            // Last segment is fact_id; label not directly available here
+            format!("[記憶] {}", &node_key[node_key.rfind(':').map(|i| i + 1).unwrap_or(0)..])
+        } else {
+            path_to_title.get(node_key).cloned().unwrap_or_else(|| node_key.clone())
+        };
+        let rel = result_relations.get(node_key).cloned().unwrap_or_else(|| "link".to_string());
+        let node_type = if is_memory { "memory_fact" } else { "note" };
+        result_nodes.push(json!({
+            "file_path": if is_memory { "" } else { node_key.as_str() },
+            "node_id": node_key,
+            "node_type": node_type,
+            "label": label,
+            "relation": rel,
+        }));
+    }
+
+    Ok(Json(json!({ "nodes": result_nodes })))
 }
 
 // ── Backlinks ────────────────────────────────────────────────────────────────

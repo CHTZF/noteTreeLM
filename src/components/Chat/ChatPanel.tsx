@@ -80,6 +80,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const [noteSuggestions, setNoteSuggestions] = useState<{ absPath: string; label: string }[]>([])
   const noteSuggestionsRef = useRef<{ absPath: string; label: string }[]>([])
   useEffect(() => { noteSuggestionsRef.current = noteSuggestions }, [noteSuggestions])
+  // Accumulate all note abs-paths referenced in this conversation (for graph edges)
+  const referencedNotePathsRef = useRef<Set<string>>(new Set())
 
   // Track web refs from agent:web_refs (call_external_ai / web_search) for "儲存為知識"
   const pendingWebRefsRef = useRef<Array<{ path: string; title: string; excerpt: string }>>([])
@@ -493,6 +495,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
             const section = hashIdx >= 0 ? absPath.slice(hashIdx + 1) : ''
             const filename = filePart.split('/').pop()?.replace(/\.md$/, '') ?? filePart
             const label = section ? `${filename} § ${section}` : filename
+            // Accumulate for graph edge creation on memory extraction
+            e.payload.forEach(p => referencedNotePathsRef.current.add(p.split('#')[0]))
             return { absPath, label }
           })
           setNoteSuggestions(suggestions)
@@ -622,7 +626,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
           .map(m => ({ role: m.role, content: m.content }))
         if (snapshotMsgs.length >= 2) {
           lastExtractedMsgCountRef.current = snapshotMsgs.length
-          invoke('extract_memory_facts', { messages: snapshotMsgs, conversationId: conversationId ?? null }).catch(() => {})
+          invoke('extract_memory_facts', { messages: snapshotMsgs, conversationId: conversationId ?? null, notePaths: Array.from(referencedNotePathsRef.current) }).catch(() => {})
         }
       }
     } catch (e: unknown) {
@@ -670,7 +674,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       // 若 auto-save 距今不足 4 條新訊息則跳過 extract（避免重複萃取同份資料）
       const newSinceLastExtract = chatMessages.length - lastExtractedMsgCountRef.current
       const extractOp = newSinceLastExtract >= 4
-        ? invoke('extract_memory_facts', { messages: chatMessages, conversationId: conversationId ?? null }).catch(() => {})
+        ? invoke('extract_memory_facts', { messages: chatMessages, conversationId: conversationId ?? null, notePaths: Array.from(referencedNotePathsRef.current) }).catch(() => {})
         : Promise.resolve()
       Promise.all([
         extractOp,
@@ -689,6 +693,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
           }).catch(() => {}),
       ]).catch(() => {})
       lastExtractedMsgCountRef.current = 0
+    referencedNotePathsRef.current = new Set()
     }
     setRatings({})
     setMessages([])

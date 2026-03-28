@@ -1012,14 +1012,47 @@ pub async fn invoke_live_chat(
     } else {
         String::new()
     };
+
+    // Prefetch memory facts and inject into system prompt
+    let memory_ctx_hint = if let Some(ref vid) = vault_id_opt {
+        let url = format!("/vaults/{}/memory/query?limit=6", urlencoding::encode(vid));
+        match crate::api_client::daemon_get::<serde_json::Value>(&state.http_client, &url, tok_lc).await {
+            Ok(results) => {
+                let arr = results.as_array().cloned().unwrap_or_default();
+                if arr.is_empty() {
+                    String::new()
+                } else {
+                    // Emit prefetched node_ids for MemoryLinksView
+                    let node_ids: Vec<String> = arr.iter()
+                        .filter_map(|r| r["fact_id"].as_str())
+                        .map(|fid| format!("memory:{}:{}", vid, fid))
+                        .collect();
+                    if !node_ids.is_empty() {
+                        let _ = app.emit("memory:prefetched", &node_ids);
+                    }
+                    let lines: Vec<String> = arr.iter().filter_map(|r| {
+                        let cat     = r["category"].as_str()?;
+                        let content = r["content"].as_str()?;
+                        Some(format!("[{}] {}", cat, content))
+                    }).collect();
+                    format!("\n\n[你對使用者的了解]\n{}", lines.join("\n"))
+                }
+            }
+            Err(_) => String::new(),
+        }
+    } else {
+        String::new()
+    };
+
     let system = format!(
         "你是一個語音助理，使用者透過語音與你對話。{}\
-你會分三輪被呼叫：第一輪呼叫 search_skills、第二輪直接執行工具取得資料、第三輪呼叫 live_respond 輸出最終口語回覆。\
+你會分三輪被呼叫：第一輪呼叫 think + search_skills、第二輪呼叫 think + 執行工具取得資料、第三輪呼叫 live_respond 輸出最終口語回覆。\
+think 規則：每次呼叫工具之前，必須先呼叫 think 輸出一句內心獨白（10字以內），描述你正在想什麼或接下來要做什麼。例如：「這讓我想起...」「讓我查一下...」「嗯，可能是...」。\
 live_respond 規則：\
 - speech：TTS 朗讀文字，口語化繁體中文，2 句以內，不含 Markdown 或符號。若有搜尋結果，speech 說「已為您找到以下資訊」即可。\
 - content：若有查到網頁或筆記內容，把完整摘要或重點放在此欄位供畫面顯示（可含換行，無需口語化）。若無額外資料則省略。\
-- action：show_results（有資料需展示）/ open_note（開啟筆記）/ open_tab（切換頁籤）/ show_error（錯誤）/ none（只 TTS）。{}{}",
-        lang_hint, note_ctx_hint, activity_ctx_hint
+- action：show_results（有資料需展示）/ open_note（開啟筆記）/ open_tab（切換頁籤）/ show_error（錯誤）/ none（只 TTS）。{}{}{}",
+        lang_hint, note_ctx_hint, activity_ctx_hint, memory_ctx_hint
     );
 
     // 5. 建立 ToolRegistry
@@ -1162,10 +1195,12 @@ live_respond 規則：\
         }
 
         let round_tools = match round {
-            0 => filter_vault_tools_by_names(&["search_skills".to_string()]),
+            0 => filter_vault_tools_by_names(&["think".to_string(), "search_skills".to_string()]),
             1 => {
-                // skill tools only（無 plan_announce / live_respond，LLM 只能執行工具）
-                filter_vault_tools_by_names(&skill_tool_names)
+                // skill tools + think（LLM 執行工具前先說內心獨白）
+                let mut names = vec!["think".to_string()];
+                names.extend(skill_tool_names.iter().cloned());
+                filter_vault_tools_by_names(&names)
             }
             _ => {
                 // 只有 live_respond，LLM 必須輸出答案
@@ -1746,6 +1781,50 @@ pub fn vault_tools() -> serde_json::Value {
                         }
                     },
                     "required": []
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "think",
+                "description": "在執行下一個工具前，輸出一句內心獨白描述你正在思考的方向。必須在每個工具呼叫之前先呼叫此工具。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "thought": {
+                            "type": "string",
+                            "description": "內心獨白，口語化繁體中文，10字以內，描述你接下來要做什麼或想到什麼"
+                        }
+                    },
+                    "required": ["thought"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "find_related",
+                "description": "透過知識圖譜找出與指定筆記相關聯的筆記（wiki link 連結）。\
+適用情境：探索某個主題的延伸閱讀、找出相互引用的筆記群。\
+【操作序列】：先 list_structure 確認路徑 → 呼叫 find_related 取得相關節點 → 視需要 read_note 閱讀內容。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "起點筆記的相對路徑（含 .md 副檔名）"
+                        },
+                        "depth": {
+                            "type": "integer",
+                            "description": "圖譜遍歷深度（預設 1，最大 2）"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "最多回傳幾個相關筆記（預設 10）"
+                        }
+                    },
+                    "required": ["path"]
                 }
             }
         },
@@ -2905,6 +2984,14 @@ async fn execute_vault_tool(
                     if arr.is_empty() {
                         String::new()
                     } else {
+                        // Emit prefetched node_ids for MemoryLinksView highlight
+                        let node_ids: Vec<String> = arr.iter()
+                            .filter_map(|r| r["fact_id"].as_str())
+                            .map(|fid| format!("memory:{}:{}", vault_id, fid))
+                            .collect();
+                        if !node_ids.is_empty() {
+                            let _ = app.emit("memory:prefetched", &node_ids);
+                        }
                         let lines: Vec<String> = arr.iter().map(|r| {
                             let cat = r["category"].as_str().unwrap_or("general");
                             let content = r["content"].as_str().unwrap_or("");
@@ -2914,6 +3001,52 @@ async fn execute_vault_tool(
                     }
                 }
                 Err(_) => String::new(),
+            }
+        }
+        "think" => {
+            let thought = args["thought"].as_str().unwrap_or("").trim().to_string();
+            if !thought.is_empty() {
+                let _ = app.emit("live_chat:thinking", &thought);
+            }
+            String::new()
+        }
+        "find_related" => {
+            let path = ensure_md(args["path"].as_str().unwrap_or(""));
+            if path.is_empty() {
+                return "請提供筆記路徑".to_string();
+            }
+            let depth = args["depth"].as_u64().unwrap_or(1).min(2);
+            let limit = args["limit"].as_u64().unwrap_or(10).min(30);
+            let state = app.state::<crate::state::AppState>();
+            let token = state.get_auth_token().await;
+            let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+            let vault_id = state.get_vault_uuid().await;
+            if vault_id.is_empty() {
+                return "find_related 失敗：未設定 Vault".to_string();
+            }
+            let url = format!(
+                "/vaults/{}/graph/related?path={}&depth={}&limit={}",
+                urlencoding::encode(&vault_id),
+                urlencoding::encode(&path),
+                depth,
+                limit
+            );
+            match crate::api_client::daemon_get::<serde_json::Value>(&state.http_client, &url, tok).await {
+                Ok(data) => {
+                    let nodes = data["nodes"].as_array().cloned().unwrap_or_default();
+                    if nodes.is_empty() {
+                        format!("「{}」在知識圖譜中沒有相關連結的筆記。", path)
+                    } else {
+                        let lines: Vec<String> = nodes.iter().map(|n| {
+                            let label = n["label"].as_str().unwrap_or("(無標題)");
+                            let fp = n["file_path"].as_str().unwrap_or("");
+                            let rel = n["relation"].as_str().unwrap_or("link");
+                            format!("- [{}] {} ({})", rel, label, fp)
+                        }).collect();
+                        format!("「{}」的相關筆記（深度 {}）：\n{}", path, depth, lines.join("\n"))
+                    }
+                }
+                Err(e) => format!("find_related 失敗：{}", e),
             }
         }
         "open_note" => {

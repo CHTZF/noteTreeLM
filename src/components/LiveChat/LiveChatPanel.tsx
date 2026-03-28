@@ -102,6 +102,7 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
   const [sidebarOpen, _setSidebarOpen] = useState(true)
   const [displayTranscript, setDisplayTranscript] = useState('')
   const [streamingText, setStreamingText] = useState('')
+  const [thinkingText, setThinkingText] = useState('')
   // Note suggestions from search_vault / read_note tool calls
   const [noteSuggestions, setNoteSuggestions] = useState<{ absPath: string; label: string }[]>([])
   // Ref mirrors noteSuggestions so sendToLLM can read the value that was set
@@ -368,13 +369,19 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
       flushBuffer()
     })
 
+    // Think tool: show inner monologue, clear on next think or tool execution
+    const unlistenThinking = await listen<string>('live_chat:thinking', (e) => {
+      setThinkingText(e.payload)
+    })
+
     // Tool call in progress: discard any preamble text from TTS buffer
     // (e.g. "我幫你查詢" — LLM will reply again after tool execution),
     // and show a searching indicator instead.
     const unlistenToolCall = await listen<string>('agent:tool_call', () => {
       ttsBuffer = ''
       localStreamingRef.current = ''
-      setStreamingText('搜尋中…')
+      setStreamingText('')
+      // thinkingText stays visible until next think call or response completes
     })
 
     // Write tool in voice mode: auto-approve (no UI confirmation dialog).
@@ -413,12 +420,14 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
       // which can cause Tauri's "listeners[eventId].handlerId" crash.
       setTimeout(() => {
         unlistenToken()
+        unlistenThinking()
         unlistenToolCall()
         unlistenWriteReq()
         unlistenNoteRefs()
         unlistenOpenNote()
         unlistenDone()
       }, 0)
+      setThinkingText('')
       // If TTS queue is empty and nothing is playing, transition now
       if (!ttsActive && ttsQueue.length === 0) {
         if (fullResponse) {
@@ -620,6 +629,21 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
             </div>
           </div>
         ))}
+        {/* Inner monologue from think tool */}
+        {thinkingText && (
+          <div style={{ display: 'flex', justifyContent: 'flex-start', paddingLeft: '4px' }}>
+            <div style={{
+              maxWidth: '80%', padding: '4px 10px', borderRadius: '8px',
+              fontSize: '11px', lineHeight: 1.5, wordBreak: 'break-word',
+              color: 'var(--color-text-muted)', fontStyle: 'italic',
+              borderLeft: '2px solid var(--color-border)',
+              opacity: 0.75,
+            }}>
+              {thinkingText}
+              <span style={{ opacity: 0.4, marginLeft: '2px', animation: 'blink 1.2s step-end infinite' }}>…</span>
+            </div>
+          </div>
+        )}
         {/* Streaming text (thinking → speaking transition) */}
         {streamingText && (
           <div style={{ display: 'flex', justifyContent: 'flex-start' }}>

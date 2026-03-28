@@ -6,7 +6,7 @@ import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
 import { open as openPath } from '@tauri-apps/plugin-shell'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
-import { faGear, faBolt, faChevronLeft, faChevronRight, faSitemap, faFolderTree, faMagnifyingGlass, faBug, faComments, faMicrophone, faArrowRightArrowLeft, faTrash, faArrowRightFromBracket, faCircleQuestion, faUser, faFileImport, faShieldHalved, faSliders } from '@fortawesome/free-solid-svg-icons'
+import { faGear, faBolt, faChevronLeft, faChevronRight, faSitemap, faFolderTree, faMagnifyingGlass, faBug, faComments, faMicrophone, faArrowRightArrowLeft, faTrash, faArrowRightFromBracket, faCircleQuestion, faUser, faFileImport, faShieldHalved, faSliders, faBrain } from '@fortawesome/free-solid-svg-icons'
 import { useSettingsStore } from './stores/settingsStore'
 import { api } from './lib/api'
 import { useVaultStore } from './stores/vaultStore'
@@ -22,6 +22,7 @@ function getTabDisplayName(path: string): string {
   return TAB_SPECIAL_NAMES[path] ?? path.split('/').pop() ?? path
 }
 import GraphView from './components/Graph/GraphView'
+import MemoryLinksView from './components/MemoryLinks/MemoryLinksView'
 import SemanticSearchPanel from './components/Search/SemanticSearchPanel'
 import DebugPanel from './components/Debug/DebugPanel'
 import ChatPanel from './components/Chat/ChatPanel'
@@ -54,6 +55,7 @@ import { useTranslation } from 'react-i18next'
 import './styles/App.css'
 
 const GRAPH_TAB = '__graph__'
+const MEMORY_LINKS_TAB = '__memory_links__'
 const AGENT_TOOLS_TAB = '__agent_tools__'
 const CHAT_TAB = '__chat__'
 const LIVE_CHAT_TAB = '__live_chat__'
@@ -382,7 +384,7 @@ function AppMain() {
 
   // ─── Save last open note ───────────────────────────────────────────────
   useEffect(() => {
-    if (!currentPath || !settings.system_current_vault_path || currentPath === GRAPH_TAB) return
+    if (!currentPath || !settings.system_current_vault_path || currentPath === GRAPH_TAB || currentPath === MEMORY_LINKS_TAB) return
     api.setVaultLastNote(settings.system_current_vault_path, currentPath).catch(() => {})
   }, [currentPath, settings.system_current_vault_path])
 
@@ -980,6 +982,11 @@ function AppMain() {
         <GraphView onOpenNote={openNote} />
       </div>
     )
+    if (activePath === MEMORY_LINKS_TAB) return (
+      <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+        <MemoryLinksView onOpenNote={openNote} />
+      </div>
+    )
     if (activePath === AGENT_TOOLS_TAB) return (
       <div style={{ flex: 1, minHeight: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
         <AgentToolContent />
@@ -1256,6 +1263,14 @@ function AppMain() {
               title={t('tabs.graph')}
               onClick={openGraphTab}
             ><FontAwesomeIcon icon={faSitemap} /></button>
+          )}
+
+          {settings.enable_auto_memory && (
+            <button
+              className={`icon-menubar-btn${currentPath === MEMORY_LINKS_TAB ? ' active' : ''}`}
+              title="記憶連結"
+              onClick={() => openNote(MEMORY_LINKS_TAB)}
+            ><FontAwesomeIcon icon={faBrain} /></button>
           )}
 
           {settings.show_agents && (

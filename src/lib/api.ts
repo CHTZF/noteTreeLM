@@ -256,6 +256,14 @@ export const api = {
     const vaultId = await getVaultId()
     return request<unknown[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/memory/query?keywords=${encodeURIComponent(keywords.join(','))}&limit=${limit}`)
   },
+  getMemoryGraph: async () => {
+    const vaultId = await getVaultId()
+    return request<{ nodes: unknown[]; edges: unknown[] }>('GET', `/vaults/${encodeURIComponent(vaultId)}/memory/graph`)
+  },
+  deleteMemoryFact: async (factId: string) => {
+    const vaultId = await getVaultId()
+    return request<{ ok: boolean }>('DELETE', `/vaults/${encodeURIComponent(vaultId)}/memory/facts/${encodeURIComponent(factId)}`)
+  },
   updatePatternScore: (vaultId: string, signature: string, positive: boolean) =>
     request<{ ok: boolean }>('POST', `/vaults/${encodeURIComponent(vaultId)}/activity-patterns/score`, { signature, spoke: positive }),
   decayPatterns: (vaultId: string) =>

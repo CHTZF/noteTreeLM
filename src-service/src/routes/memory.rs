@@ -46,7 +46,9 @@ pub fn router() -> Router<ApiState> {
             get(get_conversation_ratings).post(create_rating),
         )
         .route("/vaults/:vault_id/memory/query", get(query_memory))
+        .route("/vaults/:vault_id/memory/graph", get(memory_graph))
         .route("/vaults/:vault_id/memory/facts", post(store_facts))
+        .route("/vaults/:vault_id/memory/facts/:fact_id", delete(delete_fact))
         .route("/vaults/:vault_id/memory/distill", post(distill_facts))
 }
 
@@ -452,6 +454,7 @@ struct FactInput {
 #[derive(Deserialize)]
 struct StoreFactsBody {
     facts: Vec<FactInput>,
+    note_refs: Option<Vec<String>>,
 }
 
 async fn store_facts(
@@ -461,6 +464,8 @@ async fn store_facts(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let now_ts = Utc::now().timestamp();
     let mut inserted = 0u32;
+    let note_refs = body.note_refs.unwrap_or_default();
+    let mut new_fact_ids: Vec<String> = Vec::new();
 
     for fact in body.facts {
         let content = fact.content.trim().to_string();
@@ -498,17 +503,52 @@ async fn store_facts(
         let fact_id = Uuid::new_v4().to_string();
         state.db
             .query("INSERT INTO memory_facts (fact_id, vault_id, conv_id, content, category, expires_at, created_at, embedding) VALUES ($fid, $vid, $cid, $content, $cat, $exp, $now, $emb)")
-            .bind(("fid", fact_id))
+            .bind(("fid", fact_id.clone()))
             .bind(("vid", vault_id.clone()))
             .bind(("cid", fact.conv_id.unwrap_or_default()))
-            .bind(("content", content))
-            .bind(("cat", category))
+            .bind(("content", content.clone()))
+            .bind(("cat", category.clone()))
             .bind(("exp", expires_at))
             .bind(("now", now_ts))
             .bind(("emb", fact.embedding))
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        // Upsert graph node for this memory fact
+        let node_id = format!("memory:{}:{}", vault_id, fact_id);
+        let label = content.chars().take(60).collect::<String>();
+        let _ = state.db
+            .query(
+                "INSERT INTO graph_nodes (vault_id, node_id, node_type, label, created_at) \
+                 VALUES ($vid, $nid, 'memory_fact', $label, $now) \
+                 ON DUPLICATE KEY UPDATE label = $label",
+            )
+            .bind(("vid", vault_id.clone()))
+            .bind(("nid", node_id.clone()))
+            .bind(("label", label))
+            .bind(("now", now_ts))
+            .await;
+
+        new_fact_ids.push(node_id);
         inserted += 1;
+    }
+
+    // Create graph edges: each new memory_fact → each referenced note
+    for fact_node_id in &new_fact_ids {
+        for note_ref in &note_refs {
+            let note_node_id = format!("{}:{}", vault_id, note_ref);
+            let edge_id = Uuid::new_v4().to_string();
+            let _ = state.db
+                .query(
+                    "INSERT INTO graph_edges (edge_id, vault_id, source_id, target_id, edge_type, weight) \
+                     VALUES ($eid, $vid, $src, $tgt, 'fact_source', 1.0)",
+                )
+                .bind(("eid", edge_id))
+                .bind(("vid", vault_id.clone()))
+                .bind(("src", fact_node_id.clone()))
+                .bind(("tgt", note_node_id))
+                .await;
+        }
     }
 
     Ok(Json(json!({ "inserted": inserted })))
@@ -565,4 +605,120 @@ async fn distill_facts(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({ "ok": true, "fact_id": fact_id, "replaced": body.source_ids.len() })))
+}
+
+// ── Memory Graph ───────────────────────────────────────────────────────────────
+
+async fn memory_graph(
+    State(state): State<ApiState>,
+    Path(vault_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let now_ts = Utc::now().timestamp();
+
+    // All non-expired memory facts
+    #[derive(serde::Deserialize)]
+    struct FactRow {
+        fact_id: String,
+        content: String,
+        category: String,
+        expires_at: i64,
+    }
+    let mut resp = state.db
+        .query("SELECT fact_id, content, category, expires_at FROM memory_facts WHERE vault_id = $vid AND expires_at > $now ORDER BY created_at DESC")
+        .bind(("vid", vault_id.clone()))
+        .bind(("now", now_ts))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let facts: Vec<FactRow> = resp.take(0).unwrap_or_default();
+
+    // All fact_source edges for this vault
+    #[derive(serde::Deserialize)]
+    struct EdgeRow { source_id: String, target_id: String }
+    let mut eresp = state.db
+        .query("SELECT source_id, target_id FROM graph_edges WHERE vault_id = $vid AND edge_type = 'fact_source'")
+        .bind(("vid", vault_id.clone()))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let edges: Vec<EdgeRow> = eresp.take(0).unwrap_or_default();
+
+    // Collect referenced note node_ids
+    let note_ids: std::collections::HashSet<String> = edges.iter()
+        .map(|e| e.target_id.clone())
+        .collect();
+
+    // Fetch note info for referenced nodes
+    #[derive(serde::Deserialize)]
+    struct NoteRow { path: String, title: String }
+    let mut nresp = state.db
+        .query("SELECT path, title FROM notes WHERE vault_id = $vid")
+        .bind(("vid", vault_id.clone()))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let note_rows: Vec<NoteRow> = nresp.take(0).unwrap_or_default();
+
+    let note_prefix = format!("{}:", vault_id);
+    let note_nodes: Vec<Value> = note_rows.iter()
+        .filter(|n| note_ids.contains(&format!("{}{}", note_prefix, n.path)))
+        .map(|n| json!({
+            "node_id": format!("{}{}", note_prefix, n.path),
+            "node_type": "note",
+            "label": n.title,
+            "file_path": n.path,
+        }))
+        .collect();
+
+    let fact_nodes: Vec<Value> = facts.iter().map(|f| {
+        let node_id = format!("memory:{}:{}", vault_id, f.fact_id);
+        json!({
+            "node_id": node_id,
+            "node_type": "memory_fact",
+            "fact_id": f.fact_id,
+            "label": f.content.chars().take(60).collect::<String>(),
+            "content": f.content,
+            "category": f.category,
+            "expires_at": f.expires_at,
+        })
+    }).collect();
+
+    let edge_list: Vec<Value> = edges.iter().map(|e| json!({
+        "source_id": e.source_id,
+        "target_id": e.target_id,
+        "edge_type": "fact_source",
+    })).collect();
+
+    let mut all_nodes = fact_nodes;
+    all_nodes.extend(note_nodes);
+    Ok(Json(json!({
+        "nodes": all_nodes,
+        "edges": edge_list,
+    })))
+}
+
+// ── Delete Fact ────────────────────────────────────────────────────────────────
+
+async fn delete_fact(
+    State(state): State<ApiState>,
+    Path((vault_id, fact_id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let node_id = format!("memory:{}:{}", vault_id, fact_id);
+
+    let _ = state.db
+        .query("DELETE memory_facts WHERE fact_id = $fid AND vault_id = $vid")
+        .bind(("fid", fact_id))
+        .bind(("vid", vault_id.clone()))
+        .await;
+
+    let _ = state.db
+        .query("DELETE FROM graph_nodes WHERE node_id = $nid AND vault_id = $vid")
+        .bind(("nid", node_id.clone()))
+        .bind(("vid", vault_id.clone()))
+        .await;
+
+    let _ = state.db
+        .query("DELETE FROM graph_edges WHERE source_id = $nid AND vault_id = $vid")
+        .bind(("nid", node_id))
+        .bind(("vid", vault_id))
+        .await;
+
+    Ok(Json(json!({ "ok": true })))
 }

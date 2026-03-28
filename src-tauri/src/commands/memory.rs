@@ -305,6 +305,7 @@ pub async fn extract_memory_facts(
     state: State<'_, AppState>,
     messages: Vec<ChatMessage>,
     conversation_id: Option<String>,
+    note_paths: Option<Vec<String>>,
 ) -> Result<u32, AppError> {
     if messages.is_empty() { return Ok(0); }
 
@@ -434,10 +435,25 @@ pub async fn extract_memory_facts(
         facts
     };
 
+    // Convert absolute note paths to vault-relative paths for graph edges
+    let vault_root = state.get_vault_path().await;
+    let note_refs: Vec<String> = note_paths.unwrap_or_default()
+        .into_iter()
+        .filter_map(|abs| {
+            if vault_root.is_empty() { return Some(abs); }
+            let prefix = if vault_root.ends_with('/') { vault_root.clone() } else { format!("{}/", vault_root) };
+            if abs.starts_with(&prefix) {
+                Some(abs[prefix.len()..].to_string())
+            } else {
+                Some(abs)
+            }
+        })
+        .collect();
+
     daemon_post::<_, serde_json::Value>(
         &state.http_client,
         &format!("/vaults/{}/memory/facts", urlencoding::encode(&vault_id)),
-        &serde_json::json!({ "facts": facts_with_emb }),
+        &serde_json::json!({ "facts": facts_with_emb, "note_refs": note_refs }),
         tok,
     ).await.ok();
 
