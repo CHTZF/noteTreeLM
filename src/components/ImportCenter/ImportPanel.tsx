@@ -348,8 +348,7 @@ export default function ImportPanel() {
     setView({ type: 'detail', itemId: item.item_id })
 
     // 同步載入該知識項目已存在的 skills（前次產生的）
-    const vaultId = await invoke<string>('get_vault_uuid')
-    api.listAgentSkills(vaultId)
+    api.listAgentSkills()
       .then(skills => setDetailSkills(skills as AgentSkill[]))
       .catch(() => {})
   }, [])
@@ -711,22 +710,19 @@ export default function ImportPanel() {
                   key={skill.skill_id}
                   skill={skill}
                   onToggle={async (id, active) => {
-                    const vaultId = await invoke<string>('get_vault_uuid')
-                    await api.updateAgentSkill(vaultId, id, { is_active: active })
+                    await api.updateAgentSkill(id, { is_active: active })
                     setDetailSkills(prev => prev.map(s =>
                       s.skill_id === id ? { ...s, is_active: active } : s
                     ))
                     window.dispatchEvent(new CustomEvent('skills-changed'))
                   }}
                   onDelete={async (id) => {
-                    const vaultId = await invoke<string>('get_vault_uuid')
-                    await api.deleteAgentSkill(vaultId, id)
+                    await api.deleteAgentSkill(id)
                     setDetailSkills(prev => prev.filter(s => s.skill_id !== id))
                     window.dispatchEvent(new CustomEvent('skills-changed'))
                   }}
                   onUpdate={async (id, title, trigger, behavior, toolCalls, injectionMode, agentScope) => {
-                    const vaultId = await invoke<string>('get_vault_uuid')
-                    await api.updateAgentSkill(vaultId, id, { title, trigger, behavior, tool_calls: toolCalls, injection_mode: injectionMode, agent_scope: agentScope })
+                    await api.updateAgentSkill(id, { title, trigger, behavior, tool_calls: toolCalls, injection_mode: injectionMode, agent_scope: agentScope })
                     setDetailSkills(prev => prev.map(s =>
                       s.skill_id === id ? { ...s, title, trigger, behavior, tool_calls: toolCalls, injection_mode: injectionMode as 'passive' | 'active', agent_scope: agentScope } : s
                     ))
@@ -801,8 +797,7 @@ export function SkillsHub() {
   }
 
   const handleUpdate = async (id: string, title: string, trigger: string, behavior: string, toolCalls: string[], injectionMode: string, agentScope: AgentScope) => {
-    const vaultId = await invoke<string>('get_vault_uuid')
-    await api.updateAgentSkill(vaultId, id, { title, trigger, behavior, tool_calls: toolCalls, injection_mode: injectionMode, agent_scope: agentScope })
+    await api.updateAgentSkill(id, { title, trigger, behavior, tool_calls: toolCalls, injection_mode: injectionMode, agent_scope: agentScope })
     setSkills(prev => prev.map(s =>
       s.skill_id === id ? { ...s, title, trigger, behavior, tool_calls: toolCalls, injection_mode: injectionMode as 'passive' | 'active', agent_scope: agentScope } : s
     ))
@@ -913,13 +908,11 @@ export function SkillsHub() {
             key={skill.skill_id}
             skill={skill}
             onToggle={async (id, active) => {
-              const vaultId = await invoke<string>('get_vault_uuid')
-              await api.updateAgentSkill(vaultId, id, { is_active: active })
+              await api.updateAgentSkill(id, { is_active: active })
               setSkills(prev => prev.map(s => s.skill_id === id ? { ...s, is_active: active } : s))
             }}
             onDelete={async (id) => {
-              const vaultId = await invoke<string>('get_vault_uuid')
-              await api.deleteAgentSkill(vaultId, id)
+              await api.deleteAgentSkill(id)
               setSkills(prev => prev.filter(s => s.skill_id !== id))
             }}
             onUpdate={handleUpdate}

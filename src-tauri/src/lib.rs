@@ -15,8 +15,7 @@ use commands::{
          warmup_embedding_server, get_embedding_server_status, start_embedding_server,
          stop_embedding_server, restart_embedding_server, check_embedding_endpoint,
          query_memory, distill_preferences, analyze_tool_patterns, extract_memory_facts, condense_memory_facts,
-         suggest_skills_from_patterns, rate_response, get_conversation_ratings, add_memory_rule,
-         get_memory_rules, delete_memory_rule, confirm_write_tool,
+         suggest_skills_from_patterns, rate_response, get_conversation_ratings, confirm_write_tool,
          test_vault_tool, run_tool_pipeline, cancel_tool_test, cancel_agent, invoke_agent, invoke_live_chat,
          set_note_status,
          add_skill_trigger},
@@ -274,15 +273,21 @@ pub fn run() {
                     if !vp.is_empty() {
                         state.set_vault_path_with_agent(vp.clone()).await;
 
-                        // daemon 負責 session 管理，直接使用預設 username
-                        let username = String::from("user"); // daemon handles sessions
-                        state.set_username(username.clone()).await;
+                        // 從 session 取得實際帳號名稱
+                        let username = if let Ok(s) = crate::api_client::daemon_get::<serde_json::Value>(
+                            &state.http_client, "/auth/session", tok_ref,
+                        ).await {
+                            s["username"].as_str().unwrap_or("").to_string()
+                        } else { String::new() };
+                        if !username.is_empty() {
+                            state.set_username(username.clone()).await;
+                        }
 
-                        // 向 daemon 取得（或建立）vault UUID
+                        // 向 daemon 取得（或建立）vault UUID（傳 account_id 讓 register_vault 正確分區）
                         if let Ok(v) = crate::api_client::daemon_post::<_, serde_json::Value>(
                             &state.http_client,
                             "/vaults",
-                            &serde_json::json!({"path": vp, "account": username}),
+                            &serde_json::json!({"path": vp, "account_id": username}),
                             tok_ref,
                         ).await {
                             if let Some(uuid) = v["vault_id"].as_str() {
@@ -350,22 +355,9 @@ pub fn run() {
                     );
                 }
 
-                // 呼叫 daemon seed-builtins：幂等重建此 vault 的內建 skills 與 agents
-                {
-                    let vault_uuid_for_seed = state.get_vault_id().await.unwrap_or_default();
-                    if !vault_uuid_for_seed.is_empty() {
-                        let seed_tok = state.get_auth_token().await;
-                        let seed_tok_ref = if seed_tok.is_empty() { None } else { Some(seed_tok.as_str()) };
-                        let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
-                            &state.http_client,
-                            &format!("/vaults/{}/seed-builtins", urlencoding::encode(&vault_uuid_for_seed)),
-                            &serde_json::json!({}),
-                            seed_tok_ref,
-                        ).await;
-                    }
-                    // 通知前端 agent:seeded（觸發 UI 刷新）
-                    let _ = app_handle.emit("agent:seeded", serde_json::json!({}));
-                }
+                // seed-builtins 由 service auth 層在 login/register 時處理（per-account 幂等）
+                // 通知前端刷新 agent/skill 面板
+                let _ = app_handle.emit("agent:seeded", serde_json::json!({}));
 
                 // 自動更新：掃描開啟 auto_update 的 import sessions
                 auto_check_all_sessions(&app_handle, &state).await;
@@ -512,9 +504,6 @@ pub fn run() {
             extract_memory_facts,
             rate_response,
             get_conversation_ratings,
-            add_memory_rule,
-            get_memory_rules,
-            delete_memory_rule,
             cancel_agent,
             invoke_agent,
             invoke_live_chat,

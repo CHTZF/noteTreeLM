@@ -50,6 +50,7 @@ export interface Settings {
   show_skills: boolean
   show_kb_assist: boolean
   show_import: boolean
+  show_memory_links: boolean
   file_sort_type: 'none' | 'asc' | 'desc'
   hotkey_toggle_view: string
   hotkey_save: string
@@ -109,6 +110,7 @@ export const DEFAULT_SETTINGS: Settings = {
   show_skills: false,
   show_kb_assist: false,
   show_import: false,
+  show_memory_links: false,
   file_sort_type: 'none',
   hotkey_toggle_view: 'mod+e',
   hotkey_save: 'mod+s',

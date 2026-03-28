@@ -31,12 +31,12 @@ async fn list_tasks(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let (query_str, maybe_vid) = if let Some(vid) = q.vault_id {
         (
-            "SELECT * FROM scheduled_tasks WHERE vault_id = $vid ORDER BY run_at_ts ASC".to_string(),
+            "SELECT *, record::id(id) AS id FROM scheduled_tasks WHERE vault_id = $vid ORDER BY run_at_ts ASC".to_string(),
             Some(vid),
         )
     } else {
         (
-            "SELECT * FROM scheduled_tasks ORDER BY run_at_ts ASC".to_string(),
+            "SELECT *, record::id(id) AS id FROM scheduled_tasks ORDER BY run_at_ts ASC".to_string(),
             None,
         )
     };

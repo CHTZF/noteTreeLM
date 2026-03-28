@@ -182,7 +182,11 @@ pub async fn save_system_settings(
         .await.map_err(|e| AppError::Settings(e))?;
 
     if !settings.system_current_vault_path.is_empty() {
-        handle_vault_switch(app, state.inner().clone(), settings.system_current_vault_path).await;
+        let state2 = state.inner().clone();
+        let new_path = settings.system_current_vault_path;
+        tokio::spawn(async move {
+            handle_vault_switch(app, state2, new_path).await;
+        });
     }
 
     Ok(())
@@ -308,6 +312,8 @@ pub async fn handle_vault_switch(app: AppHandle, state: AppState, new_path: Stri
         let stop_tx = vault::watcher::start_watcher(app, path);
         *state.watcher_stop.lock().await = Some(stop_tx);
     }
+
+    // seed-builtins 由 service auth 層在 login/register 時 per-account 處理
 }
 
 #[tauri::command]

@@ -56,7 +56,7 @@ export default function AgentsPage() {
 
   const loadDefs = useCallback(() => {
     invoke<string>('get_vault_uuid')
-      .then(vaultId => api.listAgentDefinitions(vaultId))
+      .then(() => api.listAgentDefinitions())
       .then(defs => setDefs(defs as AgentDefinition[]))
       .catch(() => {})
       .finally(() => setLoading(false))
@@ -64,7 +64,7 @@ export default function AgentsPage() {
 
   const loadSkills = useCallback(() => {
     invoke<string>('get_vault_uuid')
-      .then(vaultId => api.listAgentSkills(vaultId))
+      .then(() => api.listAgentSkills())
       .then(skills => setSkills(skills as AgentSkill[]))
       .catch(() => {})
   }, [])
@@ -99,20 +99,17 @@ export default function AgentsPage() {
   }, [loadDefs, loadSkills])
 
   const handleToggle = async (def_id: string, is_active: boolean) => {
-    const vaultId = await invoke<string>('get_vault_uuid')
-    await api.updateAgentDefinition(vaultId, def_id, { isActive: is_active })
+    await api.updateAgentDefinition(def_id, { isActive: is_active })
     setDefs(prev => prev.map(d => d.def_id === def_id ? { ...d, is_active } : d))
   }
 
   const handleDelete = async (def_id: string) => {
-    const vaultId = await invoke<string>('get_vault_uuid')
-    await api.deleteAgentDefinition(vaultId, def_id)
+    await api.deleteAgentDefinition(def_id)
     setDefs(prev => prev.filter(d => d.def_id !== def_id))
   }
 
   const handleWake = async (def_id: string) => {
-    const vaultId = await invoke<string>('get_vault_uuid')
-    await api.wakeAgentDefinition(vaultId, def_id)
+    await api.wakeAgentDefinition(def_id)
     setDefs(prev => prev.map(d => d.def_id === def_id ? { ...d, status: 'active' as const, slept_at: null } : d))
   }
 
@@ -254,8 +251,7 @@ function DefCard({
   const handleSave = async () => {
     setSaving(true)
     try {
-      const vaultId = await invoke<string>('get_vault_uuid')
-      await api.updateAgentDefinition(vaultId, def.def_id, {
+      await api.updateAgentDefinition(def.def_id, {
         name: editName,
         description: editDesc,
         skillIds: editSkills,
@@ -404,8 +400,7 @@ function CreateDefForm({ skills, onCreated, onCancel }: { skills: AgentSkill[], 
     if (!name.trim()) return
     setCreating(true)
     try {
-      const vaultId = await invoke<string>('get_vault_uuid')
-      const def = await api.createAgentDefinition(vaultId, {
+      const def = await api.createAgentDefinition( {
         name: name.trim(), description: desc.trim(),
         kind: 'sub', skillIds, toolNames: tools, maxRounds,
         trigger: trigger.trim() || null,

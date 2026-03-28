@@ -113,35 +113,28 @@ export const api = {
   createKnowledgeItem: (vaultId: string, data: unknown) =>
     request<{ item_id: string }>('POST', `/vaults/${encodeURIComponent(vaultId)}/kb/items`, data),
 
-  // Agents
-  listAgentDefinitions: (vaultId: string) =>
-    request<unknown[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/agents`),
-  createAgentDefinition: (vaultId: string, data: unknown) =>
-    request<{ def_id: string }>('POST', `/vaults/${encodeURIComponent(vaultId)}/agents`, data),
-  getAgentDefinition: (vaultId: string, defId: string) =>
-    request<unknown>('GET', `/vaults/${encodeURIComponent(vaultId)}/agents/${encodeURIComponent(defId)}`),
-  updateAgentDefinition: (vaultId: string, defId: string, data: unknown) =>
-    request<{ ok: boolean }>('PUT', `/vaults/${encodeURIComponent(vaultId)}/agents/${encodeURIComponent(defId)}`, data),
-  deleteAgentDefinition: (vaultId: string, defId: string) =>
-    request<{ ok: boolean }>('DELETE', `/vaults/${encodeURIComponent(vaultId)}/agents/${encodeURIComponent(defId)}`),
-  listAgentSkills: (vaultId: string) =>
-    request<unknown[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/skills`),
-  createAgentSkill: (vaultId: string, data: unknown) =>
-    request<{ skill_id: string }>('POST', `/vaults/${encodeURIComponent(vaultId)}/skills`, data),
-  updateAgentSkill: (vaultId: string, skillId: string, data: unknown) =>
-    request<{ ok: boolean }>('PUT', `/vaults/${encodeURIComponent(vaultId)}/skills/${encodeURIComponent(skillId)}`, data),
-  deleteAgentSkill: (vaultId: string, skillId: string) =>
-    request<{ ok: boolean }>('DELETE', `/vaults/${encodeURIComponent(vaultId)}/skills/${encodeURIComponent(skillId)}`),
+  // Agents — account_id resolved from Bearer token server-side
+  listAgentDefinitions: () =>
+    request<unknown[]>('GET', '/agents'),
+  createAgentDefinition: (data: unknown) =>
+    request<{ def_id: string }>('POST', '/agents', data),
+  getAgentDefinition: (defId: string) =>
+    request<unknown>('GET', `/agents/${encodeURIComponent(defId)}`),
+  updateAgentDefinition: (defId: string, data: unknown) =>
+    request<{ ok: boolean }>('PUT', `/agents/${encodeURIComponent(defId)}`, data),
+  deleteAgentDefinition: (defId: string) =>
+    request<{ ok: boolean }>('DELETE', `/agents/${encodeURIComponent(defId)}`),
+  listAgentSkills: () =>
+    request<unknown[]>('GET', '/skills'),
+  createAgentSkill: (data: unknown) =>
+    request<{ skill_id: string }>('POST', '/skills', data),
+  updateAgentSkill: (skillId: string, data: unknown) =>
+    request<{ ok: boolean }>('PUT', `/skills/${encodeURIComponent(skillId)}`, data),
+  deleteAgentSkill: (skillId: string) =>
+    request<{ ok: boolean }>('DELETE', `/skills/${encodeURIComponent(skillId)}`),
   listAgentTools: () => request<unknown[]>('GET', '/agent-tools'),
   createAgentTool: (data: unknown) => request<{ tool_id: string }>('POST', '/agent-tools', data),
 
-  // Memory
-  listMemoryRules: (vaultId: string) =>
-    request<unknown[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/memory/rules`),
-  createMemoryRule: (vaultId: string, data: unknown) =>
-    request<{ id: string }>('POST', `/vaults/${encodeURIComponent(vaultId)}/memory/rules`, data),
-  deleteMemoryRule: (vaultId: string, ruleId: string) =>
-    request<{ ok: boolean }>('DELETE', `/vaults/${encodeURIComponent(vaultId)}/memory/rules/${encodeURIComponent(ruleId)}`),
   listActivityPatterns: (vaultId: string) =>
     request<unknown[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/activity-patterns`),
   upsertActivityPattern: (vaultId: string, data: unknown) =>
@@ -308,12 +301,12 @@ export const api = {
   },
 
   // Agents extras
-  wakeAgentDefinition: (vaultId: string, defId: string) =>
-    request<{ ok: boolean }>('POST', `/vaults/${encodeURIComponent(vaultId)}/agents/${encodeURIComponent(defId)}/wake`, {}),
-  addSkillTrigger: (vaultId: string, skillId: string, useAsk: boolean) =>
-    request<{ ok: boolean }>('POST', `/vaults/${encodeURIComponent(vaultId)}/skills/${encodeURIComponent(skillId)}/trigger`, { use_ask: useAsk }),
-  getSkillUsageStats: (vaultId: string) =>
-    request<unknown[]>('GET', `/vaults/${encodeURIComponent(vaultId)}/skills/usage-stats`),
+  wakeAgentDefinition: (defId: string) =>
+    request<{ ok: boolean }>('POST', `/agents/${encodeURIComponent(defId)}/wake`, {}),
+  addSkillTrigger: (skillId: string, useAsk: boolean) =>
+    request<{ ok: boolean }>('POST', `/skills/${encodeURIComponent(skillId)}/trigger`, { use_ask: useAsk }),
+  getSkillUsageStats: () =>
+    request<unknown[]>('GET', '/skills/usage-stats'),
 
   // Vault state (last open note)
   getVaultLastNote: async (vaultPath: string) => {

@@ -14,14 +14,6 @@ use crate::api_state::ApiState;
 pub fn router() -> Router<ApiState> {
     Router::new()
         .route(
-            "/vaults/:vault_id/memory/rules",
-            get(list_memory_rules).post(create_memory_rule),
-        )
-        .route(
-            "/vaults/:vault_id/memory/rules/:rule_id",
-            delete(delete_memory_rule),
-        )
-        .route(
             "/vaults/:vault_id/activity-patterns",
             get(list_activity_patterns).post(upsert_activity_pattern),
         )
@@ -52,76 +44,6 @@ pub fn router() -> Router<ApiState> {
         .route("/vaults/:vault_id/memory/distill", post(distill_facts))
 }
 
-async fn list_memory_rules(
-    State(state): State<ApiState>,
-    Path(vault_id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    let mut resp = state
-        .db
-        .query("SELECT rule_id, vault_id, pattern_type, pattern, `value`, created_at FROM memory_rules WHERE vault_id = $vid ORDER BY created_at DESC")
-        .bind(("vid", vault_id))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let rows: Vec<Value> = resp
-        .take(0)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(json!(rows)))
-}
-
-async fn create_memory_rule(
-    State(state): State<ApiState>,
-    Path(vault_id): Path<String>,
-    Json(body): Json<Value>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    let rule_id = Uuid::new_v4().to_string();
-    let pattern_type = body
-        .get("pattern_type")
-        .and_then(|v| v.as_str())
-        .ok_or((StatusCode::BAD_REQUEST, "Missing pattern_type".to_string()))?
-        .to_string();
-    let pattern = body
-        .get("pattern")
-        .and_then(|v| v.as_str())
-        .ok_or((StatusCode::BAD_REQUEST, "Missing pattern".to_string()))?
-        .to_string();
-    let value = body
-        .get("value")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let now = Utc::now().timestamp();
-
-    state
-        .db
-        .query("INSERT INTO memory_rules (rule_id, vault_id, pattern_type, pattern, `value`, created_at) VALUES ($rid, $vid, $ptype, $pat, $val, $now)")
-        .bind(("rid", rule_id.clone()))
-        .bind(("vid", vault_id))
-        .bind(("ptype", pattern_type))
-        .bind(("pat", pattern))
-        .bind(("val", value))
-        .bind(("now", now))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(json!({ "id": rule_id })))
-}
-
-async fn delete_memory_rule(
-    State(state): State<ApiState>,
-    Path((vault_id, rule_id)): Path<(String, String)>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    state
-        .db
-        .query("DELETE FROM memory_rules WHERE vault_id = $vid AND rule_id = $rid")
-        .bind(("vid", vault_id))
-        .bind(("rid", rule_id))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(json!({ "ok": true })))
-}
 
 #[derive(Deserialize, Default)]
 struct PatternListQuery {
@@ -136,7 +58,7 @@ async fn list_activity_patterns(
     let min_score = q.min_score.unwrap_or(0.0);
     let mut resp = state
         .db
-        .query("SELECT * FROM activity_patterns WHERE vault_id = $vid AND deprecated = false AND score >= $min ORDER BY score DESC")
+        .query("SELECT *, record::id(id) AS id FROM activity_patterns WHERE vault_id = $vid AND deprecated = false AND score >= $min ORDER BY score DESC")
         .bind(("vid", vault_id))
         .bind(("min", min_score))
         .await
@@ -303,7 +225,7 @@ async fn get_conversation_ratings(
     let rows: Vec<Value> = if let Some(conv_id) = params.conversation_id {
         let mut resp = state
             .db
-            .query("SELECT * FROM response_ratings WHERE vault_id = $vid AND conversation_id = $cid ORDER BY created_at DESC")
+            .query("SELECT *, record::id(id) AS id FROM response_ratings WHERE vault_id = $vid AND conversation_id = $cid ORDER BY created_at DESC")
             .bind(("vid", vault_id))
             .bind(("cid", conv_id))
             .await
@@ -312,7 +234,7 @@ async fn get_conversation_ratings(
     } else {
         let mut resp = state
             .db
-            .query("SELECT * FROM response_ratings WHERE vault_id = $vid ORDER BY created_at DESC LIMIT 100")
+            .query("SELECT *, record::id(id) AS id FROM response_ratings WHERE vault_id = $vid ORDER BY created_at DESC LIMIT 100")
             .bind(("vid", vault_id))
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -633,14 +555,16 @@ async fn memory_graph(
         category: String,
         expires_at: i64,
         inject_count: Option<i64>,
+        #[allow(dead_code)]
+        created_at: Option<i64>,
     }
     let mut resp = state.db
-        .query("SELECT fact_id, content, category, expires_at, inject_count FROM memory_facts WHERE vault_id = $vid AND expires_at > $now ORDER BY created_at DESC")
+        .query("SELECT fact_id, content, category, expires_at, inject_count, created_at FROM memory_facts WHERE vault_id = $vid AND expires_at > $now ORDER BY created_at DESC")
         .bind(("vid", vault_id.clone()))
         .bind(("now", now_ts))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let facts: Vec<FactRow> = resp.take(0).unwrap_or_default();
+        .map_err(|e| { tracing::error!("memory_graph facts query failed vault={}: {}", vault_id, e); (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) })?;
+    let facts: Vec<FactRow> = resp.take(0).map_err(|e| { tracing::error!("memory_graph facts take failed vault={}: {}", vault_id, e); (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) })?;
 
     // All fact_source edges for this vault
     #[derive(serde::Deserialize)]
@@ -649,8 +573,8 @@ async fn memory_graph(
         .query("SELECT source_id, target_id FROM graph_edges WHERE vault_id = $vid AND edge_type = 'fact_source'")
         .bind(("vid", vault_id.clone()))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let edges: Vec<EdgeRow> = eresp.take(0).unwrap_or_default();
+        .map_err(|e| { tracing::error!("memory_graph edges query failed vault={}: {}", vault_id, e); (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) })?;
+    let edges: Vec<EdgeRow> = eresp.take(0).map_err(|e| { tracing::error!("memory_graph edges take failed vault={}: {}", vault_id, e); (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) })?;
 
     // Collect referenced note node_ids
     let note_ids: std::collections::HashSet<String> = edges.iter()
@@ -664,8 +588,8 @@ async fn memory_graph(
         .query("SELECT path, title FROM notes WHERE vault_id = $vid")
         .bind(("vid", vault_id.clone()))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let note_rows: Vec<NoteRow> = nresp.take(0).unwrap_or_default();
+        .map_err(|e| { tracing::error!("memory_graph notes query failed vault={}: {}", vault_id, e); (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) })?;
+    let note_rows: Vec<NoteRow> = nresp.take(0).map_err(|e| { tracing::error!("memory_graph notes take failed vault={}: {}", vault_id, e); (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) })?;
 
     let note_prefix = format!("{}:", vault_id);
     let note_nodes: Vec<Value> = note_rows.iter()

@@ -997,7 +997,7 @@ function AppMain() {
       const closeSettings = settingsTab ? () => closeTabInPane(leaf.id, settingsTab.id) : undefined
       return (
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-          <SettingsModal inline mode="personal" onClose={closeSettings} />
+          <SettingsModal key="personal" inline mode="personal" onClose={closeSettings} />
         </div>
       )
     }
@@ -1006,7 +1006,7 @@ function AppMain() {
       const closeSettings = settingsTab ? () => closeTabInPane(leaf.id, settingsTab.id) : undefined
       return (
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-          <SettingsModal inline mode="system" onClose={closeSettings} />
+          <SettingsModal key="system" inline mode="system" onClose={closeSettings} />
         </div>
       )
     }
@@ -1265,7 +1265,7 @@ function AppMain() {
             ><FontAwesomeIcon icon={faSitemap} /></button>
           )}
 
-          {settings.enable_auto_memory && (
+          {settings.show_memory_links && (
             <button
               className={`icon-menubar-btn${currentPath === MEMORY_LINKS_TAB ? ' active' : ''}`}
               title="記憶連結"

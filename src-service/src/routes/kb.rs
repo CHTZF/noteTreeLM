@@ -61,7 +61,7 @@ async fn list_import_sessions(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let mut resp = state
         .db
-        .query("SELECT * FROM import_sessions WHERE vault_id = $vid ORDER BY created_at DESC")
+        .query("SELECT *, record::id(id) AS id FROM import_sessions WHERE vault_id = $vid ORDER BY created_at DESC")
         .bind(("vid", vault_id.clone()))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -155,7 +155,7 @@ async fn get_import_session(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let mut resp = state
         .db
-        .query("SELECT * FROM import_sessions WHERE vault_id = $vid AND session_id = $sid LIMIT 1")
+        .query("SELECT *, record::id(id) AS id FROM import_sessions WHERE vault_id = $vid AND session_id = $sid LIMIT 1")
         .bind(("vid", vault_id))
         .bind(("sid", session_id))
         .await
@@ -226,7 +226,7 @@ async fn list_import_pages(
     Path((vault_id, session_id)): Path<(String, String)>,
     Query(params): Query<PagesQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let mut query_str = "SELECT * FROM import_pages WHERE vault_id = $vid AND session_id = $sid".to_string();
+    let mut query_str = "SELECT *, record::id(id) AS id FROM import_pages WHERE vault_id = $vid AND session_id = $sid".to_string();
     if params.status.is_some() { query_str.push_str(" AND status = $status"); }
     if params.q.is_some() {
         // FTS: match title or url (basic LIKE for SurrealDB)
@@ -251,7 +251,7 @@ async fn search_all_pages(
     Path(vault_id): Path<String>,
     Query(params): Query<PagesQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let mut query_str = "SELECT * FROM import_pages WHERE vault_id = $vid".to_string();
+    let mut query_str = "SELECT *, record::id(id) AS id FROM import_pages WHERE vault_id = $vid".to_string();
     if params.status.is_some() { query_str.push_str(" AND status = $status"); }
     if params.q.is_some() {
         query_str.push_str(" AND (string::lowercase(title) CONTAINS string::lowercase($q) OR string::lowercase(url) CONTAINS string::lowercase($q) OR (content_md != NONE AND string::lowercase(content_md) CONTAINS string::lowercase($q)))");
@@ -344,7 +344,7 @@ async fn list_kb_suggestions(
     Path(vault_id): Path<String>,
     Query(q): Query<SuggestionsQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let mut query_str = "SELECT * FROM kb_suggestions WHERE vault_id = $vid".to_string();
+    let mut query_str = "SELECT *, record::id(id) AS id FROM kb_suggestions WHERE vault_id = $vid".to_string();
     if q.session_id.is_some() { query_str.push_str(" AND session_id = $sid"); }
     if q.page_id.is_some() { query_str.push_str(" AND page_id = $pid"); }
     query_str.push_str(" ORDER BY created_at DESC");
@@ -461,7 +461,7 @@ async fn list_knowledge_items(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let mut resp = state
         .db
-        .query("SELECT * FROM knowledge_items WHERE vault_id = $vid ORDER BY created_at DESC")
+        .query("SELECT *, record::id(id) AS id FROM knowledge_items WHERE vault_id = $vid ORDER BY created_at DESC")
         .bind(("vid", vault_id))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -519,7 +519,7 @@ async fn get_knowledge_item(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let mut resp = state
         .db
-        .query("SELECT * FROM knowledge_items WHERE item_id = $iid AND vault_id = $vid LIMIT 1")
+        .query("SELECT *, record::id(id) AS id FROM knowledge_items WHERE item_id = $iid AND vault_id = $vid LIMIT 1")
         .bind(("iid", item_id.clone()))
         .bind(("vid", vault_id))
         .await

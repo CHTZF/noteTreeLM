@@ -40,6 +40,14 @@ pub fn router() -> Router<ApiState> {
         .route("/auth/register", post(register))
         .route("/auth/google-upsert", post(google_upsert))
         .route("/auth/change-password", post(change_password))
+        .route("/auth/generate-pairing-code", post(generate_pairing_code))
+}
+
+async fn generate_pairing_code(
+    State(state): State<ApiState>,
+) -> Json<Value> {
+    let code = state.auth.generate_pairing_code().await;
+    Json(json!({ "pairing_code": code, "expires_in": 300 }))
 }
 
 async fn login(
@@ -91,6 +99,13 @@ async fn login(
         .bind(("now", now))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Seed builtin skills/agents for this account on first login (idempotent)
+    let username_for_seed = user.username.clone();
+    let db_for_seed = state.db.clone();
+    tokio::spawn(async move {
+        crate::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
+    });
 
     Ok(Json(json!({
         "token": token,
@@ -199,6 +214,13 @@ async fn register(
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
 
+    // Seed on first registration
+    let username_for_seed = req.username.clone();
+    let db_for_seed = state.db.clone();
+    tokio::spawn(async move {
+        crate::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
+    });
+
     Ok(Json(json!({ "ok": true, "username": req.username })))
 }
 
@@ -280,6 +302,13 @@ async fn google_upsert(
             tracing::error!("google_upsert INSERT session failed: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
+
+    // Seed builtin skills/agents for this account (idempotent)
+    let username_for_seed = username.clone();
+    let db_for_seed = state.db.clone();
+    tokio::spawn(async move {
+        crate::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
+    });
 
     tracing::info!("google_upsert: session created for {}", username);
     Ok(Json(json!({

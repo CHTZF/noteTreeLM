@@ -1,81 +1,9 @@
-use crate::{api_client::{daemon_delete, daemon_get, daemon_post}, error::AppError, state::AppState};
+use crate::{api_client::{daemon_get, daemon_post}, error::AppError, state::AppState};
 use chrono::Local;
 use serde::Serialize;
 use tauri::State;
 
 use super::ai::ChatMessage;
-
-// ─── Memory Rules ─────────────────────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn add_memory_rule(
-    state: State<'_, AppState>,
-    pattern_type: String,
-    pattern: String,
-    value: String,
-) -> Result<(), AppError> {
-    let token = state.get_auth_token().await;
-    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
-    let vault_id = state.get_vault_id().await?;
-    daemon_post::<_, serde_json::Value>(
-        &state.http_client,
-        &format!("/vaults/{}/memory/rules", urlencoding::encode(&vault_id)),
-        &serde_json::json!({"pattern_type": pattern_type, "pattern": pattern, "value": value}),
-        tok,
-    ).await.map(|_| ()).map_err(|e| AppError::Database(e))
-}
-
-#[derive(Debug, Serialize)]
-pub struct MemoryRuleEntry {
-    pub id: i64,
-    pub pattern_type: String,
-    pub pattern: String,
-    pub value: String,
-    pub created_at: i64,
-}
-
-#[tauri::command]
-pub async fn get_memory_rules(state: State<'_, AppState>) -> Result<Vec<MemoryRuleEntry>, AppError> {
-    let token = state.get_auth_token().await;
-    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
-    let vault_id = state.get_vault_id().await?;
-    let rows: Vec<serde_json::Value> = daemon_get(
-        &state.http_client,
-        &format!("/vaults/{}/memory/rules", urlencoding::encode(&vault_id)),
-        tok,
-    ).await.unwrap_or_default();
-    Ok(rows.into_iter().enumerate().map(|(idx, r)| MemoryRuleEntry {
-        id: idx as i64,
-        pattern_type: r["pattern_type"].as_str().unwrap_or("").to_string(),
-        pattern: r["pattern"].as_str().unwrap_or("").to_string(),
-        value: r["value"].as_str().unwrap_or("").to_string(),
-        created_at: r["created_at"].as_i64().unwrap_or(0),
-    }).collect())
-}
-
-#[tauri::command]
-pub async fn delete_memory_rule(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
-    let token = state.get_auth_token().await;
-    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
-    let vault_id = state.get_vault_id().await?;
-    // Get rule id from list first
-    let rows: Vec<serde_json::Value> = daemon_get(
-        &state.http_client,
-        &format!("/vaults/{}/memory/rules", urlencoding::encode(&vault_id)),
-        tok,
-    ).await.unwrap_or_default();
-    if let Some(rule) = rows.into_iter().nth(id as usize) {
-        if let Some(rule_id) = rule["id"].as_str() {
-            daemon_delete::<serde_json::Value>(
-                &state.http_client,
-                &format!("/vaults/{}/memory/rules/{}", urlencoding::encode(&vault_id), urlencoding::encode(rule_id)),
-                tok,
-            ).await.map(|_| ()).map_err(|e| AppError::Database(e))?;
-        }
-    }
-    Ok(())
-}
-
 
 // ─── Memory Query ──────────────────────────────────────────────────────────────
 

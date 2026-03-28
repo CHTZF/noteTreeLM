@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
 };
@@ -30,7 +30,7 @@ async fn list_vaults(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let mut resp = state
         .db
-        .query("SELECT * FROM vaults ORDER BY created_at DESC")
+        .query("SELECT *, record::id(id) AS id FROM vaults ORDER BY created_at DESC")
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -43,6 +43,7 @@ async fn list_vaults(
 
 async fn register_vault(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let path = body
@@ -50,19 +51,25 @@ async fn register_vault(
         .and_then(|v| v.as_str())
         .ok_or((StatusCode::BAD_REQUEST, "Missing path".to_string()))?
         .to_string();
-    let account = body
-        .get("account")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+
+    // account_id: from body (legacy) or resolved from Bearer token
+    let account_id = if let Some(aid) = body.get("account_id").and_then(|v| v.as_str()) {
+        aid.to_string()
+    } else if let Some(tok) = crate::routes::auth::extract_bearer(&headers) {
+        resolve_account_id_from_token(&state, &tok).await
+            .unwrap_or_else(|| body.get("account").and_then(|v| v.as_str()).unwrap_or("").to_string())
+    } else {
+        body.get("account").and_then(|v| v.as_str()).unwrap_or("").to_string()
+    };
 
     let now = Utc::now().timestamp();
 
-    // Check if vault with this path already exists — return existing vault_id if so
+    // Check if vault with (path, account_id) already exists
     let mut check = state
         .db
-        .query("SELECT vault_id FROM vaults WHERE path = $path LIMIT 1")
+        .query("SELECT vault_id FROM vaults WHERE path = $path AND account_id = $aid LIMIT 1")
         .bind(("path", path.clone()))
+        .bind(("aid", account_id.clone()))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let existing: Vec<Value> = check.take(0).unwrap_or_default();
@@ -73,15 +80,27 @@ async fn register_vault(
     let vault_id = Uuid::new_v4().to_string();
     state
         .db
-        .query("INSERT INTO vaults (vault_id, path, account, created_at) VALUES ($vid, $path, $account, $now)")
+        .query("INSERT INTO vaults (vault_id, path, account_id, created_at) VALUES ($vid, $path, $aid, $now)")
         .bind(("vid", vault_id.clone()))
         .bind(("path", path))
-        .bind(("account", account))
+        .bind(("aid", account_id))
         .bind(("now", now))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({ "vault_id": vault_id })))
+}
+
+async fn resolve_account_id_from_token(state: &ApiState, token: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Row { username: String }
+    let now = chrono::Utc::now().timestamp();
+    let mut r = state.db
+        .query("SELECT username FROM sessions WHERE token = $t AND expires_at > $now LIMIT 1")
+        .bind(("t", token.to_string()))
+        .bind(("now", now))
+        .await.ok()?;
+    r.take::<Vec<Row>>(0).ok()?.into_iter().next().map(|r| r.username)
 }
 
 async fn vault_structure(
@@ -649,7 +668,7 @@ async fn get_backlinks(
         state
             .db
             .query(
-                "SELECT * FROM links WHERE vault_id = $vid \
+                "SELECT *, record::id(id) AS id FROM links WHERE vault_id = $vid \
                  AND string::lowercase(target_title) = string::lowercase($title)",
             )
             .bind(("vid", vault_id))
@@ -663,7 +682,7 @@ async fn get_backlinks(
         state
             .db
             .query(
-                "SELECT * FROM links WHERE vault_id = $vid \
+                "SELECT *, record::id(id) AS id FROM links WHERE vault_id = $vid \
                  AND string::lowercase(target_title) = string::lowercase($title)",
             )
             .bind(("vid", vault_id))

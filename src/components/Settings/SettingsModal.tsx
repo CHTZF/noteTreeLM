@@ -30,15 +30,8 @@ interface SettingsModalProps {
   mode?: 'system' | 'personal'
 }
 
-interface MemoryRuleEntry {
-  rule_id: string
-  pattern_type: string
-  pattern: string
-  value: string
-  created_at: number
-}
 
-type Tab = 'account' | 'general' | 'sidebar' | 'voice' | 'local' | 'advanced' | 'raw' | 'memory' | 'mobile'
+type Tab = 'account' | 'general' | 'sidebar' | 'voice' | 'local' | 'advanced' | 'raw' | 'memory' | 'mobile' | 'search'
 type ServerStatus = 'unknown' | 'running' | 'loading' | 'stopped'
 
 
@@ -125,13 +118,8 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
   const [coremlTotalBytes, setCoremlTotalBytes] = useState(0)
   const [coremlSpeedBps, setCoremlSpeedBps] = useState(0)
 
-  const [memoryRules, setMemoryRules] = useState<MemoryRuleEntry[]>([])
-  const [memoryRulesLoading, setMemoryRulesLoading] = useState(false)
   const [memoryAgentRunning, setMemoryAgentRunning] = useState(false)
   const [memoryAgentMsg, setMemoryAgentMsg] = useState('')
-  const [newRuleType, setNewRuleType] = useState<string>('temporal_exact_days')
-  const [newRulePattern, setNewRulePattern] = useState('')
-  const [newRuleValue, setNewRuleValue] = useState('')
 
   // Mobile tab state
   const [mobileTunnelUrl, setMobileTunnelUrl] = useState<string | null>(null)
@@ -239,8 +227,8 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
         setBinarySpeedBps(0)
         toast.error('下載失敗：' + p.error)
       }
-    }).then(fn => { if (cancelled) fn(); else unlisten = fn })
-    return () => { cancelled = true; unlisten?.() }
+    }).then(fn => { if (cancelled) { try { fn() } catch {} } else unlisten = fn }).catch(() => {})
+    return () => { cancelled = true; try { unlisten?.(); unlisten = null } catch {} }
   }, [])
 
   // 模型更換時清除舊測速結果
@@ -298,8 +286,8 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
         setCoremlSpeedBps(0)
         toast.error('CoreML 下載失敗：' + p.error)
       }
-    }).then(fn => { if (cancelled) fn(); else unlisten = fn })
-    return () => { cancelled = true; unlisten?.() }
+    }).then(fn => { if (cancelled) { try { fn() } catch {} } else unlisten = fn }).catch(() => {})
+    return () => { cancelled = true; try { unlisten?.(); unlisten = null } catch {} }
   }, [])
 
   // 檢查 llama-server binary 是否已安裝
@@ -334,19 +322,9 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
         setLlamaBinarySpeedBps(0)
         toast.error('下載失敗：' + p.error)
       }
-    }).then(fn => { if (cancelled) fn(); else unlisten = fn })
-    return () => { cancelled = true; unlisten?.() }
+    }).then(fn => { if (cancelled) { try { fn() } catch {} } else unlisten = fn }).catch(() => {})
+    return () => { cancelled = true; try { unlisten?.(); unlisten = null } catch {} }
   }, [])
-
-  useEffect(() => {
-    if (tab !== 'memory') return
-    setMemoryRulesLoading(true)
-    invoke<string>('get_vault_uuid')
-      .then(vaultId => api.listMemoryRules(vaultId))
-      .then(rules => setMemoryRules(rules as MemoryRuleEntry[]))
-      .catch(() => setMemoryRules([]))
-      .finally(() => setMemoryRulesLoading(false))
-  }, [tab])
 
   useEffect(() => {
     if (tab !== 'advanced') return
@@ -354,31 +332,6 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
       .then(setRepairLogs)
       .catch(() => setRepairLogs([]))
   }, [tab])
-
-  const handleDeleteMemoryRule = async (ruleId: string) => {
-    const vaultId = await invoke<string>('get_vault_uuid')
-    await api.deleteMemoryRule(vaultId, ruleId).catch(() => {})
-    setMemoryRules((prev) => prev.filter((r) => r.rule_id !== ruleId))
-  }
-
-  const handleAddMemoryRule = async () => {
-    const pattern = newRulePattern.trim()
-    if (!pattern) return
-    const vaultId = await invoke<string>('get_vault_uuid')
-    await api.createMemoryRule(vaultId, { pattern_type: newRuleType, pattern, value: newRuleValue.trim() }).catch(() => {})
-    // 重新載入以取得 server 產生的 id
-    const updated = await api.listMemoryRules(vaultId).catch(() => memoryRules) as MemoryRuleEntry[]
-    setMemoryRules(updated)
-    setNewRulePattern('')
-    setNewRuleValue('')
-  }
-
-  const patternTypeLabel = (pt: string) => {
-    if (pt === 'temporal_exact_days') return '固定天數'
-    if (pt === 'temporal_unit') return '時間單位'
-    if (pt === 'stopword') return '停用詞'
-    return pt
-  }
 
   const up = (partial: Partial<Settings>) => setDraft((d) => ({ ...d, ...partial }))
 
@@ -565,7 +518,7 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
   // ── Render ───────────────────────────────────────────────────────
 
   const tabs: [Tab, string][] = mode === 'system'
-    ? [['voice', t('settings.tab.voice')], ['local', t('settings.tab.local')], ['advanced', t('settings.tab.advanced')], ['raw', t('settings.tab.raw')]]
+    ? [['voice', t('settings.tab.voice')], ['local', t('settings.tab.local')], ['search', '網路搜尋'], ['advanced', t('settings.tab.advanced')], ['raw', t('settings.tab.raw')]]
     : [['account', t('settings.tab.account')], ['general', t('settings.tab.general')], ['sidebar', '左側選單'], ['advanced', t('settings.tab.advanced')], ['memory', t('settings.tab.memory')], ['mobile', 'Mobile'], ['raw', t('settings.tab.raw')]]
 
   const handleChangePassword = async () => {
@@ -871,38 +824,48 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                 </select>
               </div>
 
-              <ToggleRow label="Chat 自動帶入當前筆記" value={draft.chat_auto_include_note} onChange={(v) => up({ chat_auto_include_note: v })} />
-              {draft.chat_auto_include_note && (
-                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 16px 0', lineHeight: 1.5 }}>
-                  開啟筆記時，Chat 會自動將目前編輯中的筆記內容注入為 system context，讓 LLM 可直接針對筆記回答。
-                </p>
-              )}
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
-                <div>
-                  <span style={{ fontSize: '13px', color: 'var(--color-text-primary)' }}>Vault 寫入確認</span>
-                  <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '3px 0 0', lineHeight: 1.4 }}>
-                    LLM 呼叫寫入工具（新增/更新筆記、新增資料夾）時的確認方式
-                  </p>
-                </div>
-                <div style={{ display: 'flex', gap: '4px', flexShrink: 0, marginLeft: '12px' }}>
-                  {(['always', 'once', 'never'] as const).map((m) => (
-                    <button
-                      key={m}
-                      onClick={() => up({ write_confirm_mode: m })}
-                      style={{
-                        padding: '3px 10px', borderRadius: '4px', fontSize: '12px',
-                        border: '1px solid var(--color-border)',
-                        background: draft.write_confirm_mode === m ? 'var(--color-accent)' : 'transparent',
-                        color: draft.write_confirm_mode === m ? '#fff' : 'var(--color-text-muted)',
-                        cursor: 'pointer',
-                      }}
-                    >
-                      {m === 'always' ? '每次' : m === 'once' ? '本次' : '關閉'}
-                    </button>
-                  ))}
-                </div>
-              </div>
+              {/* ── 快捷鍵 ────────────────────────────────────────────────── */}
+              <SectionDivider />
+              <SectionHeader label="快捷鍵" />
+              {([
+                ['hotkey_toggle_view', '切換即時／預覽'],
+                ['hotkey_save',        '儲存'],
+                ['hotkey_bold',        '粗體'],
+                ['hotkey_italic',      '斜體'],
+              ] as [keyof Settings, string][]).map(([field, label]) => {
+                const isRecording = recordingKey === field
+                return (
+                  <div key={field} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
+                    <span style={{ fontSize: '13px', color: 'var(--color-text-primary)' }}>{label}</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <button
+                        onKeyDown={isRecording ? (e) => captureKey(e, field) : undefined}
+                        onBlur={() => { if (isRecording) setRecordingKey(null) }}
+                        onClick={() => setRecordingKey(isRecording ? null : field)}
+                        style={{
+                          minWidth: '90px', padding: '3px 10px', borderRadius: '5px', fontSize: '13px',
+                          border: `1px solid ${isRecording ? 'var(--color-accent)' : 'var(--color-border)'}`,
+                          background: isRecording ? 'var(--color-accent-dim, rgba(10,132,255,0.08))' : 'var(--color-bg-base)',
+                          color: isRecording ? 'var(--color-accent)' : 'var(--color-text-primary)',
+                          cursor: 'pointer', textAlign: 'center' as const, fontFamily: 'monospace',
+                          outline: 'none',
+                        }}
+                        autoFocus={isRecording}
+                      >
+                        {isRecording ? '按下快捷鍵…' : displayHotkey(String(draft[field] ?? ''))}
+                      </button>
+                      {draft[field] && (
+                        <button onClick={() => up({ [field]: '' } as any)}
+                          style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-text-muted)', fontSize: '14px', lineHeight: 1, padding: '2px 4px' }}
+                          title="清除">×</button>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </>}
 
+            {tab === 'search' && <>
               <div style={{ marginBottom: '16px' }}>
                 <label style={{ fontSize: '13px', color: 'var(--color-text-primary)', display: 'block', marginBottom: '4px' }}>
                   Brave Search API Key
@@ -950,46 +913,6 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                   )
                 })()}
               </div>
-
-              {/* ── 快捷鍵 ────────────────────────────────────────────────── */}
-              <SectionDivider />
-              <SectionHeader label="快捷鍵" />
-              {([
-                ['hotkey_toggle_view', '切換即時／預覽'],
-                ['hotkey_save',        '儲存'],
-                ['hotkey_bold',        '粗體'],
-                ['hotkey_italic',      '斜體'],
-              ] as [keyof Settings, string][]).map(([field, label]) => {
-                const isRecording = recordingKey === field
-                return (
-                  <div key={field} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
-                    <span style={{ fontSize: '13px', color: 'var(--color-text-primary)' }}>{label}</span>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      <button
-                        onKeyDown={isRecording ? (e) => captureKey(e, field) : undefined}
-                        onBlur={() => { if (isRecording) setRecordingKey(null) }}
-                        onClick={() => setRecordingKey(isRecording ? null : field)}
-                        style={{
-                          minWidth: '90px', padding: '3px 10px', borderRadius: '5px', fontSize: '13px',
-                          border: `1px solid ${isRecording ? 'var(--color-accent)' : 'var(--color-border)'}`,
-                          background: isRecording ? 'var(--color-accent-dim, rgba(10,132,255,0.08))' : 'var(--color-bg-base)',
-                          color: isRecording ? 'var(--color-accent)' : 'var(--color-text-primary)',
-                          cursor: 'pointer', textAlign: 'center' as const, fontFamily: 'monospace',
-                          outline: 'none',
-                        }}
-                        autoFocus={isRecording}
-                      >
-                        {isRecording ? '按下快捷鍵…' : displayHotkey(String(draft[field] ?? ''))}
-                      </button>
-                      {draft[field] && (
-                        <button onClick={() => up({ [field]: '' } as any)}
-                          style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-text-muted)', fontSize: '14px', lineHeight: 1, padding: '2px 4px' }}
-                          title="清除">×</button>
-                      )}
-                    </div>
-                  </div>
-                )
-              })}
             </>}
 
             {tab === 'voice' && <>
@@ -1387,32 +1310,6 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
               </div>
 
 
-              {/* ── Chat & Memory ──────────────────────────────────────────── */}
-              <SectionDivider />
-              <SectionHeader label="Chat 與記憶" />
-              <ToggleRow label="自動記憶整理" value={draft.enable_auto_memory} onChange={(v) => up({ enable_auto_memory: v })} />
-              {draft.enable_auto_memory && (
-                <>
-                  <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 4px 0', lineHeight: 1.5 }}>
-                    對話達到閾值時自動將原始訊息存為記憶筆記（memories/ai_memory_*.md），並提供 query_memory 工具查詢。
-                  </p>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
-                    <label style={{ fontSize: '13px', color: 'var(--color-text-secondary)', whiteSpace: 'nowrap' }}>訊息閾值</label>
-                    <input
-                      type="number" min={5} max={200}
-                      value={draft.memory_threshold}
-                      onChange={(e) => up({ memory_threshold: Math.max(5, Math.min(200, Number(e.target.value))) })}
-                      style={{
-                        width: '72px', padding: '4px 8px',
-                        background: 'var(--color-bg-base)', border: '1px solid var(--color-border)',
-                        borderRadius: '4px', color: 'var(--color-text-primary)', fontSize: '13px',
-                      }}
-                    />
-                    <span style={{ fontSize: '12px', color: 'var(--color-text-muted)' }}>則訊息後壓縮</span>
-                  </div>
-                </>
-              )}
-
               {/* ── Model Management ───────────────────────────────────────── */}
               <SectionDivider />
               <SectionHeader label="模型管理" locked={llamaStatus === 'running'} />
@@ -1470,6 +1367,12 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
               <SectionDivider />
               <SectionHeader label="功能頁籤" />
               <ToggleRow label="知識圖譜" value={draft.show_graph} onChange={(v) => up({ show_graph: v })} />
+              <ToggleRow label="記憶連結" value={draft.show_memory_links ?? false} onChange={(v) => up({ show_memory_links: v })} />
+              {draft.show_memory_links && !draft.enable_auto_memory && (
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 16px 0', lineHeight: 1.5 }}>
+                  提示：若要啟用 AI 自動整理記憶，請至「記憶」設定頁開啟「自動記憶整理」。
+                </p>
+              )}
               <ToggleRow label="Agent 管理" value={draft.show_agents} onChange={(v) => up({ show_agents: v })} />
               <ToggleRow label="技能規範" value={draft.show_skills} onChange={(v) => up({ show_skills: v })} />
               <ToggleRow label="知識助理" value={draft.show_kb_assist} onChange={(v) => up({ show_kb_assist: v })} />
@@ -1489,6 +1392,40 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
             </>}
 
             {tab === 'advanced' && <>
+              {mode === 'personal' && <>
+                <ToggleRow label="Chat 自動帶入當前筆記" value={draft.chat_auto_include_note} onChange={(v) => up({ chat_auto_include_note: v })} />
+                {draft.chat_auto_include_note && (
+                  <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 16px 0', lineHeight: 1.5 }}>
+                    開啟筆記時，Chat 會自動將目前編輯中的筆記內容注入為 system context，讓 LLM 可直接針對筆記回答。
+                  </p>
+                )}
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
+                  <div>
+                    <span style={{ fontSize: '13px', color: 'var(--color-text-primary)' }}>Vault 寫入確認</span>
+                    <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '3px 0 0', lineHeight: 1.4 }}>
+                      LLM 呼叫寫入工具（新增/更新筆記、新增資料夾）時的確認方式
+                    </p>
+                  </div>
+                  <div style={{ display: 'flex', gap: '4px', flexShrink: 0, marginLeft: '12px' }}>
+                    {(['always', 'once', 'never'] as const).map((m) => (
+                      <button
+                        key={m}
+                        onClick={() => up({ write_confirm_mode: m })}
+                        style={{
+                          padding: '3px 10px', borderRadius: '4px', fontSize: '12px',
+                          border: '1px solid var(--color-border)',
+                          background: draft.write_confirm_mode === m ? 'var(--color-accent)' : 'transparent',
+                          color: draft.write_confirm_mode === m ? '#fff' : 'var(--color-text-muted)',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        {m === 'always' ? '每次' : m === 'once' ? '本次' : '關閉'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <SectionDivider />
+              </>}
               {mode === 'system' && (
                 <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px', marginTop: '8px' }}>
                   <p style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)', margin: '0 0 6px' }}>
@@ -1511,7 +1448,7 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                 </div>
               )}
               {/* 資料庫修復紀錄 */}
-              <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px', marginTop: '8px' }}>
+              {mode === 'system' && <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: '16px', marginTop: '8px' }}>
                 <p style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text-secondary)', margin: '0 0 10px' }}>
                   資料庫修復紀錄
                 </p>
@@ -1562,90 +1499,34 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                     ))}
                   </div>
                 )}
-              </div>
+              </div>}
             </>}
 
             {tab === 'memory' && <>
-              {/* Header */}
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
-                <span style={{ fontSize: '13px', fontWeight: 500, color: 'var(--color-text-primary)' }}>記憶規則</span>
-                {memoryRulesLoading && <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>載入中…</span>}
-              </div>
-              <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '0 0 14px', lineHeight: 1.5 }}>
-                時間表達式與停用詞規則。AI 遇到未知時間詞時會自動新增；也可手動維護。
-              </p>
-
-              {/* Rules table */}
-              {!memoryRulesLoading && memoryRules.length === 0 ? (
-                <p style={{ fontSize: '12px', color: 'var(--color-text-muted)', fontStyle: 'italic', marginBottom: '14px' }}>尚無自訂規則</p>
-              ) : (
-                <div style={{ border: '1px solid var(--color-border)', borderRadius: '6px', overflow: 'hidden', marginBottom: '14px' }}>
-                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px' }}>
-                    <thead>
-                      <tr style={{ background: 'var(--color-bg-elevated)' }}>
-                        {['類型', '觸發詞', '值', '建立日期', ''].map((h) => (
-                          <th key={h} style={{ textAlign: 'left', padding: '6px 10px', color: 'var(--color-text-secondary)', fontWeight: 500, borderBottom: '1px solid var(--color-border)' }}>{h}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {memoryRules.map((rule, i) => (
-                        <tr key={rule.rule_id} style={{ background: i % 2 === 0 ? 'transparent' : 'var(--color-bg-elevated)' }}>
-                          <td style={{ padding: '6px 10px', color: 'var(--color-text-secondary)' }}>{patternTypeLabel(rule.pattern_type)}</td>
-                          <td style={{ padding: '6px 10px', color: 'var(--color-text-primary)', fontFamily: 'monospace' }}>{rule.pattern}</td>
-                          <td style={{ padding: '6px 10px', color: 'var(--color-text-secondary)', fontFamily: 'monospace' }}>{rule.value || '—'}</td>
-                          <td style={{ padding: '6px 10px', color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }}>
-                            {new Date(rule.created_at * 1000).toLocaleDateString('zh-TW')}
-                          </td>
-                          <td style={{ padding: '6px 8px', textAlign: 'right' }}>
-                            <button
-                              onClick={() => handleDeleteMemoryRule(rule.rule_id)}
-                              style={{ padding: '2px 8px', borderRadius: '4px', fontSize: '11px', background: 'transparent', border: '1px solid var(--color-border)', color: 'var(--color-text-muted)', cursor: 'pointer' }}
-                              onMouseEnter={e => { e.currentTarget.style.borderColor = '#e06c75'; e.currentTarget.style.color = '#e06c75' }}
-                              onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--color-border)'; e.currentTarget.style.color = 'var(--color-text-muted)' }}
-                            >刪除</button>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+              {/* ── Auto Memory ─────────────────────────────────────────────── */}
+              <SectionHeader label="自動記憶整理" />
+              <ToggleRow label="啟用自動記憶整理" value={draft.enable_auto_memory} onChange={(v) => up({ enable_auto_memory: v })} />
+              {draft.enable_auto_memory && (
+                <>
+                  <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '-8px 0 4px 0', lineHeight: 1.5 }}>
+                    對話達到閾值時自動將原始訊息存為記憶筆記（memories/ai_memory_*.md），並提供 query_memory 工具查詢。
+                  </p>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
+                    <label style={{ fontSize: '13px', color: 'var(--color-text-secondary)', whiteSpace: 'nowrap' }}>訊息閾值</label>
+                    <input
+                      type="number" min={5} max={200}
+                      value={draft.memory_threshold}
+                      onChange={(e) => up({ memory_threshold: Math.max(5, Math.min(200, Number(e.target.value))) })}
+                      style={{
+                        width: '72px', padding: '4px 8px',
+                        background: 'var(--color-bg-base)', border: '1px solid var(--color-border)',
+                        borderRadius: '4px', color: 'var(--color-text-primary)', fontSize: '13px',
+                      }}
+                    />
+                    <span style={{ fontSize: '12px', color: 'var(--color-text-muted)' }}>則訊息後壓縮</span>
+                  </div>
+                </>
               )}
-
-              {/* Add new rule form */}
-              <div style={{ border: '1px solid var(--color-border)', borderRadius: '8px', padding: '10px 12px' }}>
-                <span style={{ fontSize: '11px', fontWeight: 600, color: 'var(--color-text-secondary)', display: 'block', marginBottom: '8px' }}>新增規則</span>
-                <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
-                  <select
-                    value={newRuleType}
-                    onChange={e => setNewRuleType(e.target.value)}
-                    style={{ height: '28px', padding: '0 6px', borderRadius: '6px', border: '1px solid var(--color-border)', background: 'var(--color-bg-elevated)', color: 'var(--color-text-primary)', fontSize: '12px', outline: 'none' }}
-                  >
-                    <option value="temporal_exact_days">固定天數</option>
-                    <option value="temporal_unit">時間單位</option>
-                    <option value="stopword">停用詞</option>
-                  </select>
-                  <input
-                    value={newRulePattern}
-                    onChange={e => setNewRulePattern(e.target.value)}
-                    onKeyDown={e => { if (e.key === 'Enter') handleAddMemoryRule() }}
-                    placeholder="觸發詞（如「大前天」）"
-                    style={{ flex: 1, minWidth: '100px', height: '28px', padding: '0 8px', borderRadius: '6px', border: '1px solid var(--color-border)', background: 'var(--color-bg-elevated)', color: 'var(--color-text-primary)', fontSize: '12px', outline: 'none' }}
-                  />
-                  <input
-                    value={newRuleValue}
-                    onChange={e => setNewRuleValue(e.target.value)}
-                    onKeyDown={e => { if (e.key === 'Enter') handleAddMemoryRule() }}
-                    placeholder={newRuleType === 'temporal_exact_days' ? '負整數如 -3' : newRuleType === 'temporal_unit' ? 'hours/minutes/weeks' : '（停用詞留空）'}
-                    style={{ flex: 1, minWidth: '100px', height: '28px', padding: '0 8px', borderRadius: '6px', border: '1px solid var(--color-border)', background: 'var(--color-bg-elevated)', color: 'var(--color-text-primary)', fontSize: '12px', outline: 'none' }}
-                  />
-                  <button
-                    onClick={handleAddMemoryRule}
-                    style={{ padding: '4px 12px', borderRadius: '6px', fontSize: '12px', background: 'var(--color-accent-dim)', border: '1px solid var(--color-accent)', color: 'var(--color-accent)', cursor: 'pointer', whiteSpace: 'nowrap' }}
-                  >+ 新增</button>
-                </div>
-              </div>
-
               {/* 立即整合記憶 */}
               <div style={{ marginTop: '20px', borderTop: '1px solid var(--color-border)', paddingTop: '16px' }}>
                 <span style={{ fontSize: '13px', fontWeight: 500, color: 'var(--color-text-primary)', display: 'block', marginBottom: '6px' }}>記憶整合</span>

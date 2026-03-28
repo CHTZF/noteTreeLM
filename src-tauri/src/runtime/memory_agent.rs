@@ -5,7 +5,7 @@
 //
 // 公開入口：
 //   MemoryAgent::build_system_prompt() — 動態建立記憶查詢系統提示詞
-//   MemoryAgent::tools_definition()    — query_memory + add_memory_rule 工具定義
+//   MemoryAgent::tools_definition()    — query_memory 工具定義
 //
 // 輔助函式：
 //   parse_query_since*                 — 時間表達式解析（純 Rust，< 1µs）
@@ -40,11 +40,7 @@ impl MemoryAgent {
 - 今天 → since=\"{today}\"  昨天 → since=\"{yesterday}\"  前天 → since=\"{day_before}\"\n\
 - N天前（N≥3）→ since 自行計算  本月 → since=\"{this_month}\"  上月 → since=\"{last_month}\"\n\
 - 本週 → since 為本週一（今天是週{weekday}）  X月 → since=\"{{year}}-{{X:02}}-01\"\n\
-- 遇到 Rust 不認識的時間表達式（如「3小時前」「大前天」「上上週」）→ 先呼叫 add_memory_rule 儲存規則，再呼叫 query_memory\n\
-【add_memory_rule 規則】\n\
-  temporal_exact_days: 固定天數，value 為負整數（如「大前天」\"-3\"）\n\
-  temporal_unit: 數字+後綴，value 為 hours/minutes/weeks（如「小時前」\"hours\"）\n\
-  stopword: 應過濾的停用字，value 為空字串\n\
+- 遇到無法識別的時間表達式 → 依最接近的規則估算，無法確定則忽略 since 參數\n\
 【輸出規則】只輸出記憶摘要，不對話，不提問。找不到記憶只回覆「未找到相關記憶」。",
             today = today_str, yesterday = yesterday_str, day_before = day_before_str,
             this_month = this_month_str, last_month = last_month_str,
@@ -52,7 +48,7 @@ impl MemoryAgent {
         )
     }
 
-    /// 固定的兩個工具定義（query_memory + add_memory_rule）
+    /// 工具定義（query_memory）
     pub fn tools_definition() -> Value {
         serde_json::json!([
             {
@@ -69,26 +65,6 @@ impl MemoryAgent {
                             "limit":    { "type": "integer", "description": "最多筆數，預設 3" }
                         },
                         "required": []
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "add_memory_rule",
-                    "description": "發現 Rust 不認識的時間表達式時，儲存規則讓系統下次直接處理（不再需要 LLM）",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "pattern_type": { "type": "string",
-                                "enum": ["temporal_exact_days","temporal_unit","stopword"],
-                                "description": "規則類型" },
-                            "pattern": { "type": "string",
-                                "description": "觸發字串，如「大前天」「小時前」" },
-                            "value": { "type": "string",
-                                "description": "temporal_exact_days: 負整數如\"-3\"；temporal_unit: hours/minutes/weeks；stopword: 空字串" }
-                        },
-                        "required": ["pattern_type","pattern","value"]
                     }
                 }
             }
@@ -190,22 +166,6 @@ fn extract_number_before(query: &str, suffix: &str) -> Option<i64> {
 
 
 // ── 記憶 DB 工具 ──────────────────────────────────────────────────────────────
-
-/// 將規則寫入 memory_rules 表（供 add_memory_rule command 共用）
-pub(crate) async fn add_memory_rule_to_db(http_client: &reqwest::Client, tok: Option<&str>, vault_id: &str, pattern_type: &str, pattern: &str, value: &str) -> String {
-    use crate::api_client::daemon_post;
-    let result_msg = format!("已記住規則：{} = {}", pattern, value);
-    let body = serde_json::json!({
-        "vault_id": vault_id,
-        "pattern_type": pattern_type,
-        "pattern": pattern,
-        "value": value,
-    });
-    match daemon_post::<_, serde_json::Value>(http_client, "/memory-rules", &body, tok).await {
-        Ok(_) => result_msg,
-        Err(e) => format!("儲存規則失敗：{}", e),
-    }
-}
 
 /// 格式化記憶筆記列表為純文字（供 LLM context 使用）
 pub(crate) fn format_memory_rows(rows: &[(String, String, i64)], prefix: &str) -> String {

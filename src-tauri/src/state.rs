@@ -72,7 +72,10 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        let http_client = reqwest::Client::new();
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_default();
         let auth_token: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
         let system_agent = Arc::new(SystemAgentService::new(http_client.clone(), auth_token.clone()));
         Self {

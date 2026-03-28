@@ -196,31 +196,6 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // add_memory_rule — 讓 LLM 學習新的時間表達式規則
-    {
-        let client = ctx.http_client.clone();
-        let tok = ctx.auth_token.clone();
-        let vid = ctx.vault_id.clone();
-        registry.register(
-            "add_memory_rule".into(),
-            Tool {
-                execute: Arc::new(move |args: Value| {
-                    let ptype   = args["pattern_type"].as_str().unwrap_or("").to_string();
-                    let pattern = args["pattern"].as_str().unwrap_or("").to_string();
-                    let value   = args["value"].as_str().unwrap_or("").to_string();
-                    let client = client.clone();
-                    let tok = tok.clone();
-                    let vid = vid.clone();
-                    Box::pin(async move {
-                        let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
-                        Ok(Value::String(crate::runtime::memory_agent::add_memory_rule_to_db(&client, tok_ref, &vid, &ptype, &pattern, &value).await))
-                    })
-                }),
-                rollback: None,
-            },
-        );
-    }
-
     // append_to_note — 在既有筆記末尾追加內容
     {
         let vp = ctx.vault_path.clone();

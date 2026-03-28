@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { open } from '@tauri-apps/plugin-dialog'
 import { useSettingsStore } from '../../stores/settingsStore'
+import ModelDownloader, { EMBEDDING_MODELS } from '../Settings/ModelDownloader'
 
 interface OnboardingProps {
   onComplete: () => void
@@ -9,8 +10,11 @@ interface OnboardingProps {
 export default function Onboarding({ onComplete }: OnboardingProps) {
   const [step, setStep] = useState(1)
   const [vaultPath, setVaultPath] = useState('')
+  const [embeddingModelPath, setEmbeddingModelPath] = useState('')
   const [error, setError] = useState('')
   const { saveSystem, savePersonal } = useSettingsStore()
+
+  const TOTAL_STEPS = 4
 
   const selectVault = async () => {
     const selected = await open({
@@ -23,10 +27,19 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
 
   const handleComplete = async () => {
     if (!vaultPath) { setError('請選擇 Vault 資料夾'); return }
-    await saveSystem({ system_current_vault_path: vaultPath } as any)
+    const systemPatch: Record<string, unknown> = { system_current_vault_path: vaultPath }
+    if (embeddingModelPath) systemPatch.embedding_model_path = embeddingModelPath
+    await saveSystem(systemPatch as any)
     await savePersonal({ onboarding_done: true, personal_current_vault_path: vaultPath })
     onComplete()
   }
+
+  const btnBase: React.CSSProperties = {
+    padding: '8px 20px', borderRadius: '6px',
+    fontSize: '14px', fontWeight: 500, cursor: 'pointer',
+  }
+  const btnPrimary: React.CSSProperties = { ...btnBase, background: '#7c8cf8', color: '#fff' }
+  const btnSecondary: React.CSSProperties = { ...btnBase, background: '#373a40', color: '#c9cdd4' }
 
   return (
     <div style={{
@@ -35,14 +48,15 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
       background: '#1a1b1e',
     }}>
       <div style={{
-        width: 480, padding: '40px',
+        width: 520, padding: '40px',
         background: '#25262b', borderRadius: '16px',
         border: '1px solid #373a40',
         boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
+        maxHeight: '90vh', overflowY: 'auto',
       }}>
         {/* 步驟指示器 */}
         <div style={{ display: 'flex', gap: '8px', marginBottom: '32px' }}>
-          {[1,2,3].map(i => (
+          {Array.from({ length: TOTAL_STEPS }, (_, i) => i + 1).map(i => (
             <div key={i} style={{
               flex: 1, height: '3px', borderRadius: '2px',
               background: i <= step ? '#7c8cf8' : '#373a40',
@@ -76,12 +90,8 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
             {error && <p style={{ color: '#e06c75', fontSize: '13px', marginBottom: '12px' }}>{error}</p>}
             <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
               <button
-                onClick={() => { if (!vaultPath) { setError('請選擇 Vault 資料夾'); return }; setStep(2) }}
-                style={{
-                  padding: '8px 20px', borderRadius: '6px',
-                  background: '#7c8cf8', color: '#fff',
-                  fontSize: '14px', fontWeight: 500,
-                }}
+                onClick={() => { if (!vaultPath) { setError('請選擇 Vault 資料夾'); return }; setError(''); setStep(2) }}
+                style={btnPrimary}
               >下一步 →</button>
             </div>
           </>
@@ -93,22 +103,38 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
               語音輸入設定
             </h2>
             <p style={{ color: '#8b8fa8', marginBottom: '24px', fontSize: '14px' }}>
-              需要安裝 Whisper 模型才能使用語音輸入。可稍後在設定中配置。
+              需要安裝 Whisper 模型才能使用語音輸入。可稍後在系統設定 → 本機模型 中配置。
             </p>
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <button
-                onClick={() => setStep(1)}
-                style={{ padding: '8px 16px', borderRadius: '6px', background: '#373a40', color: '#c9cdd4', fontSize: '14px' }}
-              >← 上一步</button>
-              <button
-                onClick={() => setStep(3)}
-                style={{ padding: '8px 20px', borderRadius: '6px', background: '#7c8cf8', color: '#fff', fontSize: '14px', fontWeight: 500 }}
-              >下一步 →</button>
+              <button onClick={() => setStep(1)} style={btnSecondary}>← 上一步</button>
+              <button onClick={() => setStep(3)} style={btnPrimary}>下一步 →</button>
             </div>
           </>
         )}
 
         {step === 3 && (
+          <>
+            <h2 style={{ fontSize: '20px', fontWeight: 600, color: '#c9cdd4', marginBottom: '8px' }}>
+              語意搜尋（Embedding）
+            </h2>
+            <p style={{ color: '#8b8fa8', marginBottom: '20px', fontSize: '14px' }}>
+              Embedding 模型讓 AI 能夠理解筆記語義，提供更準確的搜尋結果。可選擇跳過，稍後在系統設定中配置。
+            </p>
+            <ModelDownloader
+              models={EMBEDDING_MODELS}
+              title="Embedding 模型"
+              kind="llm"
+              value={embeddingModelPath}
+              onChange={setEmbeddingModelPath}
+            />
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '24px' }}>
+              <button onClick={() => setStep(2)} style={btnSecondary}>← 上一步</button>
+              <button onClick={() => setStep(4)} style={btnPrimary}>下一步 →</button>
+            </div>
+          </>
+        )}
+
+        {step === 4 && (
           <>
             <h2 style={{ fontSize: '20px', fontWeight: 600, color: '#c9cdd4', marginBottom: '8px' }}>
               AI 功能（選填）
@@ -117,14 +143,8 @@ export default function Onboarding({ onComplete }: OnboardingProps) {
               提供 OpenAI API Key 可啟用 LLM 主題分析和智慧摘要。可稍後在設定中配置。
             </p>
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <button
-                onClick={() => setStep(2)}
-                style={{ padding: '8px 16px', borderRadius: '6px', background: '#373a40', color: '#c9cdd4', fontSize: '14px' }}
-              >← 上一步</button>
-              <button
-                onClick={handleComplete}
-                style={{ padding: '8px 20px', borderRadius: '6px', background: '#7c8cf8', color: '#fff', fontSize: '14px', fontWeight: 500 }}
-              >開始使用 ✓</button>
+              <button onClick={() => setStep(3)} style={btnSecondary}>← 上一步</button>
+              <button onClick={handleComplete} style={btnPrimary}>開始使用 ✓</button>
             </div>
           </>
         )}

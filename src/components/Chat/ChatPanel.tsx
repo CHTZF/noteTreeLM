@@ -385,7 +385,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     if (!pendingSkillNotFound) return
     setSkillsPickerLoaded(false)
     invoke<string>('get_vault_uuid')
-      .then(vaultId => api.listAgentSkills(vaultId))
+      .then(() => api.listAgentSkills())
       .then(skills => { setSkillsForPicker(skills as AgentSkill[]); setSkillsPickerLoaded(true) })
       .catch(() => { setSkillsForPicker([]); setSkillsPickerLoaded(true) })
   }, [pendingSkillNotFound])
@@ -859,8 +859,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     if (!skillPreview || skillPreview.loading) return
     setSavingSkill(true)
     try {
-      const vaultId = await invoke<string>('get_vault_uuid')
-      await api.createAgentSkill(vaultId, {
+      await api.createAgentSkill( {
         knowledgeItemId: 'conversation',
         title: skillPreview.title,
         trigger: skillPreview.trigger,
@@ -1158,8 +1157,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
             <div style={{ display: 'flex', gap: '6px' }}>
               <button
                 onClick={async () => {
-                  const vaultId = await invoke<string>('get_vault_uuid')
-                  await api.addSkillTrigger(vaultId, pendingSkillFound.skill_id, false)
+                  await api.addSkillTrigger(pendingSkillFound.skill_id, false)
                   setPendingSkillFound(null)
                 }}
                 style={{ padding: '4px 12px', borderRadius: '4px', background: 'var(--color-accent)', color: '#fff', border: 'none', cursor: 'pointer', fontSize: '12px' }}
@@ -1191,8 +1189,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
                   <button
                     key={skill.skill_id}
                     onClick={async () => {
-                      const vaultId = await invoke<string>('get_vault_uuid')
-                      await api.addSkillTrigger(vaultId, skill.skill_id, false)
+                      await api.addSkillTrigger(skill.skill_id, false)
                       setPendingSkillNotFound(null)
                       setSkillsForPicker([])
                       setSkillsPickerLoaded(false)

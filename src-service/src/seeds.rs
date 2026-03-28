@@ -381,17 +381,30 @@ const AGENTS: &[BuiltinAgent] = &[
     },
 ];
 
-/// 為指定 vault 幂等重建所有內建 skills 與 agent definitions。
-/// 每次呼叫：先刪舊 builtin 資料，再全量插入最新版本。
-pub async fn seed_builtins(db: &SurrealDb, vault_id: &str) {
+/// 為指定 account 幂等重建所有內建 skills 與 agent definitions。
+/// 若此 account 已有 builtin 資料則直接回傳（幂等）。
+/// 強制重建請傳 force = true（目前預留，呼叫端永遠傳 false）。
+pub async fn seed_builtins(db: &SurrealDb, account_id: &str) {
+    // 幂等判斷：已有 builtin skill 則跳過
+    #[derive(serde::Deserialize)]
+    struct CountRow { count: i64 }
+    if let Ok(mut r) = db.query(
+        "SELECT count() AS count FROM agent_skills WHERE account_id = $aid AND knowledge_item_id = '__builtin__' GROUP ALL"
+    ).bind(("aid", account_id.to_string())).await {
+        let rows: Vec<CountRow> = r.take(0).unwrap_or_default();
+        if rows.into_iter().next().map(|r| r.count).unwrap_or(0) > 0 {
+            tracing::debug!("seed_builtins: account {} already seeded, skipping", account_id);
+            return;
+        }
+    }
+
     let now = Utc::now().timestamp();
 
     // ── Skills ───────────────────────────────────────────────────────────────
-    // 刪除此 vault 的舊 builtin skills
     let _ = db.query(
-        "DELETE agent_skills WHERE vault_id = $vid AND knowledge_item_id = '__builtin__'"
+        "DELETE agent_skills WHERE account_id = $aid AND knowledge_item_id = '__builtin__'"
     )
-    .bind(("vid", vault_id.to_string()))
+    .bind(("aid", account_id.to_string()))
     .await;
 
     for s in SKILLS {
@@ -403,15 +416,15 @@ pub async fn seed_builtins(db: &SurrealDb, vault_id: &str) {
         );
         let _ = db.query(
             "INSERT INTO agent_skills \
-             (skill_id, vault_id, knowledge_item_id, title, trigger, behavior, \
+             (skill_id, account_id, knowledge_item_id, title, trigger, behavior, \
               tool_calls, is_active, injection_mode, agent_scope, \
               need_tool_chain, tool_chain_order, trigger_count, created_at) \
-             VALUES ($sid, $vid, '__builtin__', $title, $trigger, $behavior, \
+             VALUES ($sid, $aid, '__builtin__', $title, $trigger, $behavior, \
                      $tools, true, $imode, 'all', \
                      $need_chain, $chain_order, 0, $now)"
         )
         .bind(("sid",         s.id.to_string()))
-        .bind(("vid",         vault_id.to_string()))
+        .bind(("aid",         account_id.to_string()))
         .bind(("title",       s.title.to_string()))
         .bind(("trigger",     s.trigger.to_string()))
         .bind(("behavior",    s.behavior.to_string()))
@@ -423,14 +436,13 @@ pub async fn seed_builtins(db: &SurrealDb, vault_id: &str) {
         .await;
     }
 
-    tracing::info!("Seeded {} builtin skills for vault {}", SKILLS.len(), vault_id);
+    tracing::info!("Seeded {} builtin skills for account {}", SKILLS.len(), account_id);
 
     // ── Agent Definitions ────────────────────────────────────────────────────
-    // 刪除此 vault 的舊 builtin agents
     let _ = db.query(
-        "DELETE agent_definitions WHERE vault_id = $vid AND is_builtin = true"
+        "DELETE agent_definitions WHERE account_id = $aid AND is_builtin = true"
     )
-    .bind(("vid", vault_id.to_string()))
+    .bind(("aid", account_id.to_string()))
     .await;
 
     for a in AGENTS {
@@ -439,15 +451,15 @@ pub async fn seed_builtins(db: &SurrealDb, vault_id: &str) {
         );
         let _ = db.query(
             "INSERT INTO agent_definitions \
-             (def_id, vault_id, name, description, kind, skill_ids, tool_names, \
+             (def_id, account_id, name, description, kind, skill_ids, tool_names, \
               system_prompt, max_rounds, is_active, is_builtin, trigger, \
               status, use_count, created_at) \
-             VALUES ($did, $vid, $name, $desc, $kind, [], $tools, \
+             VALUES ($did, $aid, $name, $desc, $kind, [], $tools, \
                      $prompt, $rounds, true, true, $trigger, \
                      'active', 0, $now)"
         )
         .bind(("did",    a.id.to_string()))
-        .bind(("vid",    vault_id.to_string()))
+        .bind(("aid",    account_id.to_string()))
         .bind(("name",   a.name.to_string()))
         .bind(("desc",   a.description.to_string()))
         .bind(("kind",   a.kind.to_string()))
@@ -459,5 +471,5 @@ pub async fn seed_builtins(db: &SurrealDb, vault_id: &str) {
         .await;
     }
 
-    tracing::info!("Seeded {} builtin agents for vault {}", AGENTS.len(), vault_id);
+    tracing::info!("Seeded {} builtin agents for account {}", AGENTS.len(), account_id);
 }
