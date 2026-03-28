@@ -105,6 +105,7 @@ async fn run_scheduler(db: SurrealDb, event_tx: tokio::sync::broadcast::Sender<c
             vault_id: String,
             description: String,
             agent_type: Option<String>,
+            #[allow(dead_code)]
             agent_prompt: Option<String>,
             repeat_interval_secs: i64,
         }

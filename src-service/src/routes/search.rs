@@ -22,6 +22,7 @@ struct SearchQuery {
 
 #[derive(Debug)]
 struct SearchResult {
+    #[allow(dead_code)]
     chunk_id:  String,
     file_path: String,
     section:   String,

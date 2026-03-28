@@ -463,6 +463,7 @@ pub async fn extract_memory_facts(
 // ─── Retrieval ────────────────────────────────────────────────────────────────
 
 /// Retrieve relevant memory facts from daemon memory query.
+#[allow(dead_code)]
 pub(crate) async fn retrieve_relevant_facts(
     vault_id: &str,
     query_text: &str,
@@ -680,6 +681,7 @@ pub async fn condense_memory_facts(state: State<'_, AppState>) -> Result<u32, Ap
     Ok(condensed)
 }
 
+#[allow(dead_code)]
 fn extract_cjk_keywords(text: &str, max: usize) -> Vec<String> {
     const STOPS: &[char] = &[
         '你','我','他','她','它','的','了','嗎','是','有','在','說','道','記',

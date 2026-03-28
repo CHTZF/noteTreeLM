@@ -19,6 +19,7 @@ pub struct LoginRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct LoginResponse {
     pub token: String,
     pub username: String,
@@ -224,7 +225,7 @@ async fn google_upsert(
 
     // Check if user already exists
     #[derive(serde::Deserialize)]
-    struct UserRow { username: String }
+    struct UserRow { #[allow(dead_code)] username: String }
     let mut check = state
         .db
         .query("SELECT username FROM users WHERE username = $u LIMIT 1")

@@ -425,6 +425,7 @@ fn build_memory_registry(
 // ─── 排程 Agent 通用入口 ──────────────────────────────────────────────────────
 
 /// 排程器觸發時呼叫，根據 agent_type 路由到對應的執行邏輯
+#[allow(dead_code)]
 pub async fn run_scheduled_agent(
     app: &tauri::AppHandle,
     vault_id: String,

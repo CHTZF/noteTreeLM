@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::{
     api_client::{daemon_get, daemon_post, daemon_put, daemon_patch, daemon_delete},
     error::AppError,

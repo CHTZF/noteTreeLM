@@ -1,4 +1,4 @@
-import { useEffect, useRef, useCallback } from 'react'
+import { useEffect, useRef, useCallback, useState } from 'react'
 import cytoscape, { Core, NodeSingular } from 'cytoscape'
 import fcose from 'cytoscape-fcose'
 import { listen } from '@tauri-apps/api/event'
@@ -48,14 +48,18 @@ interface Props {
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
+type SourceFilter = 'all' | 'live_chat' | 'chat'
+
 export default function MemoryLinksView({ onOpenNote }: Props) {
-  const containerRef   = useRef<HTMLDivElement>(null)
-  const cyRef          = useRef<Core | null>(null)
-  const focusedRef     = useRef<Set<string>>(new Set())   // currently focused node_ids
-  const dmnIdsRef      = useRef<string[]>([])             // top-N by inject_count
-  const dmnTimerRef    = useRef<ReturnType<typeof setInterval> | null>(null)
-  const dmnPhaseRef    = useRef<0 | 1>(0)                 // 0=exhale(dim), 1=inhale(bright)
-  const { settings }   = useSettingsStore()
+  const containerRef      = useRef<HTMLDivElement>(null)
+  const cyRef             = useRef<Core | null>(null)
+  const focusedRef        = useRef<Set<string>>(new Set())   // currently focused node_ids
+  const dmnIdsRef         = useRef<string[]>([])             // top-N by inject_count
+  const dmnTimerRef       = useRef<ReturnType<typeof setInterval> | null>(null)
+  const dmnPhaseRef       = useRef<0 | 1>(0)                 // 0=exhale(dim), 1=inhale(bright)
+  const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
+  const sourceFilterRef   = useRef<SourceFilter>('all')
+  const { settings }      = useSettingsStore()
 
   // ── Build Cytoscape elements from API data ──────────────────────────────
   const buildElements = (nodes: MemoryNode[], edges: MemoryEdge[]): cytoscape.ElementDefinition[] => [
@@ -311,15 +315,23 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
     }).catch(() => {})
   }, [applyFocus, startDMN])
 
+  // ── Keep sourceFilterRef in sync with state ──────────────────────────────
+  useEffect(() => { sourceFilterRef.current = sourceFilter }, [sourceFilter])
+
   // ── Listen for memory:prefetched events ──────────────────────────────────
   useEffect(() => {
     let unlisten: (() => void) | null = null
 
-    listen<string[]>('memory:prefetched', async (event) => {
+    listen<{ node_ids: string[]; source: string }>('memory:prefetched', async (event) => {
       const cy = cyRef.current
       if (!cy) return
 
-      const incomingIds = new Set(event.payload)
+      // Source filter: skip if not matching selected filter
+      const { node_ids, source } = event.payload
+      const filter = sourceFilterRef.current
+      if (filter !== 'all' && source !== filter) return
+
+      const incomingIds = new Set(node_ids)
 
       // Add any new nodes that aren't in graph yet (lazy-add)
       const missingIds = [...incomingIds].filter(id => cy.getElementById(id).length === 0)
@@ -361,6 +373,7 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
 
   return (
     <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', position: 'relative' }}>
+      {/* Legend */}
       <div
         style={{
           position: 'absolute', top: 12, left: 12, zIndex: 10,
@@ -382,6 +395,32 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
         rule
         <span style={{ width: 10, height: 10, borderRadius: '50%', background: NOTE_COLOR, display: 'inline-block', marginLeft: 6 }} />
         note
+      </div>
+      {/* Source filter */}
+      <div
+        style={{
+          position: 'absolute', top: 12, right: 12, zIndex: 10,
+          display: 'flex', alignItems: 'center', gap: 6,
+        }}
+      >
+        <select
+          value={sourceFilter}
+          onChange={e => setSourceFilter(e.target.value as SourceFilter)}
+          style={{
+            background: 'var(--color-surface)',
+            border: '1px solid var(--color-border)',
+            borderRadius: 6,
+            color: 'var(--color-text-muted)',
+            fontSize: 12,
+            padding: '3px 8px',
+            cursor: 'pointer',
+            outline: 'none',
+          }}
+        >
+          <option value="all">全部</option>
+          <option value="live_chat">Live Chat</option>
+          <option value="chat">Chat</option>
+        </select>
       </div>
       <div ref={containerRef} style={{ flex: 1 }} />
     </div>

@@ -1,10 +1,11 @@
+#![allow(dead_code, unused_variables)]
 /// tools/readonly.rs — 唯讀工具註冊（daemon API 版）
 use std::sync::Arc;
 
 use serde_json::Value;
 use tauri::Emitter;
 
-use crate::commands::ai::{tool_list_structure, tool_read_note, search_skills_for_tool, get_embedding};
+use crate::commands::ai::{tool_list_structure, tool_read_note, search_skills_for_tool};
 use crate::runtime::tool_registry::ToolRegistry;
 use crate::runtime::types::Tool;
 

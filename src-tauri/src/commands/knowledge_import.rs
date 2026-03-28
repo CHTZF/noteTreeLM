@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::{api_client::{daemon_delete, daemon_get, daemon_patch, daemon_post, daemon_put}, commands::ai::ensure_server_running, error::AppError, state::AppState};
 use chrono::Datelike as _;
 use futures_util::StreamExt as _;
@@ -2281,7 +2282,7 @@ pub async fn generate_skills_via_tool_call(
             .unwrap_or_default();
 
         // 計算 trigger embedding
-        let trigger_embedding: Option<Vec<f32>> = if let Some(url) = emb_url {
+        let _trigger_embedding: Option<Vec<f32>> = if let Some(url) = emb_url {
             let v = crate::commands::ai::get_embedding(client, url, &trigger).await;
             if v.is_empty() { None } else { Some(v) }
         } else { None };
@@ -2884,7 +2885,7 @@ pub async fn get_aging_notes(
     if vault_path.is_empty() { return Ok(vec![]); }
     let threshold = threshold_days.unwrap_or(30);
     let now_secs = chrono::Utc::now().timestamp();
-    let threshold_secs = threshold * 86400;
+    let _threshold_secs = threshold * 86400;
     let vault_root = std::path::PathBuf::from(&vault_path);
 
     let mut results = Vec::new();

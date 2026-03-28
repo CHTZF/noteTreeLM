@@ -787,7 +787,7 @@ async fn run_sub_agent_with_system(
                 .collect::<Vec<_>>()
                 .join("\n");
 
-            if let (Some(ref conv_id), Some(ref ef)) = (&conversation_id, &embed_fn) {
+            if let (Some(ref conv_id), Some(ref _ef)) = (&conversation_id, &embed_fn) {
                 // pending_plan 路徑：儲存 deferred 工具，sub-agent 先回傳確認訊息
                 use crate::commands::conversation::{save_pending_plan, DeferredTool};
                 let deferred: Vec<DeferredTool> = llm_result.tool_calls.iter()

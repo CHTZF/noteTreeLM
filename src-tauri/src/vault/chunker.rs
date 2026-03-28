@@ -1,4 +1,5 @@
 //! Markdown Chunker — splits notes into heading-level chunks.
+#![allow(dead_code)]
 
 use once_cell::sync::Lazy;
 use regex::Regex;

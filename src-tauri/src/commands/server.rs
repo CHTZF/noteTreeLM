@@ -334,6 +334,7 @@ pub async fn get_embedding(client: &reqwest::Client, base_url: &str, text: &str)
 /// Returns one `Vec<f32>` per input text (empty vec if that text failed).
 /// Falls back to individual `get_embedding` calls if the batch endpoint
 /// returns an unexpected format.
+#[allow(dead_code)]
 pub async fn get_embeddings_batch(
     client: &reqwest::Client,
     base_url: &str,

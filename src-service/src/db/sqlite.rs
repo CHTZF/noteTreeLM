@@ -85,6 +85,7 @@ pub fn fts_delete_file(
 
 /// Rebuild the FTS index for a vault from a pre-computed list of chunks.
 /// Clears existing rows for the vault first, then batch-inserts.
+#[allow(dead_code)]
 pub fn fts_rebuild_vault(
     conn: &Connection,
     vault_id: &str,
@@ -112,6 +113,7 @@ pub struct FtsResult {
     pub file_path: String,
     pub section:   String,
     pub content:   String,
+    #[allow(dead_code)]
     pub status:    String,
 }
 
@@ -157,6 +159,7 @@ pub fn fts_search(
 }
 
 /// Return the number of indexed chunks for a vault (used for health check).
+#[allow(dead_code)]
 pub fn fts_count(conn: &Connection, vault_id: &str) -> SqliteResult<i64> {
     conn.query_row(
         "SELECT count(*) FROM chunks_fts WHERE vault_id = ?1",

@@ -54,6 +54,7 @@ use std::path::PathBuf;
 use tauri::State;
 
 /// 若 embedding server 正在運行，回傳其 base URL；否則回傳 None。
+#[allow(dead_code)]
 async fn embedding_url(state: &AppState) -> Option<String> {
     let port = *state.embedding_actual_port.lock().await;
     port.map(|p| format!("http://127.0.0.1:{}", p))
@@ -95,6 +96,7 @@ pub struct Link {
     pub line_number: i64,
 }
 
+#[allow(dead_code)]
 fn compute_checksum(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());

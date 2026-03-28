@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use tauri::State;
-use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::state::AppState;

@@ -45,4 +45,5 @@ impl From<url::ParseError> for AppError {
     }
 }
 
+#[allow(dead_code)]
 pub type Result<T> = std::result::Result<T, AppError>;

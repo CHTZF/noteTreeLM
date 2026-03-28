@@ -1,4 +1,5 @@
 // memory_agent.rs
+#![allow(dead_code)]
 //
 // MemoryAgent：提供記憶查詢的系統 Prompt 與工具定義（無狀態靜態方法）。
 //

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::{error::AppError, state::AppState};
 use std::time::Duration;
 use tauri::{AppHandle, State};

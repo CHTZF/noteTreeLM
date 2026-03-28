@@ -1,10 +1,7 @@
 use crate::{error::AppError, state::AppState};
-use crate::runtime::memory_agent::{
-    parse_text_tool_calls, tool_query_memory,
-};
+use crate::runtime::memory_agent::parse_text_tool_calls;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,21 +11,19 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 // ─── Re-exports from sub-modules ──────────────────────────────────────────────
 pub use super::server::{
-    get_embedding, get_embeddings_batch, warmup_llama_server,
+    get_embedding, warmup_llama_server,
     stop_llama_server, get_llama_server_status, start_llama_server, restart_llama_server,
     warmup_embedding_server, get_embedding_server_status, check_embedding_endpoint,
     start_embedding_server, stop_embedding_server, restart_embedding_server,
 };
 pub(crate) use super::server::ensure_server_running;
 pub use super::external_ai::process_with_llm;
-pub(crate) use super::external_ai::read_api_key;
 pub use super::memory::{
     add_memory_rule, get_memory_rules, delete_memory_rule,
     query_memory,
     distill_preferences, extract_memory_facts, condense_memory_facts, suggest_skills_from_patterns,
     rate_response, get_conversation_ratings, analyze_tool_patterns,
 };
-pub(crate) use super::memory::retrieve_relevant_facts;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChatMessage {
@@ -37,6 +32,7 @@ pub struct ChatMessage {
 }
 /// 呼叫 LLM（非串流）根據 user_ask 生成 agent 規格 JSON。
 /// 回傳 (name, description, trigger, tool_names)；任何錯誤 fallback 至 raw input。
+#[allow(dead_code)]
 async fn generate_agent_spec(
     client: &reqwest::Client,
     base_url: &str,
@@ -284,6 +280,7 @@ pub async fn cancel_agent(state: State<'_, AppState>) -> Result<(), AppError> {
     Ok(())
 }
 /// 從查詢文字取出最多 N 個有意義的 CJK bigram，供 keyword 搜尋
+#[allow(dead_code)]
 fn extract_cjk_keywords(text: &str, max: usize) -> Vec<String> {
     const STOPS: &[char] = &[
         '你','我','他','她','它','的','了','嗎','是','有','在','說','道','記',
@@ -525,7 +522,7 @@ pub async fn invoke_agent(
     }
 
     // 10. 記憶事實語意搜尋（daemon 架構下已移除本地 DB 依賴，回傳空字串）
-    let (memory_context, query_vec_opt) = if let Some(_vid) = vault_id_opt.as_ref() {
+    let (memory_context, _query_vec_opt) = if let Some(_vid) = vault_id_opt.as_ref() {
         let query_vec = get_embedding(&client, &base_url, &input).await;
         let vec_opt = if query_vec.is_empty() { None } else { Some(query_vec) };
         (String::new(), vec_opt)
@@ -987,7 +984,7 @@ pub async fn invoke_live_chat(
     let tok_lc = if auth_token_lc.is_empty() { None } else { Some(auth_token_lc.as_str()) };
 
     // 3. 從 DB 載入對話歷史
-    let mut messages_json: Vec<serde_json::Value> = {
+    let messages_json: Vec<serde_json::Value> = {
         let db_msgs = load_messages(&state.http_client, tok_lc, &conversation_id).await?;
         let mut arr = db_msgs.as_array().cloned().unwrap_or_default();
         arr.push(serde_json::json!({"role": "user", "content": input}));
@@ -1028,7 +1025,10 @@ pub async fn invoke_live_chat(
                         .map(|fid| format!("memory:{}:{}", vid, fid))
                         .collect();
                     if !node_ids.is_empty() {
-                        let _ = app.emit("memory:prefetched", &node_ids);
+                        let _ = app.emit("memory:prefetched", serde_json::json!({
+                            "node_ids": node_ids,
+                            "source": "chat"
+                        }));
                     }
                     let lines: Vec<String> = arr.iter().filter_map(|r| {
                         let cat     = r["category"].as_str()?;
@@ -1157,7 +1157,7 @@ live_respond 規則：\
     // live_respond 在 search_skills 執行後才注入，防止 LLM 在第一輪就呼叫它提早結束
     let live_chat_tool_names: Vec<String> = vec!["search_skills"]
         .into_iter().map(String::from).collect();
-    let tools = filter_vault_tools_by_names(&live_chat_tool_names);
+    let _tools = filter_vault_tools_by_names(&live_chat_tool_names);
 
     // 11. Tool loop（最多 2 輪：round 0 = 第一輪 LLM → 可呼叫搜尋；round 1 = 再次 LLM → 必須呼叫 live_respond）
     use crate::runtime::dispatcher::Dispatcher;
@@ -2391,6 +2391,7 @@ pub(crate) fn tool_read_note(rel_path: &str, vault_path: &str) -> String {
 
 /// 去除口語指令詞，只保留核心主題詞
 /// 例：「幫我找筆記內 飲料」→「飲料」
+#[allow(dead_code)]
 fn clean_fts_query(query: &str) -> String {
     // 前綴指令詞（依長度降序，避免短詞先匹配）
     const PREFIXES: &[&str] = &[
@@ -2459,6 +2460,7 @@ fn clean_fts_query(query: &str) -> String {
 
 // ── 數值比較過濾 ─────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum Comparison {
     LessThan(f64),
@@ -2469,6 +2471,7 @@ enum Comparison {
     About(f64), // ±15%
 }
 
+#[allow(dead_code)]
 impl Comparison {
     fn matches(&self, value: f64) -> bool {
         match self {
@@ -2493,6 +2496,7 @@ impl Comparison {
 }
 
 /// 從查詢字串中解析比較詞 + 數字，返回 (比較條件, 去掉比較部分後的搜索詞)
+#[allow(dead_code)]
 fn parse_comparison(query: &str) -> (Option<Comparison>, String) {
     // 有序列表：長詞優先（避免「不超過」被「超過」先匹配）
     let keywords: &[(&str, &str)] = &[
@@ -2554,6 +2558,7 @@ fn parse_comparison(query: &str) -> (Option<Comparison>, String) {
 }
 
 /// 從文字內容中找出含有數字且符合比較條件的行
+#[allow(dead_code)]
 fn filter_lines_by_comparison(content: &str, cmp: &Comparison) -> Vec<String> {
     let mut matched = Vec::new();
     for line in content.lines() {
@@ -2718,7 +2723,7 @@ pub async fn set_note_status(
 
     let on_disk = abs.as_ref().map(|p| p.exists()).unwrap_or(false);
 
-    let new_content: String = if on_disk {
+    let _new_content: String = if on_disk {
         let abs_path = abs.as_ref().unwrap();
         let content = tokio::fs::read_to_string(abs_path).await
             .map_err(|e| AppError::AI(format!("Read failed: {}", e)))?;
@@ -2990,7 +2995,10 @@ async fn execute_vault_tool(
                             .map(|fid| format!("memory:{}:{}", vault_id, fid))
                             .collect();
                         if !node_ids.is_empty() {
-                            let _ = app.emit("memory:prefetched", &node_ids);
+                            let _ = app.emit("memory:prefetched", serde_json::json!({
+                                "node_ids": node_ids,
+                                "source": "live_chat"
+                            }));
                         }
                         let lines: Vec<String> = arr.iter().map(|r| {
                             let cat = r["category"].as_str().unwrap_or("general");

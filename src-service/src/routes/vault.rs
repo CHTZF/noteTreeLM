@@ -528,7 +528,7 @@ async fn get_graph_related(
     #[derive(serde::Deserialize)]
     struct EdgeRow { source_id: String, target_id: String, edge_type: String }
     let node_prefix = format!("{}:", vault_id);
-    let mut eresp = state
+    let eresp = state
         .db
         .query("SELECT source_id, target_id, edge_type FROM graph_edges WHERE vault_id = $vid")
         .bind(("vid", vault_id.clone()))
@@ -645,7 +645,7 @@ async fn get_backlinks(
     }
 
     // Find links where target_title matches (case-insensitive) OR target_path matches source_path
-    let mut qb = if !target_title.is_empty() {
+    let qb = if !target_title.is_empty() {
         state
             .db
             .query(

@@ -1,10 +1,9 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::Manager;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::state::AppState;
-use crate::api_client::{daemon_get, daemon_post, DAEMON_BASE};
+use crate::api_client::{daemon_get, daemon_post};
 
 // ── Google OAuth 2.0 憑證（桌面應用程式類型）────────────────────────────────
 const GOOGLE_OAUTH_JSON: &str = include_str!("../../google-oauth.json");
