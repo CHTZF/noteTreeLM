@@ -2836,15 +2836,43 @@ async fn execute_vault_tool(
                 return "記憶查詢失敗：未設定 Vault".to_string();
             }
             let kw_param = urlencoding::encode(&keywords.join(",")).to_string();
-            let url = format!("/vaults/{}/memory/query?keywords={}&limit={}", urlencoding::encode(&vault_id), kw_param, limit);
+            // Fetch more candidates than needed for potential rerank
+            let fetch_limit = (limit * 3).min(30);
+            let url = format!("/vaults/{}/memory/query?keywords={}&limit={}", urlencoding::encode(&vault_id), kw_param, fetch_limit);
             match crate::api_client::daemon_get::<serde_json::Value>(&state.http_client, &url, tok).await {
                 Ok(results) => {
-                    let arr = results.as_array().cloned().unwrap_or_default();
+                    let mut arr = results.as_array().cloned().unwrap_or_default();
                     if arr.is_empty() {
                         "記憶查詢：找不到相關記憶。".to_string()
                     } else {
-                        let lines: Vec<String> = arr.iter().take(5).map(|r| {
-                            format!("- **{}** — {}", r["title"].as_str().unwrap_or(""), r["snippet"].as_str().unwrap_or(""))
+                        // Cosine rerank if embedding server is available and facts have embeddings
+                        let emb_url = {
+                            let port = *state.llama_actual_port.lock().await;
+                            port.map(|p| format!("http://127.0.0.1:{}", p))
+                        };
+                        if let Some(ref url) = emb_url {
+                            let query_text = if keywords.is_empty() { String::new() } else { keywords.join(" ") };
+                            if !query_text.is_empty() {
+                                let query_vec = crate::commands::server::get_embedding(&state.http_client, url, &query_text).await;
+                                if !query_vec.is_empty() {
+                                    arr.sort_by(|a, b| {
+                                        let sim_a = a["embedding"].as_str()
+                                            .and_then(|s| serde_json::from_str::<Vec<f32>>(s).ok())
+                                            .map(|v| cosine_similarity(&query_vec, &v))
+                                            .unwrap_or(0.0);
+                                        let sim_b = b["embedding"].as_str()
+                                            .and_then(|s| serde_json::from_str::<Vec<f32>>(s).ok())
+                                            .map(|v| cosine_similarity(&query_vec, &v))
+                                            .unwrap_or(0.0);
+                                        sim_b.partial_cmp(&sim_a).unwrap_or(std::cmp::Ordering::Equal)
+                                    });
+                                }
+                            }
+                        }
+                        let lines: Vec<String> = arr.iter().take(limit as usize).map(|r| {
+                            let cat = r["category"].as_str().unwrap_or("general");
+                            let content = r["content"].as_str().unwrap_or("");
+                            format!("- [{}] {}", cat, content)
                         }).collect();
                         format!("記憶查詢結果：\n{}", lines.join("\n"))
                     }

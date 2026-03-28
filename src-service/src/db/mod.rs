@@ -339,8 +339,9 @@ async fn run_migrations(db: &SurrealDb) -> Result<(), surrealdb::Error> {
         "DEFINE FIELD IF NOT EXISTS conv_id    ON memory_facts TYPE option<string>;",
         "DEFINE FIELD IF NOT EXISTS content    ON memory_facts TYPE string;",
         "DEFINE FIELD IF NOT EXISTS category   ON memory_facts TYPE string DEFAULT 'general';",
-        "DEFINE FIELD IF NOT EXISTS expires_at ON memory_facts TYPE int DEFAULT 0;",
-        "DEFINE FIELD IF NOT EXISTS created_at ON memory_facts TYPE int DEFAULT 0;",
+        "DEFINE FIELD IF NOT EXISTS expires_at  ON memory_facts TYPE int DEFAULT 0;",
+        "DEFINE FIELD IF NOT EXISTS created_at  ON memory_facts TYPE int DEFAULT 0;",
+        "DEFINE FIELD IF NOT EXISTS embedding   ON memory_facts TYPE option<string>;",
         "DEFINE INDEX IF NOT EXISTS idx_memory_facts_id ON memory_facts FIELDS fact_id UNIQUE;",
         "DEFINE INDEX IF NOT EXISTS idx_memory_facts_fts ON memory_facts FIELDS content SEARCH ANALYZER noteanalyzer BM25;",
 

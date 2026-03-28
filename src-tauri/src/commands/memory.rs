@@ -412,10 +412,32 @@ pub async fn extract_memory_facts(
     let count = facts.len() as u32;
     if count == 0 { return Ok(0); }
 
+    // Enrich facts with embeddings if embedding server is available
+    let emb_url = {
+        let port = *state.llama_actual_port.lock().await;
+        port.map(|p| format!("http://127.0.0.1:{}", p))
+    };
+    let facts_with_emb: Vec<serde_json::Value> = if let Some(ref url) = emb_url {
+        let mut enriched = Vec::new();
+        for mut fact in facts {
+            let content = fact["content"].as_str().unwrap_or("").to_string();
+            let emb = crate::commands::server::get_embedding(&state.http_client, url, &content).await;
+            if !emb.is_empty() {
+                if let Ok(emb_json) = serde_json::to_string(&emb) {
+                    fact["embedding"] = serde_json::Value::String(emb_json);
+                }
+            }
+            enriched.push(fact);
+        }
+        enriched
+    } else {
+        facts
+    };
+
     daemon_post::<_, serde_json::Value>(
         &state.http_client,
         &format!("/vaults/{}/memory/facts", urlencoding::encode(&vault_id)),
-        &serde_json::json!({ "facts": facts }),
+        &serde_json::json!({ "facts": facts_with_emb }),
         tok,
     ).await.ok();
 

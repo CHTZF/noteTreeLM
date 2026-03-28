@@ -384,7 +384,7 @@ async fn query_memory(
 
     let rows: Vec<Value> = if keywords.is_empty() && categories.is_empty() {
         let mut resp = state.db
-            .query("SELECT fact_id, content, category, created_at FROM memory_facts WHERE vault_id = $vid AND expires_at > $now ORDER BY created_at DESC LIMIT $limit")
+            .query("SELECT fact_id, content, category, created_at, embedding FROM memory_facts WHERE vault_id = $vid AND expires_at > $now ORDER BY created_at DESC LIMIT $limit")
             .bind(("vid", vault_id))
             .bind(("now", now_ts))
             .bind(("limit", limit))
@@ -394,7 +394,7 @@ async fn query_memory(
     } else if !keywords.is_empty() && categories.is_empty() {
         let kw = keywords[0].to_lowercase();
         let mut resp = state.db
-            .query("SELECT fact_id, content, category, created_at FROM memory_facts WHERE vault_id = $vid AND expires_at > $now AND string::contains(string::lowercase(content), $kw) ORDER BY created_at DESC LIMIT $limit")
+            .query("SELECT fact_id, content, category, created_at, embedding FROM memory_facts WHERE vault_id = $vid AND expires_at > $now AND string::contains(string::lowercase(content), $kw) ORDER BY created_at DESC LIMIT $limit")
             .bind(("vid", vault_id))
             .bind(("now", now_ts))
             .bind(("kw", kw))
@@ -408,7 +408,7 @@ async fn query_memory(
             .map(|(i, _)| format!("category = $cat{}", i))
             .collect::<Vec<_>>().join(" OR ");
         let mut qb = state.db
-            .query(format!("SELECT fact_id, content, category, created_at FROM memory_facts WHERE vault_id = $vid AND expires_at > $now AND ({}) ORDER BY created_at DESC LIMIT $limit", cat_cond))
+            .query(format!("SELECT fact_id, content, category, created_at, embedding FROM memory_facts WHERE vault_id = $vid AND expires_at > $now AND ({}) ORDER BY created_at DESC LIMIT $limit", cat_cond))
             .bind(("vid", vault_id))
             .bind(("now", now_ts))
             .bind(("limit", limit));
@@ -423,7 +423,7 @@ async fn query_memory(
             .map(|(i, _)| format!("category = $cat{}", i))
             .collect::<Vec<_>>().join(" OR ");
         let mut qb = state.db
-            .query(format!("SELECT fact_id, content, category, created_at FROM memory_facts WHERE vault_id = $vid AND expires_at > $now AND string::contains(string::lowercase(content), $kw) AND ({}) ORDER BY created_at DESC LIMIT $limit", cat_cond))
+            .query(format!("SELECT fact_id, content, category, created_at, embedding FROM memory_facts WHERE vault_id = $vid AND expires_at > $now AND string::contains(string::lowercase(content), $kw) AND ({}) ORDER BY created_at DESC LIMIT $limit", cat_cond))
             .bind(("vid", vault_id))
             .bind(("now", now_ts))
             .bind(("kw", kw))
@@ -445,6 +445,8 @@ struct FactInput {
     content: String,
     category: Option<String>,
     conv_id: Option<String>,
+    /// JSON-serialized Vec<f32> embedding (optional)
+    embedding: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -495,7 +497,7 @@ async fn store_facts(
 
         let fact_id = Uuid::new_v4().to_string();
         state.db
-            .query("INSERT INTO memory_facts (fact_id, vault_id, conv_id, content, category, expires_at, created_at) VALUES ($fid, $vid, $cid, $content, $cat, $exp, $now)")
+            .query("INSERT INTO memory_facts (fact_id, vault_id, conv_id, content, category, expires_at, created_at, embedding) VALUES ($fid, $vid, $cid, $content, $cat, $exp, $now, $emb)")
             .bind(("fid", fact_id))
             .bind(("vid", vault_id.clone()))
             .bind(("cid", fact.conv_id.unwrap_or_default()))
@@ -503,6 +505,7 @@ async fn store_facts(
             .bind(("cat", category))
             .bind(("exp", expires_at))
             .bind(("now", now_ts))
+            .bind(("emb", fact.embedding))
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         inserted += 1;
