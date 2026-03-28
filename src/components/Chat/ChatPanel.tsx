@@ -62,8 +62,6 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const tokenCountRef = useRef(0)
   const sessionWriteApprovedRef = useRef(false)
   const userMsgCountRef = useRef(0)
-  // 追蹤上次 extract_memory_facts 時的訊息數量，避免 auto-save 與 clearChat 重複萃取
-  const lastExtractedMsgCountRef = useRef(0)
   // Reflection 執行中旗標：防止多輪反思並發
   const isReflectingRef = useRef(false)
   // isStreaming 的同步版本：防止 React state 非同步導致快速雙擊穿透
@@ -617,18 +615,6 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         triggerReflection()
       }
 
-      // 每 memory_threshold 則訊息自動快照記憶（app 關閉前也能保留）
-      const autoSaveThreshold = settings.memory_threshold ?? 20
-      if (userMsgCountRef.current > 0 && userMsgCountRef.current % autoSaveThreshold === 0) {
-        const snapshotMsgs = [...messages, { role: 'user' as const, content: text },
-          { role: 'assistant' as const, content: finalContent }]
-          .filter(m => m.role === 'user' || m.role === 'assistant')
-          .map(m => ({ role: m.role, content: m.content }))
-        if (snapshotMsgs.length >= 2) {
-          lastExtractedMsgCountRef.current = snapshotMsgs.length
-          invoke('extract_memory_facts', { messages: snapshotMsgs, conversationId: conversationId ?? null, notePaths: Array.from(referencedNotePathsRef.current) }).catch(() => {})
-        }
-      }
     } catch (e: unknown) {
       const msg =
         typeof e === 'string'
@@ -667,34 +653,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   }
 
   const clearChat = () => {
-    // 有意義的對話（至少 1 則 user + 1 則 assistant）才儲存記憶
-    const meaningfulMsgs = messages.filter(m => m.role === 'user' || m.role === 'assistant')
-    if (meaningfulMsgs.length >= 2) {
-      const chatMessages = meaningfulMsgs.map(m => ({ role: m.role, content: m.content }))
-      // 若 auto-save 距今不足 4 條新訊息則跳過 extract（避免重複萃取同份資料）
-      const newSinceLastExtract = chatMessages.length - lastExtractedMsgCountRef.current
-      const extractOp = newSinceLastExtract >= 4
-        ? invoke('extract_memory_facts', { messages: chatMessages, conversationId: conversationId ?? null, notePaths: Array.from(referencedNotePathsRef.current) }).catch(() => {})
-        : Promise.resolve()
-      Promise.all([
-        extractOp,
-        invoke('distill_preferences').catch(() => {}),
-        invoke('condense_memory_facts').catch(() => {}),
-        invoke('analyze_tool_patterns').catch(() => {}),
-        invoke<Array<{ signature: string; suggested_title: string; suggested_trigger: string; suggested_behavior: string }>>('suggest_skills_from_patterns')
-          .then(suggestions => {
-            if (suggestions.length > 0) {
-              const s = suggestions[0]
-              setMessages(prev => [...prev, {
-                role: 'notice' as const,
-                content: `💡 根據你的使用習慣，建議建立技能「**${s.suggested_title}**」。觸發詞：${s.suggested_trigger}`,
-              }])
-            }
-          }).catch(() => {}),
-      ]).catch(() => {})
-      lastExtractedMsgCountRef.current = 0
     referencedNotePathsRef.current = new Set()
-    }
     setRatings({})
     setMessages([])
     setError('')

@@ -177,7 +177,6 @@ export const api = {
 
   // Conversations extras
   getOrCreateLiveChatConv: (vaultId: string, accountId: string) => request<{ id: string }>('POST', '/conversations/live-chat', { vault_id: vaultId, account_id: accountId }),
-  markConversationProcessed: (id: string) => request<{ ok: boolean }>('PATCH', `/conversations/${encodeURIComponent(id)}/processed`, {}),
   getUnprocessedConversations: (vaultId: string) => request<unknown[]>('GET', `/conversations?vault_id=${encodeURIComponent(vaultId)}&unprocessed=true`),
   getConversationRatings: (conversationId: string) => request<Array<{ content_hash: string; rating: string }>>('GET', `/conversations/${encodeURIComponent(conversationId)}/ratings`),
   rateResponse: (conversationId: string | undefined, contentHash: string, rating: string) =>

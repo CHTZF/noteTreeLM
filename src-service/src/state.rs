@@ -24,6 +24,7 @@ pub struct DaemonState {
     pub servers: Arc<RwLock<Vec<ServerInfo>>>,
     pub sqlite: crate::db::sqlite::SqliteConn,
     pub embedding_url: Arc<RwLock<Option<String>>>,
+    pub llm_url: Arc<RwLock<Option<String>>>,
     /// Public tunnel URL from cloudflared (None if cloudflared not running)
     pub tunnel_url: Arc<RwLock<Option<String>>>,
     /// Broadcast channel for server-sent events (capacity 64).
@@ -39,6 +40,7 @@ impl DaemonState {
             servers: Arc::new(RwLock::new(Vec::new())),
             sqlite,
             embedding_url: Arc::new(RwLock::new(None)),
+            llm_url: Arc::new(RwLock::new(None)),
             tunnel_url: Arc::new(RwLock::new(None)),
             event_tx,
         }

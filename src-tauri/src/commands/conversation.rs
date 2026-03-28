@@ -30,24 +30,6 @@ pub struct ConversationSnapshot {
 // ── Commands ───────────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn save_conversation_messages(
-    state: State<'_, AppState>,
-    conversation_id: String,
-    messages_json: String,
-) -> Result<(), AppError> {
-    let token = state.get_auth_token().await;
-    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
-    let messages: serde_json::Value = serde_json::from_str(&messages_json)
-        .map_err(|e| AppError::AI(e.to_string()))?;
-    daemon_put::<_, serde_json::Value>(
-        &state.http_client,
-        &format!("/conversations/{}/messages", urlencoding::encode(&conversation_id)),
-        &serde_json::json!({"messages": messages}),
-        tok,
-    ).await.map(|_| ()).map_err(|e| AppError::Database(e))
-}
-
-#[tauri::command]
 pub async fn create_conversation(
     state: State<'_, AppState>,
     username: String,

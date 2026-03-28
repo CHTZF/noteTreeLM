@@ -160,6 +160,10 @@ async fn servers_register_handler(
         let url = format!("http://127.0.0.1:{}", info.port);
         *state.daemon.embedding_url.write().await = Some(url);
     }
+    if info.name == "llama" {
+        let url = format!("http://127.0.0.1:{}", info.port);
+        *state.daemon.llm_url.write().await = Some(url);
+    }
 
     let mut servers = state.daemon.servers.write().await;
     if let Some(existing) = servers.iter_mut().find(|s| s.name == info.name) {

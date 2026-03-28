@@ -297,13 +297,59 @@ async fn save_messages(
     state
         .db
         .query("UPDATE conversations SET messages_json = $mj, updated_at = $now WHERE id = type::thing(\"conversations\", $id)")
-        .bind(("mj", messages_json))
+        .bind(("mj", messages_json.clone()))
         .bind(("now", now))
-        .bind(("id", id))
+        .bind(("id", id.clone()))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // Check if memory pipeline should be triggered
+    maybe_trigger_memory_pipeline(state, id, messages_json).await;
+
     Ok(Json(json!({ "ok": true })))
+}
+
+async fn maybe_trigger_memory_pipeline(state: ApiState, conv_id: String, messages_json: String) {
+    // Count user+assistant messages
+    let msg_count = serde_json::from_str::<Vec<Value>>(&messages_json)
+        .ok()
+        .map(|arr| arr.iter().filter(|m| {
+            matches!(m["role"].as_str(), Some("user") | Some("assistant"))
+        }).count())
+        .unwrap_or(0);
+
+    if msg_count == 0 { return }
+
+    // Fetch conversation metadata (account_id, vault_id)
+    #[derive(serde::Deserialize)]
+    struct ConvMeta { account_id: Option<String>, vault_id: Option<String> }
+    let Ok(mut resp) = state.db
+        .query("SELECT account_id, vault_id FROM conversations WHERE id = type::thing(\"conversations\", $id) LIMIT 1")
+        .bind(("id", conv_id.clone()))
+        .await
+    else { return };
+
+    let rows: Vec<ConvMeta> = resp.take(0).unwrap_or_default();
+    let Some(meta) = rows.into_iter().next() else { return };
+    let account_id = meta.account_id.unwrap_or_default();
+    let vault_id = meta.vault_id.unwrap_or_default();
+    if account_id.is_empty() || vault_id.is_empty() { return }
+
+    // Read user memory settings
+    let (enabled, threshold) = crate::memory_pipeline::get_user_memory_settings(&state.db, &account_id).await;
+    if !enabled { return }
+    if threshold == 0 { return }
+
+    // Trigger only at exact multiples of threshold
+    if msg_count % threshold as usize != 0 { return }
+
+    tokio::spawn(crate::memory_pipeline::run(
+        state,
+        account_id,
+        vault_id,
+        conv_id,
+        messages_json,
+    ));
 }
 
 async fn mark_processed(

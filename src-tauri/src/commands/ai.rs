@@ -20,8 +20,7 @@ pub(crate) use super::server::ensure_server_running;
 pub use super::external_ai::process_with_llm;
 pub use super::memory::{
     query_memory,
-    distill_preferences, extract_memory_facts, condense_memory_facts, suggest_skills_from_patterns,
-    rate_response, get_conversation_ratings, analyze_tool_patterns,
+    rate_response, get_conversation_ratings,
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -428,6 +428,17 @@ function AppMain() {
     return () => { cancelled = true; unlisten?.() }
   }, [])
 
+  // ─── memory:processed toast ───────────────────────────────────────────
+  useEffect(() => {
+    let cancelled = false
+    let unlisten: (() => void) | null = null
+    listen<{ facts_added: number }>('service:memory:processed', (event) => {
+      const n = event.payload.facts_added
+      if (n > 0) toast.info(`已整理 ${n} 條記憶`)
+    }).then(fn => { if (cancelled) fn(); else unlisten = fn })
+    return () => { cancelled = true; unlisten?.() }
+  }, [])
+
   // ─── FileWatcher + graph sync ──────────────────────────────────────────
   useEffect(() => {
     if (!appReady) return
