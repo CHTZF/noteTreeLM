@@ -31,9 +31,23 @@ pub(crate) use crate::runtime::agent_factory::{generate_agent_spec, extract_cjk_
 pub use crate::runtime::llm_engine::compute_centroid;
 pub(crate) use crate::runtime::llm_engine::{StreamResult, send_streaming_request};
 
-/// 取消正在進行的 Agent 串流（設定取消旗標，同時拒絕待確認的寫入工具）
+/// 取消正在進行的 Agent 串流
 #[tauri::command]
 pub async fn cancel_agent(state: State<'_, AppState>) -> Result<(), AppError> {
+    let session_id = state.agent_session.lock().await.clone();
+    let vault_id = state.get_vault_id().await.unwrap_or_default();
+    let auth_token = state.get_auth_token().await;
+    let tok = if auth_token.is_empty() { None } else { Some(auth_token.as_str()) };
+
+    if let Some(sid) = session_id {
+        let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
+            &state.http_client,
+            &format!("/vaults/{}/agent/cancel", urlencoding::encode(&vault_id)),
+            &serde_json::json!({ "session_id": sid }),
+            tok,
+        ).await;
+    }
+    // Keep local flag for the no-vault (live chat) path
     state.agent_cancel.store(true, Ordering::Relaxed);
     if let Some(tx) = state.write_confirm_tx.lock().await.take() {
         let _ = tx.send(false);
@@ -41,12 +55,26 @@ pub async fn cancel_agent(state: State<'_, AppState>) -> Result<(), AppError> {
     Ok(())
 }
 
-/// 前端確認/拒絕寫入工具（invoke_agent 等待此命令後繼續執行）
+/// 前端確認/拒絕寫入工具
 #[tauri::command]
 pub async fn confirm_write_tool(
     state: State<'_, AppState>,
     approved: bool,
 ) -> Result<(), AppError> {
+    let session_id = state.agent_session.lock().await.clone();
+    let vault_id = state.get_vault_id().await.unwrap_or_default();
+    let auth_token = state.get_auth_token().await;
+    let tok = if auth_token.is_empty() { None } else { Some(auth_token.as_str()) };
+
+    if let Some(sid) = session_id {
+        let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
+            &state.http_client,
+            &format!("/vaults/{}/agent/confirm", urlencoding::encode(&vault_id)),
+            &serde_json::json!({ "session_id": sid, "approved": approved }),
+            tok,
+        ).await;
+    }
+    // Keep local fallback for live chat path
     let tx = state.write_confirm_tx.lock().await.take();
     if let Some(tx) = tx {
         let _ = tx.send(approved);
@@ -73,8 +101,7 @@ pub async fn invoke_agent(
 ) -> Result<String, AppError> {
     use crate::commands::conversation::{load_messages, save_messages, maybe_set_title};
     use crate::runtime::intent_classifier::{Intent, IntentClassifier};
-    use crate::runtime::tool_registry::ToolRegistry;
-    use crate::runtime::types::{ConfirmWriteFn, EmitEventFn, LlmFn, LlmRound};
+    use crate::runtime::types::{EmitEventFn, LlmFn, LlmRound};
 
     // 1. 確保 llama-server 運行，取得 base_url
     let base_url = ensure_server_running(state.inner(), &app).await?;
@@ -119,37 +146,9 @@ pub async fn invoke_agent(
         }
     }
 
-    // 4. 建立 ToolRegistry（vault 可用時注入工具）
-    // 使用 llama-server 處理所有 agent trigger embedding（chat 就緒時必然可用）
-    let reg_emb_url: Option<String> = Some(base_url.clone());
-    let skill_emb_url = reg_emb_url.clone(); // 保留一份給 skill pre-pass 使用
+    let skill_emb_url: Option<String> = Some(base_url.clone());
 
-    // 延遲繫結 handle（供 spawn_sub_agent 工具使用）
-    let llm_fn_late = crate::tools::make_late_llm_fn();
-    let registry_late: Arc<tokio::sync::Mutex<Option<Arc<ToolRegistry>>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
-
-    let registry = if !vault_path.is_empty() && vault_id_opt.is_some() {
-        crate::tools::build_vault_registry(
-            vault_path.clone(),
-            vault_id_opt.clone().unwrap_or_default(),
-            state.http_client.clone(),
-            auth_token.clone(),
-            app.clone(),
-            reg_emb_url.clone(),
-            Arc::clone(&llm_fn_late),
-            Arc::clone(&registry_late),
-            Arc::clone(&state.system_agent),
-            Some(Arc::clone(&state.agent_cancel)),
-        )
-    } else {
-        Arc::new(ToolRegistry::new())
-    };
-    // 設定延遲繫結的 registry（spawn_sub_agent 使用）
-    *registry_late.lock().await = Some(Arc::clone(&registry));
-
-    // 5. llm_fn：執行一輪 LLM 串流，返回 LlmRound
-    //    tools_opt: None = 不傳工具；Some(json) = 傳指定工具列表（由 Agent 決定）
+    // 4. llm_fn：執行一輪 LLM 串流，返回 LlmRound（用於 no-vault 純對話路徑）
     let client_fn = client.clone();
     let base_fn = base_url.clone();
     let app_fn = app.clone();
@@ -182,24 +181,8 @@ pub async fn invoke_agent(
             Ok(LlmRound { full_text: result.full_text, tool_calls })
         })
     });
-    // 設定延遲繫結的 llm_fn（spawn_sub_agent 使用）
-    *llm_fn_late.lock().await = Some(llm_fn.clone());
 
-    // 6. confirm_write_fn：設定 oneshot channel，等待 confirm_write_tool 命令
-    let write_tx = Arc::clone(&state.write_confirm_tx);
-    let confirm_write: ConfirmWriteFn = Arc::new(move |_display: String| {
-        let tx = Arc::clone(&write_tx);
-        Box::pin(async move {
-            let (ch_tx, ch_rx) = tokio::sync::oneshot::channel::<bool>();
-            *tx.lock().await = Some(ch_tx);
-            tokio::time::timeout(Duration::from_secs(60), ch_rx)
-                .await
-                .unwrap_or(Ok(false))
-                .unwrap_or(false)
-        })
-    });
-
-    // 7. emit_fn：通用事件發送（包裝 AppHandle::emit）
+    // 5. emit_fn：通用事件發送（包裝 AppHandle::emit）
     let app_emit = app.clone();
     let emit_fn: EmitEventFn = Arc::new(move |event: String, payload: serde_json::Value| {
         let _ = app_emit.emit(&event, payload);
@@ -282,11 +265,6 @@ pub async fn invoke_agent(
 
 
     let response_text = if vault_id_opt.is_some() && use_tools.unwrap_or(true) {
-        // messages_json 已包含當前 user input（line 654 append 過）
-        use crate::runtime::dispatcher::Dispatcher;
-        use crate::runtime::planner::Planner;
-        use crate::runtime::transaction::Transaction;
-
         // 保留前端傳來的 system（ORCHESTRATOR_SYSTEM，含明確工具使用規則）；
         // 若無 system，補上最低限度的 anti-hallucination 提示
         let anti_hallucination = "\n\n必須實際呼叫工具完成任務；禁止假裝或虛構結果。\
@@ -295,7 +273,6 @@ pub async fn invoke_agent(
         let mut msgs: Vec<serde_json::Value> = if let Some(sys_msg) = messages_json.iter()
             .find(|m| m["role"].as_str() == Some("system"))
         {
-            // 前端已有 system → 在末尾追加 anti-hallucination 補丁
             let patched_content = format!(
                 "{}{}",
                 sys_msg["content"].as_str().unwrap_or(""),
@@ -305,17 +282,11 @@ pub async fn invoke_agent(
                 .chain(messages_json.iter().filter(|m| m["role"].as_str() != Some("system")).cloned())
                 .collect()
         } else {
-            // 無 system → 使用 fallback
             let fallback = format!("你是一個筆記助理，可以使用工具搜尋、讀取和管理筆記。{}", anti_hallucination);
             std::iter::once(serde_json::json!({"role": "system", "content": fallback}))
                 .chain(messages_json.iter().cloned())
                 .collect()
         };
-
-        let dispatcher = Dispatcher::new(Arc::clone(&registry));
-        let tx = Arc::new(Transaction::new());
-        let _ = tx.prepare().await;
-        let mut final_text = String::new();
 
         // Skill pre-pass：active skills（永遠注入）+ passive skills（embedding 相似度匹配）
         // 同時從命中的 skill.tool_calls 收集本輪所需工具子集（減少 context 用量）
@@ -484,141 +455,31 @@ pub async fn invoke_agent(
             msgs = system_part.into_iter().chain(trimmed.into_iter()).collect();
         }
 
-        'tool_loop: for _round in 0..8usize {
-            if state.agent_cancel.load(std::sync::atomic::Ordering::Relaxed) { break; }
+        // ── Service delegation ────────────────────────────────────────────────
+        // Extract tool names from the computed tools Value for the service call.
+        let tool_names: Vec<String> = tools
+            .as_array()
+            .map(|arr| arr.iter()
+                .filter_map(|t| t["function"]["name"].as_str().map(String::from))
+                .collect())
+            .unwrap_or_default();
 
-            let result = match llm_fn(
-                msgs.clone(),
-                Some(tools.clone()),
-                Some(Arc::clone(&state.agent_cancel)),
-            ).await {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("[chat] llm error: {e}");
-                    return Err(AppError::AI(format!("{}", e)));
-                }
-            };
-            final_text = result.full_text.clone();
-            if result.tool_calls.is_empty() { break; }
+        let vault_id_str = vault_id_opt.as_deref().unwrap_or("");
+        crate::api_client::daemon_post::<_, serde_json::Value>(
+            &state.http_client,
+            &format!("/vaults/{}/agent/run", urlencoding::encode(vault_id_str)),
+            &serde_json::json!({
+                "session_id": session_id,
+                "messages": msgs,
+                "tool_names": tool_names,
+                "vault_path": vault_path,
+                "conversation_id": conversation_id,
+            }),
+            tok,
+        ).await.map_err(|e| AppError::AI(e.to_string()))?;
 
-            for (_, name, _) in &result.tool_calls {
-                (emit_fn)("agent:tool_call".into(), serde_json::json!({
-                    "session_id": session_id,
-                    "display": format!("🔧 {name}"),
-                }));
-            }
-
-            // 寫入工具確認
-            let has_write = result.tool_calls.iter().any(|(_, n, _)|
-                matches!(n.as_str(), "create_note" | "update_note" | "create_folder" | "delete_note" | "delete_folder" | "move_note" | "append_to_note"));
-            if has_write {
-                let display = result.tool_calls.iter()
-                    .filter(|(_, n, _)| matches!(n.as_str(), "create_note"|"update_note"|"create_folder"|"delete_note"|"delete_folder"|"move_note"|"append_to_note"))
-                    .map(|(_, n, a)| format!("- {} {}", n, a["path"].as_str().or_else(|| a["from"].as_str()).unwrap_or("")))
-                    .collect::<Vec<_>>().join("\n");
-                (emit_fn)("agent:write_request".into(), serde_json::Value::String(display.clone()));
-                let approved = confirm_write.clone()(display).await;
-                if !approved {
-                    let tc_json: Vec<serde_json::Value> = result.tool_calls.iter().map(|(id, n, a)| {
-                        serde_json::json!({"id": id, "type": "function", "function": {"name": n, "arguments": a.to_string()}})
-                    }).collect();
-                    msgs.push(serde_json::json!({"role": "assistant", "content": null, "tool_calls": tc_json}));
-                    for (tool_id, name, _) in &result.tool_calls {
-                        msgs.push(serde_json::json!({"role": "tool", "tool_call_id": tool_id, "name": name, "content": "用戶拒絕了此寫入操作。"}));
-                    }
-                    continue 'tool_loop;
-                }
-            }
-
-            let tool_graph = Planner::plan(&result.tool_calls);
-            let results = match dispatcher.run(Arc::clone(&tx), tool_graph).await {
-                Ok(r) => r,
-                Err(e) => { eprintln!("[chat] tool error: {e}"); break; }
-            };
-
-            let tc_json: Vec<serde_json::Value> = result.tool_calls.iter().map(|(id, n, a)| {
-                serde_json::json!({"id": id, "type": "function", "function": {"name": n, "arguments": a.to_string()}})
-            }).collect();
-            msgs.push(serde_json::json!({"role": "assistant", "content": null, "tool_calls": tc_json}));
-
-            for ((tool_id, name, args), res) in result.tool_calls.iter().zip(results.iter()) {
-                let raw = res.as_str().map(String::from).unwrap_or_else(|| res.to_string());
-
-                // search_skills 動態注入：解析回傳 JSON，擴展本輪 tools 供後續 LLM 呼叫使用
-                let raw = if name == "search_skills" {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                        // 擴展 tools（合併現有 + skill 指定工具）
-                        if let Some(arr) = v["required_tools"].as_array() {
-                            let names: Vec<String> = arr.iter()
-                                .filter_map(|x| x.as_str().map(String::from))
-                                .collect();
-                            if !names.is_empty() {
-                                // 合併現有 tools 中已有的（如 search_skills / plan_announce）+ skill tools
-                                let existing_names: Vec<String> = tools.as_array()
-                                    .map(|a| a.iter()
-                                        .filter_map(|t| t["function"]["name"].as_str().map(String::from))
-                                        .collect())
-                                    .unwrap_or_default();
-                                let mut all_names = existing_names;
-                                for n in &names { if !all_names.contains(n) { all_names.push(n.clone()); } }
-                                tools = filter_vault_tools_by_names(&all_names);
-                            }
-                        }
-                        // LLM 看到 behavior 文字，不是 JSON
-                        v["behavior"].as_str().map(String::from).unwrap_or(raw)
-                    } else {
-                        raw
-                    }
-                } else {
-                    raw
-                };
-
-                // Tool result 上限 3000 chars，防止大型 read_note 繞過 sliding window
-                const MAX_TOOL_RESULT: usize = 3000;
-                let res_str = if raw.chars().count() > MAX_TOOL_RESULT {
-                    // read_note：嘗試從 chunks 表並行摘要；其他工具截斷
-                    if name == "read_note" {
-                        if let (Some(_vid), Some(_fp)) = (vault_id_opt.as_deref(), args["path"].as_str()) {
-                            // parallel_chunk_summarize 已移除本地 DB 依賴，直接截斷（daemon 架構）
-                            {
-                                let truncated: String = raw.chars().take(MAX_TOOL_RESULT).collect();
-                                format!("{}…（內容已截斷）", truncated)
-                            }
-                        } else {
-                            let truncated: String = raw.chars().take(MAX_TOOL_RESULT).collect();
-                            format!("{}…（內容已截斷）", truncated)
-                        }
-                    } else {
-                        let truncated: String = raw.chars().take(MAX_TOOL_RESULT).collect();
-                        format!("{}…（內容已截斷，如需完整請分段呼叫）", truncated)
-                    }
-                } else {
-                    raw
-                };
-                msgs.push(serde_json::json!({"role": "tool", "tool_call_id": tool_id, "name": name, "content": res_str}));
-            }
-
-            // open_note 是 terminal tool：執行完直接結束，不需再呼叫 LLM
-            if result.tool_calls.iter().any(|(_, n, _)| n == "open_note") {
-                let opened: Vec<&str> = result.tool_calls.iter()
-                    .filter(|(_, n, _)| n == "open_note")
-                    .map(|(_, _, a)| a["path"].as_str().unwrap_or("筆記"))
-                    .collect();
-                final_text = format!("已為你打開：{}", opened.join("、"));
-                break;
-            }
-        }
-
-        let _ = tx.commit().await;
-        (emit_fn)("llm:done".into(), serde_json::Value::String(final_text.clone()));
-
-        // 更新 messages_json 供 save 段落使用：保留完整 tool call history（含 tool role）
-        // 前端顯示時透過 get_conversation 的 display_messages_json 過濾，不在此處截斷
-        messages_json = msgs.into_iter()
-            .filter(|m| m["role"].as_str() != Some("system"))
-            .collect();
-
-        final_text
+        // Tokens arrive via SSE passthrough; return session_id immediately.
+        return Ok(session_id);
     } else {
         // 無 vault 或 use_tools=false → 直接 LLM（純對話）
         // llm_fn 內部 send_streaming_request 已逐 token emit llm:token；此處只需 emit done
@@ -691,13 +552,10 @@ pub async fn invoke_live_chat(
     activity_context: Option<String>, // 使用者活動紀錄（allOpenPaths + 最近操作），由前端提供
     language: Option<String>,         // whisper language 設定（"zh-TW", "en", etc.）
 ) -> Result<String, AppError> {
-    use crate::commands::conversation::{load_messages, save_messages};
-    use crate::runtime::types::{EmitEventFn, LlmFn, LlmRound};
-    use crate::runtime::tool_registry::ToolRegistry;
+    use crate::commands::conversation::load_messages;
 
     // 1. 確保 llama-server 運行
-    let base_url = ensure_server_running(state.inner(), &app).await?;
-    let client = state.http_client.clone();
+    let _base_url = ensure_server_running(state.inner(), &app).await?;
 
     // 2. Vault 資訊
     let vault_path = state.get_vault_path().await;
@@ -742,7 +600,6 @@ pub async fn invoke_live_chat(
                 if arr.is_empty() {
                     String::new()
                 } else {
-                    // Emit prefetched node_ids for MemoryLinksView
                     let node_ids: Vec<String> = arr.iter()
                         .filter_map(|r| r["fact_id"].as_str())
                         .map(|fid| format!("memory:{}:{}", vid, fid))
@@ -778,88 +635,17 @@ live_respond 規則：\
         lang_hint, note_ctx_hint, activity_ctx_hint, memory_ctx_hint
     );
 
-    // 5. 建立 ToolRegistry
-    let llm_fn_late = crate::tools::make_late_llm_fn();
-    let registry_late: Arc<tokio::sync::Mutex<Option<Arc<ToolRegistry>>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
-
-    let registry = if !vault_path.is_empty() && vault_id_opt.is_some() {
-        crate::tools::build_vault_registry(
-            vault_path.clone(),
-            vault_id_opt.clone().unwrap_or_default(),
-            state.http_client.clone(),
-            auth_token_lc.clone(),
-            app.clone(),
-            Some(base_url.clone()),
-            Arc::clone(&llm_fn_late),
-            Arc::clone(&registry_late),
-            Arc::clone(&state.system_agent),
-            Some(Arc::clone(&state.agent_cancel)),
-        )
-    } else {
-        Arc::new(ToolRegistry::new())
-    };
-    *registry_late.lock().await = Some(Arc::clone(&registry));
-
-    // 6. llm_fn
-    let client_fn = client.clone();
-    let base_fn = base_url.clone();
-    let app_fn = app.clone();
-    let cancel_flag = Arc::clone(&state.agent_cancel);
-    let llm_fn: LlmFn = Arc::new(move |msgs, tools_opt, cancel| {
-        let client = client_fn.clone();
-        let base = base_fn.clone();
-        let app = app_fn.clone();
-        Box::pin(async move {
-            // 語音助理回覆短促：max_tokens 512 加快首 token 速度
-            // tool_choice: "required" 強制 LLM 必須呼叫工具，不允許生成純文字
-            let body = if let Some(tools) = tools_opt {
-                serde_json::json!({
-                    "messages": msgs,
-                    "tools": tools,
-                    "tool_choice": "required",
-                    "max_tokens": 512,
-                    "temperature": 0.7,
-                    "stream": true,
-                })
-            } else {
-                serde_json::json!({
-                    "messages": msgs,
-                    "max_tokens": 512,
-                    "temperature": 0.7,
-                    "stream": true,
-                })
-            };
-            let result = send_streaming_request(&client, &base, body, &app, cancel)
-                .await
-                .map_err(|e| e.to_string())?;
-            let tool_calls = detect_tool_calls(&result);
-            Ok(LlmRound { full_text: result.full_text, tool_calls })
-        })
-    });
-    *llm_fn_late.lock().await = Some(llm_fn.clone());
-
-    // 7. emit_fn
-    let app_emit = app.clone();
-    let emit_fn: EmitEventFn = Arc::new(move |event: String, payload: serde_json::Value| {
-        let _ = app_emit.emit(&event, payload);
-    });
-
-    // 8. 取消旗標
+    // 5. 取消旗標 + session
     state.agent_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+    let session_id = uuid::Uuid::new_v4().to_string();
+    *state.agent_session.lock().await = Some(session_id.clone());
 
-    // 8b. Live chat 執行期間自動核准寫入工具（無確認 UI）。
-    // make_confirm_write 會讀取此旗標，為 true 時直接回傳 true 不等前端。
-    // 使用 AtomicBool 而非 polling task，不影響並行的 stream_chat 確認流程。
-    state.live_chat_active.store(true, std::sync::atomic::Ordering::SeqCst);
-
-    // 9. 組裝 messages（system + sliding window）
-    let mut msgs: Vec<serde_json::Value> = {
+    // 6. 組裝 messages（system + sliding window）
+    let msgs: Vec<serde_json::Value> = {
         let sys_msg = serde_json::json!({"role": "system", "content": system});
         let hist: Vec<serde_json::Value> = messages_json.iter()
             .filter(|m| m["role"].as_str() != Some("system"))
             .cloned().collect();
-        // Sliding window 8000 chars
         const MAX_HISTORY_CHARS: usize = 8000;
         let total: usize = hist.iter().map(|m| m["content"].as_str().unwrap_or("").len()).sum();
         let trimmed = if total > MAX_HISTORY_CHARS {
@@ -876,214 +662,21 @@ live_respond 規則：\
         std::iter::once(sys_msg).chain(trimmed.into_iter()).collect()
     };
 
-    // 10. 工具清單：第一輪只有 search_skills，強制 LLM 先路由再執行再 live_respond
-    // live_respond 在 search_skills 執行後才注入，防止 LLM 在第一輪就呼叫它提早結束
-    let live_chat_tool_names: Vec<String> = vec!["search_skills"]
-        .into_iter().map(String::from).collect();
-    let _tools = filter_vault_tools_by_names(&live_chat_tool_names);
+    // 7. POST to service (blocking — service runs 3-round loop, SSE emitted inline)
+    let vault_id_str = vault_id_opt.as_deref().unwrap_or("");
+    let resp = crate::api_client::daemon_post::<_, serde_json::Value>(
+        &state.http_client,
+        &format!("/vaults/{}/agent/live_chat", urlencoding::encode(vault_id_str)),
+        &serde_json::json!({
+            "session_id": session_id,
+            "messages": msgs,
+            "vault_path": vault_path,
+            "conversation_id": conversation_id,
+        }),
+        tok_lc,
+    ).await.map_err(|e| AppError::AI(e.to_string()))?;
 
-    // 11. Tool loop（最多 2 輪：round 0 = 第一輪 LLM → 可呼叫搜尋；round 1 = 再次 LLM → 必須呼叫 live_respond）
-    use crate::runtime::dispatcher::Dispatcher;
-    use crate::runtime::planner::Planner;
-    use crate::runtime::transaction::Transaction;
-
-    let dispatcher = Dispatcher::new(Arc::clone(&registry));
-    let tx = Arc::new(Transaction::new());
-    let _ = tx.prepare().await;
-    let mut final_speech = String::new();
-    let mut live_action: Option<serde_json::Value> = None;
-
-    // 輔助：emit 錯誤 action（TTS + 顯示錯誤卡片）
-    let emit_error_action = |speech: &str, detail: String| {
-        (emit_fn)("live_chat:action".into(), serde_json::json!({
-            "speech": speech,
-            "action": "show_error",
-            "error": detail,
-        }));
-    };
-
-    // 三輪固定流程，每輪工具清單不同，無條件判斷
-    // Round 0：只有 search_skills → 取得 skill tool names
-    // Round 1：skill tools + plan_announce → LLM 宣告計畫並執行工具
-    // Round 2：只有 live_respond → LLM 必須輸出最終答案
-    let mut skill_tool_names: Vec<String> = Vec::new();
-
-    'tool_loop: for round in 0..3usize {
-        if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) { break; }
-
-        // 每輪的工具清單由 round 決定，不做動態條件判斷
-        // Round 1：若 search_skills 未回傳任何工具，直接跳過（避免空 tools + required 出錯）
-        if round == 1 && skill_tool_names.is_empty() {
-            continue;
-        }
-
-        let round_tools = match round {
-            0 => filter_vault_tools_by_names(&["think".to_string(), "search_skills".to_string()]),
-            1 => {
-                // skill tools + think（LLM 執行工具前先說內心獨白）
-                let mut names = vec!["think".to_string()];
-                names.extend(skill_tool_names.iter().cloned());
-                filter_vault_tools_by_names(&names)
-            }
-            _ => {
-                // 只有 live_respond，LLM 必須輸出答案
-                filter_vault_tools_by_names(&["live_respond".to_string()])
-            }
-        };
-
-        let result = match llm_fn(
-            msgs.clone(),
-            Some(round_tools),
-            Some(Arc::clone(&cancel_flag)),
-        ).await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("[live_chat] llm error: {e}");
-                emit_error_action("抱歉，語言模型回應失敗，請稍後再試。", format!("LLM 錯誤：{e}"));
-                state.live_chat_active.store(false, std::sync::atomic::Ordering::SeqCst);
-                return Ok(String::new());
-            }
-        };
-
-        // Round 2：LLM 只有 live_respond，接受其輸出（tool call 或純文字）
-        if round == 2 {
-            if let Some((_, _, args)) = result.tool_calls.iter().find(|(_, n, _)| n == "live_respond") {
-                final_speech = args["speech"].as_str().unwrap_or("").to_string();
-                live_action = Some(args.clone());
-            } else {
-                // 模型沒有呼叫 live_respond，直接用文字
-                final_speech = result.full_text.clone();
-            }
-            break 'tool_loop;
-        }
-
-        // Round 0 / 1：執行工具
-        // plan_announce 不在 registry，特殊處理；其餘走 dispatcher
-        let (pa_calls, real_calls): (Vec<_>, Vec<_>) = result.tool_calls.iter()
-            .partition(|(_, n, _)| n == "plan_announce");
-
-        for (_, name, _) in &result.tool_calls {
-            if name != "plan_announce" {
-                (emit_fn)("live_chat:tool_call".into(), serde_json::json!({"display": format!("🔧 {name}")}));
-            }
-        }
-
-        let tc_json: Vec<serde_json::Value> = result.tool_calls.iter().map(|(id, n, a)|
-            serde_json::json!({"id": id, "type": "function", "function": {"name": n, "arguments": a.to_string()}})
-        ).collect();
-        // 沒有 tool call 也沒有文字 → 直接進下一輪
-        if tc_json.is_empty() { continue; }
-        msgs.push(serde_json::json!({"role": "assistant", "content": null, "tool_calls": tc_json}));
-
-        // plan_announce → 自動確認
-        for (tool_id, _, _) in &pa_calls {
-            msgs.push(serde_json::json!({"role": "tool", "tool_call_id": tool_id,
-                "name": "plan_announce", "content": "✅ 已自動確認，繼續執行"}));
-        }
-
-        if real_calls.is_empty() { continue; }
-
-        let real_calls_owned: Vec<_> = real_calls.into_iter().cloned().collect();
-        let tool_graph = Planner::plan(&real_calls_owned);
-        let results = match dispatcher.run(Arc::clone(&tx), tool_graph).await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("[live_chat] tool error: {e}");
-                emit_error_action("抱歉，執行工具時遇到問題，已為您顯示錯誤訊息。", format!("工具執行失敗：{e}"));
-                break;
-            }
-        };
-
-        for ((tool_id, name, _), res) in real_calls_owned.iter().zip(results.iter()) {
-            let raw = res.as_str().map(String::from).unwrap_or_else(|| res.to_string());
-
-            // Round 0：search_skills → 記錄 skill tool names（Round 1 使用）
-            let raw = if name == "search_skills" {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                    if let Some(arr) = v["required_tools"].as_array() {
-                        skill_tool_names = arr.iter()
-                            .filter_map(|x| x.as_str().map(String::from))
-                            .collect();
-                    }
-                    v["behavior"].as_str().map(String::from).unwrap_or(raw)
-                } else { raw }
-            } else { raw };
-
-            let res_str = if raw.chars().count() > 2000 {
-                format!("{}…（已截斷）", raw.chars().take(2000).collect::<String>())
-            } else { raw };
-            msgs.push(serde_json::json!({"role": "tool", "tool_call_id": tool_id, "name": name, "content": res_str}));
-        }
-    }
-
-    let _ = tx.commit().await;
-
-    // 12. 儲存回 DB（過濾 system，追加 assistant 回覆）
-    {
-        let mut to_save: Vec<serde_json::Value> = messages_json.iter()
-            .filter(|m| m["role"].as_str() != Some("system"))
-            .cloned().collect();
-        if !final_speech.is_empty() {
-            to_save.push(serde_json::json!({"role": "assistant", "content": final_speech}));
-        }
-        let arr = serde_json::Value::Array(to_save.clone());
-        let _ = save_messages(&state.http_client, tok_lc, &conversation_id, &arr).await;
-
-        // 每 10 則 user 訊息自動存至 vault memory（inline，不透過 Tauri command）
-        let user_count = to_save.iter().filter(|m| m["role"].as_str() == Some("user")).count();
-        if user_count > 0 && user_count % 10 == 0 && !vault_path.is_empty() {
-            use chrono::Local;
-            let now = Local::now();
-            let timestamp = now.format("%Y%m%d_%H%M%S").to_string();
-            let display_time = now.format("%Y-%m-%d %H:%M:%S").to_string();
-            let rel_path = format!("memories/ai_memory_live_{}.md", timestamp);
-            let abs_path = std::path::PathBuf::from(&vault_path).join(&rel_path);
-            let mut content = format!(
-                "---\ncreated: {}\nmessage_count: {}\nsource: live_chat\n---\n\n# AI 語音對話記憶 — {}\n\n",
-                now.to_rfc3339(),
-                to_save.iter().filter(|m| m["role"].as_str() != Some("tool")).count(),
-                display_time
-            );
-            for msg in &to_save {
-                match msg["role"].as_str() {
-                    Some("user") => content.push_str(&format!("**使用者**\n\n{}\n\n---\n\n", msg["content"].as_str().unwrap_or(""))),
-                    Some("assistant") => content.push_str(&format!("**助手**\n\n{}\n\n---\n\n", msg["content"].as_str().unwrap_or(""))),
-                    _ => {}
-                }
-            }
-            if let Some(parent) = abs_path.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
-            }
-            let _ = tokio::fs::write(&abs_path, &content).await;
-            // Sync memory note to daemon (no file watcher in daemon)
-            let vault_id = state.get_vault_uuid().await;
-            if !vault_id.is_empty() {
-                let token2 = state.get_auth_token().await;
-                let tok2: Option<&str> = if token2.is_empty() { None } else { Some(token2.as_str()) };
-                let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
-                    &state.http_client,
-                    &format!("/vaults/{}/notes", urlencoding::encode(&vault_id)),
-                    &serde_json::json!({"path": rel_path, "content": content}),
-                    tok2,
-                ).await;
-            }
-        }
-    }
-
-    // 復原旗標，恢復 stream_chat 的正常確認流程
-    state.live_chat_active.store(false, std::sync::atomic::Ordering::SeqCst);
-
-    // 13. emit live_chat:action（前端根據 action 執行 UI 操作）
-    // 若迴圈未產生任何回應（工具錯誤 break 或取消），且沒有錯誤 action 已發出，補發 fallback
-    if let Some(action_args) = live_action {
-        (emit_fn)("live_chat:action".into(), action_args);
-    } else if final_speech.is_empty() && !cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
-        emit_error_action(
-            "抱歉，我沒有得到有效的回覆，請再試一次。",
-            "未能取得有效回應".to_string(),
-        );
-    }
-
+    let final_speech = resp["speech"].as_str().unwrap_or("").to_string();
     Ok(final_speech)
 }
 
