@@ -176,7 +176,7 @@ const SKILLS: &[BuiltinSkill] = &[
         id: "builtin_schedule_task",
         title: "排程/提醒任務",
         trigger: "排程、設定提醒、定時任務、設定鬧鐘、幫我排程、提醒我、到時候提醒、設定時間、定時提醒、schedule、remind me、set reminder、set alarm、幫我設一個提醒、X點提醒我、明天提醒、每天提醒、固定時間、重複執行、定期通知、設定排程任務、每週提醒",
-        behavior: "步驟1：呼叫 get_current_datetime 取得現在時間（作為計算相對時間的基準）。步驟2：根據使用者描述確定：（a）任務描述 description、（b）執行時間 run_at（ISO 8601 格式，需含時區，例如 2026-03-22T09:00:00+08:00）、（c）若需重複則填 repeat_interval_seconds（秒數，如每天=86400、每週=604800，不重複則填 0）。步驟3：呼叫 schedule_task 完成排程。步驟4：回覆使用者已排程的時間與任務內容。",
+        behavior: "步驟1：呼叫 get_current_datetime 取得現在時間（作為計算相對時間的基準）。步驟2：根據使用者描述確定：（a）任務描述 description、（b）執行時間 run_at（ISO 8601 格式，需含時區，例如 2026-03-22T09:00:00+08:00）、（c）若需重複則填 repeat_interval_seconds（秒數，如每天=86400、每週=604800，不重複則填 0）、（d）若使用者要求執行特定 agent（如定期整理記憶）則填 agent_def_name（如 'memory_agent'），否則留空。步驟3：呼叫 schedule_task 完成排程。步驟4：回覆使用者已排程的時間與任務內容。\n可用的 agent_def_name：'memory_agent'（定期整理對話記憶）。",
         tools: &["get_current_datetime", "schedule_task"],
         need_tool_chain: true,
         tool_chain_order: &["get_current_datetime", "schedule_task"],
@@ -302,6 +302,16 @@ const SKILLS: &[BuiltinSkill] = &[
         tool_chain_order: &["prefetch_memory"],
         injection_mode: "proactive",
     },
+    BuiltinSkill {
+        id: "builtin_organize_memory",
+        title: "整理/提取記憶",
+        trigger: "整理記憶、提取記憶、分析對話記憶、幫我整理記憶、記憶整理、萃取記憶、從對話提取知識、記憶分析、幫我歸納記憶、organize memory、extract memory、memory cleanup、分析我的對話記憶、整理過去的對話、把對話轉成記憶、記憶萃取",
+        behavior: "步驟1：呼叫 get_unprocessed_conversations 取得尚未分析記憶的對話列表（含標題與預覽）。步驟2：對每個對話呼叫 get_conversation_content 取得完整訊息內容。步驟3：判斷是否有長期記憶價值（使用者偏好/背景/規則/重要決策），一般查詢/閒聊無記憶價值可跳過。步驟4：有記憶價值 → 呼叫 save_memory_facts 儲存萃取的事實。步驟5：無論有無記憶價值，每個對話都必須呼叫 mark_conversation_processed 標記完成。步驟6：所有對話處理完畢後，呼叫 condense_memory_facts（不傳 category，壓縮所有類別）。步驟7：呼叫 distill_preferences 將偏好/規則蒸餾為 agent skill。步驟8：回覆整理摘要（處理幾個對話、儲存幾條記憶）。",
+        tools: &["get_unprocessed_conversations", "get_conversation_content", "save_memory_facts", "mark_conversation_processed", "condense_memory_facts", "distill_preferences"],
+        need_tool_chain: true,
+        tool_chain_order: &["get_unprocessed_conversations", "get_conversation_content", "save_memory_facts", "mark_conversation_processed", "condense_memory_facts", "distill_preferences"],
+        injection_mode: "passive",
+    },
 ];
 
 const AGENTS: &[BuiltinAgent] = &[
@@ -357,6 +367,37 @@ const AGENTS: &[BuiltinAgent] = &[
             5. 回覆使用者已建立的卡片列表。",
         max_rounds: 5,
         trigger: "建立筆記卡片、知識卡片、建議卡片、整理成卡片、幫我做成卡片、suggest note card、create note card、concept 卡片、procedure 卡片、reference 卡片",
+    },
+    BuiltinAgent {
+        id: "builtin_memory_agent",
+        name: "memory_agent",
+        description: "定期掃描未分析的對話，萃取長期記憶事實並整理到記憶庫",
+        kind: "scheduled",
+        tool_names: &["get_unprocessed_conversations", "get_conversation_content", "save_memory_facts", "mark_conversation_processed", "condense_memory_facts", "distill_preferences"],
+        system_prompt: "你是記憶管理助理。\n\
+            ## 模式判斷\n\
+            若使用者訊息中包含「conv_id:」，進入 **單一對話模式**：\n\
+              1. 直接呼叫 get_conversation_content（使用指定的 conv_id，跳過 get_unprocessed_conversations）\n\
+              2. 判斷是否有長期記憶價值\n\
+              3. 有價值 → 呼叫 save_memory_facts\n\
+              4. 呼叫 mark_conversation_processed\n\
+              5. 呼叫 condense_memory_facts（不傳 category）\n\
+              6. 呼叫 distill_preferences\n\
+            \n\
+            若使用者訊息中不含「conv_id:」，進入 **全量掃描模式**：\n\
+              1. 呼叫 get_unprocessed_conversations 取得待分析對話列表\n\
+              2. 對每個對話呼叫 get_conversation_content 取得內容\n\
+              3. 判斷是否有長期記憶價值（使用者偏好/背景/規則/重要決策）\n\
+                 - 一般查詢、搜尋、閒聊 → 無記憶價值\n\
+                 - 使用者分享個人資訊、設定偏好、做重要決定 → 有記憶價值\n\
+              4. 有價值 → 呼叫 save_memory_facts\n\
+              5. 每個對話無論成功失敗 → 呼叫 mark_conversation_processed\n\
+              6. 所有對話處理完畢後 → 呼叫 condense_memory_facts（不傳 category）\n\
+              7. 呼叫 distill_preferences\n\
+            \n\
+            完成後輸出摘要（處理幾個對話、儲存幾條記憶）。",
+        max_rounds: 20,
+        trigger: "memory_agent",
     },
     BuiltinAgent {
         id: "builtin_note_summarizer",

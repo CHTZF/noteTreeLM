@@ -1540,8 +1540,16 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                       setMemoryAgentRunning(true)
                       setMemoryAgentMsg('')
                       try {
-                        await invoke('trigger_memory_agent')
-                        setMemoryAgentMsg('記憶整合已在背景啟動，結果將寫入 vault/log/')
+                        await api.createScheduledTask({
+                          vault_id: await invoke<string>('get_vault_uuid'),
+                          account_id: session?.username ?? '',
+                          description: '立即整理記憶',
+                          agent_def_name: 'memory_agent',
+                          agent_prompt: '請開始分析並提取記憶。',
+                          run_at_ts: Math.floor(Date.now() / 1000),
+                          repeat_interval_secs: 0,
+                        })
+                        setMemoryAgentMsg('記憶整合已在背景啟動')
                       } catch (e) {
                         setMemoryAgentMsg(`啟動失敗：${e}`)
                       } finally {

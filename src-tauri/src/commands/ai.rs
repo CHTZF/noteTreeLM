@@ -1992,13 +1992,16 @@ pub fn vault_tools() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "schedule_task",
-                "description": "排程一個任務，在指定時間執行（可設定重複間隔）",
+                "description": "排程一個任務，在指定時間執行（可設定重複間隔）。若需排程執行 agent，填入 agent_def_name。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "description": {"type": "string", "description": "任務描述（到時會顯示通知）"},
                         "run_at": {"type": "string", "description": "執行時間，ISO 8601 格式（如 2026-03-21T09:00:00+08:00）"},
-                        "repeat_interval_seconds": {"type": "integer", "description": "重複間隔秒數，0 或省略表示只執行一次"}
+                        "repeat_interval_seconds": {"type": "integer", "description": "重複間隔秒數，0 或省略表示只執行一次"},
+                        "agent_def_name": {"type": "string", "description": "要執行的 agent 名稱（如 'memory_agent'），省略則只顯示通知"},
+                        "agent_prompt": {"type": "string", "description": "傳給 agent 的初始提示（可選）"},
+                        "account_id": {"type": "string", "description": "目前使用者的 account_id"}
                     },
                     "required": ["description", "run_at"]
                 }

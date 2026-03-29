@@ -45,8 +45,6 @@ use commands::{
                get_last_mode_conversation_id, set_last_mode_conversation_id,
                get_kb_chat_messages, save_kb_chat_messages},
     patterns::{save_pattern, update_pattern_score, list_patterns, decay_patterns, set_pattern_intent},
-    memory_agent::{get_unprocessed_conversations, get_conversation_content, call_claude_cli,
-                   write_memory_log, mark_conversation_processed, trigger_memory_agent},
     vault::*,
     voice::{transcribe_audio, stop_whisper_server, warmup_whisper_server,
             get_whisper_server_status, start_whisper_server, restart_whisper_server},
@@ -533,13 +531,6 @@ pub fn run() {
             download_llama_server,
             get_coreml_model_path,
             download_coreml_model,
-            // Memory Agent
-            get_unprocessed_conversations,
-            get_conversation_content,
-            call_claude_cli,
-            write_memory_log,
-            mark_conversation_processed,
-            trigger_memory_agent,
             // Activity Pattern Learning
             save_pattern,
             update_pattern_score,

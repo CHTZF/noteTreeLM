@@ -758,7 +758,7 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
         );
     }
 
-    // schedule_task — 排程任務（daemon POST /vaults/:vid/schedules）
+    // schedule_task — 排程任務（daemon POST /scheduled-tasks）
     {
         let client = ctx.http_client.clone();
         let tok = ctx.auth_token.clone();
@@ -770,8 +770,9 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                     let description = args["description"].as_str().unwrap_or("").to_string();
                     let run_at_str = args["run_at"].as_str().unwrap_or("").to_string();
                     let repeat_interval_secs = args["repeat_interval_seconds"].as_i64().unwrap_or(0);
-                    let agent_type = args["agent_type"].as_str().map(String::from);
+                    let agent_def_name = args["agent_def_name"].as_str().map(String::from);
                     let agent_prompt = args["agent_prompt"].as_str().map(String::from);
+                    let account_id = args["account_id"].as_str().unwrap_or("").to_string();
                     let client = client.clone();
                     let tok = tok.clone();
                     let vid = vid.clone();
@@ -789,11 +790,13 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                         let tok_ref = if tok.is_empty() { None } else { Some(tok.as_str()) };
                         let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
                             &client,
-                            &format!("/vaults/{}/schedules", urlencoding::encode(&vid)),
+                            "/scheduled-tasks",
                             &serde_json::json!({
                                 "task_id": task_id,
+                                "vault_id": vid,
+                                "account_id": account_id,
                                 "description": description,
-                                "agent_type": agent_type,
+                                "agent_def_name": agent_def_name,
                                 "agent_prompt": agent_prompt,
                                 "run_at_ts": run_at_ts,
                                 "repeat_interval_secs": repeat_interval_secs,
@@ -806,8 +809,8 @@ pub fn register(registry: &mut ToolRegistry, ctx: &BuildCtx) {
                         } else {
                             String::new()
                         };
-                        let agent_info = agent_type
-                            .map(|t| format!("，呼叫 agent: {}", t))
+                        let agent_info = agent_def_name
+                            .map(|t| format!("，執行 agent: {}", t))
                             .unwrap_or_default();
 
                         Ok(Value::String(format!(

@@ -291,6 +291,7 @@ pub async fn handle_vault_switch(app: AppHandle, state: AppState, new_path: Stri
             let client = state.http_client.clone();
             let tok2 = token.clone();
             let vid = vault_uuid.clone();
+            let aid = state.get_username().await;
             let run_at_ts = chrono::Utc::now().timestamp() + 8 * 3600;
             tokio::spawn(async move {
                 let t = if tok2.is_empty() { None } else { Some(tok2.as_str()) };
@@ -299,8 +300,9 @@ pub async fn handle_vault_switch(app: AppHandle, state: AppState, new_path: Stri
                     "/scheduled-tasks",
                     &serde_json::json!({
                         "vault_id": vid,
+                        "account_id": aid,
                         "description": "Memory Agent",
-                        "agent_type": "memory_agent",
+                        "agent_def_name": "memory_agent",
                         "agent_prompt": "請開始分析並提取記憶。",
                         "run_at_ts": run_at_ts,
                         "repeat_interval_secs": 28800

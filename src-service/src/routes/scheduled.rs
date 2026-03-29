@@ -67,13 +67,18 @@ async fn create_task(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let account_id = body
+        .get("account_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let description = body
         .get("description")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let agent_type = body
-        .get("agent_type")
+    let agent_def_name = body
+        .get("agent_def_name")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let agent_prompt = body
@@ -92,11 +97,12 @@ async fn create_task(
 
     state
         .db
-        .query("INSERT INTO scheduled_tasks (task_id, vault_id, description, agent_type, agent_prompt, run_at_ts, repeat_interval_secs, status, created_at) VALUES ($tid, $vid, $desc, $atype, $aprompt, $run_at, $interval, 'pending', $now)")
+        .query("INSERT INTO scheduled_tasks (task_id, vault_id, account_id, description, agent_def_name, agent_prompt, run_at_ts, repeat_interval_secs, status, created_at) VALUES ($tid, $vid, $aid, $desc, $aname, $aprompt, $run_at, $interval, 'pending', $now)")
         .bind(("tid", task_id.clone()))
         .bind(("vid", vault_id))
+        .bind(("aid", account_id))
         .bind(("desc", description))
-        .bind(("atype", agent_type))
+        .bind(("aname", agent_def_name))
         .bind(("aprompt", agent_prompt))
         .bind(("run_at", run_at_ts))
         .bind(("interval", repeat_interval_secs))

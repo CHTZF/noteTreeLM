@@ -5,7 +5,6 @@ use tokio::signal;
 use tokio::sync::RwLock;
 use crate::api_state::ApiState;
 use crate::auth::store::AuthStore;
-use crate::db::SurrealDb;
 use crate::state::DaemonState;
 
 pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
@@ -29,10 +28,9 @@ pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 
     // Spawn scheduler loop
     {
-        let sched_db = db.clone();
-        let sched_event_tx = daemon_state.event_tx.clone();
+        let sched_api_state = ApiState::new(auth_store.clone(), db.clone(), daemon_state.clone());
         tokio::spawn(async move {
-            run_scheduler(sched_db, sched_event_tx).await;
+            run_scheduler(sched_api_state).await;
         });
     }
 
@@ -92,7 +90,7 @@ pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_scheduler(db: SurrealDb, event_tx: tokio::sync::broadcast::Sender<crate::state::ServiceEvent>) {
+async fn run_scheduler(state: crate::api_state::ApiState) {
     tracing::info!("Scheduler started");
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
@@ -103,15 +101,15 @@ async fn run_scheduler(db: SurrealDb, event_tx: tokio::sync::broadcast::Sender<c
         struct TaskRow {
             task_id: String,
             vault_id: String,
+            account_id: Option<String>,
             description: String,
-            agent_type: Option<String>,
-            #[allow(dead_code)]
+            agent_def_name: Option<String>,
             agent_prompt: Option<String>,
             repeat_interval_secs: i64,
         }
 
-        let mut resp = match db.query(
-            "SELECT task_id, vault_id, description, agent_type, agent_prompt, repeat_interval_secs \
+        let mut resp = match state.db.query(
+            "SELECT task_id, vault_id, account_id, description, agent_def_name, agent_prompt, repeat_interval_secs \
              FROM scheduled_tasks \
              WHERE status = 'pending' AND run_at_ts <= $now"
         )
@@ -127,29 +125,42 @@ async fn run_scheduler(db: SurrealDb, event_tx: tokio::sync::broadcast::Sender<c
         let due: Vec<TaskRow> = resp.take(0).unwrap_or_default();
         for task in due {
             tracing::info!(
-                "Scheduled task due: {} (vault={}, type={:?})",
-                task.description, task.vault_id, task.agent_type
+                "Scheduled task due: {} (vault={}, agent={:?})",
+                task.description, task.vault_id, task.agent_def_name
             );
 
-            let _ = event_tx.send(crate::state::ServiceEvent {
-                event: "schedule:triggered".to_string(),
-                payload: serde_json::json!({
-                    "task_id": task.task_id,
-                    "vault_id": task.vault_id,
-                    "description": task.description,
-                }),
+            // Emit SSE notification to frontend
+            state.daemon.emit("schedule:triggered", serde_json::json!({
+                "task_id": task.task_id,
+                "vault_id": task.vault_id,
+                "description": task.description,
+            }));
+
+            // Execute agent in background
+            let state_clone = state.clone();
+            let tid = task.task_id.clone();
+            let vid = task.vault_id.clone();
+            let aid = task.account_id.clone().unwrap_or_default();
+            let desc = task.description.clone();
+            let agent_name = task.agent_def_name.clone();
+            let agent_prompt = task.agent_prompt.clone();
+            tokio::spawn(async move {
+                crate::service_agent::execute_scheduled_task(
+                    state_clone, tid, vid, aid, agent_name, agent_prompt, desc,
+                ).await;
             });
 
+            // Update schedule
             if task.repeat_interval_secs > 0 {
                 let next_ts = now_ts + task.repeat_interval_secs;
-                let _ = db.query(
+                let _ = state.db.query(
                     "UPDATE scheduled_tasks SET run_at_ts = $next WHERE task_id = $tid"
                 )
                 .bind(("next", next_ts))
                 .bind(("tid", task.task_id.clone()))
                 .await;
             } else {
-                let _ = db.query(
+                let _ = state.db.query(
                     "UPDATE scheduled_tasks SET status = 'done' WHERE task_id = $tid"
                 )
                 .bind(("tid", task.task_id.clone()))

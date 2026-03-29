@@ -428,13 +428,14 @@ function AppMain() {
     return () => { cancelled = true; unlisten?.() }
   }, [])
 
-  // ─── memory:processed toast ───────────────────────────────────────────
+  // ─── schedule:completed toast (memory agent 完成通知) ────────────────
   useEffect(() => {
     let cancelled = false
     let unlisten: (() => void) | null = null
-    listen<{ facts_added: number }>('service:memory:processed', (event) => {
-      const n = event.payload.facts_added
-      if (n > 0) toast.info(`已整理 ${n} 條記憶`)
+    listen<{ agent: string; summary: string }>('schedule:completed', (event) => {
+      if (event.payload.agent === 'memory_agent' && event.payload.summary) {
+        toast.info(`記憶整理完成`)
+      }
     }).then(fn => { if (cancelled) fn(); else unlisten = fn })
     return () => { cancelled = true; unlisten?.() }
   }, [])

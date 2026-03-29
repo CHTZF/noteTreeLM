@@ -4,7 +4,7 @@ mod chunker;
 mod daemon;
 mod db;
 mod embedder;
-pub mod memory_pipeline;
+pub mod service_agent;
 mod mdns;
 mod routes;
 pub mod seeds;

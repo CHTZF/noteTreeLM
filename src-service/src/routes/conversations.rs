@@ -303,13 +303,13 @@ async fn save_messages(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Check if memory pipeline should be triggered
-    maybe_trigger_memory_pipeline(state, id, messages_json).await;
+    // Trigger memory agent if threshold reached
+    maybe_trigger_memory_agent(state, id, messages_json).await;
 
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn maybe_trigger_memory_pipeline(state: ApiState, conv_id: String, messages_json: String) {
+async fn maybe_trigger_memory_agent(state: ApiState, conv_id: String, messages_json: String) {
     // Count user+assistant messages
     let msg_count = serde_json::from_str::<Vec<Value>>(&messages_json)
         .ok()
@@ -336,20 +336,44 @@ async fn maybe_trigger_memory_pipeline(state: ApiState, conv_id: String, message
     if account_id.is_empty() || vault_id.is_empty() { return }
 
     // Read user memory settings
-    let (enabled, threshold) = crate::memory_pipeline::get_user_memory_settings(&state.db, &account_id).await;
+    let (enabled, threshold) = get_user_memory_settings(&state.db, &account_id).await;
     if !enabled { return }
     if threshold == 0 { return }
 
     // Trigger only at exact multiples of threshold
     if msg_count % threshold as usize != 0 { return }
 
-    tokio::spawn(crate::memory_pipeline::run(
+    let task_id = uuid::Uuid::new_v4().to_string();
+    tokio::spawn(crate::service_agent::execute_scheduled_task(
         state,
-        account_id,
+        task_id,
         vault_id,
-        conv_id,
-        messages_json,
+        account_id,
+        Some("memory_agent".to_string()),
+        Some(format!("conv_id:{}", conv_id)),
+        "auto memory".to_string(),
     ));
+}
+
+async fn get_user_memory_settings(db: &crate::db::SurrealDb, account_id: &str) -> (bool, u32) {
+    #[derive(serde::Deserialize)]
+    struct Row { key: String, value: String }
+    let Ok(mut resp) = db
+        .query("SELECT `key`, `value` FROM user_settings WHERE username = $u AND `key` IN ['enable_auto_memory', 'memory_threshold']")
+        .bind(("u", account_id.to_string()))
+        .await
+    else { return (false, 20) };
+    let rows: Vec<Row> = resp.take(0).unwrap_or_default();
+    let mut enabled = false;
+    let mut threshold = 20u32;
+    for r in rows {
+        match r.key.as_str() {
+            "enable_auto_memory" => enabled = r.value == "true",
+            "memory_threshold"   => threshold = r.value.parse().unwrap_or(20),
+            _ => {}
+        }
+    }
+    (enabled, threshold)
 }
 
 async fn mark_processed(
