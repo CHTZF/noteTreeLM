@@ -26,6 +26,10 @@ pub fn router() -> Router<ApiState> {
         .route("/skills/seed-builtins", post(seed_builtins))
         .route("/agent-tools", get(list_agent_tools).post(create_agent_tool))
         .route("/agent-tools/:tool_id", put(update_agent_tool).delete(delete_agent_tool))
+        // ── Interactive agent run/cancel/confirm ─────────────────────────────
+        .route("/vaults/:vid/agent/run", post(agent_run))
+        .route("/vaults/:vid/agent/cancel", post(agent_cancel))
+        .route("/vaults/:vid/agent/confirm", post(agent_confirm))
 }
 
 /// Resolve account_id from Bearer token (username from sessions table).
@@ -526,5 +530,79 @@ async fn delete_agent_tool(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ── Interactive agent endpoints ───────────────────────────────────────────────
+
+/// POST /vaults/:vid/agent/run
+/// Body: { session_id, messages: [{role, content}], tool_names: [], vault_path }
+/// Spawns run_interactive_agent in background; immediately returns { session_id }.
+async fn agent_run(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let account_id = account_id_from_headers(&state, &headers).await?;
+    let session_id = body["session_id"]
+        .as_str()
+        .map(String::from)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let messages: Vec<serde_json::Value> = body["messages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let tool_names: Vec<String> = body["tool_names"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).map(String::from).collect())
+        .unwrap_or_default();
+    let vault_path = body["vault_path"].as_str().unwrap_or("").to_string();
+
+    tokio::spawn(crate::service_agent::run_interactive_agent(
+        state,
+        session_id.clone(),
+        messages,
+        tool_names,
+        vault_id,
+        account_id,
+        vault_path,
+    ));
+
+    Ok(Json(json!({ "session_id": session_id })))
+}
+
+/// POST /vaults/:vid/agent/cancel
+/// Body: { session_id }
+/// Sets the cancel flag for the given session.
+async fn agent_cancel(
+    State(state): State<ApiState>,
+    Path(_vault_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let session_id = body["session_id"].as_str().unwrap_or("");
+    let sessions = state.daemon.agent_sessions.lock().await;
+    if let Some(sess) = sessions.get(session_id) {
+        sess.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// POST /vaults/:vid/agent/confirm
+/// Body: { session_id, approved: bool }
+/// Resolves the pending write-confirm oneshot for the given session.
+async fn agent_confirm(
+    State(state): State<ApiState>,
+    Path(_vault_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let session_id = body["session_id"].as_str().unwrap_or("");
+    let approved = body["approved"].as_bool().unwrap_or(false);
+    let mut sessions = state.daemon.agent_sessions.lock().await;
+    if let Some(sess) = sessions.get_mut(session_id) {
+        if let Some(tx) = sess.confirm_tx.take() {
+            let _ = tx.send(approved);
+        }
+    }
     Ok(Json(json!({ "ok": true })))
 }

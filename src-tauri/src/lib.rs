@@ -119,10 +119,19 @@ async fn subscribe_service_events(app_handle: tauri::AppHandle) {
                 } else if line.starts_with("data:") {
                     data_buf = line["data:".len()..].trim().to_string();
                 } else if line.is_empty() && !event_name.is_empty() {
-                    // Dispatch event
+                    // Passthrough events re-emitted without "service:" prefix so
+                    // the frontend receives the same event names as the Tauri-native flow.
+                    const PASSTHROUGH: &[&str] = &[
+                        "llm:token", "llm:done",
+                        "agent:tool_call", "agent:write_request", "agent:note_refs",
+                    ];
                     let payload: serde_json::Value = serde_json::from_str(&data_buf)
                         .unwrap_or(serde_json::json!({}));
-                    let _ = app_handle.emit(&format!("service:{}", event_name), payload);
+                    if PASSTHROUGH.contains(&event_name.as_str()) {
+                        let _ = app_handle.emit(&event_name, payload);
+                    } else {
+                        let _ = app_handle.emit(&format!("service:{}", event_name), payload);
+                    }
                     event_name.clear();
                     data_buf.clear();
                 }
