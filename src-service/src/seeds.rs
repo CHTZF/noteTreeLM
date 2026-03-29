@@ -306,10 +306,10 @@ const SKILLS: &[BuiltinSkill] = &[
         id: "builtin_organize_memory",
         title: "整理/提取記憶",
         trigger: "整理記憶、提取記憶、分析對話記憶、幫我整理記憶、記憶整理、萃取記憶、從對話提取知識、記憶分析、幫我歸納記憶、organize memory、extract memory、memory cleanup、分析我的對話記憶、整理過去的對話、把對話轉成記憶、記憶萃取",
-        behavior: "步驟1：呼叫 get_unprocessed_conversations 取得尚未分析記憶的對話列表（含標題與預覽）。步驟2：對每個對話呼叫 get_conversation_content 取得完整訊息內容。步驟3：判斷是否有長期記憶價值（使用者偏好/背景/規則/重要決策），一般查詢/閒聊無記憶價值可跳過。步驟4：有記憶價值 → 呼叫 save_memory_facts 儲存萃取的事實。步驟5：無論有無記憶價值，每個對話都必須呼叫 mark_conversation_processed 標記完成。步驟6：所有對話處理完畢後，呼叫 condense_memory_facts（不傳 category，壓縮所有類別）。步驟7：呼叫 distill_preferences 將偏好/規則蒸餾為 agent skill。步驟8：回覆整理摘要（處理幾個對話、儲存幾條記憶）。",
-        tools: &["get_unprocessed_conversations", "get_conversation_content", "save_memory_facts", "mark_conversation_processed", "condense_memory_facts", "distill_preferences"],
+        behavior: "步驟1：呼叫 get_unprocessed_conversations 取得尚未分析記憶的對話列表（含標題與預覽）。步驟2：對每個對話呼叫 get_conversation_content 取得完整訊息內容。步驟3：判斷是否有長期記憶價值（使用者偏好/背景/規則/重要決策），一般查詢/閒聊無記憶價值可跳過。步驟4：有記憶價值 → 呼叫 save_memory_facts 儲存萃取的事實。步驟5：無論有無記憶價值，每個對話都必須呼叫 mark_conversation_processed 標記完成。步驟6：所有對話處理完畢後，呼叫 condense_memory_facts（不傳 category，壓縮所有類別）。步驟7：回覆整理摘要（處理幾個對話、儲存幾條記憶）。",
+        tools: &["get_unprocessed_conversations", "get_conversation_content", "save_memory_facts", "mark_conversation_processed", "condense_memory_facts"],
         need_tool_chain: true,
-        tool_chain_order: &["get_unprocessed_conversations", "get_conversation_content", "save_memory_facts", "mark_conversation_processed", "condense_memory_facts", "distill_preferences"],
+        tool_chain_order: &["get_unprocessed_conversations", "get_conversation_content", "save_memory_facts", "mark_conversation_processed", "condense_memory_facts"],
         injection_mode: "passive",
     },
 ];
@@ -373,27 +373,26 @@ const AGENTS: &[BuiltinAgent] = &[
         name: "memory_agent",
         description: "定期掃描未分析的對話，萃取長期記憶事實並整理到記憶庫",
         kind: "scheduled",
-        tool_names: &["get_unprocessed_conversations", "get_conversation_content", "save_memory_facts", "mark_conversation_processed", "condense_memory_facts", "distill_preferences"],
+        tool_names: &["get_unprocessed_conversations", "get_conversation_content", "save_memory_facts", "mark_conversation_processed", "condense_memory_facts"],
         system_prompt: "你是記憶管理助理。\n\
             ## 模式判斷\n\
             若使用者訊息中包含「conv_id:」，進入 **單一對話模式**：\n\
-              1. 直接呼叫 get_conversation_content（使用指定的 conv_id，跳過 get_unprocessed_conversations）\n\
-              2. 判斷是否有長期記憶價值\n\
-              3. 有價值 → 呼叫 save_memory_facts\n\
-              4. 呼叫 mark_conversation_processed\n\
-              5. 呼叫 condense_memory_facts（不傳 category）\n\
-              6. 呼叫 distill_preferences\n\
+              1. 從訊息中解析 conv_id 與 skip_count（若有 skip_count: 欄位，解析為數字，預設 0）\n\
+              2. 呼叫 get_conversation_content（帶入 conversation_id 與 skip_count），跳過 get_unprocessed_conversations\n\
+              3. 判斷是否有長期記憶價值\n\
+              4. 有價值 → 呼叫 save_memory_facts；記錄回傳的 facts_saved 數字\n\
+              5. 呼叫 mark_conversation_processed\n\
+              6. 僅當 facts_saved > 0 時，呼叫 condense_memory_facts（不傳 category）\n\
             \n\
             若使用者訊息中不含「conv_id:」，進入 **全量掃描模式**：\n\
               1. 呼叫 get_unprocessed_conversations 取得待分析對話列表\n\
-              2. 對每個對話呼叫 get_conversation_content 取得內容\n\
+              2. 對每個對話，以 processed_msg_count 作為 skip_count 呼叫 get_conversation_content（只讀尚未處理的新訊息）\n\
               3. 判斷是否有長期記憶價值（使用者偏好/背景/規則/重要決策）\n\
                  - 一般查詢、搜尋、閒聊 → 無記憶價值\n\
                  - 使用者分享個人資訊、設定偏好、做重要決定 → 有記憶價值\n\
-              4. 有價值 → 呼叫 save_memory_facts\n\
+              4. 有價值 → 呼叫 save_memory_facts；累計 facts_saved 總數\n\
               5. 每個對話無論成功失敗 → 呼叫 mark_conversation_processed\n\
-              6. 所有對話處理完畢後 → 呼叫 condense_memory_facts（不傳 category）\n\
-              7. 呼叫 distill_preferences\n\
+              6. 所有對話處理完畢後，僅當累計 facts_saved > 0 時，呼叫 condense_memory_facts（不傳 category）\n\
             \n\
             完成後輸出摘要（處理幾個對話、儲存幾條記憶）。",
         max_rounds: 20,
@@ -513,4 +512,56 @@ pub async fn seed_builtins(db: &SurrealDb, account_id: &str) {
     }
 
     tracing::info!("Seeded {} builtin agents for account {}", AGENTS.len(), account_id);
+
+    // Ensure periodic memory-agent scheduled tasks exist for every vault this account owns
+    #[derive(serde::Deserialize)]
+    struct VaultRow { vault_id: String }
+    let vaults: Vec<VaultRow> = db
+        .query("SELECT vault_id FROM vaults WHERE account_id = $aid")
+        .bind(("aid", account_id.to_string()))
+        .await
+        .ok()
+        .and_then(|mut r| r.take::<Vec<VaultRow>>(0).ok())
+        .unwrap_or_default();
+
+    for v in vaults {
+        ensure_memory_schedule(db, &v.vault_id, account_id).await;
+    }
+}
+
+/// Idempotently ensures a periodic memory_agent scheduled task exists for (vault_id, account_id).
+/// Creates one if absent; does nothing if one already exists.
+pub async fn ensure_memory_schedule(db: &SurrealDb, vault_id: &str, account_id: &str) {
+    // Check if a memory_agent task already exists for this vault+account
+    #[derive(serde::Deserialize)]
+    struct Row { #[allow(dead_code)] task_id: String }
+    let existing: Vec<Row> = db
+        .query("SELECT task_id FROM scheduled_tasks WHERE vault_id = $vid AND account_id = $aid AND agent_def_name = 'memory_agent' LIMIT 1")
+        .bind(("vid", vault_id.to_string()))
+        .bind(("aid", account_id.to_string()))
+        .await
+        .ok()
+        .and_then(|mut r| r.take::<Vec<Row>>(0).ok())
+        .unwrap_or_default();
+
+    if !existing.is_empty() { return; }
+
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().timestamp();
+    let run_at = now + 28800; // first run in 8 hours
+
+    let _ = db
+        .query("INSERT INTO scheduled_tasks \
+                (task_id, vault_id, account_id, description, agent_def_name, agent_prompt, \
+                 run_at_ts, repeat_interval_secs, status, created_at) \
+                VALUES ($tid, $vid, $aid, '定期記憶整理', 'memory_agent', NONE, \
+                        $run_at, 28800, 'pending', $now)")
+        .bind(("tid",    task_id))
+        .bind(("vid",    vault_id.to_string()))
+        .bind(("aid",    account_id.to_string()))
+        .bind(("run_at", run_at))
+        .bind(("now",    now))
+        .await;
+
+    tracing::info!("[seeds] created memory_agent schedule for vault={} account={}", vault_id, account_id);
 }

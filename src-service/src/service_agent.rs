@@ -11,7 +11,6 @@
 use serde_json::{json, Value};
 use crate::api_state::ApiState;
 use crate::db::SurrealDb;
-use chrono::Local;
 
 const MAX_ROUNDS: usize = 20;
 
@@ -73,12 +72,15 @@ pub async fn execute_scheduled_task(
         .build()
         .unwrap_or_default();
 
+    let embedding_url = state.daemon.embedding_url.read().await.clone();
+
     let result = run_agent_loop(
         &client,
         &llm_url,
         &state.db,
         &vault_id,
         &account_id,
+        &embedding_url,
         &system_prompt,
         &initial_msg,
         &tool_names,
@@ -102,6 +104,7 @@ async fn run_agent_loop(
     db: &SurrealDb,
     vault_id: &str,
     account_id: &str,
+    embedding_url: &Option<String>,
     system_prompt: &str,
     initial_msg: &str,
     tool_names: &[String],
@@ -168,7 +171,7 @@ async fn run_agent_loop(
                     .and_then(|s| serde_json::from_str(s).ok())
                     .unwrap_or(json!({}));
 
-                let result = dispatch_tool(client, llm_url, db, vault_id, account_id, &fn_name, &fn_args).await;
+                let result = dispatch_tool(client, llm_url, db, vault_id, account_id, embedding_url, &fn_name, &fn_args).await;
                 let result_str = match &result {
                     Ok(v) => serde_json::to_string(v).unwrap_or_default(),
                     Err(e) => format!("ERROR: {}", e),
@@ -199,22 +202,25 @@ async fn dispatch_tool(
     db: &SurrealDb,
     vault_id: &str,
     account_id: &str,
+    embedding_url: &Option<String>,
     name: &str,
     args: &Value,
 ) -> Result<Value, String> {
     match name {
         "get_unprocessed_conversations" => {
             let limit = args["limit"].as_i64().unwrap_or(20);
-            get_unprocessed_conversations(db, vault_id, limit).await
+            get_unprocessed_conversations(db, vault_id, account_id, limit).await
         }
         "get_conversation_content" => {
             let conv_id = args["conversation_id"].as_str().unwrap_or("").to_string();
-            get_conversation_content(db, &conv_id).await
+            let skip_count = args["skip_count"].as_i64().unwrap_or(0);
+            let char_limit = args["char_limit"].as_i64().unwrap_or(500);
+            get_conversation_content(db, &conv_id, skip_count, char_limit).await
         }
         "save_memory_facts" => {
             let conv_id = args["conversation_id"].as_str().unwrap_or("").to_string();
             let facts = args["facts"].as_array().cloned().unwrap_or_default();
-            save_memory_facts(db, vault_id, account_id, &conv_id, facts).await
+            save_memory_facts(client, db, vault_id, account_id, &conv_id, facts, embedding_url).await
         }
         "mark_conversation_processed" => {
             let conv_id = args["conversation_id"].as_str().unwrap_or("").to_string();
@@ -222,10 +228,7 @@ async fn dispatch_tool(
         }
         "condense_memory_facts" => {
             let category = args["category"].as_str().map(String::from);
-            condense_memory_facts(client, llm_url, db, vault_id, category).await
-        }
-        "distill_preferences" => {
-            distill_preferences(client, llm_url, db, vault_id, account_id).await
+            condense_memory_facts(client, llm_url, db, vault_id, account_id, category, embedding_url).await
         }
         _ => Err(format!("unknown tool: {}", name)),
     }
@@ -236,6 +239,7 @@ async fn dispatch_tool(
 async fn get_unprocessed_conversations(
     db: &SurrealDb,
     vault_id: &str,
+    account_id: &str,
     limit: i64,
 ) -> Result<Value, String> {
     #[derive(serde::Deserialize)]
@@ -244,14 +248,17 @@ async fn get_unprocessed_conversations(
         title: String,
         updated_at: i64,
         messages_json: Option<String>,
+        memory_processed_msg_count: Option<i64>,
     }
 
     let mut resp = db
-        .query("SELECT record::id(id) AS id, title, updated_at, messages_json \
+        .query("SELECT record::id(id) AS id, title, updated_at, messages_json, memory_processed_msg_count \
                 FROM conversations \
-                WHERE vault_id = $vid AND (memory_processed = NONE OR memory_processed = false) \
+                WHERE vault_id = $vid AND account_id = $aid \
+                AND (memory_processed_at IS NONE OR memory_processed_at < updated_at) \
                 ORDER BY updated_at DESC LIMIT $lim")
         .bind(("vid", vault_id.to_string()))
+        .bind(("aid", account_id.to_string()))
         .bind(("lim", limit))
         .await
         .map_err(|e| e.to_string())?;
@@ -264,6 +271,7 @@ async fn get_unprocessed_conversations(
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or(json!([]));
         let message_count = msgs.as_array().map(|a| a.len()).unwrap_or(0);
+        let processed_msg_count = r.memory_processed_msg_count.unwrap_or(0);
         let preview = msgs.as_array()
             .and_then(|a| a.iter().rev().find(|m| m["role"].as_str() == Some("user")))
             .and_then(|m| m["content"].as_str())
@@ -274,6 +282,8 @@ async fn get_unprocessed_conversations(
             "title": r.title,
             "updated_at": r.updated_at,
             "message_count": message_count,
+            "processed_msg_count": processed_msg_count,
+            "new_message_count": (message_count as i64 - processed_msg_count).max(0),
             "preview": preview,
         })
     }).collect();
@@ -284,6 +294,8 @@ async fn get_unprocessed_conversations(
 async fn get_conversation_content(
     db: &SurrealDb,
     conv_id: &str,
+    skip_count: i64,
+    char_limit: i64,
 ) -> Result<Value, String> {
     #[derive(serde::Deserialize)]
     struct Row { messages_json: Option<String> }
@@ -301,12 +313,14 @@ async fn get_conversation_content(
 
     let msgs: Value = serde_json::from_str(&messages_json).unwrap_or(json!([]));
     let arr = msgs.as_array().cloned().unwrap_or_default();
+    let skip = (skip_count as usize).min(arr.len());
 
-    let text = arr.iter()
+    let limit = (char_limit.max(100).min(8000)) as usize;
+    let text = arr[skip..].iter()
         .filter(|m| matches!(m["role"].as_str(), Some("user") | Some("assistant")))
         .map(|m| {
             let role = m["role"].as_str().unwrap_or("user");
-            let content: String = m["content"].as_str().unwrap_or("").chars().take(500).collect();
+            let content: String = m["content"].as_str().unwrap_or("").chars().take(limit).collect();
             format!("[{}]: {}", role, content)
         })
         .collect::<Vec<_>>()
@@ -316,15 +330,16 @@ async fn get_conversation_content(
 }
 
 async fn save_memory_facts(
+    client: &reqwest::Client,
     db: &SurrealDb,
     vault_id: &str,
     account_id: &str,
     conv_id: &str,
     facts: Vec<Value>,
+    embedding_url: &Option<String>,
 ) -> Result<Value, String> {
     let valid_cats = ["personal", "preference", "project", "rule", "general"];
     let now = chrono::Utc::now().timestamp();
-    let expires_at = now + 60 * 60 * 24 * 365;
     let mut count = 0u32;
 
     for fact in &facts {
@@ -337,10 +352,38 @@ async fn save_memory_facts(
             .unwrap_or("general")
             .to_string();
 
+        // expires_at: personal/rule → 365 days, others → 90 days
+        let days = if category == "personal" || category == "rule" { 365i64 } else { 90 };
+        let expires_at = now + days * 86400;
+
+        // Dedup: skip if a non-expired fact with same prefix (first 40 chars) already exists
+        let prefix: String = content.chars().take(40).collect::<String>().to_lowercase();
+        let mut check = db
+            .query("SELECT fact_id FROM memory_facts WHERE vault_id = $vid AND string::startsWith(string::lowercase(content), $prefix) AND expires_at > $now LIMIT 1")
+            .bind(("vid", vault_id.to_string()))
+            .bind(("prefix", prefix))
+            .bind(("now", now))
+            .await
+            .map_err(|e| e.to_string())?;
+        let existing: Vec<Value> = check.take(0).map_err(|e| e.to_string())?;
+        if !existing.is_empty() {
+            // Refresh expires_at
+            let fid = existing[0]["fact_id"].as_str().unwrap_or("").to_string();
+            let _ = db.query("UPDATE memory_facts SET expires_at = $exp WHERE fact_id = $fid")
+                .bind(("exp", expires_at))
+                .bind(("fid", fid))
+                .await;
+            continue;
+        }
+
+        // Compute embedding (stored as native array, not JSON string)
+        let embedding_vec: Option<Vec<f32>> =
+            crate::embedder::embed_text(client, embedding_url, &content).await;
+
         let fact_id = uuid::Uuid::new_v4().to_string();
         let _ = db
-            .query("INSERT INTO memory_facts (fact_id, vault_id, account_id, conv_id, content, category, expires_at, created_at) \
-                    VALUES ($fid, $vid, $aid, $cid, $content, $cat, $exp, $now)")
+            .query("INSERT INTO memory_facts (fact_id, vault_id, account_id, conv_id, content, category, expires_at, created_at, embedding) \
+                    VALUES ($fid, $vid, $aid, $cid, $content, $cat, $exp, $now, $emb)")
             .bind(("fid", fact_id))
             .bind(("vid", vault_id.to_string()))
             .bind(("aid", account_id.to_string()))
@@ -349,6 +392,7 @@ async fn save_memory_facts(
             .bind(("cat", category))
             .bind(("exp", expires_at))
             .bind(("now", now))
+            .bind(("emb", embedding_vec))
             .await;
         count += 1;
     }
@@ -360,11 +404,29 @@ async fn mark_conversation_processed(
     db: &SurrealDb,
     conv_id: &str,
 ) -> Result<Value, String> {
-    db.query("UPDATE conversations SET memory_processed = true WHERE record::id(id) = $cid")
+    // Read current message count so scheduler knows the watermark
+    #[derive(serde::Deserialize)]
+    struct Row { messages_json: Option<String> }
+    let msg_count = db
+        .query("SELECT messages_json FROM conversations WHERE record::id(id) = $cid LIMIT 1")
         .bind(("cid", conv_id.to_string()))
         .await
+        .ok()
+        .and_then(|mut r| r.take::<Vec<Row>>(0).ok())
+        .and_then(|rows| rows.into_iter().next())
+        .and_then(|r| r.messages_json)
+        .and_then(|s| serde_json::from_str::<Vec<Value>>(&s).ok())
+        .map(|arr| arr.len() as i64)
+        .unwrap_or(0);
+
+    let now = chrono::Utc::now().timestamp();
+    db.query("UPDATE conversations SET memory_processed_at = $now, memory_processed_msg_count = $count WHERE record::id(id) = $cid")
+        .bind(("cid", conv_id.to_string()))
+        .bind(("now", now))
+        .bind(("count", msg_count))
+        .await
         .map_err(|e| e.to_string())?;
-    Ok(json!({ "ok": true }))
+    Ok(json!({ "ok": true, "processed_msg_count": msg_count }))
 }
 
 async fn condense_memory_facts(
@@ -372,7 +434,9 @@ async fn condense_memory_facts(
     llm_url: &str,
     db: &SurrealDb,
     vault_id: &str,
+    account_id: &str,
     category: Option<String>,
+    embedding_url: &Option<String>,
 ) -> Result<Value, String> {
     const CONDENSE_THRESHOLD: usize = 8;
     let all_cats = ["personal", "preference", "project", "rule", "general"];
@@ -389,8 +453,9 @@ async fn condense_memory_facts(
         struct FactRow { fact_id: String, content: String }
 
         let Ok(mut resp) = db
-            .query("SELECT fact_id, content FROM memory_facts WHERE vault_id = $vid AND category = $cat AND expires_at > $now ORDER BY created_at DESC LIMIT 50")
+            .query("SELECT fact_id, content FROM memory_facts WHERE vault_id = $vid AND account_id = $aid AND category = $cat AND expires_at > $now ORDER BY created_at DESC LIMIT 50")
             .bind(("vid", vault_id.to_string()))
+            .bind(("aid", account_id.to_string()))
             .bind(("cat", cat.to_string()))
             .bind(("now", now))
             .await
@@ -424,103 +489,46 @@ async fn condense_memory_facts(
             _ => continue,
         };
 
-        for fid in &source_ids {
-            let _ = db.query("DELETE FROM memory_facts WHERE fact_id = $fid")
-                .bind(("fid", fid.clone())).await;
-        }
-        let expires_at = now + 60 * 60 * 24 * 365;
+        // Concurrent condensation guard: verify at least one source fact still exists
+        // before proceeding. If another agent already condensed this batch, skip.
+        let still_exists: Vec<Value> = db
+            .query("SELECT fact_id FROM memory_facts WHERE fact_id = $fid LIMIT 1")
+            .bind(("fid", source_ids[0].clone()))
+            .await
+            .ok()
+            .and_then(|mut r| r.take::<Vec<Value>>(0).ok())
+            .unwrap_or_default();
+        if still_exists.is_empty() { continue; }
+
+        // Insert-before-delete: new fact is persisted before sources are removed.
+        // If INSERT fails or embedder is down, sources are preserved (no data loss).
+        let expires_at = now + 365 * 86400;
         let new_fid = uuid::Uuid::new_v4().to_string();
-        let _ = db.query("INSERT INTO memory_facts (fact_id, vault_id, content, category, expires_at, created_at) VALUES ($fid, $vid, $content, $cat, $exp, $now)")
+        let embedding_vec: Option<Vec<f32>> =
+            crate::embedder::embed_text(client, embedding_url, &summary).await;
+        let insert_ok = db
+            .query("INSERT INTO memory_facts (fact_id, vault_id, account_id, content, category, expires_at, created_at, embedding) VALUES ($fid, $vid, $aid, $content, $cat, $exp, $now, $emb)")
             .bind(("fid", new_fid))
             .bind(("vid", vault_id.to_string()))
+            .bind(("aid", account_id.to_string()))
             .bind(("content", summary))
             .bind(("cat", cat.to_string()))
             .bind(("exp", expires_at))
             .bind(("now", now))
-            .await;
-        condensed += 1;
+            .bind(("emb", embedding_vec))
+            .await
+            .is_ok();
+
+        if insert_ok {
+            for fid in &source_ids {
+                let _ = db.query("DELETE FROM memory_facts WHERE fact_id = $fid")
+                    .bind(("fid", fid.clone())).await;
+            }
+            condensed += 1;
+        }
     }
 
     Ok(json!({ "categories_condensed": condensed }))
-}
-
-async fn distill_preferences(
-    client: &reqwest::Client,
-    llm_url: &str,
-    db: &SurrealDb,
-    vault_id: &str,
-    account_id: &str,
-) -> Result<Value, String> {
-    let now = chrono::Utc::now().timestamp();
-
-    #[derive(serde::Deserialize)]
-    struct FactRow { content: String, category: String }
-
-    let Ok(mut resp) = db
-        .query("SELECT content, category FROM memory_facts WHERE vault_id = $vid AND category IN ['personal','preference','rule'] AND expires_at > $now ORDER BY created_at DESC LIMIT 30")
-        .bind(("vid", vault_id.to_string()))
-        .bind(("now", now))
-        .await
-    else { return Err("DB query failed".to_string()) };
-
-    let facts: Vec<FactRow> = resp.take(0).unwrap_or_default();
-    if facts.is_empty() { return Ok(json!({ "ok": true, "skipped": "no facts" })) }
-
-    let combined = facts.iter()
-        .map(|f| format!("[{}] {}", f.category, f.content))
-        .collect::<Vec<_>>().join("\n");
-
-    let body = json!({
-        "messages": [
-            { "role": "system", "content": "你是使用者偏好分析系統。從以下記憶事實中，整理出使用者的偏好規則。\n\
-                輸出格式：條列式，每條以「- 」開頭，簡潔描述。不超過 15 條。只輸出列表，不要說明。" },
-            { "role": "user", "content": format!("記憶事實：\n{}", combined) }
-        ],
-        "stream": false, "temperature": 0.3, "max_tokens": 512,
-    });
-
-    let Ok(resp) = client.post(format!("{}/v1/chat/completions", llm_url))
-        .json(&body).send().await
-    else { return Err("LLM request failed".to_string()) };
-    let Ok(resp_json) = resp.json::<Value>().await
-    else { return Err("LLM response parse failed".to_string()) };
-
-    let prefs = match resp_json["choices"][0]["message"]["content"].as_str() {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => return Ok(json!({ "ok": true, "skipped": "empty LLM response" })),
-    };
-
-    let updated_time = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
-    let behavior = format!("更新時間：{}\n\n{}", updated_time, prefs);
-    let skill_id = "distilled_user_prefs".to_string();
-
-    let existing: Vec<Value> = db
-        .query("SELECT record::id(id) AS id FROM agent_skills WHERE account_id = $aid AND skill_id = $sid LIMIT 1")
-        .bind(("aid", account_id.to_string()))
-        .bind(("sid", skill_id.clone()))
-        .await.ok()
-        .and_then(|mut r| r.take::<Vec<Value>>(0).ok())
-        .unwrap_or_default();
-
-    if existing.is_empty() {
-        let _ = db.query("INSERT INTO agent_skills (account_id, skill_id, title, trigger, behavior, is_active, injection_mode, created_at, updated_at) VALUES ($aid, $sid, $title, $trigger, $behavior, true, 'system', $now, $now)")
-            .bind(("aid", account_id.to_string()))
-            .bind(("sid", skill_id.clone()))
-            .bind(("title", "使用者偏好（自動蒸餾）".to_string()))
-            .bind(("trigger", "__auto_injected__".to_string()))
-            .bind(("behavior", behavior.clone()))
-            .bind(("now", now))
-            .await;
-    } else {
-        let _ = db.query("UPDATE agent_skills SET behavior = $behavior, updated_at = $now WHERE account_id = $aid AND skill_id = $sid")
-            .bind(("behavior", behavior.clone()))
-            .bind(("now", now))
-            .bind(("aid", account_id.to_string()))
-            .bind(("sid", skill_id))
-            .await;
-    }
-
-    Ok(json!({ "ok": true }))
 }
 
 // ── Tools schema ──────────────────────────────────────────────────────────────
@@ -545,11 +553,13 @@ fn build_tools_schema(tool_names: &[String]) -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "get_conversation_content",
-                "description": "取得指定對話的完整訊息內容",
+                "description": "取得指定對話的訊息內容。使用 skip_count 跳過已處理過的舊訊息（從 get_unprocessed_conversations 取得 processed_msg_count 作為此值）。",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "conversation_id": { "type": "string", "description": "對話 ID" }
+                        "conversation_id": { "type": "string", "description": "對話 ID" },
+                        "skip_count": { "type": "number", "description": "跳過前 N 條訊息（已處理過的）。預設 0 表示讀取全部。" },
+                        "char_limit": { "type": "number", "description": "每條訊息最多擷取幾個字元。預設 500，若 context 允許可設定至 1500 以讀取更完整內容。範圍 100-8000。" }
                     },
                     "required": ["conversation_id"]
                 }
@@ -608,18 +618,6 @@ fn build_tools_schema(tool_names: &[String]) -> Vec<Value> {
                             "description": "要壓縮的類別（personal/preference/project/rule/general），省略則處理所有類別"
                         }
                     },
-                    "required": []
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "distill_preferences",
-                "description": "將 personal/preference/rule 類別的記憶事實蒸餾為使用者偏好規則，更新到 agent_skill（distilled_user_prefs）。建議在 condense_memory_facts 後呼叫。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
                     "required": []
                 }
             }

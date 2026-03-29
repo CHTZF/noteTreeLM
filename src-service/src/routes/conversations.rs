@@ -151,7 +151,7 @@ async fn create_conversation(
 
     state
         .db
-        .query("INSERT INTO conversations (id, account_id, vault_id, mode, title, messages_json, memory_processed, created_at, updated_at) VALUES ($id, $account_id, $vault_id, $mode, $title, '[]', false, $now, $now)")
+        .query("INSERT INTO conversations (id, account_id, vault_id, mode, title, messages_json, created_at, updated_at) VALUES ($id, $account_id, $vault_id, $mode, $title, '[]', $now, $now)")
         .bind(("id", id.clone()))
         .bind(("account_id", account_id))
         .bind(("vault_id", vault_id))
@@ -303,22 +303,22 @@ async fn save_messages(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Trigger memory agent if threshold reached
-    maybe_trigger_memory_agent(state, id, messages_json).await;
+    // Trigger memory agent check in background (non-blocking)
+    tokio::spawn(maybe_trigger_memory_agent(state, id, messages_json));
 
     Ok(Json(json!({ "ok": true })))
 }
 
 async fn maybe_trigger_memory_agent(state: ApiState, conv_id: String, messages_json: String) {
-    // Count user+assistant messages
-    let msg_count = serde_json::from_str::<Vec<Value>>(&messages_json)
+    // Parse messages, filter to user+assistant only
+    let msgs: Vec<Value> = serde_json::from_str::<Vec<Value>>(&messages_json)
         .ok()
-        .map(|arr| arr.iter().filter(|m| {
+        .map(|arr| arr.into_iter().filter(|m| {
             matches!(m["role"].as_str(), Some("user") | Some("assistant"))
-        }).count())
-        .unwrap_or(0);
+        }).collect())
+        .unwrap_or_default();
 
-    if msg_count == 0 { return }
+    if msgs.is_empty() { return }
 
     // Fetch conversation metadata (account_id, vault_id)
     #[derive(serde::Deserialize)]
@@ -340,8 +340,39 @@ async fn maybe_trigger_memory_agent(state: ApiState, conv_id: String, messages_j
     if !enabled { return }
     if threshold == 0 { return }
 
+    // Ensure a periodic memory_agent schedule exists for this vault+account.
+    // Handles the case where the vault was created before auto_memory was enabled.
+    crate::seeds::ensure_memory_schedule(&state.db, &vault_id, &account_id).await;
+
     // Trigger only at exact multiples of threshold
-    if msg_count % threshold as usize != 0 { return }
+    if msgs.len() % threshold as usize != 0 { return }
+
+    // Two-stage judgment:
+    // Stage 1 — keyword fast path: obvious personal-info signals → trigger immediately (no LLM call).
+    // Stage 2 — LLM judgment for ambiguous cases (multilingual / synonyms).
+    //            Short 5s timeout + fail-closed: if LLM is busy serving chat, skip this trigger
+    //            silently; the 8h scheduler will pick up unprocessed conversations later.
+    let positives_found = keyword_should_remember(&msgs);
+    if !positives_found {
+        let should_trigger = llm_should_remember(&state, &msgs).await;
+        if !should_trigger {
+            tracing::debug!("[memory] conv {} skipped: LLM judged no memory value", conv_id);
+            return;
+        }
+    }
+
+    // Fetch the watermark so the agent can skip already-processed messages
+    #[derive(serde::Deserialize)]
+    struct WatermarkRow { memory_processed_msg_count: Option<i64> }
+    let skip_count = state.db
+        .query("SELECT memory_processed_msg_count FROM conversations WHERE id = type::thing(\"conversations\", $id) LIMIT 1")
+        .bind(("id", conv_id.clone()))
+        .await
+        .ok()
+        .and_then(|mut r| r.take::<Vec<WatermarkRow>>(0).ok())
+        .and_then(|rows| rows.into_iter().next())
+        .and_then(|r| r.memory_processed_msg_count)
+        .unwrap_or(0);
 
     let task_id = uuid::Uuid::new_v4().to_string();
     tokio::spawn(crate::service_agent::execute_scheduled_task(
@@ -350,9 +381,90 @@ async fn maybe_trigger_memory_agent(state: ApiState, conv_id: String, messages_j
         vault_id,
         account_id,
         Some("memory_agent".to_string()),
-        Some(format!("conv_id:{}", conv_id)),
+        Some(format!("conv_id:{} skip_count:{}", conv_id, skip_count)),
         "auto memory".to_string(),
     ));
+}
+
+/// LLM-based judgment for ambiguous cases not caught by keyword heuristic.
+/// Uses a 5s timeout and is fail-closed: if the LLM server is busy (serving chat),
+/// returns false and lets the 8h scheduler handle the conversation later.
+async fn llm_should_remember(state: &ApiState, msgs: &[Value]) -> bool {
+    let llm_url = match state.daemon.llm_url.read().await.clone() {
+        Some(u) => u,
+        None => return false, // fail-closed: no server, skip
+    };
+
+    let excerpt = msgs.iter().rev().take(6).collect::<Vec<_>>().into_iter().rev()
+        .map(|m| {
+            let role = m["role"].as_str().unwrap_or("user");
+            let content: String = m["content"].as_str().unwrap_or("").chars().take(120).collect();
+            format!("[{}]: {}", role, content)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let body = serde_json::json!({
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是記憶價值評估器。判斷以下對話片段是否包含值得長期記憶的資訊（例如：使用者偏好、個人背景、重要決策、習慣規則）。一般問答、搜尋、閒聊不具記憶價值。只回答 yes 或 no，不要解釋。"
+            },
+            { "role": "user", "content": excerpt }
+        ],
+        "stream": false,
+        "temperature": 0.0,
+        "max_tokens": 5,
+    });
+
+    // Short timeout: if LLM is busy serving chat requests, give up rather than queue behind them.
+    // fail-closed → return false; the 8h scheduler will catch this conversation later.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    let Ok(resp) = client
+        .post(format!("{}/v1/chat/completions", llm_url))
+        .json(&body)
+        .send()
+        .await
+    else { return false }; // fail-closed: timeout or connection error → skip
+
+    let Ok(json) = resp.json::<Value>().await else { return false };
+
+    let answer = json["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_lowercase();
+
+    answer.contains("yes")
+}
+
+/// Fast keyword heuristic to decide if a conversation is worth remembering.
+/// Returns `true` if user messages contain clear personal-info signals.
+/// Runs in microseconds, no LLM call needed.
+fn keyword_should_remember(msgs: &[Value]) -> bool {
+    // Personal-info / preference signals (zh + en)
+    const POSITIVE: &[&str] = &[
+        // Chinese
+        "我喜歡", "我偏好", "我習慣", "我是", "我有", "我想要", "我覺得",
+        "我不喜歡", "我討厭", "我都", "每次", "一直", "請記住", "記住",
+        "偏好", "規則", "習慣", "我的", "我用", "我在", "我需要",
+        "決定", "決策", "選擇", "我選", "以後", "下次", "記得",
+        // English
+        "i like", "i prefer", "i always", "i usually", "i am", "i have",
+        "i hate", "i love", "i need", "i want", "i think", "remember",
+        "my preference", "my rule", "i decided", "i chose",
+    ];
+
+    // Check only user messages from the last 10 turns
+    msgs.iter().rev().take(10)
+        .filter(|m| m["role"].as_str() == Some("user"))
+        .any(|m| {
+            let content = m["content"].as_str().unwrap_or("").to_lowercase();
+            POSITIVE.iter().any(|kw| content.contains(kw))
+        })
 }
 
 async fn get_user_memory_settings(db: &crate::db::SurrealDb, account_id: &str) -> (bool, u32) {
@@ -383,7 +495,7 @@ async fn mark_processed(
     let now = Utc::now().timestamp();
     state
         .db
-        .query("UPDATE conversations SET memory_processed = true, updated_at = $now WHERE id = type::thing(\"conversations\", $id)")
+        .query("UPDATE conversations SET memory_processed_at = $now, updated_at = $now WHERE id = type::thing(\"conversations\", $id)")
         .bind(("now", now))
         .bind(("id", id))
         .await
@@ -504,7 +616,7 @@ async fn get_or_create_live_chat(
     let now = Utc::now().timestamp();
     state
         .db
-        .query("INSERT INTO conversations (id, account_id, vault_id, mode, title, messages_json, memory_processed, created_at, updated_at) VALUES ($id, $account_id, $vault_id, 'live_chat', 'Live Chat', '[]', false, $now, $now)")
+        .query("INSERT INTO conversations (id, account_id, vault_id, mode, title, messages_json, created_at, updated_at) VALUES ($id, $account_id, $vault_id, 'live_chat', 'Live Chat', '[]', $now, $now)")
         .bind(("id", id.clone()))
         .bind(("account_id", account_id))
         .bind(("vault_id", vault_id))

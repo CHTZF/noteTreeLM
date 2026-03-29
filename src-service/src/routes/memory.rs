@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -281,91 +281,158 @@ async fn create_rating(
 
 #[derive(Deserialize)]
 struct MemoryQueryParams {
+    /// Keyword filter (comma-separated)
     keywords: Option<String>,
+    /// Category filter (comma-separated)
     category: Option<String>,
+    /// Max results
     limit: Option<i64>,
+    /// Semantic text query — when provided, computes embedding and ranks by cosine similarity.
+    /// Takes priority over keyword search.
+    q: Option<String>,
 }
 
 async fn query_memory(
     State(state): State<ApiState>,
     Path(vault_id): Path<String>,
+    headers: HeaderMap,
     Query(params): Query<MemoryQueryParams>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(10).min(50);
     let now_ts = Utc::now().timestamp();
 
-    let keywords: Vec<String> = params.keywords
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect())
-        .unwrap_or_default();
+    // Resolve account_id from Bearer token (empty = anonymous, no account filter)
+    let account_id = crate::routes::auth::account_id_from_token(&state.db, &headers).await;
+    let has_account = !account_id.is_empty();
 
-    let categories: Vec<String> = params.category
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect())
-        .unwrap_or_default();
+    let rows: Vec<Value> = if let Some(q_text) = params.q.as_deref().filter(|s| !s.is_empty()) {
+        // ── Semantic search: compute query embedding, rank by cosine similarity ──
+        let embedding_url = state.daemon.embedding_url.read().await.clone();
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
 
-    let rows: Vec<Value> = if keywords.is_empty() && categories.is_empty() {
-        let mut resp = state.db
-            .query("SELECT fact_id, content, category, created_at, embedding FROM memory_facts WHERE vault_id = $vid AND expires_at > $now ORDER BY created_at DESC LIMIT $limit")
-            .bind(("vid", vault_id))
-            .bind(("now", now_ts))
-            .bind(("limit", limit))
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        resp.take(0).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    } else if !keywords.is_empty() && categories.is_empty() {
-        let kw = keywords[0].to_lowercase();
-        let mut resp = state.db
-            .query("SELECT fact_id, content, category, created_at, embedding FROM memory_facts WHERE vault_id = $vid AND expires_at > $now AND string::contains(string::lowercase(content), $kw) ORDER BY created_at DESC LIMIT $limit")
-            .bind(("vid", vault_id))
-            .bind(("now", now_ts))
-            .bind(("kw", kw))
-            .bind(("limit", limit))
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        resp.take(0).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    } else if keywords.is_empty() && !categories.is_empty() {
-        // category filter only — SurrealDB doesn't support IN with bind arrays cleanly, use OR
-        let cat_cond = categories.iter().enumerate()
-            .map(|(i, _)| format!("category = $cat{}", i))
-            .collect::<Vec<_>>().join(" OR ");
-        let mut qb = state.db
-            .query(format!("SELECT fact_id, content, category, created_at, embedding FROM memory_facts WHERE vault_id = $vid AND expires_at > $now AND ({}) ORDER BY created_at DESC LIMIT $limit", cat_cond))
-            .bind(("vid", vault_id))
-            .bind(("now", now_ts))
-            .bind(("limit", limit));
-        for (i, cat) in categories.iter().enumerate() {
-            qb = qb.bind((format!("cat{}", i), cat.clone()));
+        let query_vec = crate::embedder::embed_text(&http_client, &embedding_url, q_text).await;
+
+        if let Some(qvec) = query_vec {
+            // Use SurrealDB vector::similarity::cosine for ranking.
+            // Only facts with array embeddings participate; NULL embeddings get score NULL
+            // and will be excluded by the ORDER BY (SurrealDB sorts NULLs last in DESC).
+            let sql = if has_account {
+                "SELECT fact_id, content, category, created_at, \
+                 vector::similarity::cosine(embedding, $qvec) AS score \
+                 FROM memory_facts \
+                 WHERE vault_id = $vid AND account_id = $aid AND expires_at > $now \
+                 AND embedding IS NOT NONE \
+                 ORDER BY score DESC LIMIT $limit"
+            } else {
+                "SELECT fact_id, content, category, created_at, \
+                 vector::similarity::cosine(embedding, $qvec) AS score \
+                 FROM memory_facts \
+                 WHERE vault_id = $vid AND expires_at > $now \
+                 AND embedding IS NOT NONE \
+                 ORDER BY score DESC LIMIT $limit"
+            };
+            let mut qb = state.db.query(sql)
+                .bind(("vid", vault_id.clone()))
+                .bind(("now", now_ts))
+                .bind(("limit", limit))
+                .bind(("qvec", qvec));
+            if has_account { qb = qb.bind(("aid", account_id.clone())); }
+            let mut resp = qb.await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            resp.take(0).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        } else {
+            // Embedder unavailable — fall back to keyword search using q_text
+            let kw = q_text.to_lowercase();
+            let sql = if has_account {
+                "SELECT fact_id, content, category, created_at FROM memory_facts \
+                 WHERE vault_id = $vid AND account_id = $aid AND expires_at > $now \
+                 AND string::contains(string::lowercase(content), $kw) \
+                 ORDER BY created_at DESC LIMIT $limit"
+            } else {
+                "SELECT fact_id, content, category, created_at FROM memory_facts \
+                 WHERE vault_id = $vid AND expires_at > $now \
+                 AND string::contains(string::lowercase(content), $kw) \
+                 ORDER BY created_at DESC LIMIT $limit"
+            };
+            let mut qb = state.db.query(sql)
+                .bind(("vid", vault_id.clone()))
+                .bind(("now", now_ts))
+                .bind(("kw", kw))
+                .bind(("limit", limit));
+            if has_account { qb = qb.bind(("aid", account_id.clone())); }
+            let mut resp = qb.await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            resp.take(0).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         }
-        let mut resp = qb.await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        resp.take(0).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     } else {
-        let kw = keywords[0].to_lowercase();
-        let cat_cond = categories.iter().enumerate()
-            .map(|(i, _)| format!("category = $cat{}", i))
-            .collect::<Vec<_>>().join(" OR ");
-        let mut qb = state.db
-            .query(format!("SELECT fact_id, content, category, created_at, embedding FROM memory_facts WHERE vault_id = $vid AND expires_at > $now AND string::contains(string::lowercase(content), $kw) AND ({}) ORDER BY created_at DESC LIMIT $limit", cat_cond))
-            .bind(("vid", vault_id))
-            .bind(("now", now_ts))
-            .bind(("kw", kw))
-            .bind(("limit", limit));
-        for (i, cat) in categories.iter().enumerate() {
-            qb = qb.bind((format!("cat{}", i), cat.clone()));
-        }
+        // ── Keyword / category filter search ──
+        let keywords: Vec<String> = params.keywords
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect())
+            .unwrap_or_default();
+        let categories: Vec<String> = params.category
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect())
+            .unwrap_or_default();
+
+        let aid_clause = if has_account { " AND account_id = $aid" } else { "" };
+
+        let mut qb = if keywords.is_empty() && categories.is_empty() {
+            state.db.query(format!(
+                "SELECT fact_id, content, category, created_at FROM memory_facts \
+                 WHERE vault_id = $vid{} AND expires_at > $now \
+                 ORDER BY created_at DESC LIMIT $limit", aid_clause))
+                .bind(("vid", vault_id.clone())).bind(("now", now_ts)).bind(("limit", limit))
+        } else if !keywords.is_empty() && categories.is_empty() {
+            state.db.query(format!(
+                "SELECT fact_id, content, category, created_at FROM memory_facts \
+                 WHERE vault_id = $vid{} AND expires_at > $now \
+                 AND string::contains(string::lowercase(content), $kw) \
+                 ORDER BY created_at DESC LIMIT $limit", aid_clause))
+                .bind(("vid", vault_id.clone())).bind(("now", now_ts))
+                .bind(("kw", keywords[0].to_lowercase())).bind(("limit", limit))
+        } else if keywords.is_empty() {
+            let cat_cond = categories.iter().enumerate()
+                .map(|(i, _)| format!("category = $cat{}", i)).collect::<Vec<_>>().join(" OR ");
+            let mut q = state.db.query(format!(
+                "SELECT fact_id, content, category, created_at FROM memory_facts \
+                 WHERE vault_id = $vid{} AND expires_at > $now AND ({}) \
+                 ORDER BY created_at DESC LIMIT $limit", aid_clause, cat_cond))
+                .bind(("vid", vault_id.clone())).bind(("now", now_ts)).bind(("limit", limit));
+            for (i, cat) in categories.iter().enumerate() { q = q.bind((format!("cat{}", i), cat.clone())); }
+            q
+        } else {
+            let cat_cond = categories.iter().enumerate()
+                .map(|(i, _)| format!("category = $cat{}", i)).collect::<Vec<_>>().join(" OR ");
+            let mut q = state.db.query(format!(
+                "SELECT fact_id, content, category, created_at FROM memory_facts \
+                 WHERE vault_id = $vid{} AND expires_at > $now \
+                 AND string::contains(string::lowercase(content), $kw) AND ({}) \
+                 ORDER BY created_at DESC LIMIT $limit", aid_clause, cat_cond))
+                .bind(("vid", vault_id.clone())).bind(("now", now_ts))
+                .bind(("kw", keywords[0].to_lowercase())).bind(("limit", limit));
+            for (i, cat) in categories.iter().enumerate() { q = q.bind((format!("cat{}", i), cat.clone())); }
+            q
+        };
+        if has_account { qb = qb.bind(("aid", account_id.clone())); }
         let mut resp = qb.await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         resp.take(0).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
 
-    // Increment inject_count for each returned fact (best-effort, non-blocking)
+    // Increment inject_count for each returned fact — spawn so it doesn't block response
     for row in &rows {
         if let Some(fid) = row["fact_id"].as_str() {
-            let _ = state.db
-                .query("UPDATE memory_facts SET inject_count = (inject_count ?? 0) + 1 WHERE fact_id = $fid")
-                .bind(("fid", fid.to_string()))
-                .await;
+            let db = state.db.clone();
+            let fid = fid.to_string();
+            tokio::spawn(async move {
+                let _ = db
+                    .query("UPDATE memory_facts SET inject_count = (inject_count ?? 0) + 1 WHERE fact_id = $fid")
+                    .bind(("fid", fid))
+                    .await;
+            });
         }
     }
 
@@ -379,8 +446,10 @@ struct FactInput {
     content: String,
     category: Option<String>,
     conv_id: Option<String>,
-    /// JSON-serialized Vec<f32> embedding (optional)
-    embedding: Option<String>,
+    /// Caller-supplied account_id (optional; falls back to Bearer token lookup)
+    account_id: Option<String>,
+    /// Pre-computed embedding as float array (optional; server computes if absent)
+    embedding: Option<Vec<f32>>,
 }
 
 #[derive(Deserialize)]
@@ -392,8 +461,36 @@ struct StoreFactsBody {
 async fn store_facts(
     State(state): State<ApiState>,
     Path(vault_id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<StoreFactsBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    // Resolve account_id from Bearer token (best-effort; empty string if anonymous)
+    let bearer_account_id: String = {
+        use crate::routes::auth::extract_bearer;
+        #[derive(serde::Deserialize)]
+        struct Row { username: String }
+        if let Some(token) = extract_bearer(&headers) {
+            let now = Utc::now().timestamp();
+            state.db
+                .query("SELECT username FROM sessions WHERE token = $t AND expires_at > $now LIMIT 1")
+                .bind(("t", token))
+                .bind(("now", now))
+                .await
+                .ok()
+                .and_then(|mut r| r.take::<Vec<Row>>(0).ok())
+                .and_then(|rows| rows.into_iter().next())
+                .map(|r| r.username)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        }
+    };
+
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+    let embedding_url = state.daemon.embedding_url.read().await.clone();
     let now_ts = Utc::now().timestamp();
     let mut inserted = 0u32;
     let note_refs = body.note_refs.unwrap_or_default();
@@ -432,17 +529,30 @@ async fn store_facts(
             continue;
         }
 
+        // Compute embedding server-side if caller didn't supply one (stored as native array)
+        let embedding_vec: Option<Vec<f32>> = if fact.embedding.is_some() {
+            fact.embedding
+        } else {
+            crate::embedder::embed_text(&http_client, &embedding_url, &content).await
+        };
+
+        // Resolve account_id: prefer per-fact field, fall back to Bearer token, then empty
+        let fact_account_id = fact.account_id
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| bearer_account_id.clone());
+
         let fact_id = Uuid::new_v4().to_string();
         state.db
-            .query("INSERT INTO memory_facts (fact_id, vault_id, conv_id, content, category, expires_at, created_at, embedding) VALUES ($fid, $vid, $cid, $content, $cat, $exp, $now, $emb)")
+            .query("INSERT INTO memory_facts (fact_id, vault_id, account_id, conv_id, content, category, expires_at, created_at, embedding) VALUES ($fid, $vid, $aid, $cid, $content, $cat, $exp, $now, $emb)")
             .bind(("fid", fact_id.clone()))
             .bind(("vid", vault_id.clone()))
+            .bind(("aid", fact_account_id))
             .bind(("cid", fact.conv_id.unwrap_or_default()))
             .bind(("content", content.clone()))
             .bind(("cat", category.clone()))
             .bind(("exp", expires_at))
             .bind(("now", now_ts))
-            .bind(("emb", fact.embedding))
+            .bind(("emb", embedding_vec))
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -502,12 +612,14 @@ struct DistillFactsBody {
 async fn distill_facts(
     State(state): State<ApiState>,
     Path(vault_id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<DistillFactsBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     if body.source_ids.is_empty() || body.summary.trim().is_empty() {
         return Ok(Json(json!({ "ok": false, "reason": "empty input" })));
     }
 
+    let account_id = crate::routes::auth::account_id_from_token(&state.db, &headers).await;
     let now_ts = Utc::now().timestamp();
     // personal/rule summaries last 365 days, others 180 days (longer than raw facts)
     let days = if body.category == "personal" || body.category == "rule" { 365i64 } else { 180 };
@@ -522,17 +634,29 @@ async fn distill_facts(
             .await;
     }
 
-    // Insert summary fact
+    // Compute embedding for the summary so it's discoverable by semantic search
+    let embedding_url = state.daemon.embedding_url.read().await.clone();
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+    let summary = body.summary.trim().to_string();
+    let embedding: Option<Vec<f32>> =
+        crate::embedder::embed_text(&http_client, &embedding_url, &summary).await;
+
+    // Insert summary fact with embedding and account_id
     let fact_id = uuid::Uuid::new_v4().to_string();
     state.db
-        .query("INSERT INTO memory_facts (fact_id, vault_id, conv_id, content, category, expires_at, created_at) VALUES ($fid, $vid, $cid, $content, $cat, $exp, $now)")
+        .query("INSERT INTO memory_facts (fact_id, vault_id, account_id, conv_id, content, category, expires_at, created_at, embedding) VALUES ($fid, $vid, $aid, $cid, $content, $cat, $exp, $now, $emb)")
         .bind(("fid", fact_id.clone()))
         .bind(("vid", vault_id))
+        .bind(("aid", account_id))
         .bind(("cid", Option::<String>::None))
-        .bind(("content", body.summary.trim().to_string()))
+        .bind(("content", summary))
         .bind(("cat", body.category))
         .bind(("exp", expires_at))
         .bind(("now", now_ts))
+        .bind(("emb", embedding))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -544,10 +668,13 @@ async fn distill_facts(
 async fn memory_graph(
     State(state): State<ApiState>,
     Path(vault_id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let now_ts = Utc::now().timestamp();
+    let account_id = crate::routes::auth::account_id_from_token(&state.db, &headers).await;
+    let has_account = !account_id.is_empty();
 
-    // All non-expired memory facts
+    // All non-expired memory facts (account-scoped)
     #[derive(serde::Deserialize)]
     struct FactRow {
         fact_id: String,
@@ -558,9 +685,15 @@ async fn memory_graph(
         #[allow(dead_code)]
         created_at: Option<i64>,
     }
+    let facts_sql = if has_account {
+        "SELECT fact_id, content, category, expires_at, inject_count, created_at FROM memory_facts WHERE vault_id = $vid AND account_id = $aid AND expires_at > $now ORDER BY created_at DESC"
+    } else {
+        "SELECT fact_id, content, category, expires_at, inject_count, created_at FROM memory_facts WHERE vault_id = $vid AND expires_at > $now ORDER BY created_at DESC"
+    };
     let mut resp = state.db
-        .query("SELECT fact_id, content, category, expires_at, inject_count, created_at FROM memory_facts WHERE vault_id = $vid AND expires_at > $now ORDER BY created_at DESC")
+        .query(facts_sql)
         .bind(("vid", vault_id.clone()))
+        .bind(("aid", account_id))
         .bind(("now", now_ts))
         .await
         .map_err(|e| { tracing::error!("memory_graph facts query failed vault={}: {}", vault_id, e); (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()) })?;
