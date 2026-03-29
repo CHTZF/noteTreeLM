@@ -656,6 +656,222 @@ async fn load_agent_def(
     rows.into_iter().next()
 }
 
+// ── Live Chat agent (3-round fixed flow, no write confirm) ───────────────────
+
+/// Entry point for invoke_live_chat.
+///
+/// 3-round fixed flow:
+///   Round 0: think + search_skills → get skill tool names
+///   Round 1: think + skill tools   → execute tools, gather data
+///   Round 2: live_respond only     → output final oral answer
+///
+/// Emits:
+///   llm:token        → streaming tokens (rounds 0-1)
+///   live_chat:action → {speech, action, content?, error?}  (terminal event)
+/// Returns the final speech string (empty if cancelled or error).
+pub async fn run_live_chat_agent(
+    state: ApiState,
+    session_id: String,
+    messages: Vec<Value>,      // already assembled (system + history + user)
+    vault_id: String,
+    account_id: String,
+    vault_path: String,
+    conversation_id: String,
+) -> String {
+    // Register cancel flag
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut sessions = state.daemon.agent_sessions.lock().await;
+        sessions.insert(session_id.clone(), AgentSession {
+            cancel: Arc::clone(&cancel),
+            confirm_tx: None,
+        });
+    }
+
+    let llm_url = match state.daemon.llm_url.read().await.clone() {
+        Some(u) => u,
+        None => {
+            state.daemon.emit("live_chat:action", json!({
+                "speech": "抱歉，語言模型尚未就緒。", "action": "show_error",
+            }));
+            cleanup_session(&state, &session_id).await;
+            return String::new();
+        }
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .unwrap_or_default();
+    let embedding_url = state.daemon.embedding_url.read().await.clone();
+
+    let mut msgs = messages.clone();
+    let mut final_speech = String::new();
+    let mut live_action: Option<Value> = None;
+    let mut skill_tool_names: Vec<String> = Vec::new();
+
+    // Emit helper for error action
+    let emit_error = |state: &ApiState, speech: &str, detail: String| {
+        state.daemon.emit("live_chat:action", json!({
+            "speech": speech,
+            "action": "show_error",
+            "error": detail,
+        }));
+    };
+
+    'tool_loop: for round in 0..3usize {
+        if cancel.load(Ordering::Relaxed) { break; }
+
+        if round == 1 && skill_tool_names.is_empty() {
+            // search_skills returned nothing → skip to live_respond
+            continue;
+        }
+
+        // Build tool names for this round
+        let round_tool_names: Vec<String> = match round {
+            0 => vec!["think".to_string(), "search_skills".to_string()],
+            1 => {
+                let mut n = vec!["think".to_string()];
+                n.extend(skill_tool_names.iter().cloned());
+                n
+            }
+            _ => vec!["live_respond".to_string()],
+        };
+
+        let tools_schema = build_tools_schema_interactive(&round_tool_names);
+        let body = if tools_schema.is_empty() {
+            json!({ "messages": msgs, "stream": true, "temperature": 0.7, "max_tokens": 512 })
+        } else {
+            json!({
+                "messages": msgs,
+                "tools": tools_schema,
+                "tool_choice": "required",
+                "stream": true,
+                "temperature": 0.7,
+                "max_tokens": 512,
+            })
+        };
+
+        let (text, finish_reason, tool_chunks) = match stream_llm_round(
+            &client, &llm_url, body, &state, &session_id, &cancel,
+        ).await {
+            Ok(r) => r,
+            Err(e) => {
+                emit_error(&state, "抱歉，語言模型回應失敗，請稍後再試。", format!("LLM error: {e}"));
+                cleanup_session(&state, &session_id).await;
+                return String::new();
+            }
+        };
+
+        // Round 2: expect live_respond tool call or fallback to plain text
+        if round == 2 {
+            if let Some(tc) = tool_chunks.iter().find(|(_, n, _)| n == "live_respond") {
+                let args: Value = serde_json::from_str(&tc.2).unwrap_or(json!({}));
+                final_speech = args["speech"].as_str().unwrap_or("").to_string();
+                live_action = Some(args);
+            } else if !text.is_empty() {
+                final_speech = text.clone();
+                live_action = Some(json!({ "speech": final_speech, "action": "none" }));
+            }
+            break 'tool_loop;
+        }
+
+        if tool_chunks.is_empty() { continue; }
+
+        // Build assistant message with tool_calls
+        let tc_json: Vec<Value> = tool_chunks.iter().map(|tc| json!({
+            "id": tc.0, "type": "function",
+            "function": { "name": tc.1, "arguments": tc.2 },
+        })).collect();
+        msgs.push(json!({ "role": "assistant", "content": Value::Null, "tool_calls": tc_json }));
+        let _ = (text, finish_reason); // suppress unused warnings
+
+        // Execute each tool call
+        for (tc_id, tc_name, tc_args_str) in &tool_chunks {
+            let args: Value = serde_json::from_str(tc_args_str).unwrap_or(json!({}));
+
+            // plan_announce / think: auto-confirm without execution
+            if matches!(tc_name.as_str(), "plan_announce" | "think") {
+                msgs.push(json!({
+                    "role": "tool", "tool_call_id": tc_id,
+                    "content": "✅ 已自動確認，繼續執行",
+                }));
+                continue;
+            }
+
+            state.daemon.emit("live_chat:tool_call", json!({
+                "session_id": session_id,
+                "display": tc_name,
+            }));
+
+            let result = dispatch_interactive_tool(
+                &client, &llm_url, &state.db,
+                &vault_id, &account_id, &vault_path, &embedding_url,
+                tc_name, &args,
+            ).await;
+
+            let result_str = match result {
+                Ok(ref v) => {
+                    // Round 0: search_skills → extract skill tool names
+                    if tc_name == "search_skills" {
+                        if let Ok(parsed) = serde_json::from_str::<Value>(&serde_json::to_string(v).unwrap_or_default()) {
+                            if let Some(arr) = parsed["required_tools"].as_array() {
+                                skill_tool_names = arr.iter()
+                                    .filter_map(|x| x.as_str().map(String::from))
+                                    .collect();
+                            }
+                            parsed["behavior"].as_str().map(String::from)
+                                .unwrap_or_else(|| serde_json::to_string(v).unwrap_or_default())
+                        } else {
+                            serde_json::to_string(v).unwrap_or_default()
+                        }
+                    } else {
+                        // Truncate large results
+                        let s = serde_json::to_string(v).unwrap_or_default();
+                        if s.chars().count() > 2000 {
+                            format!("{}…（已截斷）", s.chars().take(2000).collect::<String>())
+                        } else {
+                            s
+                        }
+                    }
+                }
+                Err(ref e) => format!("ERROR: {}", e),
+            };
+
+            msgs.push(json!({
+                "role": "tool", "tool_call_id": tc_id,
+                "content": result_str,
+            }));
+        }
+    }
+
+    // Save conversation to DB
+    let mut to_save: Vec<Value> = messages.iter()
+        .filter(|m| m["role"].as_str() != Some("system"))
+        .cloned()
+        .collect();
+    if !final_speech.is_empty() {
+        to_save.push(json!({ "role": "assistant", "content": final_speech }));
+    }
+    let now = chrono::Utc::now().timestamp();
+    let _ = state.db
+        .query("UPDATE conversations SET messages_json = $msgs, updated_at = $now WHERE record::id(id) = $cid")
+        .bind(("msgs", serde_json::to_string(&to_save).unwrap_or_else(|_| "[]".to_string())))
+        .bind(("now", now))
+        .bind(("cid", conversation_id.clone()))
+        .await;
+
+    // Emit live_chat:action or fallback
+    if let Some(action_args) = live_action {
+        state.daemon.emit("live_chat:action", action_args);
+    } else if !cancel.load(Ordering::Relaxed) {
+        emit_error(&state, "抱歉，我沒有得到有效的回覆，請再試一次。", "未能取得有效回應".to_string());
+    }
+
+    cleanup_session(&state, &session_id).await;
+    final_speech
+}
+
 // ── Interactive agent (streaming, write-confirm, SSE) ─────────────────────────
 
 /// Public entry point called from routes/agents.rs for user-facing agent runs.
@@ -675,6 +891,8 @@ pub async fn run_interactive_agent(
     vault_id: String,
     account_id: String,
     vault_path: String,
+    // If Some, save final conversation to DB and set title when done.
+    conversation_id: Option<String>,
 ) {
     // 1. Register cancel flag in session map
     let cancel = Arc::new(AtomicBool::new(false));
@@ -819,12 +1037,72 @@ pub async fn run_interactive_agent(
     }
 
     state.daemon.emit("llm:done", json!(full_response));
+
+    // Persist conversation to DB if conversation_id provided
+    if let Some(ref conv_id) = conversation_id {
+        // Filter system messages, append final assistant reply
+        let mut to_save: Vec<Value> = msgs.iter()
+            .filter(|m| m["role"].as_str() != Some("system"))
+            .cloned()
+            .collect();
+        if !full_response.is_empty() {
+            to_save.push(json!({ "role": "assistant", "content": full_response }));
+        }
+        let now = chrono::Utc::now().timestamp();
+        let _ = state.db
+            .query("UPDATE conversations SET messages_json = $msgs, updated_at = $now WHERE record::id(id) = $cid")
+            .bind(("msgs", serde_json::to_string(&to_save).unwrap_or_else(|_| "[]".to_string())))
+            .bind(("now", now))
+            .bind(("cid", conv_id.clone()))
+            .await;
+        // Set title from first user message if not yet set
+        maybe_set_conv_title(&state.db, conv_id, &to_save).await;
+    }
+
     cleanup_session(&state, &session_id).await;
 }
 
 async fn cleanup_session(state: &ApiState, session_id: &str) {
     let mut sessions = state.daemon.agent_sessions.lock().await;
     sessions.remove(session_id);
+}
+
+/// Set conversation title from first user message if title is still empty / default.
+async fn maybe_set_conv_title(db: &SurrealDb, conv_id: &str, messages: &[Value]) {
+    #[derive(serde::Deserialize)]
+    struct Row { title: String }
+    let current_title = db
+        .query("SELECT title FROM conversations WHERE record::id(id) = $cid LIMIT 1")
+        .bind(("cid", conv_id.to_string()))
+        .await
+        .ok()
+        .and_then(|mut r| r.take::<Vec<Row>>(0).ok())
+        .and_then(|rows| rows.into_iter().next())
+        .map(|r| r.title)
+        .unwrap_or_default();
+
+    // Only auto-title if still empty or placeholder
+    if !current_title.is_empty() && current_title != "New Conversation" && current_title != "新對話" {
+        return;
+    }
+
+    let auto_title = messages.iter()
+        .find(|m| m["role"].as_str() == Some("user"))
+        .and_then(|m| m["content"].as_str())
+        .map(|c| {
+            let chars: String = c.chars().take(20).collect();
+            if c.chars().count() > 20 { format!("{}…", chars) } else { chars }
+        });
+
+    if let Some(title) = auto_title {
+        let now = chrono::Utc::now().timestamp();
+        let _ = db
+            .query("UPDATE conversations SET title = $title, updated_at = $now WHERE record::id(id) = $cid")
+            .bind(("title", title))
+            .bind(("now", now))
+            .bind(("cid", conv_id.to_string()))
+            .await;
+    }
 }
 
 /// Stream one LLM round, emitting llm:token events. Returns (text, finish_reason, tool_chunks).

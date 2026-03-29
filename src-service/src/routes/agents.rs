@@ -30,6 +30,7 @@ pub fn router() -> Router<ApiState> {
         .route("/vaults/:vid/agent/run", post(agent_run))
         .route("/vaults/:vid/agent/cancel", post(agent_cancel))
         .route("/vaults/:vid/agent/confirm", post(agent_confirm))
+        .route("/vaults/:vid/agent/live_chat", post(agent_live_chat))
 }
 
 /// Resolve account_id from Bearer token (username from sessions table).
@@ -558,6 +559,7 @@ async fn agent_run(
         .map(|a| a.iter().filter_map(|v| v.as_str()).map(String::from).collect())
         .unwrap_or_default();
     let vault_path = body["vault_path"].as_str().unwrap_or("").to_string();
+    let conversation_id = body["conversation_id"].as_str().map(String::from);
 
     tokio::spawn(crate::service_agent::run_interactive_agent(
         state,
@@ -567,6 +569,7 @@ async fn agent_run(
         vault_id,
         account_id,
         vault_path,
+        conversation_id,
     ));
 
     Ok(Json(json!({ "session_id": session_id })))
@@ -586,6 +589,42 @@ async fn agent_cancel(
         sess.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+/// POST /vaults/:vid/agent/live_chat
+/// Body: { session_id, messages, vault_path, conversation_id }
+/// Spawns run_live_chat_agent in background; immediately returns { session_id }.
+async fn agent_live_chat(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let account_id = account_id_from_headers(&state, &headers).await?;
+    let session_id = body["session_id"]
+        .as_str()
+        .map(String::from)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let messages: Vec<serde_json::Value> = body["messages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let vault_path = body["vault_path"].as_str().unwrap_or("").to_string();
+    let conversation_id = body["conversation_id"].as_str().unwrap_or("").to_string();
+
+    // Await inline so the caller gets final_speech back (used as TTS fallback by Tauri).
+    // SSE events (llm:token, live_chat:action) are broadcast independently during execution.
+    let speech = crate::service_agent::run_live_chat_agent(
+        state,
+        session_id.clone(),
+        messages,
+        vault_id,
+        account_id,
+        vault_path,
+        conversation_id,
+    ).await;
+
+    Ok(Json(json!({ "session_id": session_id, "speech": speech })))
 }
 
 /// POST /vaults/:vid/agent/confirm
