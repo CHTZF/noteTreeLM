@@ -74,6 +74,9 @@ async fn register_vault(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let existing: Vec<Value> = check.take(0).unwrap_or_default();
     if let Some(existing_id) = existing.first().and_then(|r| r["vault_id"].as_str()) {
+        let existing_id = existing_id.to_string();
+        // Idempotent: ensure schedule exists even for vaults created before scheduling was added
+        crate::seeds::ensure_memory_schedule(&state.db, &existing_id, &account_id).await;
         return Ok(Json(json!({ "vault_id": existing_id })));
     }
 
@@ -83,10 +86,13 @@ async fn register_vault(
         .query("INSERT INTO vaults (vault_id, path, account_id, created_at) VALUES ($vid, $path, $aid, $now)")
         .bind(("vid", vault_id.clone()))
         .bind(("path", path))
-        .bind(("aid", account_id))
+        .bind(("aid", account_id.clone()))
         .bind(("now", now))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Ensure periodic memory_agent schedule exists for this vault+account
+    crate::seeds::ensure_memory_schedule(&state.db, &vault_id, &account_id).await;
 
     Ok(Json(json!({ "vault_id": vault_id })))
 }

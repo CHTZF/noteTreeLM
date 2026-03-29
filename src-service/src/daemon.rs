@@ -92,10 +92,25 @@ pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_scheduler(state: crate::api_state::ApiState) {
     tracing::info!("Scheduler started");
+    // Track last cleanup to run once per day
+    let mut last_cleanup_ts: i64 = 0;
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
 
         let now_ts = chrono::Utc::now().timestamp();
+
+        // Daily cleanup: delete expired memory_facts (runs at most once per 24h)
+        if now_ts - last_cleanup_ts >= 86400 {
+            match state.db
+                .query("DELETE memory_facts WHERE expires_at < $now")
+                .bind(("now", now_ts))
+                .await
+            {
+                Ok(_) => tracing::info!("[scheduler] expired memory_facts cleanup done"),
+                Err(e) => tracing::warn!("[scheduler] cleanup error: {}", e),
+            }
+            last_cleanup_ts = now_ts;
+        }
 
         #[derive(serde::Deserialize)]
         struct TaskRow {

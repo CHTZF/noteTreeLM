@@ -385,3 +385,27 @@ pub fn extract_bearer(headers: &HeaderMap) -> Option<String> {
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(|s| s.to_string())
 }
+
+/// Resolve the account_id (username) for a Bearer token.
+/// Returns an empty string if the token is absent, invalid, or expired.
+pub async fn account_id_from_token(
+    db: &crate::db::SurrealDb,
+    headers: &HeaderMap,
+) -> String {
+    #[derive(serde::Deserialize)]
+    struct Row { username: String }
+    let token = match extract_bearer(headers) {
+        Some(t) => t,
+        None => return String::new(),
+    };
+    let now = chrono::Utc::now().timestamp();
+    db.query("SELECT username FROM sessions WHERE token = $t AND expires_at > $now LIMIT 1")
+        .bind(("t", token))
+        .bind(("now", now))
+        .await
+        .ok()
+        .and_then(|mut r| r.take::<Vec<Row>>(0).ok())
+        .and_then(|rows| rows.into_iter().next())
+        .map(|r| r.username)
+        .unwrap_or_default()
+}
