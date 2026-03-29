@@ -3,6 +3,33 @@ use super::types::ToolCall;
 
 use serde_json::Value;
 
+/// 解析 LLM 以文字格式輸出的工具調用
+/// 支援格式：<tool_call>{"name":"func","arguments":{...}}</tool_call>
+pub(crate) fn parse_text_tool_calls(content: &str) -> Vec<Value> {
+    let mut calls = Vec::new();
+    let mut remaining = content;
+    while let Some(start) = remaining.find("<tool_call>") {
+        let after_open = &remaining[start + "<tool_call>".len()..];
+        if let Some(end) = after_open.find("</tool_call>") {
+            let json_str = after_open[..end].trim();
+            if let Ok(v) = serde_json::from_str::<Value>(json_str) {
+                let name = v["name"].as_str().unwrap_or("").to_string();
+                let args_str = serde_json::to_string(&v["arguments"])
+                    .unwrap_or_else(|_| "{}".to_string());
+                calls.push(serde_json::json!({
+                    "id": format!("call_{}", name),
+                    "type": "function",
+                    "function": { "name": name, "arguments": args_str }
+                }));
+            }
+            remaining = &after_open[end + "</tool_call>".len()..];
+        } else {
+            break;
+        }
+    }
+    calls
+}
+
 pub struct Planner;
 
 impl Planner {

@@ -1374,3 +1374,48 @@ pub async fn search_vault_chunks(
 pub async fn get_vault_uuid(state: State<'_, AppState>) -> Result<String, String> {
     Ok(state.get_vault_uuid().await)
 }
+
+/// 設定筆記的 frontmatter status 欄位（draft / verified / deprecated）
+#[tauri::command]
+pub async fn set_note_status(
+    state: State<'_, AppState>,
+    path: String,
+    status: String,
+) -> Result<(), AppError> {
+    if !matches!(status.as_str(), "draft" | "verified" | "deprecated") {
+        return Err(AppError::AI(format!("Invalid status: {}", status)));
+    }
+    let vault_id = state.get_vault_id().await?;
+    let vault_path = state.get_vault_path().await;
+
+    let abs = if !vault_path.is_empty() {
+        Some(std::path::Path::new(&vault_path).join(&path))
+    } else {
+        None
+    };
+
+    let on_disk = abs.as_ref().map(|p| p.exists()).unwrap_or(false);
+
+    let _new_content: String = if on_disk {
+        let abs_path = abs.as_ref().unwrap();
+        let content = tokio::fs::read_to_string(abs_path).await
+            .map_err(|e| AppError::AI(format!("Read failed: {}", e)))?;
+        let updated = crate::runtime::tool_dispatch::set_frontmatter_key(&content, "status", &status);
+        tokio::fs::write(abs_path, &updated).await
+            .map_err(|e| AppError::AI(format!("Write failed: {}", e)))?;
+        {
+            let token = state.get_auth_token().await;
+            let tok: Option<&str> = if token.is_empty() { None } else { Some(token.as_str()) };
+            let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
+                &state.http_client,
+                &format!("/vaults/{}/notes", urlencoding::encode(&vault_id)),
+                &serde_json::json!({"path": path, "content": updated.clone()}),
+                tok,
+            ).await;
+        }
+        updated
+    } else {
+        format!("---\nstatus: {}\n---\n\n", status)
+    };
+    Ok(())
+}

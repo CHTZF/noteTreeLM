@@ -355,3 +355,50 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { dot / (norm_a * norm_b) }
 }
+
+/// 將 use_ask 加入指定技能的 trigger 欄位，並重新計算 trigger_embedding。
+#[tauri::command]
+pub async fn add_skill_trigger(
+    skill_id: String,
+    use_ask: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let vault_id = state.get_vault_id().await.map_err(|e| e.to_string())?;
+    let token = state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+
+    // GET current skill trigger from daemon
+    let current_skill: serde_json::Value = daemon_get(
+        &state.http_client,
+        &format!("/vaults/{}/skills/{}", urlencoding::encode(&vault_id), urlencoding::encode(&skill_id)),
+        tok,
+    ).await.unwrap_or_else(|_| serde_json::json!({}));
+
+    let current_trigger = current_skill["trigger"].as_str().unwrap_or("").to_string();
+    let new_trigger = if current_trigger.is_empty() {
+        use_ask.clone()
+    } else {
+        format!("{}、{}", current_trigger, use_ask)
+    };
+
+    let emb_url = {
+        let port = *state.embedding_actual_port.lock().await;
+        port.map(|p| format!("http://127.0.0.1:{}", p))
+    };
+
+    let mut update_body = serde_json::json!({"trigger": new_trigger});
+
+    if let Some(url) = &emb_url {
+        let new_embedding: Vec<f32> = crate::commands::server::get_embedding(&state.http_client, &url, &new_trigger).await;
+        if !new_embedding.is_empty() {
+            update_body["trigger_embedding"] = serde_json::json!(new_embedding);
+        }
+    }
+
+    daemon_put::<_, serde_json::Value>(
+        &state.http_client,
+        &format!("/vaults/{}/skills/{}", urlencoding::encode(&vault_id), urlencoding::encode(&skill_id)),
+        &update_body,
+        tok,
+    ).await.map(|_| ()).map_err(|e| e)
+}
