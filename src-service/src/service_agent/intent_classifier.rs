@@ -1,4 +1,4 @@
-use crate::runtime::types::EmbedFn;
+use super::types::EmbedFn;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Intent {
@@ -17,6 +17,31 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
         return 0.0;
     }
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// 計算多個 embedding 向量的 centroid（平均向量），並做 L2 正規化
+pub fn compute_centroid(vecs: &[Vec<f32>]) -> Vec<f32> {
+    if vecs.is_empty() {
+        return vec![];
+    }
+    let dim = vecs[0].len();
+    if dim == 0 {
+        return vec![];
+    }
+    let mut centroid = vec![0f32; dim];
+    for v in vecs {
+        for (i, &f) in v.iter().enumerate() {
+            if i < dim { centroid[i] += f; }
+        }
+    }
+    let n = vecs.len() as f32;
+    for f in &mut centroid { *f /= n; }
+    // L2 normalize
+    let norm: f32 = centroid.iter().map(|f| f * f).sum::<f32>().sqrt();
+    if norm > 1e-8 {
+        for f in &mut centroid { *f /= norm; }
+    }
+    centroid
 }
 
 impl IntentClassifier {
@@ -46,8 +71,6 @@ impl IntentClassifier {
         cache: &tokio::sync::Mutex<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>>,
         embed_fn: &EmbedFn,
     ) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-        use crate::commands::ai::compute_centroid;
-
         // 快速路徑：已有快取
         {
             let guard = cache.lock().await;
@@ -58,15 +81,15 @@ impl IntentClassifier {
 
         // 計算三組 centroid
         async fn batch(ef: &EmbedFn, phrases: &[&str]) -> Vec<Vec<f32>> {
-            futures::future::join_all(
+            futures_util::future::join_all(
                 phrases.iter().map(|p| (ef)(p.to_string()))
             ).await.into_iter().filter(|v| !v.is_empty()).collect()
         }
 
         let (cv, ccl, ci) = tokio::join!(
-            batch(embed_fn, Self::confirm_phrases()),
-            batch(embed_fn, Self::cancel_phrases()),
-            batch(embed_fn, Self::interrupt_phrases()),
+            batch(embed_fn, IntentClassifier::confirm_phrases()),
+            batch(embed_fn, IntentClassifier::cancel_phrases()),
+            batch(embed_fn, IntentClassifier::interrupt_phrases()),
         );
         let cc = compute_centroid(&cv);
         let ccl = compute_centroid(&ccl);
@@ -124,19 +147,18 @@ impl IntentClassifier {
         input: &str,
         embed_fn: &EmbedFn,
     ) -> Intent {
-        use crate::commands::ai::compute_centroid;
         const THRESHOLD: f32 = 0.75;
 
         async fn batch(ef: &EmbedFn, phrases: &[&str]) -> Vec<Vec<f32>> {
-            futures::future::join_all(
+            futures_util::future::join_all(
                 phrases.iter().map(|p| (ef)(p.to_string()))
             ).await.into_iter().filter(|v| !v.is_empty()).collect()
         }
 
         let (cv, ccl, ci) = tokio::join!(
-            batch(embed_fn, Self::confirm_phrases()),
-            batch(embed_fn, Self::cancel_phrases()),
-            batch(embed_fn, Self::interrupt_phrases()),
+            batch(embed_fn, IntentClassifier::confirm_phrases()),
+            batch(embed_fn, IntentClassifier::cancel_phrases()),
+            batch(embed_fn, IntentClassifier::interrupt_phrases()),
         );
         let confirm_centroid   = compute_centroid(&cv);
         let cancel_centroid    = compute_centroid(&ccl);

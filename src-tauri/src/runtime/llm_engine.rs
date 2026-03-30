@@ -11,7 +11,29 @@ use futures_util::StreamExt;
 use tauri::{AppHandle, Emitter};
 
 use crate::error::AppError;
-use crate::runtime::planner::parse_text_tool_calls;
+/// 解析 LLM 以 <tool_call>...</tool_call> 文字格式輸出的工具呼叫（local-model fallback）
+fn parse_text_tool_calls(content: &str) -> Vec<serde_json::Value> {
+    let mut calls = Vec::new();
+    let mut remaining = content;
+    while let Some(start) = remaining.find("<tool_call>") {
+        let after_open = &remaining[start + "<tool_call>".len()..];
+        if let Some(end) = after_open.find("</tool_call>") {
+            let json_str = after_open[..end].trim();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                let name = v["name"].as_str().unwrap_or("").to_string();
+                let args_str = serde_json::to_string(&v["arguments"])
+                    .unwrap_or_else(|_| "{}".to_string());
+                calls.push(serde_json::json!({
+                    "function": { "name": name, "arguments": args_str }
+                }));
+            }
+            remaining = &after_open[end + "</tool_call>".len()..];
+        } else {
+            break;
+        }
+    }
+    calls
+}
 
 /// 串流過程中累積的單一 tool call 資料
 pub(crate) struct ToolCallAccumulator {

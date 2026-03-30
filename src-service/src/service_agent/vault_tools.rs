@@ -1,0 +1,799 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use futures_util::StreamExt;
+use serde_json::{json, Value};
+use crate::api_state::ApiState;
+use crate::db::SurrealDb;
+
+// ── Rollback infrastructure ───────────────────────────────────────────────────
+
+/// Tracks how to undo a completed write operation.
+#[derive(Debug)]
+pub(super) enum RollbackEntry {
+    /// Undo a create_note / append_to_note by restoring original (or deleting if created fresh).
+    WriteFile { path: String, content: String },
+    /// Undo a delete_note by restoring the file.
+    RestoreFile { path: String, content: String },
+    /// Undo a create_note (no prior content) by deleting the file.
+    DeleteFile { path: String },
+    /// Undo a create_folder by removing the directory.
+    RemoveDir { path: String },
+    /// Undo a move_note by moving back (full absolute paths).
+    MoveFile { from_abs: String, to_abs: String },
+}
+
+/// Execute rollbacks in reverse order (most-recent first).
+pub(super) async fn execute_rollback(entries: Vec<RollbackEntry>) {
+    for entry in entries.into_iter().rev() {
+        match entry {
+            RollbackEntry::DeleteFile { path } => {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+            RollbackEntry::WriteFile { path, content } | RollbackEntry::RestoreFile { path, content } => {
+                if let Some(parent) = std::path::Path::new(&path).parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                let _ = tokio::fs::write(&path, content).await;
+            }
+            RollbackEntry::RemoveDir { path } => {
+                let _ = tokio::fs::remove_dir_all(&path).await;
+            }
+            RollbackEntry::MoveFile { from_abs, to_abs } => {
+                // Move back: from_abs is destination of original move, to_abs is source
+                let _ = tokio::fs::rename(&from_abs, &to_abs).await;
+            }
+        }
+    }
+}
+
+// ── Read-only vault tools ─────────────────────────────────────────────────────
+
+pub(super) fn vault_list_structure(rel_path: &str, vault_path: &str) -> String {
+    if vault_path.is_empty() { return "Vault 未設定".to_string(); }
+    let base = std::path::Path::new(vault_path);
+    let target = if rel_path.is_empty() { base.to_path_buf() } else { base.join(rel_path) };
+    if !target.exists() { return format!("路徑不存在：{}", rel_path); }
+
+    fn list_dir(dir: &std::path::Path, base: &std::path::Path, depth: u32) -> String {
+        if depth > 4 { return String::new(); }
+        let mut out = String::new();
+        let Ok(entries) = std::fs::read_dir(dir) else { return out; };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') { continue; }
+            let rel = path.strip_prefix(base).unwrap_or(&path).to_string_lossy().to_string();
+            let indent = "  ".repeat(depth as usize);
+            if path.is_dir() {
+                out.push_str(&format!("{}{}/\n", indent, name));
+                out.push_str(&list_dir(&path, base, depth + 1));
+            } else if name.ends_with(".md") {
+                out.push_str(&format!("{}{}\n", indent, rel));
+            }
+        }
+        out
+    }
+
+    list_dir(&target, base, 0)
+}
+
+pub(super) fn vault_read_note(rel_path: &str, vault_path: &str) -> String {
+    if vault_path.is_empty() { return "Vault 未設定".to_string(); }
+    if rel_path.is_empty() { return "路徑為空".to_string(); }
+    let full = std::path::Path::new(vault_path).join(rel_path);
+    match std::fs::read_to_string(&full) {
+        Ok(c) => c,
+        Err(_) => format!("讀取失敗：{}", rel_path),
+    }
+}
+
+pub(super) async fn vault_search(db: &SurrealDb, vault_id: &str, query: &str) -> Result<Value, String> {
+    if query.is_empty() { return Ok(json!([])); }
+    #[derive(serde::Deserialize)]
+    struct Row { path: String, title: String }
+    let mut resp = db
+        .query("SELECT path, title FROM notes WHERE vault_id = $vid AND content ~ $q LIMIT 8")
+        .bind(("vid", vault_id.to_string()))
+        .bind(("q", query.to_string()))
+        .await
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<Row> = resp.take(0).map_err(|e| e.to_string())?;
+    let result: Vec<Value> = rows.iter().map(|r| json!({"path": r.path, "title": r.title})).collect();
+    Ok(json!(result))
+}
+
+pub(super) async fn vault_query_memory(
+    db: &SurrealDb,
+    vault_id: &str,
+    account_id: &str,
+    keywords: &[String],
+    limit: u64,
+) -> Result<Value, String> {
+    let now = chrono::Utc::now().timestamp();
+    #[derive(serde::Deserialize)]
+    struct Row { content: String, category: String }
+    let rows: Vec<Row> = if keywords.is_empty() {
+        let mut r = db
+            .query("SELECT content, category FROM memory_facts WHERE vault_id = $vid AND account_id = $aid AND expires_at > $now ORDER BY created_at DESC LIMIT $lim")
+            .bind(("vid", vault_id.to_string()))
+            .bind(("aid", account_id.to_string()))
+            .bind(("now", now))
+            .bind(("lim", limit))
+            .await
+            .map_err(|e| e.to_string())?;
+        r.take(0).map_err(|e| e.to_string())?
+    } else {
+        let mut collected: Vec<Row> = Vec::new();
+        for kw in keywords.iter().take(3) {
+            let mut r = db
+                .query("SELECT content, category FROM memory_facts WHERE vault_id = $vid AND account_id = $aid AND content ~ $kw AND expires_at > $now LIMIT $lim")
+                .bind(("vid", vault_id.to_string()))
+                .bind(("aid", account_id.to_string()))
+                .bind(("kw", kw.clone()))
+                .bind(("now", now))
+                .bind(("lim", limit))
+                .await
+                .map_err(|e| e.to_string())?;
+            let rows: Vec<Row> = r.take(0).map_err(|e| e.to_string())?;
+            collected.extend(rows);
+        }
+        collected
+    };
+    let result: Vec<Value> = rows.iter().map(|r| json!({"content": r.content, "category": r.category})).collect();
+    Ok(json!(result))
+}
+
+// ── Write vault tools ─────────────────────────────────────────────────────────
+
+pub(super) async fn vault_create_note(
+    rel_path: &str,
+    content: &str,
+    vault_path: &str,
+    client: &reqwest::Client,
+    db: &SurrealDb,
+    vault_id: &str,
+) -> Result<Value, String> {
+    if vault_path.is_empty() { return Err("Vault 未設定".to_string()); }
+    let full = std::path::Path::new(vault_path).join(rel_path);
+    if let Some(parent) = full.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
+    }
+    tokio::fs::write(&full, content).await.map_err(|e| e.to_string())?;
+    sync_note_to_db(client, db, vault_id, rel_path, content).await;
+    Ok(json!({ "ok": true, "path": rel_path }))
+}
+
+pub(super) async fn vault_update_note(
+    rel_path: &str,
+    content: &str,
+    vault_path: &str,
+    client: &reqwest::Client,
+    db: &SurrealDb,
+    vault_id: &str,
+) -> Result<Value, String> {
+    if vault_path.is_empty() { return Err("Vault 未設定".to_string()); }
+    let full = std::path::Path::new(vault_path).join(rel_path);
+    if !full.exists() { return Err(format!("筆記不存在：{}", rel_path)); }
+    tokio::fs::write(&full, content).await.map_err(|e| e.to_string())?;
+    sync_note_to_db(client, db, vault_id, rel_path, content).await;
+    Ok(json!({ "ok": true, "path": rel_path }))
+}
+
+pub(super) async fn vault_create_folder(
+    rel_path: &str,
+    vault_path: &str,
+    db: &SurrealDb,
+    vault_id: &str,
+) -> Result<Value, String> {
+    if vault_path.is_empty() { return Err("Vault 未設定".to_string()); }
+    let full = std::path::Path::new(vault_path).join(rel_path);
+    tokio::fs::create_dir_all(&full).await.map_err(|e| e.to_string())?;
+    let now = chrono::Utc::now().timestamp();
+    let _ = db
+        .query("UPDATE vaults SET updated_at = $now WHERE vault_id = $vid")
+        .bind(("now", now))
+        .bind(("vid", vault_id.to_string()))
+        .await;
+    Ok(json!({ "ok": true, "path": rel_path }))
+}
+
+pub(super) async fn vault_delete_note(
+    rel_path: &str,
+    vault_path: &str,
+    db: &SurrealDb,
+    vault_id: &str,
+) -> Result<Value, String> {
+    if vault_path.is_empty() { return Err("Vault 未設定".to_string()); }
+    let full = std::path::Path::new(vault_path).join(rel_path);
+    if !full.exists() { return Err(format!("筆記不存在：{}", rel_path)); }
+    tokio::fs::remove_file(&full).await.map_err(|e| format!("刪除失敗：{}", e))?;
+    let _ = db
+        .query("DELETE FROM notes WHERE vault_id = $vid AND path = $path")
+        .bind(("vid", vault_id.to_string()))
+        .bind(("path", rel_path.to_string()))
+        .await;
+    Ok(json!({ "ok": true, "path": rel_path }))
+}
+
+pub(super) async fn vault_delete_folder(
+    rel_path: &str,
+    vault_path: &str,
+) -> Result<Value, String> {
+    if vault_path.is_empty() { return Err("Vault 未設定".to_string()); }
+    let full = std::path::Path::new(vault_path).join(rel_path);
+    if !full.exists() { return Err(format!("資料夾不存在：{}", rel_path)); }
+    tokio::fs::remove_dir_all(&full).await.map_err(|e| format!("刪除資料夾失敗：{}", e))?;
+    Ok(json!({ "ok": true, "path": rel_path }))
+}
+
+pub(super) async fn vault_move_note(
+    from_rel: &str,
+    to_rel: &str,
+    vault_path: &str,
+    client: &reqwest::Client,
+    db: &SurrealDb,
+    vault_id: &str,
+) -> Result<Value, String> {
+    if vault_path.is_empty() { return Err("Vault 未設定".to_string()); }
+    let base = std::path::Path::new(vault_path);
+    let from_full = base.join(from_rel);
+    let to_full = base.join(to_rel);
+    if !from_full.exists() { return Err(format!("來源不存在：{}", from_rel)); }
+    if let Some(parent) = to_full.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
+    }
+    tokio::fs::rename(&from_full, &to_full).await.map_err(|e| format!("移動失敗：{}", e))?;
+    // Update DB: remove old path, add new path
+    let _ = db
+        .query("DELETE FROM notes WHERE vault_id = $vid AND path = $old_path")
+        .bind(("vid", vault_id.to_string()))
+        .bind(("old_path", from_rel.to_string()))
+        .await;
+    let new_content = tokio::fs::read_to_string(&to_full).await.unwrap_or_default();
+    sync_note_to_db(client, db, vault_id, to_rel, &new_content).await;
+    Ok(json!({ "ok": true, "from": from_rel, "to": to_rel }))
+}
+
+pub(super) async fn vault_append_to_note(
+    rel_path: &str,
+    content: &str,
+    vault_path: &str,
+    client: &reqwest::Client,
+    db: &SurrealDb,
+    vault_id: &str,
+) -> Result<Value, String> {
+    if vault_path.is_empty() { return Err("Vault 未設定".to_string()); }
+    let full = std::path::Path::new(vault_path).join(rel_path);
+    if !full.exists() { return Err(format!("筆記不存在：{}", rel_path)); }
+    let mut existing = tokio::fs::read_to_string(&full).await.map_err(|e| e.to_string())?;
+    if !existing.ends_with('\n') { existing.push('\n'); }
+    existing.push_str(content);
+    tokio::fs::write(&full, &existing).await.map_err(|e| e.to_string())?;
+    sync_note_to_db(client, db, vault_id, rel_path, &existing).await;
+    Ok(json!({ "ok": true, "path": rel_path }))
+}
+
+/// Best-effort: update the note record in DB so search index stays fresh.
+pub(super) async fn sync_note_to_db(
+    _client: &reqwest::Client,
+    db: &SurrealDb,
+    vault_id: &str,
+    path: &str,
+    content: &str,
+) {
+    let now = chrono::Utc::now().timestamp();
+    let title = path.split('/').last().unwrap_or(path).trim_end_matches(".md").to_string();
+    let note_id = uuid::Uuid::new_v4().to_string();
+    let _ = db
+        .query("INSERT INTO notes (note_id, vault_id, path, title, content, updated_at, created_at) VALUES ($nid, $vid, $path, $title, $content, $now, $now) ON DUPLICATE KEY UPDATE content = $content, title = $title, updated_at = $now")
+        .bind(("nid", note_id))
+        .bind(("vid", vault_id.to_string()))
+        .bind(("path", path.to_string()))
+        .bind(("title", title))
+        .bind(("content", content.to_string()))
+        .bind(("now", now))
+        .await;
+}
+
+// ── Tool classification helpers ───────────────────────────────────────────────
+
+/// Write tool check for interactive agent: tools that modify vault state and require user confirmation.
+pub(super) fn is_interactive_write_tool(name: &str) -> bool {
+    matches!(name,
+        "create_note" | "update_note" | "create_folder" |
+        "delete_note" | "delete_folder" | "move_note" | "append_to_note" |
+        "create_agent_skill"
+    )
+}
+
+/// Extract note paths for agent:note_refs event
+pub(super) fn extract_note_refs(tool_name: &str, args: &Value, _result: &Value, _vault_path: &str) -> Vec<String> {
+    match tool_name {
+        "read_note" => {
+            let p = args["path"].as_str().unwrap_or("");
+            if p.is_empty() { return vec![]; }
+            let full = if p.ends_with(".md") { p.to_string() } else { format!("{}.md", p) };
+            vec![full]
+        }
+        "open_note" => {
+            args["paths"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).map(String::from).collect())
+                .unwrap_or_else(|| {
+                    args["path"].as_str().map(|p| vec![p.to_string()]).unwrap_or_default()
+                })
+        }
+        "search_vault" => {
+            // result is a JSON array of {path, title}
+            _result.as_array()
+                .map(|arr| arr.iter()
+                    .filter_map(|v| v["path"].as_str())
+                    .map(String::from)
+                    .collect())
+                .unwrap_or_default()
+        }
+        _ => vec![],
+    }
+}
+
+// ── Tool dispatcher ───────────────────────────────────────────────────────────
+
+/// Dispatch result: value + optional rollback entry (for write operations).
+pub(super) type DispatchResult = Result<(Value, Option<RollbackEntry>), String>;
+
+/// Tool dispatcher for interactive agent (vault tools + agent tools + memory tools).
+/// Returns (result_value, optional_rollback_entry).
+pub(super) async fn dispatch_interactive_tool(
+    client: &reqwest::Client,
+    llm_url: &str,
+    db: &SurrealDb,
+    vault_id: &str,
+    account_id: &str,
+    vault_path: &str,
+    embedding_url: &Option<String>,
+    name: &str,
+    args: &Value,
+) -> DispatchResult {
+    match name {
+        // ── Special tools (SSE side-effects emitted by the calling closure) ──
+        "plan_announce" => {
+            // Executor has already emitted agent:plan_announce via the tool closure
+            Ok((json!("✅ 已確認計畫，請立即執行"), None))
+        }
+        "open_note" => {
+            // Executor closure emits agent:open_note + agent:note_refs
+            let paths: Vec<Value> = args["paths"].as_array()
+                .cloned()
+                .unwrap_or_else(|| {
+                    args["path"].as_str().map(|p| vec![json!(p)]).unwrap_or_default()
+                });
+            Ok((json!({ "opened": paths }), None))
+        }
+        "think" => {
+            Ok((json!("✅"), None))
+        }
+
+        // ── Vault read tools ─────────────────────────────────────────────────
+        "list_structure" => {
+            let path = args["path"].as_str().unwrap_or("");
+            Ok((Value::String(vault_list_structure(path, vault_path)), None))
+        }
+        "read_note" => {
+            let raw_path = args["path"].as_str().unwrap_or("");
+            let path = if raw_path.ends_with(".md") { raw_path.to_string() } else { format!("{}.md", raw_path) };
+            Ok((Value::String(vault_read_note(&path, vault_path)), None))
+        }
+        "search_vault" => {
+            let query = args["query"].as_str().unwrap_or("");
+            vault_search(db, vault_id, query).await.map(|v| (v, None))
+        }
+        "query_memory" => {
+            let keywords: Vec<String> = args["keywords"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).map(String::from).collect())
+                .unwrap_or_default();
+            let limit = args["limit"].as_u64().unwrap_or(5).min(20);
+            vault_query_memory(db, vault_id, account_id, &keywords, limit).await.map(|v| (v, None))
+        }
+
+        // ── Vault write tools (with rollback) ────────────────────────────────
+        "create_note" => {
+            let path = args["path"].as_str().unwrap_or("");
+            let path = if path.ends_with(".md") { path.to_string() } else { format!("{}.md", path) };
+            let content = args["content"].as_str().unwrap_or("");
+            let full_abs = std::path::Path::new(vault_path).join(&path).to_string_lossy().to_string();
+            let file_existed = std::path::Path::new(&full_abs).exists();
+            let original = if file_existed { tokio::fs::read_to_string(&full_abs).await.unwrap_or_default() } else { String::new() };
+            vault_create_note(&path, content, vault_path, client, db, vault_id).await.map(|v| {
+                let rollback = if file_existed {
+                    RollbackEntry::WriteFile { path: full_abs, content: original }
+                } else {
+                    RollbackEntry::DeleteFile { path: full_abs }
+                };
+                (v, Some(rollback))
+            })
+        }
+        "update_note" => {
+            let path = args["path"].as_str().unwrap_or("");
+            let path = if path.ends_with(".md") { path.to_string() } else { format!("{}.md", path) };
+            let content = args["content"].as_str().unwrap_or("");
+            let full_abs = std::path::Path::new(vault_path).join(&path).to_string_lossy().to_string();
+            // Read original before overwrite (for rollback)
+            let original = tokio::fs::read_to_string(&full_abs).await.unwrap_or_default();
+            vault_update_note(&path, content, vault_path, client, db, vault_id).await.map(|v| {
+                let rollback = RollbackEntry::WriteFile { path: full_abs, content: original };
+                (v, Some(rollback))
+            })
+        }
+        "create_folder" => {
+            let path = args["path"].as_str().unwrap_or("");
+            let full_abs = std::path::Path::new(vault_path).join(path).to_string_lossy().to_string();
+            vault_create_folder(path, vault_path, db, vault_id).await.map(|v| {
+                let rollback = RollbackEntry::RemoveDir { path: full_abs };
+                (v, Some(rollback))
+            })
+        }
+        "delete_note" => {
+            let path = args["path"].as_str().unwrap_or("");
+            let path = if path.ends_with(".md") { path.to_string() } else { format!("{}.md", path) };
+            let full_abs = std::path::Path::new(vault_path).join(&path).to_string_lossy().to_string();
+            // Read content before delete (for rollback restore)
+            let original = tokio::fs::read_to_string(&full_abs).await.unwrap_or_default();
+            vault_delete_note(&path, vault_path, db, vault_id).await.map(|v| {
+                let rollback = RollbackEntry::RestoreFile { path: full_abs, content: original };
+                (v, Some(rollback))
+            })
+        }
+        "delete_folder" => {
+            let path = args["path"].as_str().unwrap_or("");
+            // Folder deletion is not fully reversible (contents lost); rollback is a no-op marker
+            vault_delete_folder(path, vault_path).await.map(|v| (v, None))
+        }
+        "move_note" => {
+            let from = args["from"].as_str().unwrap_or("");
+            let to = args["to"].as_str().unwrap_or("");
+            let from = if from.ends_with(".md") { from.to_string() } else { format!("{}.md", from) };
+            let to = if to.ends_with(".md") { to.to_string() } else { format!("{}.md", to) };
+            let from_abs = std::path::Path::new(vault_path).join(&from).to_string_lossy().to_string();
+            let to_abs = std::path::Path::new(vault_path).join(&to).to_string_lossy().to_string();
+            vault_move_note(&from, &to, vault_path, client, db, vault_id).await.map(|v| {
+                // Rollback: move back (from_abs ← to_abs)
+                let rollback = RollbackEntry::MoveFile { from_abs: to_abs, to_abs: from_abs };
+                (v, Some(rollback))
+            })
+        }
+        "append_to_note" => {
+            let path = args["path"].as_str().unwrap_or("");
+            let path = if path.ends_with(".md") { path.to_string() } else { format!("{}.md", path) };
+            let content = args["content"].as_str().unwrap_or("");
+            let full_abs = std::path::Path::new(vault_path).join(&path).to_string_lossy().to_string();
+            let original = tokio::fs::read_to_string(&full_abs).await.unwrap_or_default();
+            vault_append_to_note(&path, content, vault_path, client, db, vault_id).await.map(|v| {
+                let rollback = RollbackEntry::WriteFile { path: full_abs, content: original };
+                (v, Some(rollback))
+            })
+        }
+
+        // ── Agent tools ──────────────────────────────────────────────────────
+        "search_skills" => {
+            let query = args["query"].as_str().unwrap_or("");
+            #[derive(serde::Deserialize)]
+            struct Row { title: String, behavior: String, tool_calls: Option<Value> }
+            let now = chrono::Utc::now().timestamp();
+            let mut resp = db
+                .query("SELECT title, behavior, tool_calls FROM agent_skills WHERE account_id = $aid AND is_active = true AND expires_at > $now LIMIT 10")
+                .bind(("aid", account_id.to_string()))
+                .bind(("now", now))
+                .await
+                .map_err(|e| e.to_string())?;
+            let rows: Vec<Row> = resp.take(0).map_err(|e| e.to_string())?;
+            // Filter by keyword relevance
+            let q_lower = query.to_lowercase();
+            let results: Vec<Value> = rows.iter()
+                .filter(|r| q_lower.is_empty() || r.title.to_lowercase().contains(&q_lower) || r.behavior.to_lowercase().contains(&q_lower))
+                .map(|r| json!({
+                    "title": r.title,
+                    "behavior": r.behavior,
+                    "required_tools": r.tool_calls,
+                }))
+                .collect();
+            Ok((json!(results), None))
+        }
+        "create_agent_skill" => {
+            let title = args["title"].as_str().unwrap_or("").to_string();
+            let trigger = args["trigger"].as_str().unwrap_or("").to_string();
+            let behavior = args["behavior"].as_str().unwrap_or("").to_string();
+            let tool_calls: Option<Value> = args.get("tool_calls").cloned();
+            let injection_mode = args["injection_mode"].as_str().unwrap_or("system").to_string();
+            let skill_id = uuid::Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().timestamp();
+            db.query("INSERT INTO agent_skills (skill_id, account_id, title, trigger, behavior, tool_calls, is_active, trigger_count, injection_mode, created_at) VALUES ($sid, $aid, $title, $trigger, $behavior, $tc, true, 0, $imode, $now)")
+                .bind(("sid", skill_id.clone())).bind(("aid", account_id.to_string()))
+                .bind(("title", title)).bind(("trigger", trigger)).bind(("behavior", behavior))
+                .bind(("tc", tool_calls)).bind(("imode", injection_mode)).bind(("now", now))
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok((json!({ "ok": true, "skill_id": skill_id }), None))
+        }
+
+        // ── Memory agent tools ───────────────────────────────────────────────
+        "get_unprocessed_conversations" => {
+            let limit = args["limit"].as_i64().unwrap_or(20);
+            super::memory_tools::get_unprocessed_conversations(db, vault_id, account_id, limit)
+                .await.map(|v| (v, None))
+        }
+        "get_conversation_content" => {
+            let conv_id = args["conversation_id"].as_str().unwrap_or("").to_string();
+            let skip = args["skip_count"].as_i64().unwrap_or(0);
+            let char_limit = args["char_limit"].as_i64().unwrap_or(500);
+            super::memory_tools::get_conversation_content(db, &conv_id, skip, char_limit)
+                .await.map(|v| (v, None))
+        }
+        "save_memory_facts" => {
+            let conv_id = args["conversation_id"].as_str().unwrap_or("").to_string();
+            let facts = args["facts"].as_array().cloned().unwrap_or_default();
+            super::memory_tools::save_memory_facts(client, db, vault_id, account_id, &conv_id, facts, embedding_url)
+                .await.map(|v| (v, None))
+        }
+        "mark_conversation_processed" => {
+            let conv_id = args["conversation_id"].as_str().unwrap_or("").to_string();
+            super::memory_tools::mark_conversation_processed(db, &conv_id)
+                .await.map(|v| (v, None))
+        }
+        "condense_memory_facts" => {
+            let category = args["category"].as_str().map(String::from);
+            super::memory_tools::condense_memory_facts(client, llm_url, db, vault_id, account_id, category, embedding_url)
+                .await.map(|v| (v, None))
+        }
+        _ => Err(format!("unknown tool: {}", name)),
+    }
+}
+
+// ── Tool schemas ──────────────────────────────────────────────────────────────
+
+/// Build the tools schema for interactive agent.
+/// Includes vault tools, agent tools, and memory tools.
+/// `open_note` and `plan_announce` are always included.
+pub(super) fn build_tools_schema_interactive(tool_names: &[String]) -> Vec<Value> {
+    let all_tools: Vec<Value> = vec![
+        // ── Read tools ───────────────────────────────────────────────────────
+        json!({ "type": "function", "function": {
+            "name": "list_structure",
+            "description": "列出 vault 的資料夾和筆記結構",
+            "parameters": { "type": "object", "properties": {
+                "path": { "type": "string", "description": "子路徑，省略則顯示根目錄" }
+            }, "required": [] }
+        }}),
+        json!({ "type": "function", "function": {
+            "name": "read_note",
+            "description": "讀取指定路徑的筆記內容",
+            "parameters": { "type": "object", "properties": {
+                "path": { "type": "string", "description": "筆記的相對路徑（可省略 .md）" }
+            }, "required": ["path"] }
+        }}),
+        json!({ "type": "function", "function": {
+            "name": "search_vault",
+            "description": "在 vault 中搜尋相關筆記",
+            "parameters": { "type": "object", "properties": {
+                "query": { "type": "string", "description": "搜尋關鍵字" }
+            }, "required": ["query"] }
+        }}),
+        json!({ "type": "function", "function": {
+            "name": "query_memory",
+            "description": "查詢長期記憶事實",
+            "parameters": { "type": "object", "properties": {
+                "keywords": { "type": "array", "items": { "type": "string" }, "description": "關鍵字列表" },
+                "limit": { "type": "number", "description": "最多幾條，預設 5" }
+            }, "required": [] }
+        }}),
+        // ── Write tools ──────────────────────────────────────────────────────
+        json!({ "type": "function", "function": {
+            "name": "create_note",
+            "description": "建立新筆記",
+            "parameters": { "type": "object", "properties": {
+                "path": { "type": "string", "description": "筆記路徑（可省略 .md）" },
+                "content": { "type": "string", "description": "筆記內容（Markdown）" }
+            }, "required": ["path", "content"] }
+        }}),
+        json!({ "type": "function", "function": {
+            "name": "update_note",
+            "description": "更新現有筆記的全部內容",
+            "parameters": { "type": "object", "properties": {
+                "path": { "type": "string", "description": "筆記路徑（可省略 .md）" },
+                "content": { "type": "string", "description": "新的筆記內容" }
+            }, "required": ["path", "content"] }
+        }}),
+        json!({ "type": "function", "function": {
+            "name": "append_to_note",
+            "description": "在現有筆記末尾追加內容",
+            "parameters": { "type": "object", "properties": {
+                "path": { "type": "string", "description": "筆記路徑（可省略 .md）" },
+                "content": { "type": "string", "description": "要追加的內容" }
+            }, "required": ["path", "content"] }
+        }}),
+        json!({ "type": "function", "function": {
+            "name": "create_folder",
+            "description": "建立新資料夾",
+            "parameters": { "type": "object", "properties": {
+                "path": { "type": "string", "description": "資料夾相對路徑" }
+            }, "required": ["path"] }
+        }}),
+        json!({ "type": "function", "function": {
+            "name": "delete_note",
+            "description": "刪除指定的筆記（不可恢復）",
+            "parameters": { "type": "object", "properties": {
+                "path": { "type": "string", "description": "筆記路徑（可省略 .md）" }
+            }, "required": ["path"] }
+        }}),
+        json!({ "type": "function", "function": {
+            "name": "delete_folder",
+            "description": "刪除整個資料夾及其內容（不可恢復）",
+            "parameters": { "type": "object", "properties": {
+                "path": { "type": "string", "description": "資料夾路徑" }
+            }, "required": ["path"] }
+        }}),
+        json!({ "type": "function", "function": {
+            "name": "move_note",
+            "description": "移動或重新命名筆記",
+            "parameters": { "type": "object", "properties": {
+                "from": { "type": "string", "description": "來源路徑（可省略 .md）" },
+                "to":   { "type": "string", "description": "目標路徑（可省略 .md）" }
+            }, "required": ["from", "to"] }
+        }}),
+        // ── Agent / UI tools ─────────────────────────────────────────────────
+        json!({ "type": "function", "function": {
+            "name": "open_note",
+            "description": "在編輯器中打開指定筆記，讓使用者查看。呼叫後對話結束。",
+            "parameters": { "type": "object", "properties": {
+                "paths": { "type": "array", "items": { "type": "string" }, "description": "要打開的筆記路徑列表" }
+            }, "required": ["paths"] }
+        }}),
+        json!({ "type": "function", "function": {
+            "name": "plan_announce",
+            "description": "在執行寫入操作前，向使用者宣告計畫。呼叫後自動繼續執行，不需確認。",
+            "parameters": { "type": "object", "properties": {
+                "plan": { "type": "string", "description": "即將執行的操作計畫描述" }
+            }, "required": ["plan"] }
+        }}),
+        json!({ "type": "function", "function": {
+            "name": "search_skills",
+            "description": "搜尋可用的 agent 技能，了解如何處理特定類型的請求",
+            "parameters": { "type": "object", "properties": {
+                "query": { "type": "string", "description": "要搜尋的技能主題或關鍵字" }
+            }, "required": ["query"] }
+        }}),
+        json!({ "type": "function", "function": {
+            "name": "create_agent_skill",
+            "description": "建立新的 agent 技能，學習如何處理特定類型的任務",
+            "parameters": { "type": "object", "properties": {
+                "title":          { "type": "string", "description": "技能名稱" },
+                "trigger":        { "type": "string", "description": "觸發條件描述" },
+                "behavior":       { "type": "string", "description": "行為描述（注入到 system prompt 的文字）" },
+                "injection_mode": { "type": "string", "description": "注入模式：system / active / proactive / passive" },
+                "tool_calls":     { "type": "array",  "items": { "type": "string" }, "description": "此技能需要的工具列表" }
+            }, "required": ["title", "trigger", "behavior"] }
+        }}),
+        // ── Memory agent tools ───────────────────────────────────────────────
+        json!({ "type": "function", "function": {
+            "name": "get_unprocessed_conversations",
+            "description": "取得尚未處理的對話列表，用於記憶提煉",
+            "parameters": { "type": "object", "properties": {
+                "limit": { "type": "number", "description": "最多幾條，預設 20" }
+            }, "required": [] }
+        }}),
+        json!({ "type": "function", "function": {
+            "name": "get_conversation_content",
+            "description": "取得指定對話的訊息內容",
+            "parameters": { "type": "object", "properties": {
+                "conversation_id": { "type": "string" },
+                "skip_count":      { "type": "number", "description": "跳過前幾則" },
+                "char_limit":      { "type": "number", "description": "字元限制，預設 500" }
+            }, "required": ["conversation_id"] }
+        }}),
+        json!({ "type": "function", "function": {
+            "name": "save_memory_facts",
+            "description": "儲存從對話中提煉的記憶事實",
+            "parameters": { "type": "object", "properties": {
+                "conversation_id": { "type": "string" },
+                "facts": { "type": "array", "items": { "type": "object" } }
+            }, "required": ["conversation_id", "facts"] }
+        }}),
+        json!({ "type": "function", "function": {
+            "name": "mark_conversation_processed",
+            "description": "標記對話已完成記憶提煉",
+            "parameters": { "type": "object", "properties": {
+                "conversation_id": { "type": "string" }
+            }, "required": ["conversation_id"] }
+        }}),
+        json!({ "type": "function", "function": {
+            "name": "condense_memory_facts",
+            "description": "壓縮並合併同類記憶事實",
+            "parameters": { "type": "object", "properties": {
+                "category": { "type": "string", "description": "只壓縮指定類別，省略則全部" }
+            }, "required": [] }
+        }}),
+    ];
+
+    all_tools.into_iter()
+        .filter(|t| {
+            let name = t["function"]["name"].as_str().unwrap_or("");
+            tool_names.iter().any(|n| n == name)
+        })
+        .collect()
+}
+
+// ── LLM streaming ─────────────────────────────────────────────────────────────
+
+/// Stream one LLM round, emitting llm:token events. Returns (text, finish_reason, tool_chunks).
+/// tool_chunks: Vec<(id, name, arguments_str)>
+pub(super) async fn stream_llm_round(
+    client: &reqwest::Client,
+    llm_url: &str,
+    body: Value,
+    state: &ApiState,
+    _session_id: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(String, String, Vec<(String, String, String)>), String> {
+    let resp = client
+        .post(format!("{}/v1/chat/completions", llm_url))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("llm error {}: {}", status, text));
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut sse_buf = String::new();
+    let mut full_text = String::new();
+    let mut finish_reason = "stop".to_string();
+    let mut tool_chunks: Vec<(String, String, String)> = Vec::new();
+
+    while let Some(item) = stream.next().await {
+        if cancel.load(Ordering::Relaxed) { break; }
+        let bytes = item.map_err(|e| e.to_string())?;
+        sse_buf.push_str(&String::from_utf8_lossy(&bytes));
+
+        while let Some(event_end) = sse_buf.find("\n\n") {
+            let event = sse_buf[..event_end].to_string();
+            sse_buf = sse_buf[event_end + 2..].to_string();
+
+            for line in event.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if data.trim() == "[DONE]" { continue; }
+                    if let Ok(j) = serde_json::from_str::<Value>(data) {
+                        let choice = &j["choices"][0];
+                        if let Some(fr) = choice["finish_reason"].as_str() {
+                            if !fr.is_empty() { finish_reason = fr.to_string(); }
+                        }
+                        let delta = &choice["delta"];
+                        if let Some(content) = delta["content"].as_str() {
+                            if !content.is_empty() {
+                                state.daemon.emit("llm:token", json!(content));
+                                full_text.push_str(content);
+                            }
+                        }
+                        if let Some(tc_arr) = delta["tool_calls"].as_array() {
+                            for tc in tc_arr {
+                                let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                                while tool_chunks.len() <= idx {
+                                    tool_chunks.push((String::new(), String::new(), String::new()));
+                                }
+                                let acc = &mut tool_chunks[idx];
+                                if let Some(id) = tc["id"].as_str() { if !id.is_empty() { acc.0 = id.to_string(); } }
+                                if let Some(n) = tc["function"]["name"].as_str() { if !n.is_empty() { acc.1 = n.to_string(); } }
+                                if let Some(a) = tc["function"]["arguments"].as_str() { acc.2.push_str(a); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((full_text, finish_reason, tool_chunks))
+}

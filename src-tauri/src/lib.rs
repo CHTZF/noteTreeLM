@@ -5,7 +5,6 @@ pub mod crypto;
 mod error;
 pub mod runtime;
 mod state;
-pub mod tools;
 mod vault;
 
 use commands::auth::{login, logout, get_session, change_password, start_google_oauth};

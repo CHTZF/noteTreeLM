@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,10 +22,12 @@ pub struct ServiceEvent {
 
 /// Per-session state for interactive agent runs.
 /// `cancel` — set true to abort the agent loop.
-/// `confirm_tx` — oneshot sender resolved by POST /agent/confirm; None when no write is pending.
+/// `transaction` — Arc<Transaction> managed by Executor; commit/cancel resolved by POST /agent/confirm.
 pub struct AgentSession {
+    pub session_id: String,
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
-    pub confirm_tx: Option<oneshot::Sender<bool>>,
+    pub transaction: Option<Arc<crate::service_agent::transaction::Transaction>>,
+    pub conversation_id: String,
 }
 
 #[derive(Clone)]
@@ -40,6 +42,8 @@ pub struct DaemonState {
     pub event_tx: tokio::sync::broadcast::Sender<ServiceEvent>,
     /// Active interactive agent sessions keyed by session_id.
     pub agent_sessions: Arc<Mutex<HashMap<String, AgentSession>>>,
+    /// Intent centroid cache (confirm / cancel / interrupt embeddings).
+    pub intent_centroids: Arc<Mutex<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>>>,
 }
 
 impl DaemonState {
@@ -55,6 +59,7 @@ impl DaemonState {
             tunnel_url: Arc::new(RwLock::new(None)),
             event_tx,
             agent_sessions: Arc::new(Mutex::new(HashMap::new())),
+            intent_centroids: Arc::new(Mutex::new(None)),
         }
     }
 

@@ -220,8 +220,16 @@ pub async fn wake_agent_definition(
 #[tauri::command]
 pub async fn list_ephemeral_agents(
     state: State<'_, AppState>,
-) -> Result<Vec<crate::runtime::system_agent::EphemeralAgent>, AppError> {
-    Ok(state.system_agent.list_ephemeral().await)
+) -> Result<Vec<serde_json::Value>, AppError> {
+    let vault_id = state.get_vault_id().await.unwrap_or_default();
+    let auth_token = state.get_auth_token().await;
+    let tok = if auth_token.is_empty() { None } else { Some(auth_token.as_str()) };
+    let result = crate::api_client::daemon_get::<Vec<serde_json::Value>>(
+        &state.http_client,
+        &format!("/vaults/{}/agents/ephemeral", urlencoding::encode(&vault_id)),
+        tok,
+    ).await.unwrap_or_default();
+    Ok(result)
 }
 
 /// 清除本次 session 的 ephemeral agents 記錄
@@ -229,7 +237,15 @@ pub async fn list_ephemeral_agents(
 pub async fn clear_ephemeral_agents(
     state: State<'_, AppState>,
 ) -> Result<(), AppError> {
-    state.system_agent.clear_session().await;
+    let vault_id = state.get_vault_id().await.unwrap_or_default();
+    let auth_token = state.get_auth_token().await;
+    let tok = if auth_token.is_empty() { None } else { Some(auth_token.as_str()) };
+    let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
+        &state.http_client,
+        &format!("/vaults/{}/agents/ephemeral/clear", urlencoding::encode(&vault_id)),
+        &serde_json::json!({}),
+        tok,
+    ).await;
     Ok(())
 }
 

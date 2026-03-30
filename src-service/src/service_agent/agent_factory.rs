@@ -1,18 +1,20 @@
-/// runtime/agent_factory.rs
+/// service_agent/agent_factory.rs
 ///
 /// Agent 規格生成：
 ///   generate_agent_spec / extract_cjk_keywords
 
 use std::time::Duration;
 
+use super::types::NewSkillSpec;
+
 /// 呼叫 LLM（非串流）根據 user_ask 生成 agent 規格 JSON。
 /// 回傳 (name, description, trigger, tool_names, system_prompt, skills)；任何錯誤 fallback 至 raw input。
 #[allow(dead_code)]
-pub(crate) async fn generate_agent_spec(
+pub(super) async fn generate_agent_spec(
     client: &reqwest::Client,
     base_url: &str,
     input: &str,
-) -> (String, String, String, Vec<String>, String, Vec<crate::runtime::system_agent::NewSkillSpec>) {
+) -> (String, String, String, Vec<String>, String, Vec<NewSkillSpec>) {
     let fallback = || (
         input.chars().take(24).collect::<String>(),
         input.to_string(),
@@ -100,7 +102,7 @@ system_prompt 撰寫重點：說明使用者的用詞習慣、意圖語意、工
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
     let system_prompt = spec["system_prompt"].as_str().unwrap_or("").to_string();
-    let skills: Vec<crate::runtime::system_agent::NewSkillSpec> = spec["skills"].as_array()
+    let skills: Vec<NewSkillSpec> = spec["skills"].as_array()
         .map(|arr| arr.iter()
             .filter_map(|v| serde_json::from_value(v.clone()).ok())
             .collect())
@@ -112,7 +114,7 @@ system_prompt 撰寫重點：說明使用者的用詞習慣、意圖語意、工
 
 /// 從查詢文字取出最多 N 個有意義的 CJK bigram，供 keyword 搜尋
 #[allow(dead_code)]
-pub(crate) fn extract_cjk_keywords(text: &str, max: usize) -> Vec<String> {
+pub(super) fn extract_cjk_keywords(text: &str, max: usize) -> Vec<String> {
     const STOPS: &[char] = &[
         '你','我','他','她','它','的','了','嗎','是','有','在','說','道','記',
         '什','麼','這','那','就','都','也','還','不','沒','要','會','可','以',

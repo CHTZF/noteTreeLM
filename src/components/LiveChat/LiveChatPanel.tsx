@@ -450,12 +450,16 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
 
     try {
       const convId = conversationId
-      await invoke('invoke_agent', {
+      const agentResp = await invoke<{ session_id: string; conversation_id: string }>('invoke_agent', {
         input: query,
         messages: [...messagesRef.current, { role: 'user', content: query }],
         system: LIVE_CHAT_SYSTEM,
         conversationId: convId ?? undefined,
       })
+      if (!convId && agentResp.conversation_id) {
+        setConversationId(agentResp.conversation_id)
+        localStorage.setItem('live_chat_conversation_id', agentResp.conversation_id)
+      }
     } catch (e: unknown) {
       const msg = typeof e === 'string' ? e : (e instanceof Error ? e.message : JSON.stringify(e))
       addLog('live-chat', 'error', `invoke_agent 失敗：${msg}`)

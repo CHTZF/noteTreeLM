@@ -5,7 +5,6 @@ use tokio::sync::{Mutex, RwLock};
 use reqwest;
 
 use crate::error::AppError;
-use crate::runtime::system_agent::SystemAgentService;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -47,8 +46,6 @@ pub struct AppState {
     pub agent_session: Arc<Mutex<Option<String>>>,
     /// 工具測試台取消旗標：設為 true 時 run_tool_pipeline 的步驟迴圈中止
     pub tool_test_cancel: Arc<AtomicBool>,
-    /// System Agent Service — rule-based broker，負責路由 call_agent 請求
-    pub system_agent: Arc<SystemAgentService>,
     /// API key 記憶體快取：provider → key，避免重複呼叫 keychain
     pub api_key_cache: Arc<Mutex<HashMap<String, String>>>,
     /// 共用 HTTP client（所有 LLM / embedding 呼叫共用，避免重複建立 connection pool）
@@ -77,9 +74,7 @@ impl AppState {
             .build()
             .unwrap_or_default();
         let auth_token: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
-        let system_agent = Arc::new(SystemAgentService::new(http_client.clone(), auth_token.clone()));
         Self {
-            system_agent,
             vault_path: Arc::new(RwLock::new(String::new())),
             llama_server: Arc::new(Mutex::new(None)),
             whisper_server: Arc::new(Mutex::new(None)),
@@ -123,9 +118,7 @@ impl AppState {
         *self.auth_token.write().await = String::new();
     }
 
-    /// vault_id 設定後同步更新 SystemAgentService
     pub async fn set_vault_path_with_agent(&self, path: String) {
-        self.system_agent.set_vault_id(path.clone()).await;
         *self.vault_path.write().await = path;
     }
 

@@ -588,7 +588,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       ])
 
       log('  呼叫 invoke("invoke_agent")')
-      const responseText = await invoke<string>('invoke_agent', {
+      const agentResp = await invoke<{ session_id: string; conversation_id: string }>('invoke_agent', {
         input: text,
         // conversationId 存在時 Rust 從 DB 讀取歷史，不需要 frontend 再傳 messages
         messages: conversationId ? [] : llmMessages,
@@ -597,7 +597,16 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         activityContext: useActivityStore.getState().getContextString() || null,
       })
 
-      const finalContent = responseText || streamingRef.current
+      // If this was the first message (no conversationId yet), persist the one assigned by service
+      if (!conversationId && agentResp.conversation_id) {
+        setConversationId(agentResp.conversation_id)
+        invoke<string>('get_vault_uuid').then(vaultId => {
+          const username = useAuthStore.getState().session?.username ?? ''
+          api.setLastChatConversationId(`${username}_${vaultId}`, agentResp.conversation_id).catch(() => {})
+        }).catch(() => {})
+      }
+
+      const finalContent = streamingRef.current
       log(`✓ invoke_agent 完成，回覆 ${finalContent.length} 字元`)
       const webRefs = pendingWebRefsRef.current.length > 0
         ? pendingWebRefsRef.current
