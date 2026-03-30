@@ -7,7 +7,7 @@ use super::executor::Executor;
 use super::graph::ToolGraph;
 use super::tool_registry::ToolRegistry;
 use super::transaction::Transaction;
-use super::types::{EmitEventFn, IsWriteFn};
+use super::super::types::{EmitEventFn, IsWriteFn};
 
 pub struct Dispatcher {
     registry: Arc<ToolRegistry>,

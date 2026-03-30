@@ -342,7 +342,7 @@ async fn maybe_trigger_memory_agent(state: ApiState, conv_id: String, messages_j
 
     // Ensure a periodic memory_agent schedule exists for this vault+account.
     // Handles the case where the vault was created before auto_memory was enabled.
-    crate::seeds::ensure_memory_schedule(&state.db, &vault_id, &account_id).await;
+    crate::db::seeds::ensure_memory_schedule(&state.db, &vault_id, &account_id).await;
 
     // Trigger only at exact multiples of threshold
     if msgs.len() % threshold as usize != 0 { return }

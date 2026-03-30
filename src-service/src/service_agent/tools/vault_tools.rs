@@ -9,7 +9,7 @@ use crate::db::SurrealDb;
 
 /// Tracks how to undo a completed write operation.
 #[derive(Debug)]
-pub(super) enum RollbackEntry {
+pub(crate) enum RollbackEntry {
     /// Undo a create_note / append_to_note by restoring original (or deleting if created fresh).
     WriteFile { path: String, content: String },
     /// Undo a delete_note by restoring the file.
@@ -23,7 +23,7 @@ pub(super) enum RollbackEntry {
 }
 
 /// Execute rollbacks in reverse order (most-recent first).
-pub(super) async fn execute_rollback(entries: Vec<RollbackEntry>) {
+pub(crate) async fn execute_rollback(entries: Vec<RollbackEntry>) {
     for entry in entries.into_iter().rev() {
         match entry {
             RollbackEntry::DeleteFile { path } => {
@@ -48,7 +48,7 @@ pub(super) async fn execute_rollback(entries: Vec<RollbackEntry>) {
 
 // ── Read-only vault tools ─────────────────────────────────────────────────────
 
-pub(super) fn vault_list_structure(rel_path: &str, vault_path: &str) -> String {
+pub(crate) fn vault_list_structure(rel_path: &str, vault_path: &str) -> String {
     if vault_path.is_empty() { return "Vault 未設定".to_string(); }
     let base = std::path::Path::new(vault_path);
     let target = if rel_path.is_empty() { base.to_path_buf() } else { base.join(rel_path) };
@@ -79,7 +79,7 @@ pub(super) fn vault_list_structure(rel_path: &str, vault_path: &str) -> String {
     list_dir(&target, base, 0)
 }
 
-pub(super) fn vault_read_note(rel_path: &str, vault_path: &str) -> String {
+pub(crate) fn vault_read_note(rel_path: &str, vault_path: &str) -> String {
     if vault_path.is_empty() { return "Vault 未設定".to_string(); }
     if rel_path.is_empty() { return "路徑為空".to_string(); }
     let full = std::path::Path::new(vault_path).join(rel_path);
@@ -89,7 +89,7 @@ pub(super) fn vault_read_note(rel_path: &str, vault_path: &str) -> String {
     }
 }
 
-pub(super) async fn vault_search(db: &SurrealDb, vault_id: &str, query: &str) -> Result<Value, String> {
+pub(crate) async fn vault_search(db: &SurrealDb, vault_id: &str, query: &str) -> Result<Value, String> {
     if query.is_empty() { return Ok(json!([])); }
     #[derive(serde::Deserialize)]
     struct Row { path: String, title: String }
@@ -104,7 +104,7 @@ pub(super) async fn vault_search(db: &SurrealDb, vault_id: &str, query: &str) ->
     Ok(json!(result))
 }
 
-pub(super) async fn vault_query_memory(
+pub(crate) async fn vault_query_memory(
     db: &SurrealDb,
     vault_id: &str,
     account_id: &str,
@@ -147,7 +147,7 @@ pub(super) async fn vault_query_memory(
 
 // ── Write vault tools ─────────────────────────────────────────────────────────
 
-pub(super) async fn vault_create_note(
+pub(crate) async fn vault_create_note(
     rel_path: &str,
     content: &str,
     vault_path: &str,
@@ -165,7 +165,7 @@ pub(super) async fn vault_create_note(
     Ok(json!({ "ok": true, "path": rel_path }))
 }
 
-pub(super) async fn vault_update_note(
+pub(crate) async fn vault_update_note(
     rel_path: &str,
     content: &str,
     vault_path: &str,
@@ -181,7 +181,7 @@ pub(super) async fn vault_update_note(
     Ok(json!({ "ok": true, "path": rel_path }))
 }
 
-pub(super) async fn vault_create_folder(
+pub(crate) async fn vault_create_folder(
     rel_path: &str,
     vault_path: &str,
     db: &SurrealDb,
@@ -199,7 +199,7 @@ pub(super) async fn vault_create_folder(
     Ok(json!({ "ok": true, "path": rel_path }))
 }
 
-pub(super) async fn vault_delete_note(
+pub(crate) async fn vault_delete_note(
     rel_path: &str,
     vault_path: &str,
     db: &SurrealDb,
@@ -217,7 +217,7 @@ pub(super) async fn vault_delete_note(
     Ok(json!({ "ok": true, "path": rel_path }))
 }
 
-pub(super) async fn vault_delete_folder(
+pub(crate) async fn vault_delete_folder(
     rel_path: &str,
     vault_path: &str,
 ) -> Result<Value, String> {
@@ -228,7 +228,7 @@ pub(super) async fn vault_delete_folder(
     Ok(json!({ "ok": true, "path": rel_path }))
 }
 
-pub(super) async fn vault_move_note(
+pub(crate) async fn vault_move_note(
     from_rel: &str,
     to_rel: &str,
     vault_path: &str,
@@ -256,7 +256,7 @@ pub(super) async fn vault_move_note(
     Ok(json!({ "ok": true, "from": from_rel, "to": to_rel }))
 }
 
-pub(super) async fn vault_append_to_note(
+pub(crate) async fn vault_append_to_note(
     rel_path: &str,
     content: &str,
     vault_path: &str,
@@ -276,7 +276,7 @@ pub(super) async fn vault_append_to_note(
 }
 
 /// Best-effort: update the note record in DB so search index stays fresh.
-pub(super) async fn sync_note_to_db(
+pub(crate) async fn sync_note_to_db(
     _client: &reqwest::Client,
     db: &SurrealDb,
     vault_id: &str,
@@ -300,7 +300,7 @@ pub(super) async fn sync_note_to_db(
 // ── Tool classification helpers ───────────────────────────────────────────────
 
 /// Write tool check for interactive agent: tools that modify vault state and require user confirmation.
-pub(super) fn is_interactive_write_tool(name: &str) -> bool {
+pub(crate) fn is_interactive_write_tool(name: &str) -> bool {
     matches!(name,
         "create_note" | "update_note" | "create_folder" |
         "delete_note" | "delete_folder" | "move_note" | "append_to_note" |
@@ -309,7 +309,7 @@ pub(super) fn is_interactive_write_tool(name: &str) -> bool {
 }
 
 /// Extract note paths for agent:note_refs event
-pub(super) fn extract_note_refs(tool_name: &str, args: &Value, _result: &Value, _vault_path: &str) -> Vec<String> {
+pub(crate) fn extract_note_refs(tool_name: &str, args: &Value, _result: &Value, _vault_path: &str) -> Vec<String> {
     match tool_name {
         "read_note" => {
             let p = args["path"].as_str().unwrap_or("");
@@ -340,11 +340,11 @@ pub(super) fn extract_note_refs(tool_name: &str, args: &Value, _result: &Value, 
 // ── Tool dispatcher ───────────────────────────────────────────────────────────
 
 /// Dispatch result: value + optional rollback entry (for write operations).
-pub(super) type DispatchResult = Result<(Value, Option<RollbackEntry>), String>;
+pub(crate) type DispatchResult = Result<(Value, Option<RollbackEntry>), String>;
 
 /// Tool dispatcher for interactive agent (vault tools + agent tools + memory tools).
 /// Returns (result_value, optional_rollback_entry).
-pub(super) async fn dispatch_interactive_tool(
+pub(crate) async fn dispatch_interactive_tool(
     client: &reqwest::Client,
     llm_url: &str,
     db: &SurrealDb,
@@ -554,7 +554,7 @@ pub(super) async fn dispatch_interactive_tool(
 /// Build the tools schema for interactive agent.
 /// Includes vault tools, agent tools, and memory tools.
 /// `open_note` and `plan_announce` are always included.
-pub(super) fn build_tools_schema_interactive(tool_names: &[String]) -> Vec<Value> {
+pub(crate) fn build_tools_schema_interactive(tool_names: &[String]) -> Vec<Value> {
     let all_tools: Vec<Value> = vec![
         // ── Read tools ───────────────────────────────────────────────────────
         json!({ "type": "function", "function": {
@@ -726,7 +726,7 @@ pub(super) fn build_tools_schema_interactive(tool_names: &[String]) -> Vec<Value
 
 /// Stream one LLM round, emitting llm:token events. Returns (text, finish_reason, tool_chunks).
 /// tool_chunks: Vec<(id, name, arguments_str)>
-pub(super) async fn stream_llm_round(
+pub(crate) async fn stream_llm_round(
     client: &reqwest::Client,
     llm_url: &str,
     body: Value,

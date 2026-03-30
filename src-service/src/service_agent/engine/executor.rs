@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use super::graph::ToolGraph;
 use super::tool_registry::ToolRegistry;
 use super::transaction::{Transaction, TransactionState};
-use super::types::{EmitEventFn, IsWriteFn, ToolCall};
+use super::super::types::{EmitEventFn, IsWriteFn, ToolCall};
 
 pub struct Executor {
     registry: Arc<ToolRegistry>,

@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use crate::db::SurrealDb;
 
 /// Call llama-server /embedding endpoint (same format as llama.cpp legacy endpoint).
-pub(super) async fn embed_text_llm(client: &reqwest::Client, llm_url: &str, text: &str) -> Vec<f32> {
+pub(crate) async fn embed_text_llm(client: &reqwest::Client, llm_url: &str, text: &str) -> Vec<f32> {
     fn extract_vec(json: &Value) -> Vec<f32> {
         if let Some(arr) = json["data"][0]["embedding"].as_array() {
             let v: Vec<f32> = arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
@@ -51,7 +51,7 @@ pub(super) async fn embed_text_llm(client: &reqwest::Client, llm_url: &str, text
 }
 
 /// Cosine similarity (dot product of L2-normalized vectors).
-pub(super) fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() { return 0.0; }
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -64,7 +64,7 @@ pub(super) fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
 
 /// Load messages from DB by conversation_id.
 /// Returns vec of {role, content} objects (no system messages).
-pub(super) async fn load_messages_db(db: &SurrealDb, conv_id: &str) -> Vec<Value> {
+pub(crate) async fn load_messages_db(db: &SurrealDb, conv_id: &str) -> Vec<Value> {
     #[derive(serde::Deserialize)]
     struct Row { messages_json: Option<String> }
     let rows: Vec<Row> = db
@@ -85,7 +85,7 @@ pub(super) async fn load_messages_db(db: &SurrealDb, conv_id: &str) -> Vec<Value
 }
 
 /// Load agent definition from DB by name + account_id.
-pub(super) async fn load_agent_def(
+pub(crate) async fn load_agent_def(
     db: &SurrealDb,
     name: &str,
     account_id: &str,
@@ -103,7 +103,7 @@ pub(super) async fn load_agent_def(
 
 /// Search agent skills from SurrealDB and filter by input.
 /// Returns Vec<(skill_id, title, behavior, tool_calls, need_tool_chain, tool_chain_order, injection_mode)>
-pub(super) async fn search_skills_db(
+pub(crate) async fn search_skills_db(
     db: &SurrealDb,
     account_id: &str,
     input: &str,
@@ -145,7 +145,7 @@ pub(super) async fn search_skills_db(
 }
 
 /// Detect whether a response contains a reusable structured framework.
-pub(super) fn detect_response_framework(text: &str) -> bool {
+pub(crate) fn detect_response_framework(text: &str) -> bool {
     let has_numbered = (text.contains("1.") || text.contains("1、") || text.contains("①"))
         && (text.contains("2.") || text.contains("2、") || text.contains("②"));
     let has_sequential = (text.contains("先") && text.contains("再") && text.contains("最後"))
@@ -155,7 +155,7 @@ pub(super) fn detect_response_framework(text: &str) -> bool {
 }
 
 /// Convenience wrapper: query memory facts and return Vec<Value> (never errors, returns empty vec).
-pub(super) async fn vault_query_memory_with_limit(
+pub(crate) async fn vault_query_memory_with_limit(
     db: &SurrealDb,
     vault_id: &str,
     account_id: &str,

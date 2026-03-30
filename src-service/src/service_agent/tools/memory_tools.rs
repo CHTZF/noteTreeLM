@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use crate::db::SurrealDb;
 
-pub(super) async fn get_unprocessed_conversations(
+pub(crate) async fn get_unprocessed_conversations(
     db: &SurrealDb,
     vault_id: &str,
     account_id: &str,
@@ -56,7 +56,7 @@ pub(super) async fn get_unprocessed_conversations(
     Ok(json!(items))
 }
 
-pub(super) async fn get_conversation_content(
+pub(crate) async fn get_conversation_content(
     db: &SurrealDb,
     conv_id: &str,
     skip_count: i64,
@@ -94,7 +94,7 @@ pub(super) async fn get_conversation_content(
     Ok(Value::String(text))
 }
 
-pub(super) async fn save_memory_facts(
+pub(crate) async fn save_memory_facts(
     client: &reqwest::Client,
     db: &SurrealDb,
     vault_id: &str,
@@ -143,7 +143,7 @@ pub(super) async fn save_memory_facts(
 
         // Compute embedding (stored as native array, not JSON string)
         let embedding_vec: Option<Vec<f32>> =
-            crate::embedder::embed_text(client, embedding_url, &content).await;
+            crate::processing::embedder::embed_text(client, embedding_url, &content).await;
 
         let fact_id = uuid::Uuid::new_v4().to_string();
         let _ = db
@@ -165,7 +165,7 @@ pub(super) async fn save_memory_facts(
     Ok(json!({ "facts_saved": count }))
 }
 
-pub(super) async fn mark_conversation_processed(
+pub(crate) async fn mark_conversation_processed(
     db: &SurrealDb,
     conv_id: &str,
 ) -> Result<Value, String> {
@@ -194,7 +194,7 @@ pub(super) async fn mark_conversation_processed(
     Ok(json!({ "ok": true, "processed_msg_count": msg_count }))
 }
 
-pub(super) async fn condense_memory_facts(
+pub(crate) async fn condense_memory_facts(
     client: &reqwest::Client,
     llm_url: &str,
     db: &SurrealDb,
@@ -270,7 +270,7 @@ pub(super) async fn condense_memory_facts(
         let expires_at = now + 365 * 86400;
         let new_fid = uuid::Uuid::new_v4().to_string();
         let embedding_vec: Option<Vec<f32>> =
-            crate::embedder::embed_text(client, embedding_url, &summary).await;
+            crate::processing::embedder::embed_text(client, embedding_url, &summary).await;
         let insert_ok = db
             .query("INSERT INTO memory_facts (fact_id, vault_id, account_id, content, category, expires_at, created_at, embedding) VALUES ($fid, $vid, $aid, $content, $cat, $exp, $now, $emb)")
             .bind(("fid", new_fid))
@@ -297,7 +297,7 @@ pub(super) async fn condense_memory_facts(
 }
 
 /// Build the tools schema for scheduled agent (memory tools only).
-pub(super) fn build_scheduled_tools_schema(tool_names: &[String]) -> Vec<Value> {
+pub(crate) fn build_scheduled_tools_schema(tool_names: &[String]) -> Vec<Value> {
     let all = vec![
         json!({
             "type": "function",
@@ -397,7 +397,7 @@ pub(super) fn build_scheduled_tools_schema(tool_names: &[String]) -> Vec<Value> 
 }
 
 /// Tool dispatcher for scheduled agent (memory tools only).
-pub(super) async fn dispatch_scheduled_tool(
+pub(crate) async fn dispatch_scheduled_tool(
     client: &reqwest::Client,
     llm_url: &str,
     db: &SurrealDb,

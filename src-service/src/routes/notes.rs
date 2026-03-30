@@ -298,7 +298,7 @@ async fn delete_note(
 /// Chunk, embed, and index a note into SurrealDB chunks + SQLite FTS5.
 /// This is best-effort: errors are logged but not returned to the caller.
 async fn index_note_chunks(state: &ApiState, vault_id: &str, rel_path: &str, content: &str) {
-    let chunks = crate::chunker::split_into_chunks(content, rel_path);
+    let chunks = crate::processing::chunker::split_into_chunks(content, rel_path);
     if chunks.is_empty() {
         return;
     }
@@ -336,10 +336,10 @@ async fn index_note_chunks(state: &ApiState, vault_id: &str, rel_path: &str, con
 
     for chunk in &chunks {
         // Try to get embedding
-        let embedding = crate::embedder::embed_text(
+        let embedding = crate::processing::embedder::embed_text(
             &http_client,
             &emb_url,
-            &crate::chunker::clean_for_embedding(&chunk.content),
+            &crate::processing::chunker::clean_for_embedding(&chunk.content),
         )
         .await;
 

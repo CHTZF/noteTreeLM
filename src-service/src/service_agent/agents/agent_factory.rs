@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use super::types::NewSkillSpec;
+use super::super::types::NewSkillSpec;
 
 /// 呼叫 LLM（非串流）根據 user_ask 生成 agent 規格 JSON。
 /// 回傳 (name, description, trigger, tool_names, system_prompt, skills)；任何錯誤 fallback 至 raw input。

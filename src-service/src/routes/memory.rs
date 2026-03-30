@@ -313,7 +313,7 @@ async fn query_memory(
             .build()
             .unwrap_or_default();
 
-        let query_vec = crate::embedder::embed_text(&http_client, &embedding_url, q_text).await;
+        let query_vec = crate::processing::embedder::embed_text(&http_client, &embedding_url, q_text).await;
 
         if let Some(qvec) = query_vec {
             // Use SurrealDB vector::similarity::cosine for ranking.
@@ -533,7 +533,7 @@ async fn store_facts(
         let embedding_vec: Option<Vec<f32>> = if fact.embedding.is_some() {
             fact.embedding
         } else {
-            crate::embedder::embed_text(&http_client, &embedding_url, &content).await
+            crate::processing::embedder::embed_text(&http_client, &embedding_url, &content).await
         };
 
         // Resolve account_id: prefer per-fact field, fall back to Bearer token, then empty
@@ -642,7 +642,7 @@ async fn distill_facts(
         .unwrap_or_default();
     let summary = body.summary.trim().to_string();
     let embedding: Option<Vec<f32>> =
-        crate::embedder::embed_text(&http_client, &embedding_url, &summary).await;
+        crate::processing::embedder::embed_text(&http_client, &embedding_url, &summary).await;
 
     // Insert summary fact with embedding and account_id
     let fact_id = uuid::Uuid::new_v4().to_string();

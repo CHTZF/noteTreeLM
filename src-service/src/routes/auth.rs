@@ -104,7 +104,7 @@ async fn login(
     let username_for_seed = user.username.clone();
     let db_for_seed = state.db.clone();
     tokio::spawn(async move {
-        crate::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
+        crate::db::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
     });
 
     Ok(Json(json!({
@@ -218,7 +218,7 @@ async fn register(
     let username_for_seed = req.username.clone();
     let db_for_seed = state.db.clone();
     tokio::spawn(async move {
-        crate::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
+        crate::db::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
     });
 
     Ok(Json(json!({ "ok": true, "username": req.username })))
@@ -307,7 +307,7 @@ async fn google_upsert(
     let username_for_seed = username.clone();
     let db_for_seed = state.db.clone();
     tokio::spawn(async move {
-        crate::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
+        crate::db::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
     });
 
     tracing::info!("google_upsert: session created for {}", username);

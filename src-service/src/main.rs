@@ -1,16 +1,13 @@
 mod api_state;
 mod auth;
-mod chunker;
 mod daemon;
 mod db;
-mod embedder;
 pub mod service_agent;
-mod mdns;
+mod network;
+mod processing;
 mod routes;
-pub mod seeds;
 mod server;
 mod state;
-mod tls;
 
 fn get_data_dir() -> std::path::PathBuf {
     let base = dirs::data_dir().expect("Cannot find data directory");

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::types::Tool;
+use super::super::types::Tool;
 
 pub struct ToolRegistry {
 

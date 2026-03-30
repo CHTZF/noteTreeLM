@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::api_state::ApiState;
+use crate::service_agent::engine::transaction::Transaction;
 use super::account_id_from_headers;
 
 /// POST /vaults/:vid/agent/run
@@ -62,7 +63,7 @@ pub async fn cancel(
     if let Some(flag) = cancel_flag {
         flag.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    if let Some(tx) = tx_opt {
+    if let Some(tx) = tx_opt.map(|t: Arc<Transaction>| t) {
         let _ = tx.cancel().await;
     }
     Ok(Json(json!({ "ok": true })))
@@ -77,7 +78,7 @@ pub async fn confirm(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let session_id = body["session_id"].as_str().unwrap_or("");
     let approved = body["approved"].as_bool().unwrap_or(false);
-    let tx_opt = {
+    let tx_opt: Option<Arc<Transaction>> = {
         let sessions = state.daemon.agent_sessions.lock().await;
         sessions.values()
             .find(|s| s.session_id == session_id)

@@ -33,7 +33,7 @@ pub async fn execute_scheduled_task(
     };
 
     // Look up agent definition
-    let agent_def = match super::helpers::load_agent_def(&state.db, &agent_name, &account_id).await {
+    let agent_def = match super::super::helpers::load_agent_def(&state.db, &agent_name, &account_id).await {
         Some(a) => a,
         None => {
             tracing::warn!("[scheduler] agent '{}' not found for account '{}'", agent_name, account_id);
@@ -42,7 +42,7 @@ pub async fn execute_scheduled_task(
     };
 
     let system_prompt = agent_def["system_prompt"].as_str().unwrap_or("").to_string();
-    let max_rounds = agent_def["max_rounds"].as_i64().unwrap_or(super::MAX_ROUNDS as i64) as usize;
+    let max_rounds = agent_def["max_rounds"].as_i64().unwrap_or(super::super::MAX_ROUNDS as i64) as usize;
     let tool_names: Vec<String> = agent_def["tool_names"]
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
@@ -98,7 +98,7 @@ async fn run_agent_loop(
     tool_names: &[String],
     max_rounds: usize,
 ) -> String {
-    let tools_schema = super::memory_tools::build_scheduled_tools_schema(tool_names);
+    let tools_schema = super::super::tools::memory_tools::build_scheduled_tools_schema(tool_names);
     let mut messages: Vec<Value> = vec![
         json!({ "role": "system", "content": system_prompt }),
         json!({ "role": "user",   "content": initial_msg }),
@@ -159,7 +159,7 @@ async fn run_agent_loop(
                     .and_then(|s| serde_json::from_str(s).ok())
                     .unwrap_or(json!({}));
 
-                let result = super::memory_tools::dispatch_scheduled_tool(client, llm_url, db, vault_id, account_id, embedding_url, &fn_name, &fn_args).await;
+                let result = super::super::tools::memory_tools::dispatch_scheduled_tool(client, llm_url, db, vault_id, account_id, embedding_url, &fn_name, &fn_args).await;
                 let result_str = match &result {
                     Ok(v) => serde_json::to_string(v).unwrap_or_default(),
                     Err(e) => format!("ERROR: {}", e),

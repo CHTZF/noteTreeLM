@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::types::ToolCall;
+use super::super::types::ToolCall;
 
 pub struct ToolNode {
 

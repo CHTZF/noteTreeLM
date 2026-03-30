@@ -17,7 +17,7 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 
 use crate::db::SurrealDb;
-use super::types::{ConfirmWriteFn, EmitEventFn, EmbedFn, LlmFn, NewSkillSpec, SummarizeFn};
+use super::super::types::{ConfirmWriteFn, EmitEventFn, EmbedFn, LlmFn, NewSkillSpec, SummarizeFn};
 
 // ── AgentDefinition (local DB row) ───────────────────────────────────────────
 
@@ -797,11 +797,11 @@ async fn run_sub_agent_with_system(
     summarize_fn: Option<SummarizeFn>,
     vault_ctx: SubAgentVaultCtx,
 ) -> String {
-    use super::dispatcher::Dispatcher;
-    use super::planner::Planner;
-    use super::tool_registry::ToolRegistry;
-    use super::transaction::Transaction;
-    use super::types::Tool;
+    use super::super::engine::dispatcher::Dispatcher;
+    use super::super::engine::planner::Planner;
+    use super::super::engine::tool_registry::ToolRegistry;
+    use super::super::engine::transaction::Transaction;
+    use super::super::types::Tool;
 
     let mut messages: Vec<Value> = vec![
         serde_json::json!({"role": "system", "content": system_content}),
@@ -843,7 +843,7 @@ async fn run_sub_agent_with_system(
         let embedding_url = vault_ctx.embedding_url.clone();
         let name_owned = name.to_string();
 
-        let execute_fn: super::types::ToolFn = Arc::new(move |args: Value| {
+        let execute_fn: super::super::types::ToolFn = Arc::new(move |args: Value| {
             let client = client.clone();
             let llm_url = llm_url.clone();
             let db = db.clone();
@@ -853,7 +853,7 @@ async fn run_sub_agent_with_system(
             let embedding_url = embedding_url.clone();
             let name_owned = name_owned.clone();
             Box::pin(async move {
-                match super::vault_tools::dispatch_interactive_tool(
+                match super::super::tools::vault_tools::dispatch_interactive_tool(
                     &client, &llm_url, &db,
                     &vault_id, &account_id, &vault_path_c, &embedding_url,
                     &name_owned, &args,
@@ -873,8 +873,8 @@ async fn run_sub_agent_with_system(
     let registry = Arc::new(registry);
     // system_agent_svc handles its own emit + write confirmation outside Dispatcher;
     // pass no-ops so Executor doesn't duplicate pre-tool SSE or confirmation logic.
-    let noop_emit: super::types::EmitEventFn = Arc::new(|_, _| {});
-    let no_write: super::types::IsWriteFn = Arc::new(|_| false);
+    let noop_emit: super::super::types::EmitEventFn = Arc::new(|_, _| {});
+    let no_write: super::super::types::IsWriteFn = Arc::new(|_| false);
     let dispatcher = Dispatcher::new(Arc::clone(&registry), noop_emit, no_write);
     let tx = Arc::new(Transaction::new());
 

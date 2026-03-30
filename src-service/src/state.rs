@@ -26,7 +26,7 @@ pub struct ServiceEvent {
 pub struct AgentSession {
     pub session_id: String,
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
-    pub transaction: Option<Arc<crate::service_agent::transaction::Transaction>>,
+    pub transaction: Option<Arc<crate::service_agent::engine::transaction::Transaction>>,
     pub conversation_id: String,
 }
 

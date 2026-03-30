@@ -57,7 +57,7 @@ pub async fn run_live_chat_agent(
     let embedding_url = state.daemon.embedding_url.read().await.clone();
 
     // Load messages from DB and append current user input
-    let history = super::helpers::load_messages_db(&state.db, &conversation_id).await;
+    let history = super::super::helpers::load_messages_db(&state.db, &conversation_id).await;
     let mut base_msgs: Vec<Value> = history;
     base_msgs.push(json!({"role": "user", "content": input}));
 
@@ -90,7 +90,7 @@ pub async fn run_live_chat_agent(
         // Try semantic search if embedding_url available
         let facts: Vec<Value> = if let Some(ref emb_url) = embedding_url {
             // Semantic search via embedding
-            if let Some(query_vec) = crate::embedder::embed_text(&client, &Some(emb_url.clone()), &kw_input).await {
+            if let Some(query_vec) = crate::processing::embedder::embed_text(&client, &Some(emb_url.clone()), &kw_input).await {
                 #[derive(serde::Deserialize)]
                 struct FactRow { fact_id: String, content: String, category: String, embedding: Option<Vec<f32>> }
                 let mut r = state.db
@@ -103,7 +103,7 @@ pub async fn run_live_chat_agent(
                 if let Some(ref mut resp) = r {
                     let rows: Vec<FactRow> = resp.take(0).unwrap_or_default();
                     let mut scored: Vec<(f32, Value)> = rows.into_iter().filter_map(|row| {
-                        let sim = row.embedding.as_ref().map(|e| super::helpers::cosine_sim(e, &query_vec)).unwrap_or(0.0);
+                        let sim = row.embedding.as_ref().map(|e| super::super::helpers::cosine_sim(e, &query_vec)).unwrap_or(0.0);
                         Some((sim, json!({"fact_id": row.fact_id, "content": row.content, "category": row.category})))
                     }).collect();
                     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -111,10 +111,10 @@ pub async fn run_live_chat_agent(
                 } else { vec![] }
             } else {
                 // Fallback to keyword search
-                super::helpers::vault_query_memory_with_limit(&state.db, &vault_id, &account_id, &keywords, 6).await
+                super::super::helpers::vault_query_memory_with_limit(&state.db, &vault_id, &account_id, &keywords, 6).await
             }
         } else {
-            super::helpers::vault_query_memory_with_limit(&state.db, &vault_id, &account_id, &keywords, 6).await
+            super::super::helpers::vault_query_memory_with_limit(&state.db, &vault_id, &account_id, &keywords, 6).await
         };
 
         if !facts.is_empty() {
@@ -205,7 +205,7 @@ live_respond 規則：\
             _ => vec!["live_respond".to_string()],
         };
 
-        let tools_schema = super::vault_tools::build_tools_schema_interactive(&round_tool_names);
+        let tools_schema = super::super::tools::vault_tools::build_tools_schema_interactive(&round_tool_names);
         let body = if tools_schema.is_empty() {
             json!({ "messages": msgs, "stream": true, "temperature": 0.7, "max_tokens": 512 })
         } else {
@@ -219,7 +219,7 @@ live_respond 規則：\
             })
         };
 
-        let (text, finish_reason, tool_chunks) = match super::vault_tools::stream_llm_round(
+        let (text, finish_reason, tool_chunks) = match super::super::tools::vault_tools::stream_llm_round(
             &client, &llm_url, body, &state, &session_id, &cancel,
         ).await {
             Ok(r) => r,
@@ -270,7 +270,7 @@ live_respond 規則：\
                 "display": tc_name,
             }));
 
-            let result = super::vault_tools::dispatch_interactive_tool(
+            let result = super::super::tools::vault_tools::dispatch_interactive_tool(
                 &client, &llm_url, &state.db,
                 &vault_id, &account_id, &vault_path, &embedding_url,
                 tc_name, &args,

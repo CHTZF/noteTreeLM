@@ -6,11 +6,11 @@ use crate::api_state::ApiState;
 use crate::db::SurrealDb;
 use crate::state::AgentSession;
 
-use super::dispatcher::Dispatcher;
-use super::planner::Planner;
-use super::tool_registry::ToolRegistry;
-use super::transaction::Transaction;
-use super::types::{EmitEventFn, IsWriteFn, Tool};
+use super::super::engine::dispatcher::Dispatcher;
+use super::super::engine::planner::Planner;
+use super::super::engine::tool_registry::ToolRegistry;
+use super::super::engine::transaction::Transaction;
+use super::super::types::{EmitEventFn, IsWriteFn, Tool};
 
 /// Public entry point called from routes/agents.rs for user-facing agent runs.
 /// Now receives raw input + thin params from Tauri; does all pre-processing here.
@@ -51,28 +51,28 @@ pub async fn run_interactive_agent(
             sessions.get(&conv_id).and_then(|s| s.transaction.clone())
         };
         if let Some(pending) = pending_tx {
-            use super::transaction::TransactionState;
+            use super::super::engine::transaction::TransactionState;
             if pending.state().await == TransactionState::Preparing {
-                let embed_fn: super::types::EmbedFn = {
+                let embed_fn: super::super::types::EmbedFn = {
                     let client = reqwest::Client::new();
                     let llm_url = state.daemon.llm_url.read().await.clone().unwrap_or_default();
                     Arc::new(move |text: String| {
                         let client = client.clone();
                         let llm_url = llm_url.clone();
                         Box::pin(async move {
-                            super::helpers::embed_text_llm(&client, &llm_url, &text).await
+                            super::super::helpers::embed_text_llm(&client, &llm_url, &text).await
                         })
                     })
                 };
-                let classifier = super::intent_classifier::IntentClassifier::new();
-                let intent = match super::intent_classifier::IntentClassifier::compute_centroids_cached(
+                let classifier = super::super::intent_classifier::IntentClassifier::new();
+                let intent = match super::super::intent_classifier::IntentClassifier::compute_centroids_cached(
                     &state.daemon.intent_centroids,
                     &embed_fn,
                 ).await {
                     Some((cc, ccl, ci)) => classifier.classify_with_centroids(&input, &embed_fn, &cc, &ccl, &ci).await,
                     None => classifier.classify(&input).await,
                 };
-                use super::intent_classifier::Intent;
+                use super::super::intent_classifier::Intent;
                 match intent {
                     Intent::Confirm => { let _ = pending.commit().await; }
                     Intent::Cancel | Intent::Interrupt => { let _ = pending.cancel().await; }
@@ -122,7 +122,7 @@ pub async fn run_interactive_agent(
 
     // 3. Load messages from DB; fall back to frontend-passed messages if DB returns empty.
     let mut messages_json: Vec<Value> = {
-        let db_msgs = super::helpers::load_messages_db(&state.db, &conv_id).await;
+        let db_msgs = super::super::helpers::load_messages_db(&state.db, &conv_id).await;
         let mut v = if db_msgs.is_empty() { messages.clone() } else { db_msgs };
         if v.last().and_then(|m| m["role"].as_str()) != Some("user") {
             v.push(json!({"role": "user", "content": input}));
@@ -151,7 +151,7 @@ pub async fn run_interactive_agent(
     let mut tool_names: Vec<String> = vec!["search_skills".to_string(), "plan_announce".to_string()];
 
     if use_tools && !vault_path.is_empty() {
-        let matched = super::helpers::search_skills_db(&state.db, &account_id, &input).await;
+        let matched = super::super::helpers::search_skills_db(&state.db, &account_id, &input).await;
 
         if !matched.is_empty() {
             let mut proactive_parts: Vec<String> = vec![];
@@ -161,7 +161,7 @@ pub async fn run_interactive_agent(
                     if tool_name == "prefetch_memory" {
                         let kw_input: String = input.chars().take(120).collect();
                         let keywords = if kw_input.is_empty() { vec![] } else { vec![kw_input.clone()] };
-                        let facts = super::helpers::vault_query_memory_with_limit(&state.db, &vault_id, &account_id, &keywords, 8).await;
+                        let facts = super::super::helpers::vault_query_memory_with_limit(&state.db, &vault_id, &account_id, &keywords, 8).await;
                         if !facts.is_empty() {
                             let lines: Vec<String> = facts.iter().map(|r| {
                                 let cat = r["category"].as_str().unwrap_or("general");
@@ -275,7 +275,7 @@ pub async fn run_interactive_agent(
     };
 
     let is_write_fn: IsWriteFn = Arc::new(|name: &str| {
-        super::vault_tools::is_interactive_write_tool(name)
+        super::super::tools::vault_tools::is_interactive_write_tool(name)
     });
 
     let registry = build_interactive_registry(
@@ -291,12 +291,12 @@ pub async fn run_interactive_agent(
     );
 
     // 8. Tool loop or no-tool LLM
-    let tools_schema = super::vault_tools::build_tools_schema_interactive(&tool_names);
+    let tools_schema = super::super::tools::vault_tools::build_tools_schema_interactive(&tool_names);
     let mut msgs = messages_json.clone();
     let mut full_response = String::new();
 
     if use_tools && !vault_path.is_empty() {
-        for _round in 0..super::MAX_ROUNDS {
+        for _round in 0..super::super::MAX_ROUNDS {
             if cancel.load(Ordering::Relaxed) { break; }
 
             let body = if tools_schema.is_empty() {
@@ -312,7 +312,7 @@ pub async fn run_interactive_agent(
                 })
             };
 
-            let (text, finish_reason, tool_chunks) = match super::vault_tools::stream_llm_round(
+            let (text, finish_reason, tool_chunks) = match super::super::tools::vault_tools::stream_llm_round(
                 &client, &llm_url, body, &state, &session_id, &cancel,
             ).await {
                 Ok(r) => r,
@@ -354,7 +354,7 @@ pub async fn run_interactive_agent(
     } else {
         // No vault / use_tools=false → pure LLM streaming, no tools
         let body = json!({ "messages": msgs, "stream": true, "temperature": 0.7, "max_tokens": 2048 });
-        match super::vault_tools::stream_llm_round(&client, &llm_url, body, &state, &session_id, &cancel).await {
+        match super::super::tools::vault_tools::stream_llm_round(&client, &llm_url, body, &state, &session_id, &cancel).await {
             Ok((text, _, _)) => { full_response = text; }
             Err(e) => { tracing::warn!("[interactive] no-vault stream error: {}", e); }
         }
@@ -363,7 +363,7 @@ pub async fn run_interactive_agent(
     state.daemon.emit("llm:done", json!(full_response));
 
     // 9. Skill suggestion detection
-    if !full_response.is_empty() && super::helpers::detect_response_framework(&full_response) {
+    if !full_response.is_empty() && super::super::helpers::detect_response_framework(&full_response) {
         state.daemon.emit("agent:skill_suggestion", json!({
             "query": input,
             "response_preview": full_response.chars().take(200).collect::<String>(),
@@ -426,7 +426,7 @@ fn build_interactive_registry(
         let state_c = state.clone();
         let name_owned = name.to_string();
 
-        let execute: super::types::ToolFn = Arc::new(move |args: Value| {
+        let execute: super::super::types::ToolFn = Arc::new(move |args: Value| {
             let client = client.clone();
             let llm_url = llm_url.clone();
             let db = db.clone();
@@ -449,7 +449,7 @@ fn build_interactive_registry(
                     return Ok(json!("✅ 已確認計畫，請立即執行"));
                 }
 
-                let result = super::vault_tools::dispatch_interactive_tool(
+                let result = super::super::tools::vault_tools::dispatch_interactive_tool(
                     &client, &llm_url, &db,
                     &vault_id, &account_id, &vault_path, &embedding_url,
                     &name, &args,
@@ -458,7 +458,7 @@ fn build_interactive_registry(
                 match result {
                     Ok((v, _rollback)) => {
                         // Post-dispatch: emit note_refs
-                        let refs = super::vault_tools::extract_note_refs(&name, &args, &v, &vault_path);
+                        let refs = super::super::tools::vault_tools::extract_note_refs(&name, &args, &v, &vault_path);
                         if !refs.is_empty() {
                             state_c.daemon.emit("agent:note_refs", json!({
                                 "session_id": session_id,

@@ -158,6 +158,6 @@ pub async fn seed_builtins(
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let account_id = account_id_from_headers(&state, &headers).await?;
-    crate::seeds::seed_builtins(&state.db, &account_id).await;
+    crate::db::seeds::seed_builtins(&state.db, &account_id).await;
     Ok(Json(json!({ "ok": true, "account_id": account_id })))
 }

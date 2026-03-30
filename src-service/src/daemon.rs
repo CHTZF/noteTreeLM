@@ -13,11 +13,11 @@ pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let db = crate::db::init_db(&data_dir).await?;
     tracing::info!("Database initialized");
 
-    let hostnames = crate::tls::collect_san_hostnames();
-    let tls = crate::tls::generate_tls_cert(hostnames)?;
+    let hostnames = crate::network::tls::collect_san_hostnames();
+    let tls = crate::network::tls::generate_tls_cert(hostnames)?;
     tracing::info!("TLS SPKI pin: {}", tls.spki_pin);
 
-    let _mdns = crate::mdns::start_mdns_broadcast(&tls.spki_pin)?;
+    let _mdns = crate::network::mdns::start_mdns_broadcast(&tls.spki_pin)?;
 
     let auth_store = AuthStore::new();
     let daemon_state = DaemonState::new_with_data_dir(&data_dir);
