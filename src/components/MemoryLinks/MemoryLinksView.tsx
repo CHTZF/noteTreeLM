@@ -64,6 +64,7 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
   const activeMemoryIdsRef = useRef<string[]>([])            // node_ids from last memory:prefetched
   const breathingRef      = useRef<{ cancel: () => void } | null>(null)
   const activeEdgeIdsRef  = useRef<string[]>([])             // current round's active edge ids
+  const pendingSkillsRef  = useRef<{ id: string; label: string }[]>([])  // queued skills before memory:prefetched
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
   const sourceFilterRef   = useRef<SourceFilter>('all')
   const { settings }      = useSettingsStore()
@@ -407,32 +408,14 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
         } catch { /* best-effort */ }
       }
 
-      // Reconnect any skill/think temp nodes that arrived before memory:prefetched,
-      // collect their IDs so applyFocus includes them (prevents dimming)
-      const newEdgeIds: string[] = []
-      const earlyTempIds = new Set<string>()
-      ;(['think', 'skill'] as const).forEach(type => {
-        cy.nodes().filter((n: any) => n.data('node_type') === type && n.data('temp') && !n.data('inactive')).forEach((n: any) => {
-          const nid = n.id() as string
-          earlyTempIds.add(nid)
-          node_ids.forEach(memId => {
-            const edgeId = `edge_${type}_${nid}_${memId}`
-            if (cy.getElementById(edgeId).length === 0 && cy.getElementById(memId).length > 0) {
-              cy.add({ group: 'edges', data: { id: edgeId, source: nid, target: memId, temp: true } })
-              newEdgeIds.push(edgeId)
-            }
-          })
-        })
-      })
-
-      // Focus memory nodes + existing skill/think nodes together
-      const focusIds = new Set([...incomingIds, ...earlyTempIds])
-      applyFocus(focusIds, true)
-
-      if (newEdgeIds.length > 0) {
-        activeEdgeIdsRef.current = [...activeEdgeIdsRef.current, ...newEdgeIds]
-        startBlink(activeEdgeIdsRef.current)
+      // Drain pending skills queue (skills that arrived before activeMemoryIdsRef was set)
+      const pending = pendingSkillsRef.current
+      pendingSkillsRef.current = []
+      if (pending.length > 0) {
+        addTempNodes('skill', pending)
       }
+
+      applyFocus(incomingIds, true)
     }).then(fn => { unlisten = fn })
 
     return () => { unlisten?.() }
@@ -502,6 +485,8 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
   }, [addTempNodes])
 
   // ── Listen for agent:skills_activated ────────────────────────────────────
+  // Queue skills until memory:prefetched fires (which sets activeMemoryIdsRef).
+  // If memory is already set (e.g. second turn), add immediately.
   useEffect(() => {
     let unlisten: (() => void) | null = null
     listen<{ titles: string[]; source?: string }>('agent:skills_activated', (e) => {
@@ -509,7 +494,11 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
         id: `temp_skill_${title.replace(/\s+/g, '_')}_${i}`,
         label: `⚡ ${title}`,
       }))
-      addTempNodes('skill', items)
+      if (activeMemoryIdsRef.current.length > 0) {
+        addTempNodes('skill', items)
+      } else {
+        pendingSkillsRef.current = [...pendingSkillsRef.current, ...items]
+      }
     }).then(fn => { unlisten = fn })
     return () => { unlisten?.() }
   }, [addTempNodes])
