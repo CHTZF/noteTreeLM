@@ -364,6 +364,7 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
     let unlisten: (() => void) | null = null
 
     listen<{ node_ids: string[]; source: string }>('memory:prefetched', async (event) => {
+      console.log('[MemoryLinks] memory:prefetched raw', event.payload, 'cy=', !!cyRef.current, 'filter=', sourceFilterRef.current)
       const cy = cyRef.current
       if (!cy) return
 
@@ -376,6 +377,10 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
       if (node_ids.length === 0) {
         activeMemoryIdsRef.current = ['temp_no_memory']
         addTempNodes('memory_fact', [{ id: 'temp_no_memory', label: '📭 尚無相關記憶' }])
+        // Drain pending skills queue even for placeholder
+        const pending = pendingSkillsRef.current
+        pendingSkillsRef.current = []
+        if (pending.length > 0) addTempNodes('skill', pending)
         return
       }
 
@@ -411,6 +416,7 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
       // Drain pending skills queue (skills that arrived before activeMemoryIdsRef was set)
       const pending = pendingSkillsRef.current
       pendingSkillsRef.current = []
+      console.log('[MemoryLinks] memory:prefetched node_ids=', node_ids, 'pending skills=', pending)
       if (pending.length > 0) {
         addTempNodes('skill', pending)
       }
@@ -490,13 +496,16 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
   useEffect(() => {
     let unlisten: (() => void) | null = null
     listen<{ titles: string[]; source?: string }>('agent:skills_activated', (e) => {
+      console.log('[MemoryLinks] agent:skills_activated', e.payload, 'activeMemoryIds=', activeMemoryIdsRef.current)
       const items = e.payload.titles.map((title, i) => ({
         id: `temp_skill_${title.replace(/\s+/g, '_')}_${i}`,
         label: `⚡ ${title}`,
       }))
       if (activeMemoryIdsRef.current.length > 0) {
+        console.log('[MemoryLinks] adding skills immediately')
         addTempNodes('skill', items)
       } else {
+        console.log('[MemoryLinks] queuing skills, pending=', items)
         pendingSkillsRef.current = [...pendingSkillsRef.current, ...items]
       }
     }).then(fn => { unlisten = fn })
