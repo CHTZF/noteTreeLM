@@ -340,7 +340,7 @@ pub(crate) fn build_interactive_registry(
     embedding_url: &Option<String>,
     session_id: &str,
     state: &ApiState,
-    tx: Arc<Transaction>,
+    _tx: Arc<Transaction>,
     cancel: Arc<AtomicBool>,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();

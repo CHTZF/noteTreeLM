@@ -7,44 +7,17 @@ use crate::db::SurrealDb;
 
 // ── Rollback infrastructure ───────────────────────────────────────────────────
 
-/// Tracks how to undo a completed write operation.
+/// Tracks how to undo a completed write operation (carried in DispatchResult).
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) enum RollbackEntry {
-    /// Undo a create_note / append_to_note by restoring original (or deleting if created fresh).
-    WriteFile { path: String, content: String },
-    /// Undo a delete_note by restoring the file.
+    WriteFile  { path: String, content: String },
     RestoreFile { path: String, content: String },
-    /// Undo a create_note (no prior content) by deleting the file.
     DeleteFile { path: String },
-    /// Undo a create_folder by removing the directory.
-    RemoveDir { path: String },
-    /// Undo a move_note by moving back (full absolute paths).
-    MoveFile { from_abs: String, to_abs: String },
+    RemoveDir  { path: String },
+    MoveFile   { from_abs: String, to_abs: String },
 }
 
-/// Execute rollbacks in reverse order (most-recent first).
-pub(crate) async fn execute_rollback(entries: Vec<RollbackEntry>) {
-    for entry in entries.into_iter().rev() {
-        match entry {
-            RollbackEntry::DeleteFile { path } => {
-                let _ = tokio::fs::remove_file(&path).await;
-            }
-            RollbackEntry::WriteFile { path, content } | RollbackEntry::RestoreFile { path, content } => {
-                if let Some(parent) = std::path::Path::new(&path).parent() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
-                }
-                let _ = tokio::fs::write(&path, content).await;
-            }
-            RollbackEntry::RemoveDir { path } => {
-                let _ = tokio::fs::remove_dir_all(&path).await;
-            }
-            RollbackEntry::MoveFile { from_abs, to_abs } => {
-                // Move back: from_abs is destination of original move, to_abs is source
-                let _ = tokio::fs::rename(&from_abs, &to_abs).await;
-            }
-        }
-    }
-}
 
 // ── Read-only vault tools ─────────────────────────────────────────────────────
 
