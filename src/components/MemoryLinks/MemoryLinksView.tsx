@@ -62,6 +62,8 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
   const dmnPhaseRef       = useRef<0 | 1>(0)                 // 0=exhale(dim), 1=inhale(bright)
   const tempNodeIdsRef    = useRef<Set<string>>(new Set())   // temp think/skill node ids
   const activeMemoryIdsRef = useRef<string[]>([])            // node_ids from last memory:prefetched
+  const blinkTimerRef     = useRef<ReturnType<typeof setInterval> | null>(null)
+  const activeEdgeIdsRef  = useRef<string[]>([])             // current round's active edge ids
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
   const sourceFilterRef   = useRef<SourceFilter>('all')
   const { settings }      = useSettingsStore()
@@ -381,6 +383,28 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
     return () => { unlisten?.() }
   }, [applyFocus])
 
+  // ── Blink active edges ────────────────────────────────────────────────────
+  const stopBlink = useCallback(() => {
+    if (blinkTimerRef.current) { clearInterval(blinkTimerRef.current); blinkTimerRef.current = null }
+  }, [])
+
+  const startBlink = useCallback((edgeIds: string[]) => {
+    stopBlink()
+    if (edgeIds.length === 0) return
+    let phase = true
+    blinkTimerRef.current = setInterval(() => {
+      const cy = cyRef.current
+      if (!cy) return
+      phase = !phase
+      edgeIds.forEach(eid => {
+        const e = cy.getElementById(eid)
+        if (e.length > 0) e.style('opacity', phase ? 0.9 : 0.15)
+      })
+    }, 500)
+  }, [stopBlink])
+
+  useEffect(() => () => stopBlink(), [stopBlink])
+
   // ── Helper: add temp nodes (think/skill) + focus them ────────────────────
   const addTempNodes = useCallback((
     type: 'think' | 'skill' | 'memory_fact',
@@ -389,14 +413,23 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
     const cy = cyRef.current
     if (!cy || items.length === 0) return
 
-    // Remove old temp nodes of the same type (and their edges)
-    cy.nodes().filter((n: NodeSingular) => n.data('node_type') === type && n.data('temp')).remove()
-    cy.edges().filter((e: any) => e.data('temp') && e.data('id')?.startsWith(`edge_${type}_`)).remove()
+    // Dim existing same-type temp nodes/edges (they become "history")
+    cy.nodes().filter((n: NodeSingular) => n.data('node_type') === type && n.data('temp')).forEach((n: NodeSingular) => {
+      n.data('inactive', true)
+      ;(n as any).animate({ style: { opacity: 0.15, 'background-color': DIMMED_COLOR, 'text-opacity': 0 } }, { duration: ANIM_MS })
+    })
+    cy.edges().filter((e: any) => e.data('temp') && String(e.data('id') ?? '').startsWith(`edge_${type}_`)).forEach((e: any) => {
+      e.data('inactive', true)
+      e.style('opacity', 0.08)
+      stopBlink()
+    })
     tempNodeIdsRef.current = new Set(
       [...tempNodeIdsRef.current].filter(id => cy.getElementById(id).length > 0)
     )
 
     const newIds = new Set<string>()
+    const newEdgeIds: string[] = []
+
     items.forEach(({ id, label }) => {
       if (cy.getElementById(id).length === 0) {
         cy.add({ group: 'nodes', data: { id, label, node_type: type, temp: true } })
@@ -410,14 +443,17 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
           const edgeId = `edge_${type}_${id}_${memId}`
           if (cy.getElementById(edgeId).length === 0 && cy.getElementById(memId).length > 0) {
             cy.add({ group: 'edges', data: { id: edgeId, source: id, target: memId, temp: true } })
+            newEdgeIds.push(edgeId)
           }
         })
       }
     })
 
+    activeEdgeIdsRef.current = newEdgeIds
     cy.layout({ name: 'fcose', animate: false, randomize: false } as any).run()
     applyFocus(newIds, true)
-  }, [applyFocus])
+    startBlink(newEdgeIds)
+  }, [applyFocus, stopBlink, startBlink])
 
   // ── Listen for agent:think ────────────────────────────────────────────────
   useEffect(() => {
