@@ -524,7 +524,7 @@ pub async fn seed_builtins(db: &SurrealDb, account_id: &str) {
         let tool_names_json: serde_json::Value = serde_json::Value::Array(
             a.tool_names.iter().map(|t| serde_json::Value::String(t.to_string())).collect(),
         );
-        let _ = db.query(
+        let result = db.query(
             "INSERT INTO agent_definitions \
              (def_id, account_id, name, description, kind, skill_ids, tool_names, \
               system_prompt, max_rounds, is_active, is_builtin, trigger, \
@@ -544,6 +544,9 @@ pub async fn seed_builtins(db: &SurrealDb, account_id: &str) {
         .bind(("trigger",a.trigger.to_string()))
         .bind(("now",    now))
         .await;
+        if let Err(e) = result {
+            tracing::error!("[seeds] INSERT agent_definitions '{}' failed: {}", a.name, e);
+        }
     }
 
     tracing::info!("Seeded {} builtin agents for account {}", AGENTS.len(), account_id);
