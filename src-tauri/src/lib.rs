@@ -123,6 +123,9 @@ async fn subscribe_service_events(app_handle: tauri::AppHandle) {
                     const PASSTHROUGH: &[&str] = &[
                         "llm:token", "llm:done",
                         "agent:tool_call", "agent:write_request", "agent:note_refs",
+                        "agent:think", "agent:skills_activated", "agent:plan_announce",
+                        "agent:open_note", "agent:skill_suggestion",
+                        "memory:prefetched",
                     ];
                     let payload: serde_json::Value = serde_json::from_str(&data_buf)
                         .unwrap_or(serde_json::json!({}));
