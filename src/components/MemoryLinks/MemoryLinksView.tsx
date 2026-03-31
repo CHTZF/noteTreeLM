@@ -328,6 +328,36 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
   // ── Keep sourceFilterRef in sync with state ──────────────────────────────
   useEffect(() => { sourceFilterRef.current = sourceFilter }, [sourceFilter])
 
+  // ── Breathing animation for active edges ─────────────────────────────────
+  const stopBlink = useCallback(() => {
+    if (breathingRef.current) { breathingRef.current.cancel(); breathingRef.current = null }
+  }, [])
+
+  const startBlink = useCallback((edgeIds: string[]) => {
+    stopBlink()
+    if (edgeIds.length === 0) return
+    const BREATH_MS = 1200
+    let alive = true
+    const breathe = (inhale: boolean) => {
+      if (!alive) return
+      const cy = cyRef.current
+      if (!cy) return
+      edgeIds.forEach(eid => {
+        const e = cy.getElementById(eid)
+        if (e.length > 0) {
+          ;(e as any).stop(true).animate(
+            { style: { opacity: inhale ? 0.9 : 0.15 } },
+            { duration: BREATH_MS, easing: 'ease-in-out-sine', complete: () => breathe(!inhale) }
+          )
+        }
+      })
+    }
+    breathe(true)
+    breathingRef.current = { cancel: () => { alive = false } }
+  }, [stopBlink])
+
+  useEffect(() => () => stopBlink(), [stopBlink])
+
   // ── Listen for memory:prefetched events ──────────────────────────────────
   useEffect(() => {
     let unlisten: (() => void) | null = null
@@ -378,40 +408,29 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
       }
 
       applyFocus(incomingIds, true)
+
+      // Reconnect any skill/think temp nodes that arrived before memory:prefetched
+      const newEdgeIds: string[] = []
+      ;(['think', 'skill'] as const).forEach(type => {
+        cy.nodes().filter((n: any) => n.data('node_type') === type && n.data('temp') && !n.data('inactive')).forEach((n: any) => {
+          const nid = n.id() as string
+          node_ids.forEach(memId => {
+            const edgeId = `edge_${type}_${nid}_${memId}`
+            if (cy.getElementById(edgeId).length === 0 && cy.getElementById(memId).length > 0) {
+              cy.add({ group: 'edges', data: { id: edgeId, source: nid, target: memId, temp: true } })
+              newEdgeIds.push(edgeId)
+            }
+          })
+        })
+      })
+      if (newEdgeIds.length > 0) {
+        activeEdgeIdsRef.current = [...activeEdgeIdsRef.current, ...newEdgeIds]
+        startBlink(activeEdgeIdsRef.current)
+      }
     }).then(fn => { unlisten = fn })
 
     return () => { unlisten?.() }
-  }, [applyFocus])
-
-  // ── Breathing animation for active edges ─────────────────────────────────
-  const stopBlink = useCallback(() => {
-    if (breathingRef.current) { breathingRef.current.cancel(); breathingRef.current = null }
-  }, [])
-
-  const startBlink = useCallback((edgeIds: string[]) => {
-    stopBlink()
-    if (edgeIds.length === 0) return
-    const BREATH_MS = 1200
-    let alive = true
-    const breathe = (inhale: boolean) => {
-      if (!alive) return
-      const cy = cyRef.current
-      if (!cy) return
-      edgeIds.forEach(eid => {
-        const e = cy.getElementById(eid)
-        if (e.length > 0) {
-          ;(e as any).stop(true).animate(
-            { style: { opacity: inhale ? 0.9 : 0.15 } },
-            { duration: BREATH_MS, easing: 'ease-in-out-sine', complete: () => breathe(!inhale) }
-          )
-        }
-      })
-    }
-    breathe(true)
-    breathingRef.current = { cancel: () => { alive = false } }
-  }, [stopBlink])
-
-  useEffect(() => () => stopBlink(), [stopBlink])
+  }, [applyFocus, startBlink])
 
   // ── Helper: add temp nodes (think/skill) + focus them ────────────────────
   const addTempNodes = useCallback((
