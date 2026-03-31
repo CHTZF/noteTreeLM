@@ -22,6 +22,23 @@ pub async fn execute_scheduled_task(
         }
     };
 
+    // If account_id is empty (old task row without account_id), resolve from vault.
+    let account_id = if account_id.is_empty() {
+        #[derive(serde::Deserialize)]
+        struct AccRow { account_id: String }
+        state.db
+            .query("SELECT account_id FROM vaults WHERE vault_id = $vid LIMIT 1")
+            .bind(("vid", vault_id.clone()))
+            .await
+            .ok()
+            .and_then(|mut r| r.take::<Vec<AccRow>>(0).ok())
+            .and_then(|rows| rows.into_iter().next())
+            .map(|r| r.account_id)
+            .unwrap_or_default()
+    } else {
+        account_id
+    };
+
     if state.daemon.llm_url.read().await.is_none() {
         tracing::warn!("[scheduler] llm_url not available, skipping task {}", task_id);
         return;
