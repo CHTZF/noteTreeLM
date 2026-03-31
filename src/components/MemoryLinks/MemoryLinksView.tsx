@@ -338,6 +338,12 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
       const filter = sourceFilterRef.current
       if (filter !== 'all' && source !== filter) return
 
+      // Empty node_ids → show a "no memory" placeholder temp node
+      if (node_ids.length === 0) {
+        addTempNodes('memory_fact', [{ id: 'temp_no_memory', label: '📭 尚無相關記憶' }])
+        return
+      }
+
       const incomingIds = new Set(node_ids)
 
       // Add any new nodes that aren't in graph yet (lazy-add)
@@ -373,7 +379,7 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
 
   // ── Helper: add temp nodes (think/skill) + focus them ────────────────────
   const addTempNodes = useCallback((
-    type: 'think' | 'skill',
+    type: 'think' | 'skill' | 'memory_fact',
     items: { id: string; label: string }[],
   ) => {
     const cy = cyRef.current

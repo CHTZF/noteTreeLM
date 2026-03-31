@@ -178,7 +178,7 @@ pub async fn run_interactive_agent(
                     sys_msg["content"] = json!(format!("{}{}", old, mem_block));
                 }
             }
-            if !fact_ids.is_empty() && streaming {
+            if streaming {
                 state.daemon.emit("memory:prefetched", json!({
                     "node_ids": fact_ids,
                     "source": "chat",
