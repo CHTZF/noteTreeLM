@@ -161,11 +161,11 @@ pub async fn run_interactive_agent(
         let facts = super::super::helpers::vault_query_memory_with_limit(
             &state.db, &vault_id, &account_id, &keywords, 6,
         ).await;
+        let fact_ids: Vec<String> = facts.iter()
+            .filter_map(|f| f["fact_id"].as_str().filter(|s| !s.is_empty()))
+            .map(|fid| format!("memory:{}:{}", vault_id, fid))
+            .collect();
         if !facts.is_empty() {
-            let fact_ids: Vec<String> = facts.iter()
-                .filter_map(|f| f["fact_id"].as_str().filter(|s| !s.is_empty()))
-                .map(|fid| format!("memory:{}:{}", vault_id, fid))
-                .collect();
             let mem_lines: Vec<String> = facts.iter().map(|f| {
                 let cat = f["category"].as_str().unwrap_or("general");
                 let content = f["content"].as_str().unwrap_or("");
@@ -178,12 +178,12 @@ pub async fn run_interactive_agent(
                     sys_msg["content"] = json!(format!("{}{}", old, mem_block));
                 }
             }
-            if streaming {
-                state.daemon.emit("memory:prefetched", json!({
-                    "node_ids": fact_ids,
-                    "source": "chat",
-                }));
-            }
+        }
+        if streaming {
+            state.daemon.emit("memory:prefetched", json!({
+                "node_ids": fact_ids,
+                "source": "chat",
+            }));
         }
     }
 
