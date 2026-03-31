@@ -61,6 +61,7 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
   const dmnTimerRef       = useRef<ReturnType<typeof setInterval> | null>(null)
   const dmnPhaseRef       = useRef<0 | 1>(0)                 // 0=exhale(dim), 1=inhale(bright)
   const tempNodeIdsRef    = useRef<Set<string>>(new Set())   // temp think/skill node ids
+  const activeMemoryIdsRef = useRef<string[]>([])            // node_ids from last memory:prefetched
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
   const sourceFilterRef   = useRef<SourceFilter>('all')
   const { settings }      = useSettingsStore()
@@ -340,9 +341,12 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
 
       // Empty node_ids → show a "no memory" placeholder temp node
       if (node_ids.length === 0) {
+        activeMemoryIdsRef.current = ['temp_no_memory']
         addTempNodes('memory_fact', [{ id: 'temp_no_memory', label: '📭 尚無相關記憶' }])
         return
       }
+
+      activeMemoryIdsRef.current = node_ids
 
       const incomingIds = new Set(node_ids)
 
@@ -385,8 +389,9 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
     const cy = cyRef.current
     if (!cy || items.length === 0) return
 
-    // Remove old temp nodes of the same type
+    // Remove old temp nodes of the same type (and their edges)
     cy.nodes().filter((n: NodeSingular) => n.data('node_type') === type && n.data('temp')).remove()
+    cy.edges().filter((e: any) => e.data('temp') && e.data('id')?.startsWith(`edge_${type}_`)).remove()
     tempNodeIdsRef.current = new Set(
       [...tempNodeIdsRef.current].filter(id => cy.getElementById(id).length > 0)
     )
@@ -398,6 +403,16 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
         tempNodeIdsRef.current.add(id)
       }
       newIds.add(id)
+
+      // Connect to active memory nodes (skip for memory_fact type — it IS the anchor)
+      if (type !== 'memory_fact') {
+        activeMemoryIdsRef.current.forEach(memId => {
+          const edgeId = `edge_${type}_${id}_${memId}`
+          if (cy.getElementById(edgeId).length === 0 && cy.getElementById(memId).length > 0) {
+            cy.add({ group: 'edges', data: { id: edgeId, source: id, target: memId, temp: true } })
+          }
+        })
+      }
     })
 
     cy.layout({ name: 'fcose', animate: false, randomize: false } as any).run()
