@@ -62,7 +62,7 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
   const dmnPhaseRef       = useRef<0 | 1>(0)                 // 0=exhale(dim), 1=inhale(bright)
   const tempNodeIdsRef    = useRef<Set<string>>(new Set())   // temp think/skill node ids
   const activeMemoryIdsRef = useRef<string[]>([])            // node_ids from last memory:prefetched
-  const blinkTimerRef     = useRef<ReturnType<typeof setInterval> | null>(null)
+  const breathingRef      = useRef<{ cancel: () => void } | null>(null)
   const activeEdgeIdsRef  = useRef<string[]>([])             // current round's active edge ids
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
   const sourceFilterRef   = useRef<SourceFilter>('all')
@@ -383,24 +383,32 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
     return () => { unlisten?.() }
   }, [applyFocus])
 
-  // ── Blink active edges ────────────────────────────────────────────────────
+  // ── Breathing animation for active edges ─────────────────────────────────
   const stopBlink = useCallback(() => {
-    if (blinkTimerRef.current) { clearInterval(blinkTimerRef.current); blinkTimerRef.current = null }
+    if (breathingRef.current) { breathingRef.current.cancel(); breathingRef.current = null }
   }, [])
 
   const startBlink = useCallback((edgeIds: string[]) => {
     stopBlink()
     if (edgeIds.length === 0) return
-    let phase = true
-    blinkTimerRef.current = setInterval(() => {
+    const BREATH_MS = 1200
+    let alive = true
+    const breathe = (inhale: boolean) => {
+      if (!alive) return
       const cy = cyRef.current
       if (!cy) return
-      phase = !phase
       edgeIds.forEach(eid => {
         const e = cy.getElementById(eid)
-        if (e.length > 0) e.style('opacity', phase ? 0.9 : 0.15)
+        if (e.length > 0) {
+          ;(e as any).stop(true).animate(
+            { style: { opacity: inhale ? 0.9 : 0.15 } },
+            { duration: BREATH_MS, easing: 'ease-in-out-sine', complete: () => breathe(!inhale) }
+          )
+        }
       })
-    }, 500)
+    }
+    breathe(true)
+    breathingRef.current = { cancel: () => { alive = false } }
   }, [stopBlink])
 
   useEffect(() => () => stopBlink(), [stopBlink])
