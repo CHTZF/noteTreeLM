@@ -256,8 +256,16 @@ pub async fn run_interactive_agent(
             Some(json!(tools_schema))
         };
 
-        for _round in 0..super::super::MAX_ROUNDS {
+        let has_think = tool_names.contains(&"think".to_string());
+        for round in 0..super::super::MAX_ROUNDS {
             if cancel.load(Ordering::Relaxed) { break; }
+
+            // Force think on first round if think tool is available
+            let tool_choice = if round == 0 && has_think && tools_value.is_some() {
+                json!({ "type": "function", "function": { "name": "think" } })
+            } else {
+                json!("auto")
+            };
 
             let (text, tool_chunks) = if streaming {
                 let body = if tools_value.is_none() {
@@ -266,7 +274,7 @@ pub async fn run_interactive_agent(
                     json!({
                         "messages": msgs,
                         "tools": tools_value,
-                        "tool_choice": "auto",
+                        "tool_choice": tool_choice,
                         "stream": true,
                         "temperature": 0.7,
                         "max_tokens": 2048,
@@ -286,6 +294,7 @@ pub async fn run_interactive_agent(
                     Err(e) => { tracing::warn!("[interactive] llm error: {}", e); break; }
                 }
             };
+
 
             if !text.is_empty() {
                 full_response = text.clone();
