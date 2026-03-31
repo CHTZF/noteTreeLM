@@ -20,24 +20,6 @@ interface Message {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const LIVE_CHAT_SYSTEM = `你是一個語音對話助手，協助使用者操作他們的筆記庫（Vault）。
-
-## 最高優先規則（違反即為嚴重錯誤）
-- 絕對禁止憑空捏造任何筆記名稱、資料夾名稱、或筆記內容——必須先呼叫工具取得真實資料才能回答
-- 任何關於 Vault 結構、筆記內容的問題，一律先呼叫工具（list_structure / read_note / search_vault）
-- 不得根據「猜測」或「上下文推測」回答 Vault 相關事實，必須以工具回傳結果為準
-
-## 工具使用規則
-- 使用者詢問資料夾結構、包含什麼 → 呼叫 list_structure（傳入資料夾路徑；根目錄傳空字串）
-- 使用者說某個資料夾名稱（如「功能」「設定」）作為追問 → 呼叫 list_structure 查詢該資料夾路徑
-- 使用者說「打開」「跳轉到」「看一下」「開啟」某筆記 → 呼叫 open_note，不要用 read_note
-- 使用者說「念一下內容」「裡面寫什麼」→ 用 read_note 取得後，用 1-2 句口頭摘要
-- 工具執行成功後，只說一句口頭確認，不複述工具原始輸出
-
-## 回答格式（嚴格遵守）
-- 只輸出自然、口語化的繁體中文，控制在 2-3 句話以內
-- 絕對不能輸出 Markdown、列表符號（-/*/1.）、大括號、換行符號、程式碼`
-
 const STATE_LABEL: Record<LiveChatState, string> = {
   idle:         '已暫停',
   listening:    '聆聽中…',
@@ -277,123 +259,26 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
     }
   }, [voiceState, liveChatState])  // sendToLLM/startListening intentionally omitted (defined below)
 
-  // ── LLM streaming + chunked TTS ───────────────────────────────────────────
+  // ── LLM invoke + TTS ─────────────────────────────────────────────────────
   const sendToLLM = useCallback(async (query: string) => {
     setLiveChatState('thinking')
     setStreamingText('')
-    setNoteSuggestions([])   // clear previous note suggestions
+    setThinkingText('')
+    setNoteSuggestions([])
     setMessages(prev => [...prev, { role: 'user', content: query }])
 
-    // Local vars for this invocation — captured in closures below
-    let ttsBuffer = ''
-    const ttsQueue: string[] = []
-    let ttsActive = false
-    let llmDone = false
-    let fullResponse = ''
-    const localStreamingRef = { current: '' }
-
-    function drainTTSQueue() {
-      if (ttsActive || ttsQueue.length === 0) return
-      ttsActive = true
-      setLiveChatState('speaking')
-      const utt = new SpeechSynthesisUtterance(ttsQueue.shift()!)
-      utt.lang = 'zh-TW'
-      utt.rate = 1.15
-      utt.onend = () => {
-        ttsActive = false
-        if (ttsQueue.length > 0) {
-          drainTTSQueue()
-        } else if (llmDone) {
-          // All TTS done & LLM done → commit message, go back to listening
-          if (fullResponse) {
-            setMessages(prev => [...prev, {
-              role: 'assistant', content: fullResponse,
-              wikilinks: localNoteRefs.length > 0 ? localNoteRefs : undefined,
-            }])
-          }
-          setStreamingText('')
-          // Use a small delay to let state settle before starting recorder again
-          setTimeout(() => {
-            if (liveChatStateRef.current === 'speaking') {
-              transcriptRef.current = ''
-              setDisplayTranscript('')
-              setLiveChatState('listening')
-              toggle()
-            }
-          }, 200)
-        }
-      }
-      window.speechSynthesis.speak(utt)
-    }
-
-    function enqueueSentence(text: string) {
-      const trimmed = text.trim()
-      if (!trimmed) return
-      ttsQueue.push(trimmed)
-      drainTTSQueue()
-    }
-
-    function flushBuffer(force = false) {
-      // Try to cut at a strong sentence-ending punctuation first
-      const sentenceMatch = ttsBuffer.match(/^([\s\S]*?[。！？])(.*)$/)
-      if (sentenceMatch) {
-        enqueueSentence(sentenceMatch[1])
-        ttsBuffer = sentenceMatch[2]
-        // Recurse in case there are more complete sentences in the remainder
-        if (ttsBuffer.includes('。') || ttsBuffer.includes('！') || ttsBuffer.includes('？')) {
-          flushBuffer()
-        }
-        return
-      }
-      // Fall back to comma/pause punctuation if buffer is long enough
-      if (ttsBuffer.length > 25) {
-        const commaIdx = ttsBuffer.search(/[，、；]/)
-        if (commaIdx >= 0) {
-          enqueueSentence(ttsBuffer.slice(0, commaIdx + 1))
-          ttsBuffer = ttsBuffer.slice(commaIdx + 1)
-          return
-        }
-      }
-      // Force flush remaining text (called at llm:done)
-      if (force && ttsBuffer.trim()) {
-        enqueueSentence(ttsBuffer)
-        ttsBuffer = ''
-      }
-    }
-
-    const unlistenToken = await listen<string>('llm:token', (e) => {
-      fullResponse += e.payload
-      localStreamingRef.current += e.payload
-      setStreamingText(localStreamingRef.current)
-      ttsBuffer += e.payload
-      flushBuffer()
+    // Listen for agent:think (tool-phase inner monologue)
+    const unlistenThink = await listen<{ thought: string }>('agent:think', (e) => {
+      setThinkingText(e.payload.thought)
     })
-
-    // Think tool: show inner monologue, clear on next think or tool execution
-    const unlistenThinking = await listen<string>('live_chat:thinking', (e) => {
-      setThinkingText(e.payload)
-    })
-
-    // Tool call in progress: discard any preamble text from TTS buffer
-    // (e.g. "我幫你查詢" — LLM will reply again after tool execution),
-    // and show a searching indicator instead.
-    const unlistenToolCall = await listen<string>('agent:tool_call', () => {
-      ttsBuffer = ''
-      localStreamingRef.current = ''
-      setStreamingText('')
-      // thinkingText stays visible until next think call or response completes
-    })
-
-    // Write tool in voice mode: auto-approve (no UI confirmation dialog).
+    // Write tool in voice mode: auto-approve
     const unlistenWriteReq = await listen<string>('agent:write_request', () => {
       invoke('confirm_write_tool', { approved: true }).catch(() => {})
     })
-
-    // Note navigation: show status-bar buttons immediately and accumulate refs
-    // so they can be embedded as wikilinks in the committed assistant message.
+    // Note refs
     let localNoteRefs: { label: string; absPath: string }[] = []
-    const unlistenNoteRefs = await listen<string[]>('agent:note_refs', (e) => {
-      const suggestions = e.payload.map(absPath => {
+    const unlistenNoteRefs = await listen<{ paths: string[] }>('agent:note_refs', (e) => {
+      const suggestions = e.payload.paths.map(absPath => {
         const hashIdx = absPath.indexOf('#')
         const filePart = hashIdx >= 0 ? absPath.slice(0, hashIdx) : absPath
         const section = hashIdx >= 0 ? absPath.slice(hashIdx + 1) : ''
@@ -402,72 +287,68 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
         return { absPath, label }
       })
       setNoteSuggestions(suggestions)
-      // Deduplicate accumulation (multiple tool rounds may fire the same refs)
       for (const s of suggestions) {
         if (!localNoteRefs.some(r => r.absPath === s.absPath)) localNoteRefs.push(s)
       }
     })
-
-    // 後端 pending_plan CONFIRM → open note（embedding-based intent）
     const unlistenOpenNote = await listen<string[]>('agent:open_note', (e) => {
       if (e.payload.length > 0) onOpenNote(e.payload[0])
     })
 
-    const unlistenDone = await listen('llm:done', () => {
-      llmDone = true
-      flushBuffer(true)
-      // Defer unlisten to avoid calling it from within an active event handler,
-      // which can cause Tauri's "listeners[eventId].handlerId" crash.
-      setTimeout(() => {
-        unlistenToken()
-        unlistenThinking()
-        unlistenToolCall()
-        unlistenWriteReq()
-        unlistenNoteRefs()
-        unlistenOpenNote()
-        unlistenDone()
-      }, 0)
+    const cleanup = () => {
+      unlistenThink(); unlistenWriteReq(); unlistenNoteRefs(); unlistenOpenNote()
       setThinkingText('')
-      // If TTS queue is empty and nothing is playing, transition now
-      if (!ttsActive && ttsQueue.length === 0) {
-        if (fullResponse) {
-          setMessages(prev => [...prev, {
-            role: 'assistant', content: fullResponse,
-            wikilinks: localNoteRefs.length > 0 ? localNoteRefs : undefined,
-          }])
-        }
-        setStreamingText('')
-        setTimeout(() => {
-          if (liveChatStateRef.current === 'thinking' || liveChatStateRef.current === 'speaking') {
-            transcriptRef.current = ''
-            setDisplayTranscript('')
-            setLiveChatState('listening')
-            toggle()
-          }
-        }, 200)
-      }
-    })
+    }
 
     try {
       const convId = conversationId
-      const agentResp = await invoke<{ session_id: string; conversation_id: string }>('invoke_agent', {
+      // invoke_live_chat: blocking, returns final speech string from live_respond
+      const speech = await invoke<string>('invoke_live_chat', {
+        conversationId: convId ?? '',
         input: query,
-        messages: [...messagesRef.current, { role: 'user', content: query }],
-        system: LIVE_CHAT_SYSTEM,
-        conversationId: convId ?? undefined,
+        noteContext: null,
+        activityContext: null,
+        language: settings.whisper_language ?? 'zh-TW',
       })
-      if (!convId && agentResp.conversation_id) {
-        setConversationId(agentResp.conversation_id)
-        localStorage.setItem('live_chat_conversation_id', agentResp.conversation_id)
+      cleanup()
+
+      if (!convId) {
+        // New conversation: persist id from service (emitted via live_chat:action or read from resp)
+        // For now rely on localStorage being set by the next round's conversationId detection
       }
+
+      const speech_text = speech.trim()
+      if (!speech_text) {
+        transcriptRef.current = ''
+        setDisplayTranscript('')
+        setLiveChatState('listening')
+        toggle()
+        return
+      }
+
+      setMessages(prev => [...prev, {
+        role: 'assistant', content: speech_text,
+        wikilinks: localNoteRefs.length > 0 ? localNoteRefs : undefined,
+      }])
+
+      setLiveChatState('speaking')
+      const utt = new SpeechSynthesisUtterance(speech_text)
+      utt.lang = settings.whisper_language ?? 'zh-TW'
+      utt.rate = 1.15
+      utt.onend = () => {
+        if (liveChatStateRef.current === 'speaking') {
+          transcriptRef.current = ''
+          setDisplayTranscript('')
+          setLiveChatState('listening')
+          toggle()
+        }
+      }
+      window.speechSynthesis.speak(utt)
+
     } catch (e: unknown) {
+      cleanup()
       const msg = typeof e === 'string' ? e : (e instanceof Error ? e.message : JSON.stringify(e))
-      addLog('live-chat', 'error', `invoke_agent 失敗：${msg}`)
-      unlistenToken()
-      unlistenToolCall()
-      unlistenWriteReq()
-      unlistenNoteRefs()
-      unlistenDone()
+      addLog('live-chat', 'error', `invoke_live_chat 失敗：${msg}`)
       window.speechSynthesis.cancel()
       setTimeout(() => {
         transcriptRef.current = ''
@@ -476,7 +357,7 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
         toggle()
       }, 200)
     }
-  }, [toggle, addLog])
+  }, [toggle, addLog, conversationId, settings.whisper_language, onOpenNote])
 
   // ── Barge-in: user speaks while AI is speaking → cancel TTS + LLM stream ──
   useEffect(() => {
