@@ -42,13 +42,18 @@ pub async fn create(
 
     state.db
         .query("INSERT INTO agent_skills (skill_id, account_id, knowledge_item_id, title, trigger, behavior, tool_calls, is_active, trigger_count, injection_mode, agent_scope, created_at) VALUES ($sid, $aid, $kiid, $title, $trigger, $behavior, $tc, true, 0, $imode, $scope, $now)")
-        .bind(("sid", skill_id.clone())).bind(("aid", account_id))
+        .bind(("sid", skill_id.clone())).bind(("aid", account_id.clone()))
         .bind(("kiid", knowledge_item_id)).bind(("title", title))
         .bind(("trigger", trigger)).bind(("behavior", behavior))
         .bind(("tc", tool_calls)).bind(("imode", injection_mode))
         .bind(("scope", agent_scope)).bind(("now", now))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let embed_url = state.daemon.embedding_url.read().await.clone();
+    tokio::spawn(async move {
+        crate::db::seeds::embed_skills_for_account(&state.db, &account_id, &embed_url).await;
+    });
 
     Ok(Json(json!({ "skill_id": skill_id })))
 }
@@ -79,6 +84,9 @@ pub async fn update(
     let account_id = account_id_from_headers(&state, &headers).await?;
     let now = Utc::now().timestamp();
     let mut set_parts = vec!["updated_at = $now".to_string()];
+    let semantic_changed = body.get("title").is_some()
+        || body.get("trigger").is_some()
+        || body.get("behavior").is_some();
 
     if body.get("title").is_some()          { set_parts.push("title = $title".to_string()); }
     if body.get("trigger").is_some()        { set_parts.push("trigger = $trigger".to_string()); }
@@ -87,11 +95,13 @@ pub async fn update(
     if body.get("tool_calls").is_some()     { set_parts.push("tool_calls = $tool_calls".to_string()); }
     if body.get("injection_mode").is_some() { set_parts.push("injection_mode = $injection_mode".to_string()); }
     if body.get("agent_scope").is_some()    { set_parts.push("agent_scope = $agent_scope".to_string()); }
+    if semantic_changed                     { set_parts.push("embedding = NONE".to_string()); }
 
     let query = format!(
         "UPDATE agent_skills SET {} WHERE skill_id = $sid AND account_id = $aid",
         set_parts.join(", ")
     );
+    let account_id_for_embed = account_id.clone();
     let mut qb = state.db.query(&query)
         .bind(("now", now)).bind(("sid", skill_id)).bind(("aid", account_id));
 
@@ -104,6 +114,14 @@ pub async fn update(
     if let Some(v) = body["agent_scope"].as_str()    { qb = qb.bind(("agent_scope", v.to_string())); }
 
     qb.await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if semantic_changed {
+        let embed_url = state.daemon.embedding_url.read().await.clone();
+        tokio::spawn(async move {
+            crate::db::seeds::embed_skills_for_account(&state.db, &account_id_for_embed, &embed_url).await;
+        });
+    }
+
     Ok(Json(json!({ "ok": true })))
 }
 
