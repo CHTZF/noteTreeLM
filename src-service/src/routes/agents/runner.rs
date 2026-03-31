@@ -63,15 +63,12 @@ pub async fn run(
         }
     }
 
-    // Await run_agent directly so the HTTP response acts as a completion signal.
-    // Tokens flow through the SSE bridge in parallel; invoke_agent on the Tauri side
-    // reads streamingRef.current only after this HTTP call completes (= all tokens arrived).
-    crate::service_agent::run_agent(
+    tokio::spawn(crate::service_agent::run_agent(
         state, agent_def, input,
         vault_id, account_id, vault_path, conversation_id.clone(),
         true,  // streaming
         activity_context,
-    ).await;
+    ));
 
     Ok(Json(json!({ "session_id": session_id, "conversation_id": conversation_id })))
 }

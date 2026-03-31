@@ -83,6 +83,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
 
   // Track web refs from agent:web_refs (call_external_ai / web_search) for "儲存為知識"
   const pendingWebRefsRef = useRef<Array<{ path: string; title: string; excerpt: string }>>([])
+  const currentTextRef = useRef('')   // mirrors the current user input for llm:done closure
+  const cleanupRef = useRef<(() => void) | null>(null)
 
   const log = useCallback((msg: string) => addLog('chat', 'info', msg), [addLog])
   const err = useCallback((msg: string) => addLog('chat', 'error', msg), [addLog])
@@ -416,6 +418,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     setError('')
     streamingRef.current = ''
     tokenCountRef.current = 0
+    currentTextRef.current = text
 
     // 只把 user/assistant 訊息送給 LLM（tool/notice 只做 UI 顯示，不進入 context）
     const llmMessages = allMessages
@@ -529,8 +532,26 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
             log('✓ 開始收到 llm:token 串流')
           }
         }),
-        listen('llm:done', () => {
-          log(`⏹ llm:done 事件收到，共 ${tokenCountRef.current} 字元`)
+        listen<string>('llm:done', (e) => {
+          const finalContent = e.payload || streamingRef.current
+          log(`⏹ llm:done 事件收到，共 ${finalContent.length} 字元`)
+          const webRefs = pendingWebRefsRef.current.length > 0
+            ? pendingWebRefsRef.current
+            : undefined
+          setMessages(prev => [...prev, { role: 'assistant' as const, content: finalContent, webRefs }])
+          pendingWebRefsRef.current = []
+
+          const userText = currentTextRef.current
+          if (hasSkillIntent(userText) && finalContent.length > 0) {
+            doExtractSkill(userText, finalContent)
+          }
+          userMsgCountRef.current += 1
+          if (userMsgCountRef.current % REFLECTION_INTERVAL === 0) {
+            triggerReflection()
+          }
+
+          // Cleanup streaming state
+          cleanupRef.current?.()
         }),
         listen<Array<{ path: string; title: string; excerpt: string }>>('agent:web_refs', (e) => {
           pendingWebRefsRef.current = [...pendingWebRefsRef.current, ...e.payload]
@@ -592,6 +613,29 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         }),
       ])
 
+      // Register cleanup so llm:done can trigger it (must be before invoke_agent)
+      cleanupRef.current = () => {
+        cleanupRef.current = null
+        unlistenToken()
+        unlistenDone()
+        unlistenToolCall()
+        unlistenWriteReq()
+        unlistenNoteRefs()
+        unlistenOpenNote()
+        unlistenWebRefs()
+        unlistenSkillsActivated()
+        unlistenSkillSuggestion()
+        unlistenPreRouteDebug()
+        unlistenSkillFound()
+        unlistenSkillNotFound()
+        unlistenThink()
+        setPendingWriteDisplay(null)
+        setIsStreaming(false)
+        isStreamingRef.current = false
+        setStreamingText('')
+        streamingRef.current = ''
+      }
+
       log('  呼叫 invoke("invoke_agent")')
       const agentResp = await invoke<{ session_id: string; conversation_id: string }>('invoke_agent', {
         input: text,
@@ -611,23 +655,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         }).catch(() => {})
       }
 
-      const finalContent = streamingRef.current
-      log(`✓ invoke_agent 完成，回覆 ${finalContent.length} 字元`)
-      const webRefs = pendingWebRefsRef.current.length > 0
-        ? pendingWebRefsRef.current
-        : undefined
-      setMessages((prev) => [...prev, { role: 'assistant', content: finalContent, webRefs }])
-
-      // 自動偵測：使用者訊息含技能意圖關鍵字 → 自動觸發技能萃取
-      if (hasSkillIntent(text) && finalContent.length > 0) {
-        doExtractSkill(text, finalContent)
-      }
-
-      // Reflection：每 N 則對話後背景觀察模式（不阻塞 UI）
-      userMsgCountRef.current += 1
-      if (userMsgCountRef.current % REFLECTION_INTERVAL === 0) {
-        triggerReflection()
-      }
+      log(`✓ invoke_agent 完成（session: ${agentResp.session_id}）`)
 
     } catch (e: unknown) {
       const msg =
@@ -638,25 +666,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
             : (() => { try { return JSON.stringify(e, null, 2) } catch { return String(e) } })()
       err(`invoke 失敗：\n${msg}`)
       setError(msg)
-    } finally {
-      unlistenToken()
-      unlistenDone()
-      unlistenToolCall()
-      unlistenWriteReq()
-      unlistenNoteRefs()
-      unlistenOpenNote()
-      unlistenWebRefs()
-      unlistenSkillsActivated()
-      unlistenSkillSuggestion()
-      unlistenPreRouteDebug()
-      unlistenSkillFound()
-      unlistenSkillNotFound()
-      unlistenThink()
-      setPendingWriteDisplay(null)
-      setIsStreaming(false)
-      isStreamingRef.current = false
-      setStreamingText('')
-      streamingRef.current = ''
+      // On error, clean up immediately
+      cleanupRef.current?.()
     }
   }, [input, isStreaming, messages, useNoteContext, writeConfirmMode, currentPath, noteContent, conversationId, onOpenNote, log, err])
 
