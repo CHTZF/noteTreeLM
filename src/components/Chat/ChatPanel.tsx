@@ -486,6 +486,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
           const display = typeof event.payload === 'string'
             ? event.payload
             : (event.payload as any)?.display ?? JSON.stringify(event.payload)
+          if (display === 'think') return  // think is visualized in MemoryLinksView, not chat
           setMessages((prev) => [...prev, { role: 'tool', content: display }])
         }),
         listen<string[]>('agent:note_refs', (e) => {
