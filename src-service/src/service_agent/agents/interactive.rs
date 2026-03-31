@@ -573,13 +573,6 @@ pub async fn run_agent(
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
 
-    // Runtime patch: ensure query_memory is available for chat agents
-    // (old seeded agents may lack it; new seeds include it).
-    let agent_kind = agent_def["kind"].as_str().unwrap_or("chat");
-    if agent_kind == "chat" && !tool_names.contains(&"query_memory".to_string()) {
-        tool_names.push("query_memory".to_string());
-    }
-
     // Skill pre-pass: triggered when agent_def declares "search_skills" in tool_names.
     let system_injection = if !vault_path.is_empty() && tool_names.contains(&"search_skills".to_string()) {
         let http_client = reqwest::Client::new();
