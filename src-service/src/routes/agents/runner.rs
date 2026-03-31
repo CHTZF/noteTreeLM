@@ -63,12 +63,12 @@ pub async fn run(
         }
     }
 
-    tokio::spawn(crate::service_agent::run_agent(
+    crate::service_agent::run_agent(
         state, agent_def, input,
         vault_id, account_id, vault_path, conversation_id.clone(),
         true,  // streaming
         activity_context,
-    ));
+    ).await;
 
     Ok(Json(json!({ "session_id": session_id, "conversation_id": conversation_id })))
 }
