@@ -420,6 +420,20 @@ const AGENTS: &[BuiltinAgent] = &[
         trigger: "整理筆記、摘要多篇、幫我歸納、彙整資料、總結所有、整合多篇、summarize notes、consolidate、把這些筆記整理、歸納重點、統整一下、彙整成一篇、做個摘要、整理一份報告",
     },
     BuiltinAgent {
+        id: "builtin_live_chat",
+        name: "live_chat",
+        description: "語音對話助理，以口語化方式回覆並支援工具查詢",
+        kind: "chat",
+        tool_names: &["think", "search_skills"],  // search_skills = skill pre-pass signal; live_respond added by runner
+        system_prompt: "你是語音助理，使用者透過語音與你對話。\
+            第一步呼叫 think 描述你正在想什麼（10字以內）。\
+            第二步若需要查詢資料，呼叫相應的工具（search_vault、read_note、query_memory 等）。\
+            回覆規則：口語化繁體中文，簡短自然，不用 Markdown 或列點。\
+            若使用者要求操作筆記（建立/修改/刪除），直接執行工具並簡短告知結果。",
+        max_rounds: 4,
+        trigger: "",
+    },
+    BuiltinAgent {
         id: "builtin_chat",
         name: "chat",
         description: "通用筆記助理，可使用工具直接操作 vault",
