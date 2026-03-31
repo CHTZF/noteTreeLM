@@ -135,6 +135,35 @@ fn generate_pkce() -> (String, String) {
     (verifier, challenge)
 }
 
+/// Called on app startup to restore a previously saved token into AppState.
+/// Validates the token with the service; if valid, stores in AppState and returns SessionInfo.
+#[tauri::command]
+pub async fn restore_session(
+    token: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<SessionInfo>, String> {
+    if token.is_empty() {
+        return Ok(None);
+    }
+
+    #[derive(Deserialize)]
+    struct SessionResp { token: String, username: String, expires_at: i64, auth_provider: Option<String> }
+
+    match daemon_get::<Option<SessionResp>>(&state.http_client, "/auth/session", Some(&token)).await {
+        Ok(Some(s)) => {
+            state.set_auth_token(token).await;
+            state.set_username(s.username.clone()).await;
+            Ok(Some(SessionInfo {
+                token: s.token,
+                username: s.username,
+                expires_at: s.expires_at,
+                auth_provider: s.auth_provider.unwrap_or_else(|| "local".to_string()),
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
 #[tauri::command]
 pub async fn start_google_oauth(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<SessionInfo, String> {
     use tauri_plugin_shell::ShellExt;

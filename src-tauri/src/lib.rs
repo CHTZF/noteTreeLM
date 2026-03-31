@@ -7,7 +7,7 @@ pub mod runtime;
 mod state;
 mod vault;
 
-use commands::auth::{login, logout, get_session, change_password, start_google_oauth};
+use commands::auth::{login, logout, get_session, restore_session, change_password, start_google_oauth};
 use commands::{
     ai::{process_with_llm, stop_llama_server, warmup_llama_server,
          get_llama_server_status, start_llama_server, restart_llama_server,
@@ -385,6 +385,7 @@ pub fn run() {
             login,
             logout,
             get_session,
+            restore_session,
             change_password,
             start_google_oauth,
             // Settings
