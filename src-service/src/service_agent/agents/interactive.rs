@@ -65,15 +65,15 @@ pub async fn run_interactive_agent(
                         })
                     })
                 };
-                let classifier = super::super::intent_classifier::IntentClassifier::new();
-                let intent = match super::super::intent_classifier::IntentClassifier::compute_centroids_cached(
+                let classifier = super::super::engine::intent_classifier::IntentClassifier::new();
+                let intent = match super::super::engine::intent_classifier::IntentClassifier::compute_centroids_cached(
                     &state.daemon.intent_centroids,
                     &embed_fn,
                 ).await {
                     Some((cc, ccl, ci)) => classifier.classify_with_centroids(&input, &embed_fn, &cc, &ccl, &ci).await,
                     None => classifier.classify(&input).await,
                 };
-                use super::super::intent_classifier::Intent;
+                use super::super::engine::intent_classifier::Intent;
                 match intent {
                     Intent::Confirm => { let _ = pending.commit().await; }
                     Intent::Cancel | Intent::Interrupt => { let _ = pending.cancel().await; }

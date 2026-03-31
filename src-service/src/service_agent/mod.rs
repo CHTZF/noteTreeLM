@@ -3,16 +3,10 @@ pub const MAX_ROUNDS: usize = 20;
 // ── 基礎型別 ─────────────────────────────────────────────────────────────────
 pub mod types;
 
-// ── 輔助函式 ─────────────────────────────────────────────────────────────────
-pub(crate) mod helpers;
-
-// ── 意圖分類 ─────────────────────────────────────────────────────────────────
-pub mod intent_classifier;
-
-// ── 執行引擎 ─────────────────────────────────────────────────────────────────
+// ── 執行引擎（含 context, intent_classifier） ────────────────────────────────
 pub mod engine;
 
-// ── 工具實作 ─────────────────────────────────────────────────────────────────
+// ── 工具實作（含 skill_tools） ───────────────────────────────────────────────
 pub mod tools;
 
 // ── Agent 邏輯 ───────────────────────────────────────────────────────────────
@@ -23,3 +17,9 @@ pub use agents::interactive::run_interactive_agent;
 pub use agents::interactive::run_agent;
 pub use agents::scheduled::execute_scheduled_task;
 pub use tools::vault_tools;
+// Compatibility re-export so existing callers (routes, interactive.rs) need no path changes.
+pub(crate) mod helpers {
+    pub(crate) use super::engine::context::{load_messages_db, load_agent_def, vault_query_memory_with_limit, detect_response_framework};
+    pub(crate) use super::tools::skill_tools::{run_skill_pass, SkillPassResult};
+    pub(crate) use crate::processing::embedder::{cosine_sim, embed_text_llm};
+}
