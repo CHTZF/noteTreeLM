@@ -994,11 +994,6 @@ function AppMain() {
         <GraphView onOpenNote={openNote} />
       </div>
     )
-    if (activePath === MEMORY_LINKS_TAB) return (
-      <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
-        <MemoryLinksView onOpenNote={openNote} />
-      </div>
-    )
     if (activePath === AGENT_TOOLS_TAB) return (
       <div style={{ flex: 1, minHeight: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
         <AgentToolContent />
@@ -1140,8 +1135,8 @@ function AppMain() {
             }
           }}
         >
-          {/* Always-mounted Chat / LiveChat / Import / KB Assistant / Skills panels — hidden with display:none when not active */}
-          {leaf.tabs.filter(t => t.path === CHAT_TAB || t.path === LIVE_CHAT_TAB || t.path === IMPORT_TAB || t.path === KB_ASSIST_TAB || t.path === SKILLS_TAB || t.path === AGENTS_TAB).map(t => (
+          {/* Always-mounted Chat / LiveChat / Import / KB Assistant / Skills / MemoryLinks panels — hidden with display:none when not active */}
+          {leaf.tabs.filter(t => t.path === CHAT_TAB || t.path === LIVE_CHAT_TAB || t.path === IMPORT_TAB || t.path === KB_ASSIST_TAB || t.path === SKILLS_TAB || t.path === AGENTS_TAB || t.path === MEMORY_LINKS_TAB).map(t => (
             <div key={t.id} style={{
               display: t.id === leaf.activeTabId ? 'flex' : 'none',
               flex: 1, flexDirection: 'column', height: '100%', overflow: 'hidden',
@@ -1171,10 +1166,13 @@ function AppMain() {
               {t.path === KB_ASSIST_TAB && (
                 <KnowledgeAssistant onOpenNote={openNoteFromChat} />
               )}
+              {t.path === MEMORY_LINKS_TAB && (
+                <MemoryLinksView onOpenNote={openNote} />
+              )}
             </div>
           ))}
           {/* Regular content — only when active tab is not Chat/LiveChat/Import */}
-          {(!activeTab || (activeTab.path !== CHAT_TAB && activeTab.path !== LIVE_CHAT_TAB && activeTab.path !== IMPORT_TAB && activeTab.path !== KB_ASSIST_TAB && activeTab.path !== SKILLS_TAB && activeTab.path !== AGENTS_TAB)) && (
+          {(!activeTab || (activeTab.path !== CHAT_TAB && activeTab.path !== LIVE_CHAT_TAB && activeTab.path !== IMPORT_TAB && activeTab.path !== KB_ASSIST_TAB && activeTab.path !== SKILLS_TAB && activeTab.path !== AGENTS_TAB && activeTab.path !== MEMORY_LINKS_TAB)) && (
             renderPaneContent(leaf, isFocused, activePath)
           )}
           {isDraggingTab && dropZoneInfo?.paneId === leaf.id && (

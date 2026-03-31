@@ -592,6 +592,13 @@ pub async fn run_agent(
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
 
+    // TEST: verify frontend receives agent:think events
+    if streaming {
+        state.daemon.emit("agent:think", json!({ "thought": "test think event sending..." }));
+    }
+
+    tracing::info!("[run_agent] vault_path={:?} tool_names={:?}", vault_path, tool_names);
+
     // Skill pre-pass: triggered when agent_def declares "search_skills" in tool_names.
     let system_injection = if !vault_path.is_empty() && tool_names.contains(&"search_skills".to_string()) {
         let http_client = reqwest::Client::new();
