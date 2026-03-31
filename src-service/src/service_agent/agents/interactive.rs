@@ -151,6 +151,42 @@ pub async fn run_interactive_agent(
         messages_json.insert(0, json!({"role": "system", "content": sys_content}));
     }
 
+    // 4b. Auto-inject memory facts (prefetch) — query with input keywords, append to system prompt.
+    if !vault_id.is_empty() && !account_id.is_empty() {
+        let keywords: Vec<String> = input.split_whitespace()
+            .filter(|w| w.chars().count() >= 2)
+            .take(5)
+            .map(String::from)
+            .collect();
+        let facts = super::super::helpers::vault_query_memory_with_limit(
+            &state.db, &vault_id, &account_id, &keywords, 6,
+        ).await;
+        if !facts.is_empty() {
+            let fact_ids: Vec<String> = facts.iter()
+                .filter_map(|f| f["fact_id"].as_str().filter(|s| !s.is_empty()))
+                .map(|fid| format!("memory:{}:{}", vault_id, fid))
+                .collect();
+            let mem_lines: Vec<String> = facts.iter().map(|f| {
+                let cat = f["category"].as_str().unwrap_or("general");
+                let content = f["content"].as_str().unwrap_or("");
+                format!("[{}] {}", cat, content)
+            }).collect();
+            let mem_block = format!("\n\n## 相關記憶\n{}", mem_lines.join("\n"));
+            if let Some(sys_msg) = messages_json.first_mut() {
+                if sys_msg["role"].as_str() == Some("system") {
+                    let old = sys_msg["content"].as_str().unwrap_or("").to_string();
+                    sys_msg["content"] = json!(format!("{}{}", old, mem_block));
+                }
+            }
+            if !fact_ids.is_empty() && streaming {
+                state.daemon.emit("memory:prefetched", json!({
+                    "node_ids": fact_ids,
+                    "source": "chat",
+                }));
+            }
+        }
+    }
+
     // 5. Context sliding window (12000 chars)
     if !tool_names.is_empty() && !vault_path.is_empty() {
         const MAX_HISTORY_CHARS: usize = 12000;
@@ -403,23 +439,6 @@ pub(crate) fn build_interactive_registry(
                                 "session_id": session_id,
                                 "paths": refs,
                             }));
-                        }
-                        // Special: query_memory — emit memory:prefetched with fact node IDs
-                        if name == "query_memory" {
-                            let keywords: Vec<String> = args["keywords"].as_array()
-                                .map(|a| a.iter().filter_map(|v| v.as_str()).map(String::from).collect())
-                                .unwrap_or_default();
-                            let limit = args["limit"].as_u64().unwrap_or(5).min(20);
-                            if let Ok((_, fact_ids)) = super::super::tools::vault_tools::vault_query_memory_with_ids(
-                                &db, &vault_id, &account_id, &keywords, limit,
-                            ).await {
-                                if !fact_ids.is_empty() {
-                                    state_c.daemon.emit("memory:prefetched", json!({
-                                        "node_ids": fact_ids,
-                                        "source": "chat",
-                                    }));
-                                }
-                            }
                         }
                         // Special: search_skills — emit which skills were found
                         if name == "search_skills" {
