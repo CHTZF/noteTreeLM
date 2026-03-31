@@ -343,7 +343,8 @@ pub(crate) async fn dispatch_interactive_tool(
                 });
             Ok((json!({ "opened": paths }), None))
         }
-        "think" => {
+        "think" | "live_respond" => {
+            // Auto-confirm; live_respond args are consumed by the caller (runner.rs).
             Ok((json!("✅"), None))
         }
 
@@ -716,6 +717,22 @@ pub(crate) fn build_tools_schema_interactive(tool_names: &[String]) -> Vec<Value
                 "name":  { "type": "string", "description": "agent 定義的名稱" },
                 "input": { "type": "string", "description": "傳給 sub-agent 的任務描述或問題" }
             }, "required": ["name", "input"] }
+        }}),
+        json!({ "type": "function", "function": {
+            "name": "think",
+            "description": "輸出一句內心獨白（10字以內），在呼叫工具前描述正在想什麼",
+            "parameters": { "type": "object", "properties": {
+                "thought": { "type": "string", "description": "內心獨白" }
+            }, "required": ["thought"] }
+        }}),
+        json!({ "type": "function", "function": {
+            "name": "live_respond",
+            "description": "輸出語音助理的最終口語回覆（live chat 專用，呼叫後對話結束）",
+            "parameters": { "type": "object", "properties": {
+                "speech":  { "type": "string", "description": "TTS 朗讀文字，口語化，2 句以內，不含 Markdown" },
+                "action":  { "type": "string", "description": "show_results / open_note / open_tab / show_error / none" },
+                "content": { "type": "string", "description": "若有查到資料，把完整摘要放此供畫面顯示（可含換行）" }
+            }, "required": ["speech", "action"] }
         }}),
     ];
 

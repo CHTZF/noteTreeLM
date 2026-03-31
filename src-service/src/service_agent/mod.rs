@@ -21,5 +21,5 @@ pub mod agents;
 // Public entry points used by routes
 pub use agents::interactive::run_interactive_agent;
 pub use agents::interactive::run_agent;
-pub use agents::live_chat::run_live_chat_agent;
 pub use agents::scheduled::execute_scheduled_task;
+pub use tools::vault_tools;

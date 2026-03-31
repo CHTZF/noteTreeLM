@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use axum::{
     extract::{Path, State},
@@ -125,29 +125,107 @@ pub async fn confirm(
 
 /// POST /vaults/:vid/agent/live_chat
 /// Body: { session_id, input, language, note_context, activity_context, vault_path, conversation_id }
-/// Awaits run_live_chat_agent and returns { session_id, speech }.
+/// Runs run_agent (streaming:false) with skill pre-pass, then makes one final live_respond call.
 pub async fn live_chat(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(vault_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let account_id = account_id_from_headers(&state, &headers).await?;
-    let session_id = body["session_id"]
-        .as_str()
-        .map(String::from)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let input          = body["input"].as_str().unwrap_or("").to_string();
-    let language       = body["language"].as_str().map(String::from);
-    let note_context   = body["note_context"].as_str().map(String::from);
+    let account_id      = account_id_from_headers(&state, &headers).await?;
+    let session_id      = body["session_id"].as_str().map(String::from)
+                            .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let input           = body["input"].as_str().unwrap_or("").to_string();
+    let language        = body["language"].as_str().unwrap_or("zh-TW").to_string();
+    let note_context    = body["note_context"].as_str().map(String::from);
     let activity_context = body["activity_context"].as_str().map(String::from);
-    let vault_path     = body["vault_path"].as_str().unwrap_or("").to_string();
+    let vault_path      = body["vault_path"].as_str().unwrap_or("").to_string();
     let conversation_id = body["conversation_id"].as_str().unwrap_or("").to_string();
 
-    let speech = crate::service_agent::run_live_chat_agent(
-        state, session_id.clone(), input, language, note_context,
-        activity_context, vault_id, account_id, vault_path, conversation_id,
+    // Load live_chat agent_def; fall back to empty def (skill pre-pass will fill tool_names).
+    let agent_def = {
+        let mut def = crate::service_agent::helpers::load_agent_def(&state.db, "live_chat", &account_id)
+            .await
+            .unwrap_or_else(|| json!({
+                "system_prompt": "",
+                "tool_names": ["think", "search_skills"],
+            }));
+        def["session_id"] = json!(session_id.clone());
+        def
+    };
+
+    // Phase 1: run_agent (streaming:false) — tool execution (think + skill tools).
+    // live_respond is intentionally excluded; it's called separately below.
+    let agent_response = crate::service_agent::run_agent(
+        state.clone(), agent_def,
+        input.clone(), vault_id.clone(), account_id.clone(),
+        vault_path.clone(), conversation_id.clone(),
+        false,          // non-streaming: no llm:done / skill_suggestion events
+        activity_context,
     ).await;
+
+    // Phase 2: one final live_respond call to format speech.
+    let llm_url = match state.daemon.llm_url.read().await.clone() {
+        Some(u) => u,
+        None => {
+            state.daemon.emit("live_chat:action", json!({
+                "speech": "抱歉，語言模型尚未就緒。", "action": "show_error",
+            }));
+            return Ok(Json(json!({ "session_id": session_id, "speech": "" })));
+        }
+    };
+
+    let lang_hint = match language.as_str() {
+        "en" => "Reply in English.",
+        "ja" => "日本語で返答してください。",
+        "de" => "Bitte auf Deutsch antworten.",
+        "ko" => "한국어로 답변해 주세요.",
+        _    => "請用繁體中文口語回答。",
+    };
+    let note_hint = note_context.as_deref()
+        .map(|nc| format!("\n[當前開啟的筆記]\n{}", nc))
+        .unwrap_or_default();
+
+    let live_respond_schema = crate::service_agent::tools::vault_tools::build_tools_schema_interactive(
+        &["live_respond".to_string()],
+    );
+    let client = reqwest::Client::new();
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let respond_msgs = vec![
+        json!({ "role": "system", "content": format!(
+            "你是語音助理。根據助理的回覆，呼叫 live_respond 輸出口語化的最終回覆。{}{}", lang_hint, note_hint
+        )}),
+        json!({ "role": "user",      "content": input }),
+        json!({ "role": "assistant", "content": agent_response }),
+    ];
+    let respond_body = json!({
+        "messages": respond_msgs,
+        "tools": live_respond_schema,
+        "tool_choice": "required",
+        "stream": false,
+        "temperature": 0.7,
+        "max_tokens": 512,
+    });
+
+    let speech = match crate::service_agent::tools::vault_tools::call_llm_once(
+        &client, &llm_url, &respond_msgs, Some(respond_body["tools"].clone()), &cancel,
+    ).await {
+        Ok((_, tool_chunks)) => {
+            if let Some((_, _, args_str)) = tool_chunks.iter().find(|(_, n, _)| n == "live_respond") {
+                let args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                let speech = args["speech"].as_str().unwrap_or("").to_string();
+                state.daemon.emit("live_chat:action", args);
+                speech
+            } else {
+                state.daemon.emit("live_chat:action", json!({ "speech": agent_response, "action": "none" }));
+                agent_response.clone()
+            }
+        }
+        Err(_) => {
+            state.daemon.emit("live_chat:action", json!({ "speech": agent_response, "action": "none" }));
+            agent_response.clone()
+        }
+    };
 
     Ok(Json(json!({ "session_id": session_id, "speech": speech })))
 }
