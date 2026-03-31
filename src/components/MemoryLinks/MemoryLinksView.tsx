@@ -473,7 +473,16 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
 
     activeEdgeIdsRef.current = newEdgeIds
     cy.layout({ name: 'fcose', animate: false, randomize: false } as any).run()
-    applyFocus(newIds, true)
+
+    // Include all currently active temp nodes (other types) in focus so they aren't dimmed
+    const allActiveTempIds = new Set(newIds)
+    cy.nodes().filter((n: NodeSingular) => n.data('temp') && !n.data('inactive')).forEach((n: NodeSingular) => {
+      allActiveTempIds.add(n.id())
+    })
+    // Also include memory nodes
+    activeMemoryIdsRef.current.forEach(id => allActiveTempIds.add(id))
+
+    applyFocus(allActiveTempIds, true)
     startBlink(newEdgeIds)
   }, [applyFocus, stopBlink, startBlink])
 
