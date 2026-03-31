@@ -82,10 +82,17 @@ impl Executor {
                         }
                     }
                 } else {
-                    (self.emit_fn)(
-                        "agent:tool_call".to_string(),
-                        json!({ "display": node.call.name }),
-                    );
+                    if node.call.name == "think" {
+                        (self.emit_fn)(
+                            "agent:think".to_string(),
+                            json!({ "thought": node.call.args["thought"].as_str().unwrap_or("") }),
+                        );
+                    } else {
+                        (self.emit_fn)(
+                            "agent:tool_call".to_string(),
+                            json!({ "display": node.call.name }),
+                        );
+                    }
                     true
                 };
 
@@ -182,7 +189,11 @@ impl Executor {
                             Err(_) => { should_cancel = true; break; }
                         }
                     } else {
-                        emit_fn("agent:tool_call".to_string(), json!({ "display": node.call.name }));
+                        if node.call.name == "think" {
+                            emit_fn("agent:think".to_string(), json!({ "thought": node.call.args["thought"].as_str().unwrap_or("") }));
+                        } else {
+                            emit_fn("agent:tool_call".to_string(), json!({ "display": node.call.name }));
+                        }
                         true
                     };
 

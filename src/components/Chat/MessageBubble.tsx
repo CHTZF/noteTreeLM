@@ -20,6 +20,34 @@ export default function MessageBubble({
   const isUser = message.role === 'user'
   const isTool = message.role === 'tool'
   const isNotice = message.role === 'notice'
+  const isThink = message.role === 'think'
+
+  if (isThink) {
+    return (
+      <div style={{ display: 'flex', justifyContent: 'flex-start', marginBottom: 2 }}>
+        <details style={{ maxWidth: '92%' }}>
+          <summary style={{
+            fontSize: '11px', color: 'var(--color-text-muted)',
+            cursor: 'pointer', userSelect: 'none', listStyle: 'none',
+            display: 'flex', alignItems: 'center', gap: 4,
+            opacity: 0.6,
+          }}>
+            <span style={{ fontSize: 9 }}>▶</span>
+            <span style={{ fontStyle: 'italic' }}>💭 {message.content.slice(0, 40)}{message.content.length > 40 ? '…' : ''}</span>
+          </summary>
+          <div style={{
+            marginTop: 4, padding: '4px 10px',
+            borderLeft: '2px solid var(--color-border)',
+            color: 'var(--color-text-muted)',
+            fontSize: '11px', fontStyle: 'italic',
+            whiteSpace: 'pre-wrap',
+          }}>
+            {message.content}
+          </div>
+        </details>
+      </div>
+    )
+  }
 
   if (isNotice) {
     return (

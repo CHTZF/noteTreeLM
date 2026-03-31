@@ -404,6 +404,21 @@ pub(crate) fn build_interactive_registry(
                                 "paths": refs,
                             }));
                         }
+                        // Special: search_skills — emit which skills were found
+                        if name == "search_skills" {
+                            if let Some(arr) = v.as_array() {
+                                let titles: Vec<String> = arr.iter()
+                                    .filter_map(|s| s["title"].as_str().map(String::from))
+                                    .collect();
+                                if !titles.is_empty() {
+                                    state_c.daemon.emit("agent:skills_activated", json!({
+                                        "session_id": session_id,
+                                        "titles": titles,
+                                        "source": "search_skills",
+                                    }));
+                                }
+                            }
+                        }
                         // Special: open_note — also emit agent:open_note
                         if name == "open_note" {
                             let paths: Vec<Value> = args["paths"].as_array()
@@ -554,6 +569,7 @@ pub async fn run_agent(
             state.daemon.emit("agent:skills_activated", serde_json::json!({
                 "session_id": session_id,
                 "titles": skill.skill_titles,
+                "source": "pre_pass",
             }));
         }
 

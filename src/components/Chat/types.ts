@@ -1,5 +1,5 @@
 export interface Message {
-  role: 'user' | 'assistant' | 'tool' | 'notice'
+  role: 'user' | 'assistant' | 'tool' | 'notice' | 'think'
   content: string
   webRefs?: Array<{ path: string; title: string; excerpt: string }>
   savedWeb?: boolean

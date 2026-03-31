@@ -436,6 +436,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     let unlistenPreRouteDebug: (() => void) = () => {}
     let unlistenSkillFound: (() => void) = () => {}
     let unlistenSkillNotFound: (() => void) = () => {}
+    let unlistenThink: (() => void) = () => {}
 
     // Clear previous suggestions at the start of each send
     setNoteSuggestions([])
@@ -479,6 +480,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         unlistenPreRouteDebug,
         unlistenSkillFound,
         unlistenSkillNotFound,
+        unlistenThink,
       ] = await Promise.all([
         listen<{ session_id?: string; display?: string } | string>('agent:tool_call', (event) => {
           const display = typeof event.payload === 'string'
@@ -585,6 +587,9 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
           }])
           setPendingSkillNotFound(e.payload)
         }),
+        listen<{ thought: string }>('agent:think', (e) => {
+          setMessages(prev => [...prev, { role: 'think' as const, content: e.payload.thought }])
+        }),
       ])
 
       log('  呼叫 invoke("invoke_agent")')
@@ -646,6 +651,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       unlistenPreRouteDebug()
       unlistenSkillFound()
       unlistenSkillNotFound()
+      unlistenThink()
       setPendingWriteDisplay(null)
       setIsStreaming(false)
       isStreamingRef.current = false
