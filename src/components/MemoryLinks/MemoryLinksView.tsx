@@ -17,6 +17,8 @@ const CATEGORY_COLORS: Record<string, string> = {
   general:    '#60a5fa',
 }
 const NOTE_COLOR    = '#7c8cf8'
+const THINK_COLOR   = '#22d3ee'
+const SKILL_COLOR   = '#fb923c'
 const DIMMED_COLOR  = '#3a3d47'
 const FOCUSED_RING  = '#ffffff'
 
@@ -29,13 +31,14 @@ const DMN_BREATHE_MS = 2800  // full breath cycle (in → out)
 
 interface MemoryNode {
   node_id:      string
-  node_type:    'memory_fact' | 'note'
+  node_type:    'memory_fact' | 'note' | 'think' | 'skill'
   label:        string
   category?:    string
   content?:     string
   fact_id?:     string
   file_path?:   string
   inject_count?: number
+  temp?:        boolean
 }
 interface MemoryEdge {
   source_id: string
@@ -57,6 +60,7 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
   const dmnIdsRef         = useRef<string[]>([])             // top-N by inject_count
   const dmnTimerRef       = useRef<ReturnType<typeof setInterval> | null>(null)
   const dmnPhaseRef       = useRef<0 | 1>(0)                 // 0=exhale(dim), 1=inhale(bright)
+  const tempNodeIdsRef    = useRef<Set<string>>(new Set())   // temp think/skill node ids
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
   const sourceFilterRef   = useRef<SourceFilter>('all')
   const { settings }      = useSettingsStore()
@@ -150,8 +154,11 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
       const isFocused  = newFocusedIds.has(id)
       const isNeighbor = neighborIds.has(id)
       const wasActive  = oldFocused.has(id)
-      const catColor   = CATEGORY_COLORS[node.data('category')] ?? FOCUSED_RING
-      const isNote     = node.data('node_type') === 'note'
+      const nodeType   = node.data('node_type') as string
+      const catColor   = nodeType === 'think' ? THINK_COLOR
+                       : nodeType === 'skill' ? SKILL_COLOR
+                       : CATEGORY_COLORS[node.data('category')] ?? FOCUSED_RING
+      const isNote     = nodeType === 'note'
 
       if (isFocused) {
         const delay = wasActive ? 0 : DELAY_MS
@@ -364,6 +371,59 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
     return () => { unlisten?.() }
   }, [applyFocus])
 
+  // ── Helper: add temp nodes (think/skill) + focus them ────────────────────
+  const addTempNodes = useCallback((
+    type: 'think' | 'skill',
+    items: { id: string; label: string }[],
+  ) => {
+    const cy = cyRef.current
+    if (!cy || items.length === 0) return
+
+    // Remove old temp nodes of the same type
+    cy.nodes().filter((n: NodeSingular) => n.data('node_type') === type && n.data('temp')).remove()
+    tempNodeIdsRef.current = new Set(
+      [...tempNodeIdsRef.current].filter(id => cy.getElementById(id).length > 0)
+    )
+
+    const newIds = new Set<string>()
+    items.forEach(({ id, label }) => {
+      if (cy.getElementById(id).length === 0) {
+        cy.add({ group: 'nodes', data: { id, label, node_type: type, temp: true } })
+        tempNodeIdsRef.current.add(id)
+      }
+      newIds.add(id)
+    })
+
+    cy.layout({ name: 'fcose', animate: false, randomize: false } as any).run()
+    applyFocus(newIds, true)
+  }, [applyFocus])
+
+  // ── Listen for agent:think ────────────────────────────────────────────────
+  useEffect(() => {
+    let unlisten: (() => void) | null = null
+    let counter = 0
+    listen<{ thought: string }>('agent:think', (e) => {
+      counter++
+      const id = `temp_think_${counter}`
+      const label = `💭 ${e.payload.thought.slice(0, 30)}${e.payload.thought.length > 30 ? '…' : ''}`
+      addTempNodes('think', [{ id, label }])
+    }).then(fn => { unlisten = fn })
+    return () => { unlisten?.() }
+  }, [addTempNodes])
+
+  // ── Listen for agent:skills_activated ────────────────────────────────────
+  useEffect(() => {
+    let unlisten: (() => void) | null = null
+    listen<{ titles: string[]; source?: string }>('agent:skills_activated', (e) => {
+      const items = e.payload.titles.map((title, i) => ({
+        id: `temp_skill_${title.replace(/\s+/g, '_')}_${i}`,
+        label: `⚡ ${title}`,
+      }))
+      addTempNodes('skill', items)
+    }).then(fn => { unlisten = fn })
+    return () => { unlisten?.() }
+  }, [addTempNodes])
+
   // ── Font size setting sync ────────────────────────────────────────────────
   useEffect(() => {
     const cy = cyRef.current
@@ -395,6 +455,10 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
         rule
         <span style={{ width: 10, height: 10, borderRadius: '50%', background: NOTE_COLOR, display: 'inline-block', marginLeft: 6 }} />
         note
+        <span style={{ width: 10, height: 10, borderRadius: '50%', background: THINK_COLOR, display: 'inline-block', marginLeft: 6 }} />
+        think
+        <span style={{ width: 10, height: 10, borderRadius: '50%', background: SKILL_COLOR, display: 'inline-block', marginLeft: 6 }} />
+        skill
       </div>
       {/* Source filter */}
       <div
