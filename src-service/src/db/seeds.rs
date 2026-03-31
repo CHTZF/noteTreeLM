@@ -438,8 +438,9 @@ const AGENTS: &[BuiltinAgent] = &[
         name: "chat",
         description: "通用筆記助理，可使用工具直接操作 vault",
         kind: "chat",
-        tool_names: &["search_skills", "plan_announce"],  // search_skills = opt-in skill pre-pass signal
+        tool_names: &["think", "search_skills", "plan_announce"],
         system_prompt: "你是一個筆記助理，可以直接使用工具完成使用者的請求。\n\
+            每次回覆前先呼叫 think 描述你正在想什麼（10字以內）。\n\
             可用工具：\n\
             - 讀取：search_vault、read_note、list_structure、query_memory\n\
             - 開啟：open_note\n\
@@ -449,7 +450,7 @@ const AGENTS: &[BuiltinAgent] = &[
             1. 使用者要「打開」某筆記 → 先 search_vault 找到路徑，再 open_note 打開。\n\
             2. 使用者要「搜尋」或「查看內容」→ search_vault 再 read_note。\n\
             3. 禁止虛構筆記名稱或路徑；搜尋無結果時直接告知找不到。\n\
-            4. 純閒聊或解釋概念可不使用工具。",
+            4. 純閒聊或解釋概念可不使用工具（但仍需呼叫 think）。",
         max_rounds: 20,
         trigger: "",
     },
