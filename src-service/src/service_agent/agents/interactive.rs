@@ -256,16 +256,56 @@ pub async fn run_interactive_agent(
             Some(json!(tools_schema))
         };
 
-        let has_think = tool_names.contains(&"think".to_string());
-        for round in 0..super::super::MAX_ROUNDS {
-            if cancel.load(Ordering::Relaxed) { break; }
+        // Pre-think: if think tool is available, call LLM once (non-streaming) to get a thought,
+        // emit agent:think, then append the tool call + result to msgs before the main loop.
+        if tool_names.contains(&"think".to_string()) && streaming {
+            let think_schema = json!([{
+                "type": "function",
+                "function": {
+                    "name": "think",
+                    "description": "輸出一句內心獨白（10字以內），描述正在想什麼",
+                    "parameters": { "type": "object", "properties": {
+                        "thought": { "type": "string" }
+                    }, "required": ["thought"] }
+                }
+            }]);
+            let think_body = json!({
+                "messages": msgs,
+                "tools": think_schema,
+                "tool_choice": { "type": "function", "function": { "name": "think" } },
+                "stream": false,
+                "temperature": 0.7,
+                "max_tokens": 64,
+            });
+            if let Ok(resp) = client
+                .post(format!("{}/v1/chat/completions", llm_url))
+                .json(&think_body)
+                .send().await
+            {
+                if let Ok(j) = resp.json::<Value>().await {
+                    let msg = &j["choices"][0]["message"];
+                    if let Some(tcs) = msg["tool_calls"].as_array() {
+                        if let Some(tc) = tcs.first() {
+                            let id = tc["id"].as_str().unwrap_or("think_0").to_string();
+                            let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}").to_string();
+                            let args: Value = serde_json::from_str(&args_str).unwrap_or_default();
+                            let thought = args["thought"].as_str().unwrap_or("").to_string();
+                            if !thought.is_empty() {
+                                emit_fn_closure("agent:think".to_string(), json!({ "thought": thought }));
+                                msgs.push(json!({
+                                    "role": "assistant", "content": null,
+                                    "tool_calls": [{ "id": id, "type": "function", "function": { "name": "think", "arguments": args_str } }]
+                                }));
+                                msgs.push(json!({ "role": "tool", "tool_call_id": id, "content": "✅" }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
-            // Force think on first round if think tool is available
-            let tool_choice = if round == 0 && has_think && tools_value.is_some() {
-                json!({ "type": "function", "function": { "name": "think" } })
-            } else {
-                json!("auto")
-            };
+        for _round in 0..super::super::MAX_ROUNDS {
+            if cancel.load(Ordering::Relaxed) { break; }
 
             let (text, tool_chunks) = if streaming {
                 let body = if tools_value.is_none() {
@@ -274,7 +314,7 @@ pub async fn run_interactive_agent(
                     json!({
                         "messages": msgs,
                         "tools": tools_value,
-                        "tool_choice": tool_choice,
+                        "tool_choice": "auto",
                         "stream": true,
                         "temperature": 0.7,
                         "max_tokens": 2048,
