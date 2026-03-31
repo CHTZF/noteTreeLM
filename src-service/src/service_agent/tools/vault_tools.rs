@@ -84,12 +84,24 @@ pub(crate) async fn vault_query_memory(
     keywords: &[String],
     limit: u64,
 ) -> Result<Value, String> {
+    let (text, _) = vault_query_memory_with_ids(db, vault_id, account_id, keywords, limit).await?;
+    Ok(text)
+}
+
+/// Same as vault_query_memory but also returns the matched fact_ids for memory:prefetched.
+pub(crate) async fn vault_query_memory_with_ids(
+    db: &SurrealDb,
+    vault_id: &str,
+    account_id: &str,
+    keywords: &[String],
+    limit: u64,
+) -> Result<(Value, Vec<String>), String> {
     let now = chrono::Utc::now().timestamp();
     #[derive(serde::Deserialize)]
-    struct Row { content: String, category: String }
+    struct Row { fact_id: Option<String>, content: String, category: String }
     let rows: Vec<Row> = if keywords.is_empty() {
         let mut r = db
-            .query("SELECT content, category FROM memory_facts WHERE vault_id = $vid AND account_id = $aid AND expires_at > $now ORDER BY created_at DESC LIMIT $lim")
+            .query("SELECT fact_id, content, category FROM memory_facts WHERE vault_id = $vid AND account_id = $aid AND expires_at > $now ORDER BY created_at DESC LIMIT $lim")
             .bind(("vid", vault_id.to_string()))
             .bind(("aid", account_id.to_string()))
             .bind(("now", now))
@@ -101,7 +113,7 @@ pub(crate) async fn vault_query_memory(
         let mut collected: Vec<Row> = Vec::new();
         for kw in keywords.iter().take(3) {
             let mut r = db
-                .query("SELECT content, category FROM memory_facts WHERE vault_id = $vid AND account_id = $aid AND content ~ $kw AND expires_at > $now LIMIT $lim")
+                .query("SELECT fact_id, content, category FROM memory_facts WHERE vault_id = $vid AND account_id = $aid AND content ~ $kw AND expires_at > $now LIMIT $lim")
                 .bind(("vid", vault_id.to_string()))
                 .bind(("aid", account_id.to_string()))
                 .bind(("kw", kw.clone()))
@@ -114,8 +126,12 @@ pub(crate) async fn vault_query_memory(
         }
         collected
     };
+    let fact_ids: Vec<String> = rows.iter()
+        .filter_map(|r| r.fact_id.clone())
+        .map(|fid| format!("memory:{}:{}", vault_id, fid))
+        .collect();
     let result: Vec<Value> = rows.iter().map(|r| json!({"content": r.content, "category": r.category})).collect();
-    Ok(json!(result))
+    Ok((json!(result), fact_ids))
 }
 
 // ── Write vault tools ─────────────────────────────────────────────────────────
@@ -367,7 +383,7 @@ pub(crate) async fn dispatch_interactive_tool(
                 .map(|a| a.iter().filter_map(|v| v.as_str()).map(String::from).collect())
                 .unwrap_or_default();
             let limit = args["limit"].as_u64().unwrap_or(5).min(20);
-            vault_query_memory(db, vault_id, account_id, &keywords, limit).await.map(|v| (v, None))
+            vault_query_memory_with_ids(db, vault_id, account_id, &keywords, limit).await.map(|(v, _)| (v, None))
         }
 
         // ── Vault write tools (with rollback) ────────────────────────────────

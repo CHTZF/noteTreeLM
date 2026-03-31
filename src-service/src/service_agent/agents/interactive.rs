@@ -404,6 +404,23 @@ pub(crate) fn build_interactive_registry(
                                 "paths": refs,
                             }));
                         }
+                        // Special: query_memory — emit memory:prefetched with fact node IDs
+                        if name == "query_memory" {
+                            let keywords: Vec<String> = args["keywords"].as_array()
+                                .map(|a| a.iter().filter_map(|v| v.as_str()).map(String::from).collect())
+                                .unwrap_or_default();
+                            let limit = args["limit"].as_u64().unwrap_or(5).min(20);
+                            if let Ok((_, fact_ids)) = super::super::tools::vault_tools::vault_query_memory_with_ids(
+                                &db, &vault_id, &account_id, &keywords, limit,
+                            ).await {
+                                if !fact_ids.is_empty() {
+                                    state_c.daemon.emit("memory:prefetched", json!({
+                                        "node_ids": fact_ids,
+                                        "source": "chat",
+                                    }));
+                                }
+                            }
+                        }
                         // Special: search_skills — emit which skills were found
                         if name == "search_skills" {
                             if let Some(arr) = v.as_array() {
@@ -555,6 +572,13 @@ pub async fn run_agent(
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
+
+    // Runtime patch: ensure query_memory is available for chat agents
+    // (old seeded agents may lack it; new seeds include it).
+    let agent_kind = agent_def["kind"].as_str().unwrap_or("chat");
+    if agent_kind == "chat" && !tool_names.contains(&"query_memory".to_string()) {
+        tool_names.push("query_memory".to_string());
+    }
 
     // Skill pre-pass: triggered when agent_def declares "search_skills" in tool_names.
     let system_injection = if !vault_path.is_empty() && tool_names.contains(&"search_skills".to_string()) {

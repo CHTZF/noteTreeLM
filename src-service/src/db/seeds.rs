@@ -438,7 +438,7 @@ const AGENTS: &[BuiltinAgent] = &[
         name: "chat",
         description: "通用筆記助理，可使用工具直接操作 vault",
         kind: "chat",
-        tool_names: &["search_skills", "plan_announce"],  // search_skills = opt-in skill pre-pass signal
+        tool_names: &["search_skills", "query_memory", "plan_announce"],  // search_skills = skill pre-pass; query_memory = memory context
         system_prompt: "你是一個筆記助理，可以直接使用工具完成使用者的請求。\n\
             可用工具：\n\
             - 讀取：search_vault、read_note、list_structure、query_memory\n\
