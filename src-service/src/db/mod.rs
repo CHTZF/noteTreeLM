@@ -241,6 +241,7 @@ async fn run_migrations(db: &SurrealDb) -> Result<(), surrealdb::Error> {
         "DEFINE FIELD IF NOT EXISTS need_tool_chain      ON agent_skills TYPE bool DEFAULT false;",
         "DEFINE FIELD IF NOT EXISTS tool_chain_order     ON agent_skills TYPE array;",
         "DEFINE FIELD IF NOT EXISTS created_at           ON agent_skills TYPE int DEFAULT 0;",
+        "DEFINE FIELD IF NOT EXISTS embedding            ON agent_skills TYPE option<array>;",
         "DEFINE INDEX IF NOT EXISTS idx_agent_skills_id ON agent_skills FIELDS skill_id UNIQUE;",
 
         // ── agent tools ──────────────────────────────────────────────────────

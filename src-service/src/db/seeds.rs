@@ -419,6 +419,26 @@ const AGENTS: &[BuiltinAgent] = &[
         max_rounds: 8,
         trigger: "整理筆記、摘要多篇、幫我歸納、彙整資料、總結所有、整合多篇、summarize notes、consolidate、把這些筆記整理、歸納重點、統整一下、彙整成一篇、做個摘要、整理一份報告",
     },
+    BuiltinAgent {
+        id: "builtin_chat",
+        name: "chat",
+        description: "通用筆記助理，可使用工具直接操作 vault",
+        kind: "chat",
+        tool_names: &["search_skills", "plan_announce"],  // search_skills = opt-in skill pre-pass signal
+        system_prompt: "你是一個筆記助理，可以直接使用工具完成使用者的請求。\n\
+            可用工具：\n\
+            - 讀取：search_vault、read_note、list_structure、query_memory\n\
+            - 開啟：open_note\n\
+            - 寫入：create_note、update_note、append_to_note、create_folder\n\
+            - 刪除/移動：delete_note、delete_folder、move_note\n\
+            規則：\n\
+            1. 使用者要「打開」某筆記 → 先 search_vault 找到路徑，再 open_note 打開。\n\
+            2. 使用者要「搜尋」或「查看內容」→ search_vault 再 read_note。\n\
+            3. 禁止虛構筆記名稱或路徑；搜尋無結果時直接告知找不到。\n\
+            4. 純閒聊或解釋概念可不使用工具。",
+        max_rounds: 20,
+        trigger: "",
+    },
 ];
 
 /// 為指定 account 幂等重建所有內建 skills 與 agent definitions。
@@ -513,6 +533,9 @@ pub async fn seed_builtins(db: &SurrealDb, account_id: &str) {
 
     tracing::info!("Seeded {} builtin agents for account {}", AGENTS.len(), account_id);
 
+    // Embedding happens later when embed_skills_for_account is called with embedding_url.
+    // (seed_builtins doesn't have access to the daemon's embedding_url)
+
     // Ensure periodic memory-agent scheduled tasks exist for every vault this account owns
     #[derive(serde::Deserialize)]
     struct VaultRow { vault_id: String }
@@ -564,4 +587,59 @@ pub async fn ensure_memory_schedule(db: &SurrealDb, vault_id: &str, account_id: 
         .await;
 
     tracing::info!("[seeds] created memory_agent schedule for vault={} account={}", vault_id, account_id);
+}
+
+/// Embed all skills for an account that have no embedding yet.
+/// `embedding_url` — same URL used by the embedder service (e.g. llama.cpp /embedding).
+/// Called after seed_builtins (from auth routes that have access to daemon state)
+/// and after any INSERT/UPDATE on agent_skills.
+pub async fn embed_skills_for_account(
+    db: &SurrealDb,
+    account_id: &str,
+    embedding_url: &Option<String>,
+) {
+    let Some(_) = embedding_url else {
+        tracing::debug!("[seeds] embedding_url not set, skipping skill embedding");
+        return;
+    };
+
+    #[derive(serde::Deserialize)]
+    struct SkillRow {
+        skill_id: String,
+        title: String,
+        trigger: String,
+        behavior: String,
+    }
+    let rows: Vec<SkillRow> = db
+        .query("SELECT skill_id, title, trigger, behavior FROM agent_skills \
+                WHERE account_id = $aid AND embedding IS NONE")
+        .bind(("aid", account_id.to_string()))
+        .await
+        .ok()
+        .and_then(|mut r| r.take(0).ok())
+        .unwrap_or_default();
+
+    if rows.is_empty() { return; }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+
+    let count = rows.len();
+    for row in rows {
+        let text = format!("{} {} {}",
+            row.title,
+            row.trigger,
+            row.behavior.chars().take(200).collect::<String>(),
+        );
+        if let Some(vec) = crate::processing::embedder::embed_text(&client, embedding_url, &text).await {
+            let _ = db
+                .query("UPDATE agent_skills SET embedding = $emb WHERE skill_id = $sid")
+                .bind(("emb", vec))
+                .bind(("sid", row.skill_id))
+                .await;
+        }
+    }
+    tracing::info!("[seeds] embedded {} skills for account {}", count, account_id);
 }

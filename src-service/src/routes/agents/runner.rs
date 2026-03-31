@@ -13,7 +13,7 @@ use crate::service_agent::engine::transaction::Transaction;
 use super::account_id_from_headers;
 
 /// POST /vaults/:vid/agent/run
-/// Body: { session_id, input, messages, system, use_tools, activity_context, vault_path, conversation_id }
+/// Body: { session_id, input, messages, system, activity_context, vault_path, conversation_id }
 /// Spawns run_interactive_agent in background; immediately returns { session_id }.
 pub async fn run(
     State(state): State<ApiState>,
@@ -28,17 +28,46 @@ pub async fn run(
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let input = body["input"].as_str().unwrap_or("").to_string();
     let messages: Vec<Value> = body["messages"].as_array().cloned().unwrap_or_default();
-    let system = body["system"].as_str().unwrap_or("").to_string();
-    let use_tools = body["use_tools"].as_bool().unwrap_or(true);
+    let now = chrono::Utc::now().timestamp();
     let activity_context = body["activity_context"].as_str().map(String::from);
     let vault_path = body["vault_path"].as_str().unwrap_or("").to_string();
     let conversation_id = body["conversation_id"].as_str()
         .map(String::from)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    tokio::spawn(crate::service_agent::run_interactive_agent(
-        state, session_id.clone(), input, messages, system, use_tools,
-        activity_context, vault_id, account_id, vault_path, conversation_id.clone(),
+    // Load agent_def by name (default: "chat"); inject session_id for run_agent.
+    let agent_name = body["agent"].as_str().unwrap_or("chat");
+    let agent_def = {
+        let mut def = crate::service_agent::helpers::load_agent_def(&state.db, agent_name, &account_id)
+            .await
+            .unwrap_or_else(|| json!({}));
+        def["session_id"] = json!(session_id.clone());
+        def
+    };
+
+    // Upsert conversation + seed messages before spawning.
+    if !messages.is_empty() {
+        let msgs_str = serde_json::to_string(&messages).unwrap_or_else(|_| "[]".to_string());
+        let upsert = state.db
+            .query("INSERT INTO conversations (id, account_id, vault_id, mode, title, messages_json, created_at, updated_at) \
+                    VALUES (type::thing(\"conversations\", $cid), $aid, $vid, 'chat', '', $msgs, $now, $now) \
+                    ON DUPLICATE KEY UPDATE messages_json = $msgs, updated_at = $now")
+            .bind(("cid", conversation_id.clone()))
+            .bind(("aid", account_id.clone()))
+            .bind(("vid", vault_id.clone()))
+            .bind(("msgs", msgs_str))
+            .bind(("now", now))
+            .await;
+        if let Err(e) = upsert {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("failed to save conversation: {}", e)));
+        }
+    }
+
+    tokio::spawn(crate::service_agent::run_agent(
+        state, agent_def, input,
+        vault_id, account_id, vault_path, conversation_id.clone(),
+        true,  // streaming
+        activity_context,
     ));
 
     Ok(Json(json!({ "session_id": session_id, "conversation_id": conversation_id })))

@@ -478,25 +478,49 @@ pub(crate) async fn dispatch_interactive_tool(
         "search_skills" => {
             let query = args["query"].as_str().unwrap_or("");
             #[derive(serde::Deserialize)]
-            struct Row { title: String, behavior: String, tool_calls: Option<Value> }
-            let now = chrono::Utc::now().timestamp();
+            struct Row { title: String, behavior: String, tool_calls: Option<Value>, embedding: Option<Value> }
             let mut resp = db
-                .query("SELECT title, behavior, tool_calls FROM agent_skills WHERE account_id = $aid AND is_active = true AND expires_at > $now LIMIT 10")
+                .query("SELECT title, behavior, tool_calls, embedding FROM agent_skills WHERE account_id = $aid AND is_active = true LIMIT 30")
                 .bind(("aid", account_id.to_string()))
-                .bind(("now", now))
                 .await
                 .map_err(|e| e.to_string())?;
             let rows: Vec<Row> = resp.take(0).map_err(|e| e.to_string())?;
-            // Filter by keyword relevance
-            let q_lower = query.to_lowercase();
-            let results: Vec<Value> = rows.iter()
-                .filter(|r| q_lower.is_empty() || r.title.to_lowercase().contains(&q_lower) || r.behavior.to_lowercase().contains(&q_lower))
-                .map(|r| json!({
+
+            // Prefer semantic search; fall back to keyword filter
+            let q_vec = if !query.is_empty() {
+                crate::processing::embedder::embed_text(client, embedding_url, query).await
+            } else {
+                None
+            };
+
+            let results: Vec<Value> = if let Some(ref qv) = q_vec {
+                // Semantic: score every skill that has an embedding, threshold 0.60
+                let mut scored: Vec<(f32, &Row)> = rows.iter().filter_map(|r| {
+                    let emb: Vec<f32> = r.embedding.as_ref()?.as_array()?
+                        .iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
+                    if emb.is_empty() { return None; }
+                    let score = crate::service_agent::helpers::cosine_sim(qv, &emb);
+                    if score >= 0.60 { Some((score, r)) } else { None }
+                }).collect();
+                scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                scored.into_iter().take(10).map(|(_, r)| json!({
                     "title": r.title,
                     "behavior": r.behavior,
                     "required_tools": r.tool_calls,
-                }))
-                .collect();
+                })).collect()
+            } else {
+                // Keyword fallback
+                let q_lower = query.to_lowercase();
+                rows.iter()
+                    .filter(|r| q_lower.is_empty() || r.title.to_lowercase().contains(&q_lower) || r.behavior.to_lowercase().contains(&q_lower))
+                    .take(10)
+                    .map(|r| json!({
+                        "title": r.title,
+                        "behavior": r.behavior,
+                        "required_tools": r.tool_calls,
+                    }))
+                    .collect()
+            };
             Ok((json!(results), None))
         }
         "create_agent_skill" => {
@@ -712,6 +736,14 @@ pub(crate) fn build_tools_schema_interactive(tool_names: &[String]) -> Vec<Value
                 "category": { "type": "string", "description": "只壓縮指定類別，省略則全部" }
             }, "required": [] }
         }}),
+        json!({ "type": "function", "function": {
+            "name": "call_agent",
+            "description": "呼叫另一個已定義的 agent 執行特定任務，並取回結果",
+            "parameters": { "type": "object", "properties": {
+                "name":  { "type": "string", "description": "agent 定義的名稱" },
+                "input": { "type": "string", "description": "傳給 sub-agent 的任務描述或問題" }
+            }, "required": ["name", "input"] }
+        }}),
     ];
 
     all_tools.into_iter()
@@ -796,4 +828,53 @@ pub(crate) async fn stream_llm_round(
     }
 
     Ok((full_text, finish_reason, tool_chunks))
+}
+
+/// Non-streaming LLM call for sub-agents. Returns (content, tool_chunks).
+/// Does NOT emit llm:token events — caller handles output.
+pub(crate) async fn call_llm_once(
+    client: &reqwest::Client,
+    llm_url: &str,
+    messages: &[Value],
+    tools: Option<Value>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(String, Vec<(String, String, String)>), String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".into());
+    }
+    let mut body = json!({
+        "messages": messages,
+        "stream": false,
+        "temperature": 0.7,
+        "max_tokens": 1024,
+    });
+    if let Some(t) = tools {
+        body["tools"] = t;
+        body["tool_choice"] = json!("auto");
+    }
+    let resp = client
+        .post(format!("{}/v1/chat/completions", llm_url))
+        .json(&body)
+        .send().await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("llm error {}: {}", status, text));
+    }
+    let j: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let msg = &j["choices"][0]["message"];
+    let content = msg["content"].as_str().unwrap_or("").to_string();
+    let mut tool_chunks: Vec<(String, String, String)> = Vec::new();
+    if let Some(tcs) = msg["tool_calls"].as_array() {
+        for tc in tcs {
+            let id   = tc["id"].as_str().unwrap_or("").to_string();
+            let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+            let args = tc["function"]["arguments"].as_str().unwrap_or("{}").to_string();
+            if !name.is_empty() {
+                tool_chunks.push((id, name, args));
+            }
+        }
+    }
+    Ok((content, tool_chunks))
 }

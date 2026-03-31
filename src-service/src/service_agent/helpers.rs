@@ -199,3 +199,157 @@ pub(crate) async fn vault_query_memory_with_limit(
         "category": r.category,
     })).collect()
 }
+
+// ── Skill pre-pass ────────────────────────────────────────────────────────────
+
+pub(crate) struct SkillPassResult {
+    /// Tool names required by matched skills (empty = no skills matched).
+    pub tool_names: Vec<String>,
+    /// Extra text to inject into the system prompt (proactive context + skill behaviours).
+    pub system_injection: String,
+    /// Display titles of matched skills, for agent:skills_activated SSE.
+    pub skill_titles: Vec<String>,
+    /// skill_ids to bump trigger_count asynchronously.
+    pub skill_ids: Vec<String>,
+}
+
+/// Semantic skill search: embeds `input`, scores all skills that have embeddings
+/// via cosine similarity, and returns skills above `threshold`.
+/// Skills without embeddings fall through to keyword matching in `run_skill_pass`.
+async fn semantic_skill_search(
+    client: &reqwest::Client,
+    embedding_url: &Option<String>,
+    db: &SurrealDb,
+    account_id: &str,
+    input: &str,
+    threshold: f32,
+) -> Option<Vec<(String, String, String, Vec<String>, bool, Vec<String>, String)>> {
+    // Embed the user input
+    let input_vec = crate::processing::embedder::embed_text(client, embedding_url, input).await?;
+    if input_vec.is_empty() { return None; }
+
+    // Load all active skills that have an embedding
+    let mut resp = db
+        .query("SELECT *, record::id(id) AS id FROM agent_skills WHERE account_id = $aid AND is_active = true AND embedding IS NOT NONE")
+        .bind(("aid", account_id.to_string()))
+        .await.ok()?;
+    let skills: Vec<Value> = resp.take(0).ok()?;
+    if skills.is_empty() { return None; }
+
+    let mut scored: Vec<(f32, &Value)> = skills.iter().filter_map(|s| {
+        let emb: Vec<f32> = s["embedding"].as_array()?
+            .iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
+        if emb.is_empty() { return None; }
+        // Always include proactive/active skills
+        let mode = s["injection_mode"].as_str().unwrap_or("passive");
+        if mode == "active" || mode == "proactive" {
+            return Some((1.0f32, s));
+        }
+        let score = cosine_sim(&input_vec, &emb);
+        if score >= threshold { Some((score, s)) } else { None }
+    }).collect();
+
+    if scored.is_empty() { return None; }
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let results = scored.into_iter().map(|(_, s)| {
+        let skill_id = s["skill_id"].as_str().unwrap_or("").to_string();
+        let title = s["title"].as_str().unwrap_or("").to_string();
+        let behavior = s["behavior"].as_str().unwrap_or("").to_string();
+        let tool_calls: Vec<String> = if let Some(arr) = s["tool_calls"].as_array() {
+            arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+        } else if let Some(s) = s["tool_calls"].as_str() {
+            serde_json::from_str::<Vec<String>>(s).unwrap_or_default()
+        } else { vec![] };
+        let need_tool_chain = s["need_tool_chain"].as_bool().unwrap_or(false);
+        let tool_chain_order: Vec<String> = if let Some(arr) = s["tool_chain_order"].as_array() {
+            arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+        } else { vec![] };
+        let injection_mode = s["injection_mode"].as_str().unwrap_or("passive").to_string();
+        (skill_id, title, behavior, tool_calls, need_tool_chain, tool_chain_order, injection_mode)
+    }).collect();
+
+    Some(results)
+}
+
+/// Run skill matching for a user input. Returns everything the caller needs to
+/// assemble the final system prompt and tool list before calling run_interactive_agent.
+/// Uses semantic search when embeddings are available, falls back to keyword matching.
+pub(crate) async fn run_skill_pass(
+    client: &reqwest::Client,
+    embedding_url: &Option<String>,
+    db: &SurrealDb,
+    vault_id: &str,
+    account_id: &str,
+    input: &str,
+) -> SkillPassResult {
+    // Prefer semantic search; fall back to keyword matching
+    let matched = match semantic_skill_search(client, embedding_url, db, account_id, input, 0.65).await {
+        Some(results) if !results.is_empty() => results,
+        _ => search_skills_db(db, account_id, input).await,
+    };
+
+    if matched.is_empty() {
+        return SkillPassResult {
+            tool_names: vec![],
+            system_injection: String::new(),
+            skill_titles: vec![],
+            skill_ids: vec![],
+        };
+    }
+
+    // Proactive prefetch (memory facts)
+    let mut proactive_parts: Vec<String> = vec![];
+    for (_, _, _, _, need_chain, chain_order, mode) in &matched {
+        if mode != "proactive" || !*need_chain { continue; }
+        for tool_name in chain_order {
+            if tool_name == "prefetch_memory" {
+                let kw_input: String = input.chars().take(120).collect();
+                let keywords = if kw_input.is_empty() { vec![] } else { vec![kw_input.clone()] };
+                let facts = vault_query_memory_with_limit(db, vault_id, account_id, &keywords, 8).await;
+                if !facts.is_empty() {
+                    let lines: Vec<String> = facts.iter().map(|r| {
+                        let cat = r["category"].as_str().unwrap_or("general");
+                        let content = r["content"].as_str().unwrap_or("");
+                        format!("[{}] {}", cat, content)
+                    }).collect();
+                    proactive_parts.push(format!("## 相關記憶\n{}", lines.join("\n")));
+                }
+            }
+        }
+    }
+
+    let skill_text: String = matched.iter()
+        .filter(|(_, _, beh, _, _, _, mode)| !beh.is_empty() && mode != "proactive")
+        .map(|(_, title, beh, _, need_chain, chain_order, _)| {
+            if *need_chain && !chain_order.is_empty() {
+                format!("[技能：{}]\n{}\n工具執行順序：{}", title, beh, chain_order.join(" → "))
+            } else {
+                format!("[技能：{}]\n{}", title, beh)
+            }
+        })
+        .collect::<Vec<_>>().join("\n\n");
+
+    let mut injection_parts: Vec<String> = vec![];
+    let proactive_context = proactive_parts.join("\n\n");
+    if !proactive_context.is_empty() {
+        injection_parts.push(proactive_context.chars().take(1000).collect());
+    }
+    if !skill_text.is_empty() {
+        injection_parts.push(skill_text.chars().take(1500).collect());
+    }
+
+    let mut tool_names: Vec<String> = matched.iter()
+        .flat_map(|(_, _, _, tc, _, _, _)| tc.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    tool_names.sort();
+
+    SkillPassResult {
+        tool_names,
+        system_injection: injection_parts.join("\n\n"),
+        skill_titles: matched.iter().map(|(_, t, _, _, _, _, _)| t.clone()).collect(),
+        skill_ids: matched.iter().map(|(id, _, _, _, _, _, _)| id.clone()).collect(),
+    }
+}

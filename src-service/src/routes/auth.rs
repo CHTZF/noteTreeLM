@@ -101,11 +101,15 @@ async fn login(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Seed builtin skills/agents for this account on first login (idempotent)
-    let username_for_seed = user.username.clone();
-    let db_for_seed = state.db.clone();
-    tokio::spawn(async move {
-        crate::db::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
-    });
+    {
+        let username_for_seed = user.username.clone();
+        let db_for_seed = state.db.clone();
+        let embed_url = state.daemon.embedding_url.read().await.clone();
+        tokio::spawn(async move {
+            crate::db::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
+            crate::db::seeds::embed_skills_for_account(&db_for_seed, &username_for_seed, &embed_url).await;
+        });
+    }
 
     Ok(Json(json!({
         "token": token,
@@ -215,11 +219,15 @@ async fn register(
         })?;
 
     // Seed on first registration
-    let username_for_seed = req.username.clone();
-    let db_for_seed = state.db.clone();
-    tokio::spawn(async move {
-        crate::db::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
-    });
+    {
+        let username_for_seed = req.username.clone();
+        let db_for_seed = state.db.clone();
+        let embed_url = state.daemon.embedding_url.read().await.clone();
+        tokio::spawn(async move {
+            crate::db::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
+            crate::db::seeds::embed_skills_for_account(&db_for_seed, &username_for_seed, &embed_url).await;
+        });
+    }
 
     Ok(Json(json!({ "ok": true, "username": req.username })))
 }
@@ -304,11 +312,15 @@ async fn google_upsert(
         })?;
 
     // Seed builtin skills/agents for this account (idempotent)
-    let username_for_seed = username.clone();
-    let db_for_seed = state.db.clone();
-    tokio::spawn(async move {
-        crate::db::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
-    });
+    {
+        let username_for_seed = username.clone();
+        let db_for_seed = state.db.clone();
+        let embed_url = state.daemon.embedding_url.read().await.clone();
+        tokio::spawn(async move {
+            crate::db::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
+            crate::db::seeds::embed_skills_for_account(&db_for_seed, &username_for_seed, &embed_url).await;
+        });
+    }
 
     tracing::info!("google_upsert: session created for {}", username);
     Ok(Json(json!({

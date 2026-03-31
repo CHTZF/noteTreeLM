@@ -30,15 +30,16 @@ pub async fn run_interactive_agent(
     state: ApiState,
     session_id: String,
     input: String,
-    messages: Vec<Value>,          // fallback when no conversation_id
     system: String,
-    use_tools: bool,
+    streaming: bool,               // true = emit llm:token SSE; false = silent (background/sub-agent)
+    tool_names: Vec<String>,       // pre-resolved by caller (runner or run_agent)
+    system_injection: String,      // extra text appended to system prompt (from skill pass)
     activity_context: Option<String>,
     vault_id: String,
     account_id: String,
     vault_path: String,
     conversation_id: String,
-) {
+) -> String {
     let conv_id = conversation_id;
 
     // 0. Write-confirmation intercept:
@@ -79,7 +80,7 @@ pub async fn run_interactive_agent(
                     _ => {} // Unrelated new question — fall through to start a fresh LLM round
                 }
                 if matches!(intent, Intent::Confirm | Intent::Cancel | Intent::Interrupt) {
-                    return;
+                    return String::new();
                 }
             }
         }
@@ -110,7 +111,7 @@ pub async fn run_interactive_agent(
         Some(u) => u,
         None => {
             state.daemon.emit("llm:done", json!(""));
-            return;
+            return String::new();
         }
     };
 
@@ -120,17 +121,16 @@ pub async fn run_interactive_agent(
         .unwrap_or_default();
     let embedding_url = state.daemon.embedding_url.read().await.clone();
 
-    // 3. Load messages from DB; fall back to frontend-passed messages if DB returns empty.
+    // 3. Load messages from DB (always authoritative — runner upserts before spawn).
     let mut messages_json: Vec<Value> = {
-        let db_msgs = super::super::helpers::load_messages_db(&state.db, &conv_id).await;
-        let mut v = if db_msgs.is_empty() { messages.clone() } else { db_msgs };
+        let mut v = super::super::helpers::load_messages_db(&state.db, &conv_id).await;
         if v.last().and_then(|m| m["role"].as_str()) != Some("user") {
             v.push(json!({"role": "user", "content": input}));
         }
         v
     };
 
-    // 4. Assemble system prompt
+    // 4. Assemble system prompt (base + activity + anti-hallucination + skill injection)
     let anti_hallucination = "\n\n必須實際呼叫工具完成任務；禁止假裝或虛構結果。\
                                若搜尋無結果，直接說明找不到。\
                                回覆中引用筆記時，請包含完整的 vault 相對路徑。";
@@ -139,7 +139,11 @@ pub async fn run_interactive_agent(
     } else {
         system.clone()
     };
-    let sys_content = format!("{}{}", sys_with_activity, anti_hallucination);
+    let sys_content = if system_injection.is_empty() {
+        format!("{}{}", sys_with_activity, anti_hallucination)
+    } else {
+        format!("{}{}\n\n{}", sys_with_activity, anti_hallucination, system_injection)
+    };
 
     if messages_json.first().and_then(|m| m["role"].as_str()) == Some("system") {
         messages_json[0] = json!({"role": "system", "content": sys_content});
@@ -147,96 +151,9 @@ pub async fn run_interactive_agent(
         messages_json.insert(0, json!({"role": "system", "content": sys_content}));
     }
 
-    // 5. Skill pre-pass + tool selection
-    let mut tool_names: Vec<String> = vec!["search_skills".to_string(), "plan_announce".to_string()];
-
-    if use_tools && !vault_path.is_empty() {
-        let matched = super::super::helpers::search_skills_db(&state.db, &account_id, &input).await;
-
-        if !matched.is_empty() {
-            let mut proactive_parts: Vec<String> = vec![];
-            for (_, _, _, _, need_chain, chain_order, mode) in &matched {
-                if mode != "proactive" || !*need_chain { continue; }
-                for tool_name in chain_order {
-                    if tool_name == "prefetch_memory" {
-                        let kw_input: String = input.chars().take(120).collect();
-                        let keywords = if kw_input.is_empty() { vec![] } else { vec![kw_input.clone()] };
-                        let facts = super::super::helpers::vault_query_memory_with_limit(&state.db, &vault_id, &account_id, &keywords, 8).await;
-                        if !facts.is_empty() {
-                            let lines: Vec<String> = facts.iter().map(|r| {
-                                let cat = r["category"].as_str().unwrap_or("general");
-                                let content = r["content"].as_str().unwrap_or("");
-                                format!("[{}] {}", cat, content)
-                            }).collect();
-                            proactive_parts.push(format!("## 相關記憶\n{}", lines.join("\n")));
-                        }
-                    }
-                }
-            }
-            let proactive_context = proactive_parts.join("\n\n");
-
-            let skill_text: String = matched.iter()
-                .filter(|(_, _, beh, _, _, _, mode)| !beh.is_empty() && mode != "proactive")
-                .map(|(_, title, beh, _, need_chain, chain_order, _)| {
-                    if *need_chain && !chain_order.is_empty() {
-                        format!("[技能：{}]\n{}\n工具執行順序：{}", title, beh, chain_order.join(" → "))
-                    } else {
-                        format!("[技能：{}]\n{}", title, beh)
-                    }
-                })
-                .collect::<Vec<_>>().join("\n\n");
-
-            let skill_titles: Vec<String> = matched.iter().map(|(_, t, _, _, _, _, _)| t.clone()).collect();
-
-            let mut required_tools: Vec<String> = matched.iter()
-                .flat_map(|(_, _, _, tc, _, _, _)| tc.clone())
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
-            required_tools.sort();
-
-            for (skill_id, _, _, _, _, _, _) in &matched {
-                let sid = skill_id.clone();
-                let db = state.db.clone();
-                let now = chrono::Utc::now().timestamp();
-                tokio::spawn(async move {
-                    let _ = db
-                        .query("UPDATE agent_skills SET trigger_count = (trigger_count OR 0) + 1, last_triggered_at = $now WHERE skill_id = $sid")
-                        .bind(("now", now))
-                        .bind(("sid", sid))
-                        .await;
-                });
-            }
-
-            if let Some(sys) = messages_json.first_mut() {
-                if sys["role"].as_str() == Some("system") {
-                    let existing = sys["content"].as_str().unwrap_or("").to_string();
-                    let mut injections = vec![existing];
-                    if !proactive_context.is_empty() {
-                        injections.push(proactive_context.chars().take(1000).collect());
-                    }
-                    if !skill_text.is_empty() {
-                        injections.push(skill_text.chars().take(1500).collect());
-                    }
-                    *sys = json!({"role": "system", "content": injections.join("\n\n")});
-                }
-            }
-
-            if !skill_titles.is_empty() {
-                state.daemon.emit("agent:skills_activated", json!({
-                    "session_id": session_id,
-                    "titles": skill_titles,
-                }));
-            }
-
-            if !required_tools.is_empty() {
-                tool_names = required_tools;
-            }
-        }
-
-        // 6. Context sliding window (12000 chars)
-        {
-            const MAX_HISTORY_CHARS: usize = 12000;
+    // 5. Context sliding window (12000 chars)
+    if !tool_names.is_empty() && !vault_path.is_empty() {
+        const MAX_HISTORY_CHARS: usize = 12000;
             let system_part: Vec<Value> = messages_json.iter()
                 .filter(|m| m["role"].as_str() == Some("system"))
                 .cloned().collect();
@@ -257,11 +174,10 @@ pub async fn run_interactive_agent(
             } else {
                 hist
             };
-            messages_json = system_part.into_iter().chain(trimmed.into_iter()).collect();
-        }
+        messages_json = system_part.into_iter().chain(trimmed.into_iter()).collect();
     }
 
-    // 7. Build ToolRegistry + Dispatcher
+    // 6. Build ToolRegistry + Dispatcher
     let emit_fn_closure: EmitEventFn = {
         let state_c = state.clone();
         let session_id_c = session_id.clone();
@@ -282,6 +198,8 @@ pub async fn run_interactive_agent(
         &client, &llm_url, &state.db,
         &vault_id, &account_id, &vault_path, &embedding_url,
         &session_id, &state,
+        Arc::clone(&tx),
+        Arc::clone(&cancel),
     );
 
     let dispatcher = Dispatcher::new(
@@ -290,35 +208,46 @@ pub async fn run_interactive_agent(
         Arc::clone(&is_write_fn),
     );
 
-    // 8. Tool loop or no-tool LLM
+    // 7. Tool loop or no-tool LLM
     let tools_schema = super::super::tools::vault_tools::build_tools_schema_interactive(&tool_names);
     let mut msgs = messages_json.clone();
     let mut full_response = String::new();
 
-    if use_tools && !vault_path.is_empty() {
+    if !tool_names.is_empty() && !vault_path.is_empty() {
+        let tools_value = if tools_schema.is_empty() {
+            None
+        } else {
+            Some(json!(tools_schema))
+        };
+
         for _round in 0..super::super::MAX_ROUNDS {
             if cancel.load(Ordering::Relaxed) { break; }
 
-            let body = if tools_schema.is_empty() {
-                json!({ "messages": msgs, "stream": true, "temperature": 0.7, "max_tokens": 2048 })
+            let (text, tool_chunks) = if streaming {
+                let body = if tools_value.is_none() {
+                    json!({ "messages": msgs, "stream": true, "temperature": 0.7, "max_tokens": 2048 })
+                } else {
+                    json!({
+                        "messages": msgs,
+                        "tools": tools_value,
+                        "tool_choice": "auto",
+                        "stream": true,
+                        "temperature": 0.7,
+                        "max_tokens": 2048,
+                    })
+                };
+                match super::super::tools::vault_tools::stream_llm_round(
+                    &client, &llm_url, body, &state, &session_id, &cancel,
+                ).await {
+                    Ok((t, _, chunks)) => (t, chunks),
+                    Err(e) => { tracing::warn!("[interactive] stream error: {}", e); break; }
+                }
             } else {
-                json!({
-                    "messages": msgs,
-                    "tools": tools_schema,
-                    "tool_choice": "auto",
-                    "stream": true,
-                    "temperature": 0.7,
-                    "max_tokens": 2048,
-                })
-            };
-
-            let (text, finish_reason, tool_chunks) = match super::super::tools::vault_tools::stream_llm_round(
-                &client, &llm_url, body, &state, &session_id, &cancel,
-            ).await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("[interactive] stream error: {}", e);
-                    break;
+                match super::super::tools::vault_tools::call_llm_once(
+                    &client, &llm_url, &msgs, tools_value.clone(), &cancel,
+                ).await {
+                    Ok(r) => r,
+                    Err(e) => { tracing::warn!("[interactive] llm error: {}", e); break; }
                 }
             };
 
@@ -326,8 +255,7 @@ pub async fn run_interactive_agent(
                 full_response = text.clone();
             }
 
-            if finish_reason == "tool_calls" && !tool_chunks.is_empty() {
-                // Build assistant message
+            if !tool_chunks.is_empty() {
                 let tc_json: Vec<Value> = tool_chunks.iter().map(|tc| json!({
                     "id": tc.0, "type": "function",
                     "function": { "name": tc.1, "arguments": tc.2 },
@@ -345,29 +273,37 @@ pub async fn run_interactive_agent(
 
                 msgs.extend(Planner::results_to_messages(&tool_chunks, results));
 
-                // Check if cancelled after this round
                 if cancel.load(Ordering::Relaxed) { break; }
             } else {
                 break;
             }
         }
     } else {
-        // No vault / use_tools=false → pure LLM streaming, no tools
-        let body = json!({ "messages": msgs, "stream": true, "temperature": 0.7, "max_tokens": 2048 });
-        match super::super::tools::vault_tools::stream_llm_round(&client, &llm_url, body, &state, &session_id, &cancel).await {
-            Ok((text, _, _)) => { full_response = text; }
-            Err(e) => { tracing::warn!("[interactive] no-vault stream error: {}", e); }
+        // No tools or no vault → pure LLM call, streaming or silent
+        if streaming {
+            let body = json!({ "messages": msgs, "stream": true, "temperature": 0.7, "max_tokens": 2048 });
+            match super::super::tools::vault_tools::stream_llm_round(&client, &llm_url, body, &state, &session_id, &cancel).await {
+                Ok((text, _, _)) => { full_response = text; }
+                Err(e) => { tracing::warn!("[interactive] no-vault stream error: {}", e); }
+            }
+        } else {
+            match super::super::tools::vault_tools::call_llm_once(&client, &llm_url, &msgs, None, &cancel).await {
+                Ok((text, _)) => { full_response = text; }
+                Err(e) => { tracing::warn!("[interactive] no-vault llm error: {}", e); }
+            }
         }
     }
 
-    state.daemon.emit("llm:done", json!(full_response));
+    if streaming {
+        state.daemon.emit("llm:done", json!(full_response));
 
-    // 9. Skill suggestion detection
-    if !full_response.is_empty() && super::super::helpers::detect_response_framework(&full_response) {
-        state.daemon.emit("agent:skill_suggestion", json!({
-            "query": input,
-            "response_preview": full_response.chars().take(200).collect::<String>(),
-        }));
+        // 9. Skill suggestion detection (only relevant for interactive sessions)
+        if !full_response.is_empty() && super::super::helpers::detect_response_framework(&full_response) {
+            state.daemon.emit("agent:skill_suggestion", json!({
+                "query": input,
+                "response_preview": full_response.chars().take(200).collect::<String>(),
+            }));
+        }
     }
 
     // 10. Persist conversation to DB
@@ -389,11 +325,12 @@ pub async fn run_interactive_agent(
         maybe_set_conv_title(&state.db, &conv_id, &to_save).await;
     }
 
+    full_response
 }
 
 /// Build a ToolRegistry where every closure calls `dispatch_interactive_tool`.
 /// Special tools (plan_announce, open_note) emit their own SSE from within the closure.
-fn build_interactive_registry(
+pub(crate) fn build_interactive_registry(
     client: &reqwest::Client,
     llm_url: &str,
     db: &crate::db::SurrealDb,
@@ -403,6 +340,8 @@ fn build_interactive_registry(
     embedding_url: &Option<String>,
     session_id: &str,
     state: &ApiState,
+    tx: Arc<Transaction>,
+    cancel: Arc<AtomicBool>,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
 
@@ -486,6 +425,52 @@ fn build_interactive_registry(
         registry.register(name.to_string(), Tool { execute, rollback: None });
     }
 
+    // ── call_agent tool ──────────────────────────────────────────────────────────
+    {
+        let db         = db.clone();
+        let vault_id   = vault_id.to_string();
+        let account_id = account_id.to_string();
+        let vault_path = vault_path.to_string();
+        let session_id = session_id.to_string();
+        let state_c    = state.clone();
+        let cancel_c   = Arc::clone(&cancel);
+
+        let execute: super::super::types::ToolFn = Arc::new(move |args: Value| {
+            let db         = db.clone();
+            let vault_id   = vault_id.clone();
+            let account_id = account_id.clone();
+            let vault_path = vault_path.clone();
+            let session_id = session_id.clone();
+            let state_c    = state_c.clone();
+            let cancel_c   = Arc::clone(&cancel_c);
+
+            Box::pin(async move {
+                let agent_name = args["name"].as_str().unwrap_or("").to_string();
+                let input      = args["input"].as_str().unwrap_or("").to_string();
+                if agent_name.is_empty() {
+                    return Err("call_agent: missing agent name".into());
+                }
+
+                let def = match super::super::helpers::load_agent_def(&db, &agent_name, &account_id).await {
+                    Some(d) => d,
+                    None => return Err(format!("call_agent: agent '{}' not found", agent_name)),
+                };
+
+                let result = super::sub_agent::run_sub_agent(
+                    &state_c,
+                    &vault_id, &account_id, &vault_path,
+                    &session_id, &agent_name,
+                    def, &input,
+                    cancel_c,
+                ).await;
+
+                Ok(serde_json::json!(result))
+            })
+        });
+
+        registry.register("call_agent".to_string(), Tool { execute, rollback: None });
+    }
+
     registry
 }
 
@@ -529,4 +514,94 @@ async fn maybe_set_conv_title(db: &SurrealDb, conv_id: &str, messages: &[Value])
             .bind(("cid", conv_id.to_string()))
             .await;
     }
+}
+
+// ── Unified agent runner ───────────────────────────────────────────────────────
+
+/// Run an agent defined by `agent_def` (from DB or inline).
+/// Thin wrapper around `run_interactive_agent` that extracts the spec and wires
+/// `tool_names_override` so skill matching is bypassed.
+///
+/// - `streaming: false` → silent background execution (scheduled tasks, sub-agents)
+/// - `streaming: true`  → interactive execution with SSE (user-triggered named agent)
+pub async fn run_agent(
+    state: ApiState,
+    agent_def: Value,
+    input: String,
+    vault_id: String,
+    account_id: String,
+    vault_path: String,
+    conversation_id: String,
+    streaming: bool,
+    activity_context: Option<String>,
+) -> String {
+    let system_prompt = agent_def["system_prompt"].as_str().unwrap_or("").to_string();
+    let mut tool_names: Vec<String> = agent_def["tool_names"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    // Skill pre-pass: triggered when agent_def declares "search_skills" in tool_names.
+    let system_injection = if !vault_path.is_empty() && tool_names.contains(&"search_skills".to_string()) {
+        let http_client = reqwest::Client::new();
+        let embedding_url = state.daemon.embedding_url.read().await.clone();
+        let skill = super::super::helpers::run_skill_pass(
+            &http_client, &embedding_url, &state.db, &vault_id, &account_id, &input,
+        ).await;
+
+        if !skill.skill_titles.is_empty() && streaming {
+            let session_id = agent_def["session_id"].as_str().unwrap_or("");
+            state.daemon.emit("agent:skills_activated", serde_json::json!({
+                "session_id": session_id,
+                "titles": skill.skill_titles,
+            }));
+        }
+
+        // Bump trigger_count asynchronously.
+        for sid in skill.skill_ids {
+            let db = state.db.clone();
+            let now = chrono::Utc::now().timestamp();
+            tokio::spawn(async move {
+                let _ = db
+                    .query("UPDATE agent_skills SET trigger_count = (trigger_count OR 0) + 1, last_triggered_at = $now WHERE skill_id = $sid")
+                    .bind(("now", now))
+                    .bind(("sid", sid))
+                    .await;
+            });
+        }
+
+        if !skill.tool_names.is_empty() {
+            // Replace search_skills with matched skill tools; keep other base tools.
+            tool_names.retain(|t| t != "search_skills");
+            for t in skill.tool_names {
+                if !tool_names.contains(&t) {
+                    tool_names.push(t);
+                }
+            }
+        }
+        // If no skills matched, search_skills stays so LLM can call it directly.
+
+        skill.system_injection
+    } else {
+        String::new()
+    };
+
+    let session_id = agent_def["session_id"].as_str()
+        .map(String::from)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    run_interactive_agent(
+        state,
+        session_id,
+        input,
+        system_prompt,
+        streaming,
+        tool_names,
+        system_injection,
+        activity_context,
+        vault_id,
+        account_id,
+        vault_path,
+        conversation_id,
+    ).await
 }
