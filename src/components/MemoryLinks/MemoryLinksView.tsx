@@ -62,12 +62,23 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
   const dmnPhaseRef       = useRef<0 | 1>(0)                 // 0=exhale(dim), 1=inhale(bright)
   const tempNodeIdsRef    = useRef<Set<string>>(new Set())   // temp think/skill node ids
   const activeMemoryIdsRef = useRef<string[]>([])            // node_ids from last memory:prefetched
+  const lastMemoryKeyRef  = useRef<string>('')               // JSON key of last memory:prefetched IDs
   const breathingRef      = useRef<{ cancel: () => void } | null>(null)
   const activeEdgeIdsRef  = useRef<string[]>([])             // current round's active edge ids
   const pendingSkillsRef  = useRef<{ id: string; label: string }[]>([])  // queued skills before memory:prefetched
+  const flowTimerRef      = useRef<ReturnType<typeof setInterval> | null>(null)
+  const flowOffsetRef     = useRef(0)
+  const [phase, setPhase] = useState<'idle' | 'skill' | 'memory' | 'thinking'>('idle')
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
   const sourceFilterRef   = useRef<SourceFilter>('all')
   const { settings }      = useSettingsStore()
+
+  const PHASE_LABELS = {
+    idle:     '',
+    skill:    '⚡ 套用技能中...',
+    memory:   '🧠 回想記憶...',
+    thinking: '💭 整理想法...',
+  }
 
   // ── Build Cytoscape elements from API data ──────────────────────────────
   const buildElements = (nodes: MemoryNode[], edges: MemoryEdge[]): cytoscape.ElementDefinition[] => [
@@ -359,73 +370,28 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
 
   useEffect(() => () => stopBlink(), [stopBlink])
 
-  // ── Listen for memory:prefetched events ──────────────────────────────────
-  useEffect(() => {
-    let unlisten: (() => void) | null = null
+  // ── Flowing dash animation for skill→memory edges ────────────────────────
+  const stopFlow = useCallback(() => {
+    if (flowTimerRef.current) { clearInterval(flowTimerRef.current); flowTimerRef.current = null }
+  }, [])
 
-    listen<{ node_ids: string[]; source: string }>('memory:prefetched', async (event) => {
-      console.log('[MemoryLinks] memory:prefetched raw', event.payload, 'cy=', !!cyRef.current, 'filter=', sourceFilterRef.current)
+  const startFlow = useCallback((edgeIds: string[]) => {
+    stopFlow()
+    if (edgeIds.length === 0) return
+    flowOffsetRef.current = 0
+    flowTimerRef.current = setInterval(() => {
       const cy = cyRef.current
       if (!cy) return
+      flowOffsetRef.current = (flowOffsetRef.current - 2 + 1000) % 1000
+      edgeIds.forEach(eid => {
+        const e = cy.getElementById(eid)
+        if (e.length > 0) e.style('line-dash-offset', flowOffsetRef.current)
+      })
+    }, 30)
+  }, [stopFlow])
 
-      // Source filter: skip if not matching selected filter
-      const { node_ids, source } = event.payload
-      const filter = sourceFilterRef.current
-      if (filter !== 'all' && source !== filter) return
+  useEffect(() => () => stopFlow(), [stopFlow])
 
-      // Empty node_ids → show a "no memory" placeholder temp node
-      if (node_ids.length === 0) {
-        activeMemoryIdsRef.current = ['temp_no_memory']
-        addTempNodes('memory_fact', [{ id: 'temp_no_memory', label: '📭 尚無相關記憶' }])
-        // Drain pending skills queue even for placeholder
-        const pending = pendingSkillsRef.current
-        pendingSkillsRef.current = []
-        if (pending.length > 0) addTempNodes('skill', pending)
-        return
-      }
-
-      activeMemoryIdsRef.current = node_ids
-
-      const incomingIds = new Set(node_ids)
-
-      // Add any new nodes that aren't in graph yet (lazy-add)
-      const missingIds = [...incomingIds].filter(id => cy.getElementById(id).length === 0)
-      if (missingIds.length > 0) {
-        try {
-          const data = await api.getMemoryGraph()
-          const nodes = (data.nodes ?? []) as MemoryNode[]
-          const edges = (data.edges ?? []) as MemoryEdge[]
-          const existingIds = new Set(cy.elements().map((e: any) => e.id()))
-          const newElems = buildElements(nodes, edges).filter(
-            el => !existingIds.has(el.data?.id as string)
-          )
-          if (newElems.length > 0) {
-            cy.add(newElems)
-            cy.layout({ name: 'fcose', animate: false, randomize: false } as any).run()
-          }
-          // Refresh DMN top-N after new data
-          const topN = nodes
-            .filter(n => n.node_type === 'memory_fact' && (n.inject_count ?? 0) > 0)
-            .sort((a, b) => (b.inject_count ?? 0) - (a.inject_count ?? 0))
-            .slice(0, DMN_TOP_N)
-            .map(n => n.node_id)
-          dmnIdsRef.current = topN
-        } catch { /* best-effort */ }
-      }
-
-      // Drain pending skills queue (skills that arrived before activeMemoryIdsRef was set)
-      const pending = pendingSkillsRef.current
-      pendingSkillsRef.current = []
-      console.log('[MemoryLinks] memory:prefetched node_ids=', node_ids, 'pending skills=', pending)
-      if (pending.length > 0) {
-        addTempNodes('skill', pending)
-      }
-
-      applyFocus(incomingIds, true)
-    }).then(fn => { unlisten = fn })
-
-    return () => { unlisten?.() }
-  }, [applyFocus, startBlink])
 
   // ── Helper: add temp nodes (think/skill) + focus them ────────────────────
   const addTempNodes = useCallback((
@@ -451,21 +417,28 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
 
     const newIds = new Set<string>()
     const newEdgeIds: string[] = []
+    const skillEdgeIds: string[] = []
 
     items.forEach(({ id, label }) => {
       if (cy.getElementById(id).length === 0) {
-        cy.add({ group: 'nodes', data: { id, label, node_type: type, temp: true } })
+        // Think nodes: start tiny and scale up
+        if (type === 'think') {
+          cy.add({ group: 'nodes', data: { id, label, node_type: type, temp: true },
+            style: { width: 0, height: 0, opacity: 0 } as any })
+        } else {
+          cy.add({ group: 'nodes', data: { id, label, node_type: type, temp: true } })
+        }
         tempNodeIdsRef.current.add(id)
       }
       newIds.add(id)
 
-      // Connect to active memory nodes (skip for memory_fact type — it IS the anchor)
       if (type !== 'memory_fact') {
         activeMemoryIdsRef.current.forEach(memId => {
           const edgeId = `edge_${type}_${id}_${memId}`
           if (cy.getElementById(edgeId).length === 0 && cy.getElementById(memId).length > 0) {
-            cy.add({ group: 'edges', data: { id: edgeId, source: id, target: memId, temp: true } })
+            cy.add({ group: 'edges', data: { id: edgeId, source: id, target: memId, temp: true, edge_type: type } })
             newEdgeIds.push(edgeId)
+            if (type === 'skill') skillEdgeIds.push(edgeId)
           }
         })
       }
@@ -474,17 +447,99 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
     activeEdgeIdsRef.current = newEdgeIds
     cy.layout({ name: 'fcose', animate: false, randomize: false } as any).run()
 
-    // Include all currently active temp nodes (other types) in focus so they aren't dimmed
+    // Style skill edges as flowing dashed
+    skillEdgeIds.forEach(eid => {
+      const e = cy.getElementById(eid)
+      if (e.length > 0) e.style({ 'line-style': 'dashed', 'line-dash-pattern': [6, 4], opacity: 0.7 })
+    })
+
+    // Think nodes: scale-in animation
+    if (type === 'think') {
+      newIds.forEach(id => {
+        const n = cy.getElementById(id)
+        if (n.length > 0) {
+          ;(n as any).animate({ style: { width: 36, height: 36, opacity: 1 } }, { duration: 400, easing: 'ease-out-cubic' })
+        }
+      })
+    }
+
+    // Update phase
+    if (type === 'skill') setPhase('skill')
+    else if (type === 'think') setPhase('thinking')
+
+    // Focus: all active temp nodes + memory nodes together
     const allActiveTempIds = new Set(newIds)
     cy.nodes().filter((n: NodeSingular) => n.data('temp') && !n.data('inactive')).forEach((n: NodeSingular) => {
       allActiveTempIds.add(n.id())
     })
-    // Also include memory nodes
     activeMemoryIdsRef.current.forEach(id => allActiveTempIds.add(id))
 
     applyFocus(allActiveTempIds, true)
-    startBlink(newEdgeIds)
-  }, [applyFocus, stopBlink, startBlink])
+
+    // Skill edges: flowing; Think edges: breathing
+    if (skillEdgeIds.length > 0) startFlow(skillEdgeIds)
+    else startBlink(newEdgeIds)
+  }, [applyFocus, stopBlink, startBlink, startFlow])
+
+  // ── Listen for memory:prefetched events ──────────────────────────────────
+  useEffect(() => {
+    let unlisten: (() => void) | null = null
+
+    listen<{ node_ids: string[]; source: string }>('memory:prefetched', async (event) => {
+      const cy = cyRef.current
+      if (!cy) return
+
+      const { node_ids, source } = event.payload
+      const filter = sourceFilterRef.current
+      if (filter !== 'all' && source !== filter) return
+
+      setPhase('memory')
+
+      if (node_ids.length === 0) {
+        activeMemoryIdsRef.current = ['temp_no_memory']
+        lastMemoryKeyRef.current = '[]'
+        addTempNodes('memory_fact', [{ id: 'temp_no_memory', label: '📭 尚無相關記憶' }])
+        const pending = pendingSkillsRef.current
+        pendingSkillsRef.current = []
+        if (pending.length > 0) addTempNodes('skill', pending)
+        return
+      }
+
+      const newKey = JSON.stringify([...node_ids].sort())
+      const sameMemory = newKey === lastMemoryKeyRef.current
+      activeMemoryIdsRef.current = node_ids
+      lastMemoryKeyRef.current = newKey
+
+      const incomingIds = new Set(node_ids)
+      const missingIds = [...incomingIds].filter(id => cy.getElementById(id).length === 0)
+      if (missingIds.length > 0) {
+        try {
+          const data = await api.getMemoryGraph()
+          const nodes = (data.nodes ?? []) as MemoryNode[]
+          const edges = (data.edges ?? []) as MemoryEdge[]
+          const existingIds = new Set(cy.elements().map((e: any) => e.id()))
+          const newElems = buildElements(nodes, edges).filter(el => !existingIds.has(el.data?.id as string))
+          if (newElems.length > 0) {
+            cy.add(newElems)
+            cy.layout({ name: 'fcose', animate: false, randomize: false } as any).run()
+          }
+          const topN = nodes
+            .filter(n => n.node_type === 'memory_fact' && (n.inject_count ?? 0) > 0)
+            .sort((a, b) => (b.inject_count ?? 0) - (a.inject_count ?? 0))
+            .slice(0, DMN_TOP_N).map(n => n.node_id)
+          dmnIdsRef.current = topN
+        } catch { /* best-effort */ }
+      }
+
+      const pending = pendingSkillsRef.current
+      pendingSkillsRef.current = []
+      if (pending.length > 0) addTempNodes('skill', pending)
+
+      if (!sameMemory) applyFocus(incomingIds, true)
+    }).then(fn => { unlisten = fn })
+
+    return () => { unlisten?.() }
+  }, [applyFocus, addTempNodes])
 
   // ── Listen for agent:think ────────────────────────────────────────────────
   useEffect(() => {
@@ -505,21 +560,28 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
   useEffect(() => {
     let unlisten: (() => void) | null = null
     listen<{ titles: string[]; source?: string }>('agent:skills_activated', (e) => {
-      console.log('[MemoryLinks] agent:skills_activated', e.payload, 'activeMemoryIds=', activeMemoryIdsRef.current)
       const items = e.payload.titles.map((title, i) => ({
         id: `temp_skill_${title.replace(/\s+/g, '_')}_${i}`,
         label: `⚡ ${title}`,
       }))
       if (activeMemoryIdsRef.current.length > 0) {
-        console.log('[MemoryLinks] adding skills immediately')
         addTempNodes('skill', items)
       } else {
-        console.log('[MemoryLinks] queuing skills, pending=', items)
         pendingSkillsRef.current = [...pendingSkillsRef.current, ...items]
       }
     }).then(fn => { unlisten = fn })
     return () => { unlisten?.() }
   }, [addTempNodes])
+
+  // ── Reset phase on llm:done ──────────────────────────────────────────────
+  useEffect(() => {
+    let unlisten: (() => void) | null = null
+    listen('llm:done', () => {
+      setPhase('idle')
+      stopFlow()
+    }).then(fn => { unlisten = fn })
+    return () => { unlisten?.() }
+  }, [stopFlow])
 
   // ── Font size setting sync ────────────────────────────────────────────────
   useEffect(() => {
@@ -584,6 +646,20 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
         </select>
       </div>
       <div ref={containerRef} style={{ flex: 1 }} />
+      {/* Status bar */}
+      {phase !== 'idle' && (
+        <div style={{
+          position: 'absolute', bottom: 10, left: '50%', transform: 'translateX(-50%)',
+          zIndex: 10, pointerEvents: 'none',
+          background: 'var(--color-surface)', border: '1px solid var(--color-border)',
+          borderRadius: 12, padding: '3px 14px',
+          fontSize: 11, color: 'var(--color-text-muted)',
+          opacity: 0.9, letterSpacing: '0.03em',
+          animation: 'fadeIn 0.3s ease',
+        }}>
+          {PHASE_LABELS[phase]}
+        </div>
+      )}
     </div>
   )
 }
