@@ -25,6 +25,20 @@ pub async fn run_migrations_pub(db: &SurrealDb) -> Result<(), surrealdb::Error> 
 }
 
 async fn run_migrations(db: &SurrealDb) -> Result<(), surrealdb::Error> {
+    // Pre-flight: drop legacy BM25 / SEARCH indexes before the main DDL transaction.
+    // These caused SurrealDB M-tree (TreeWrite) corruption on bulk note deletes.
+    // They were redundant — SQLite FTS5 handles all full-text search.
+    // Running as separate queries (not inside BEGIN TRANSACTION) ensures they succeed
+    // even if the tree state is already corrupted.
+    for stmt in &[
+        "REMOVE INDEX IF EXISTS idx_notes_fts ON notes",
+        "REMOVE INDEX IF EXISTS idx_import_pages_fts ON import_pages",
+    ] {
+        if let Err(e) = db.query(*stmt).await {
+            tracing::warn!("Pre-flight index cleanup failed ({}): {}", stmt, e);
+        }
+    }
+
     let stmts: &[&str] = &[
         // ── daemon infra ────────────────────────────────────────────────────
         "DEFINE TABLE IF NOT EXISTS daemon_secrets SCHEMAFULL;",
@@ -139,8 +153,6 @@ async fn run_migrations(db: &SurrealDb) -> Result<(), surrealdb::Error> {
         "DEFINE FIELD IF NOT EXISTS modified_at ON notes TYPE int DEFAULT 0;",
         "DEFINE FIELD IF NOT EXISTS checksum    ON notes TYPE option<string>;",
         "DEFINE INDEX IF NOT EXISTS idx_notes_vault_path ON notes FIELDS vault_id, path UNIQUE;",
-        "DEFINE ANALYZER IF NOT EXISTS noteanalyzer TOKENIZERS blank,class,camel,punct FILTERS snowball(english),lowercase;",
-        "DEFINE INDEX IF NOT EXISTS idx_notes_fts ON notes FIELDS title, content SEARCH ANALYZER noteanalyzer BM25;",
 
         // ── links ────────────────────────────────────────────────────────────
         "DEFINE TABLE IF NOT EXISTS links SCHEMALESS;",
@@ -209,7 +221,6 @@ async fn run_migrations(db: &SurrealDb) -> Result<(), surrealdb::Error> {
         "DEFINE FIELD IF NOT EXISTS last_crawled  ON import_pages TYPE option<int>;",
         "DEFINE FIELD IF NOT EXISTS created_at    ON import_pages TYPE int DEFAULT 0;",
         "DEFINE INDEX IF NOT EXISTS idx_import_pages_id ON import_pages FIELDS page_id UNIQUE;",
-        "DEFINE INDEX IF NOT EXISTS idx_import_pages_fts ON import_pages FIELDS title, content_md SEARCH ANALYZER noteanalyzer BM25;",
 
         // ── knowledge items ──────────────────────────────────────────────────
         "DEFINE TABLE IF NOT EXISTS knowledge_items SCHEMALESS;",
@@ -383,8 +394,8 @@ async fn run_migrations(db: &SurrealDb) -> Result<(), surrealdb::Error> {
         "DEFINE FIELD IF NOT EXISTS weight    ON graph_edges TYPE float DEFAULT 1.0;",
     ];
 
-    for stmt in stmts {
-        db.query(*stmt).await?;
-    }
+    // Wrap all DDL in a single transaction to avoid concurrent-migration conflicts
+    let combined = format!("BEGIN TRANSACTION;\n{}\nCOMMIT TRANSACTION;", stmts.join("\n"));
+    db.query(&combined).await?;
     Ok(())
 }

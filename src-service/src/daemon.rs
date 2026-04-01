@@ -26,13 +26,14 @@ pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
     let https_handle = axum_server::Handle::new();
 
-    // Spawn scheduler loop
-    {
+    // Spawn scheduler loop (given its own shutdown receiver so it exits cleanly)
+    let sched_task = {
         let sched_api_state = ApiState::new(auth_store.clone(), db.clone(), daemon_state.clone());
+        let sched_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
-            run_scheduler(sched_api_state).await;
-        });
-    }
+            run_scheduler(sched_api_state, sched_rx).await;
+        })
+    };
 
     // HTTP localhost server (no TLS) on :7787
     let http_task = {
@@ -80,22 +81,36 @@ pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let _ = shutdown_tx.send(());
     https_handle.graceful_shutdown(Some(std::time::Duration::from_secs(15)));
 
-    // Wait for both servers to drain, up to 15 seconds
+    // Wait for both servers + scheduler to drain, up to 15 seconds
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        async { let _ = tokio::join!(http_task, https_task); },
+        async { let _ = tokio::join!(http_task, https_task, sched_task); },
     ).await;
+
+    // Drop db last — all tasks that hold Arc<db> clones must have finished first
+    // so that no in-flight transactions are abandoned when the connection closes.
+    drop(db);
 
     tracing::info!("Service shutdown complete");
     Ok(())
 }
 
-async fn run_scheduler(state: crate::api_state::ApiState) {
+async fn run_scheduler(
+    state: crate::api_state::ApiState,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+) {
     tracing::info!("Scheduler started");
     // Track last cleanup to run once per day
     let mut last_cleanup_ts: i64 = 0;
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        // Sleep for 60s but wake immediately on shutdown signal
+        tokio::select! {
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(60)) => {}
+            _ = shutdown_rx.recv() => {
+                tracing::info!("Scheduler received shutdown signal — exiting");
+                break;
+            }
+        }
 
         let now_ts = chrono::Utc::now().timestamp();
 

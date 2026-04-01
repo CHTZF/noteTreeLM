@@ -65,7 +65,8 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
   const lastMemoryKeyRef  = useRef<string>('')               // JSON key of last memory:prefetched IDs
   const breathingRef      = useRef<{ cancel: () => void } | null>(null)
   const activeEdgeIdsRef  = useRef<string[]>([])             // current round's active edge ids
-  const pendingSkillsRef  = useRef<{ id: string; label: string }[]>([])  // queued skills before memory:prefetched
+  const pendingSkillsRef  = useRef<{ id: string; label: string }[]>([])  // queued skills before agent:think
+  const activeThinkIdRef  = useRef<string | null>(null)                  // current round's think node id
   const flowTimerRef      = useRef<ReturnType<typeof setInterval> | null>(null)
   const flowOffsetRef     = useRef(0)
   const [phase, setPhase] = useState<'idle' | 'skill' | 'memory' | 'thinking'>('idle')
@@ -207,6 +208,27 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
             'z-index':             5,
           },
         }, { duration })
+      } else if (node.data('temp') && node.data('inactive')) {
+        // Past cluster (old think/skill) — shrink but stay visible
+        const nodeType2 = node.data('node_type') as string
+        const pastColor = nodeType2 === 'think' ? THINK_COLOR
+                        : nodeType2 === 'skill' ? SKILL_COLOR
+                        : DIMMED_COLOR
+        const pastSize  = nodeType2 === 'think' ? 18 : nodeType2 === 'skill' ? 12 : 8
+        node.stop(true)
+        ;(node as any).animate({
+          style: {
+            'background-color': pastColor,
+            'width':            pastSize,
+            'height':           pastSize,
+            'opacity':          0.25,
+            'font-size':        9,
+            'text-opacity':     0,
+            'border-width':     0,
+            'border-opacity':   0,
+            'z-index':          2,
+          },
+        }, { duration: animate ? ANIM_MS / 2 : 0 })
       } else {
         node.stop(true)
         ;(node as any).animate({
@@ -394,6 +416,7 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
 
 
   // ── Helper: add temp nodes (think/skill) + focus them ────────────────────
+  // Topology: skill → think → memory
   const addTempNodes = useCallback((
     type: 'think' | 'skill' | 'memory_fact',
     items: { id: string; label: string }[],
@@ -401,16 +424,47 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
     const cy = cyRef.current
     if (!cy || items.length === 0) return
 
-    // Dim existing same-type temp nodes/edges (they become "history")
-    cy.nodes().filter((n: NodeSingular) => n.data('node_type') === type && n.data('temp')).forEach((n: NodeSingular) => {
-      n.data('inactive', true)
-      ;(n as any).animate({ style: { opacity: 0.15, 'background-color': DIMMED_COLOR, 'text-opacity': 0 } }, { duration: ANIM_MS })
-    })
-    cy.edges().filter((e: any) => e.data('temp') && String(e.data('id') ?? '').startsWith(`edge_${type}_`)).forEach((e: any) => {
-      e.data('inactive', true)
-      e.style('opacity', 0.08)
+    if (type === 'think') {
+      // Dim old think cluster: think node + all skill nodes pointing to it + their edges
+      cy.nodes().filter((n: NodeSingular) => n.data('node_type') === 'think' && n.data('temp') && !n.data('inactive')).forEach((thinkNode: NodeSingular) => {
+        const oldThinkId = thinkNode.id()
+        // Use .target().id() / .source().id() for reliability
+        cy.edges().forEach((e: any) => {
+          if (!e.data('temp') || e.data('inactive')) return
+          if (e.data('edge_type') === 'skill' && e.target().id() === oldThinkId) {
+            const skillNode = cy.getElementById(e.source().id())
+            if (skillNode.length > 0) {
+              skillNode.data('inactive', true)
+              ;(skillNode as any).stop(true).animate({ style: { opacity: 0.15, 'background-color': DIMMED_COLOR, 'text-opacity': 0 } }, { duration: ANIM_MS })
+            }
+            e.data('inactive', true)
+            e.stop(true).style('opacity', 0.08)
+          } else if (e.source().id() === oldThinkId) {
+            e.data('inactive', true)
+            e.stop(true).style('opacity', 0.08)
+          }
+        })
+        thinkNode.data('inactive', true)
+        ;(thinkNode as any).stop(true).animate({ style: { opacity: 0.15, 'background-color': DIMMED_COLOR, 'text-opacity': 0 } }, { duration: ANIM_MS })
+      })
       stopBlink()
-    })
+      stopFlow()
+    } else {
+      // Generic dim: same-type active nodes + edges
+      cy.nodes().filter((n: NodeSingular) => n.data('node_type') === type && n.data('temp') && !n.data('inactive')).forEach((n: NodeSingular) => {
+        n.data('inactive', true)
+        ;(n as any).animate({ style: { opacity: 0.15, 'background-color': DIMMED_COLOR, 'text-opacity': 0 } }, { duration: ANIM_MS })
+      })
+      cy.edges().forEach((e: any) => {
+        if (!e.data('temp') || e.data('inactive')) return
+        if (e.data('edge_type') === type) {
+          e.data('inactive', true)
+          e.stop(true).style('opacity', 0.08)
+          stopBlink()
+        }
+      })
+    }
+
     tempNodeIdsRef.current = new Set(
       [...tempNodeIdsRef.current].filter(id => cy.getElementById(id).length > 0)
     )
@@ -419,9 +473,15 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
     const newEdgeIds: string[] = []
     const skillEdgeIds: string[] = []
 
+    // For think: also drain pending skills inline (single layout + applyFocus pass)
+    const pendingSkillItems = type === 'think' ? (() => {
+      const p = pendingSkillsRef.current
+      pendingSkillsRef.current = []
+      return p
+    })() : []
+
     items.forEach(({ id, label }) => {
       if (cy.getElementById(id).length === 0) {
-        // Think nodes: start tiny and scale up
         if (type === 'think') {
           cy.add({ group: 'nodes', data: { id, label, node_type: type, temp: true },
             style: { width: 0, height: 0, opacity: 0 } as any })
@@ -432,16 +492,42 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
       }
       newIds.add(id)
 
-      if (type !== 'memory_fact') {
+      if (type === 'think') {
+        // think → memory
         activeMemoryIdsRef.current.forEach(memId => {
-          const edgeId = `edge_${type}_${id}_${memId}`
+          const edgeId = `edge_think_${id}_${memId}`
           if (cy.getElementById(edgeId).length === 0 && cy.getElementById(memId).length > 0) {
-            cy.add({ group: 'edges', data: { id: edgeId, source: id, target: memId, temp: true, edge_type: type } })
+            cy.add({ group: 'edges', data: { id: edgeId, source: id, target: memId, temp: true, edge_type: 'think' } })
             newEdgeIds.push(edgeId)
-            if (type === 'skill') skillEdgeIds.push(edgeId)
           }
         })
+        // Inline: add pending skill nodes + skill→think edges
+        pendingSkillItems.forEach(({ id: skillId, label: skillLabel }) => {
+          if (cy.getElementById(skillId).length === 0) {
+            cy.add({ group: 'nodes', data: { id: skillId, label: skillLabel, node_type: 'skill', temp: true } })
+            tempNodeIdsRef.current.add(skillId)
+          }
+          newIds.add(skillId)
+          const edgeId = `edge_skill_${skillId}_${id}`
+          if (cy.getElementById(edgeId).length === 0) {
+            cy.add({ group: 'edges', data: { id: edgeId, source: skillId, target: id, temp: true, edge_type: 'skill' } })
+            newEdgeIds.push(edgeId)
+            skillEdgeIds.push(edgeId)
+          }
+        })
+      } else if (type === 'skill') {
+        // skill → active think node
+        const thinkId = activeThinkIdRef.current
+        if (thinkId) {
+          const edgeId = `edge_skill_${id}_${thinkId}`
+          if (cy.getElementById(edgeId).length === 0 && cy.getElementById(thinkId).length > 0) {
+            cy.add({ group: 'edges', data: { id: edgeId, source: id, target: thinkId, temp: true, edge_type: 'skill' } })
+            newEdgeIds.push(edgeId)
+            skillEdgeIds.push(edgeId)
+          }
+        }
       }
+      // memory_fact: no edges
     })
 
     activeEdgeIdsRef.current = newEdgeIds
@@ -455,7 +541,7 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
 
     // Think nodes: scale-in animation
     if (type === 'think') {
-      newIds.forEach(id => {
+      items.forEach(({ id }) => {
         const n = cy.getElementById(id)
         if (n.length > 0) {
           ;(n as any).animate({ style: { width: 36, height: 36, opacity: 1 } }, { duration: 400, easing: 'ease-out-cubic' })
@@ -464,7 +550,7 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
     }
 
     // Update phase
-    if (type === 'skill') setPhase('skill')
+    if (type === 'skill' || (type === 'think' && skillEdgeIds.length > 0)) setPhase(skillEdgeIds.length > 0 ? 'skill' : 'thinking')
     else if (type === 'think') setPhase('thinking')
 
     // Focus: all active temp nodes + memory nodes together
@@ -478,8 +564,8 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
 
     // Skill edges: flowing; Think edges: breathing
     if (skillEdgeIds.length > 0) startFlow(skillEdgeIds)
-    else startBlink(newEdgeIds)
-  }, [applyFocus, stopBlink, startBlink, startFlow])
+    else if (newEdgeIds.length > 0) startBlink(newEdgeIds)
+  }, [applyFocus, stopBlink, startBlink, startFlow, stopFlow])
 
   // ── Listen for memory:prefetched events ──────────────────────────────────
   useEffect(() => {
@@ -499,9 +585,6 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
         activeMemoryIdsRef.current = ['temp_no_memory']
         lastMemoryKeyRef.current = '[]'
         addTempNodes('memory_fact', [{ id: 'temp_no_memory', label: '📭 尚無相關記憶' }])
-        const pending = pendingSkillsRef.current
-        pendingSkillsRef.current = []
-        if (pending.length > 0) addTempNodes('skill', pending)
         return
       }
 
@@ -531,10 +614,6 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
         } catch { /* best-effort */ }
       }
 
-      const pending = pendingSkillsRef.current
-      pendingSkillsRef.current = []
-      if (pending.length > 0) addTempNodes('skill', pending)
-
       if (!sameMemory) applyFocus(incomingIds, true)
     }).then(fn => { unlisten = fn })
 
@@ -548,15 +627,16 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
     listen<{ thought: string }>('agent:think', (e) => {
       counter++
       const id = `temp_think_${counter}`
+      activeThinkIdRef.current = id
       const label = `💭 ${e.payload.thought.slice(0, 30)}${e.payload.thought.length > 30 ? '…' : ''}`
+      // addTempNodes('think') dims old cluster + drains pendingSkillsRef inline
       addTempNodes('think', [{ id, label }])
     }).then(fn => { unlisten = fn })
     return () => { unlisten?.() }
   }, [addTempNodes])
 
   // ── Listen for agent:skills_activated ────────────────────────────────────
-  // Queue skills until memory:prefetched fires (which sets activeMemoryIdsRef).
-  // If memory is already set (e.g. second turn), add immediately.
+  // Skills always queue until agent:think arrives (think becomes the edge target).
   useEffect(() => {
     let unlisten: (() => void) | null = null
     listen<{ titles: string[]; source?: string }>('agent:skills_activated', (e) => {
@@ -564,14 +644,10 @@ export default function MemoryLinksView({ onOpenNote }: Props) {
         id: `temp_skill_${title.replace(/\s+/g, '_')}_${i}`,
         label: `⚡ ${title}`,
       }))
-      if (activeMemoryIdsRef.current.length > 0) {
-        addTempNodes('skill', items)
-      } else {
-        pendingSkillsRef.current = [...pendingSkillsRef.current, ...items]
-      }
+      pendingSkillsRef.current = [...pendingSkillsRef.current, ...items]
     }).then(fn => { unlisten = fn })
     return () => { unlisten?.() }
-  }, [addTempNodes])
+  }, [])
 
   // ── Reset phase on llm:done ──────────────────────────────────────────────
   useEffect(() => {

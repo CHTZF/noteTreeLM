@@ -747,16 +747,22 @@ pub async fn get_vault_path(
     state: &ApiState,
     vault_id: &str,
 ) -> Result<String, (StatusCode, String)> {
+    // Fast path: in-process cache (no DB round-trip)
+    if let Ok(cache) = state.daemon.vault_path_cache.read() {
+        if let Some(path) = cache.get(vault_id) {
+            return Ok(path.clone());
+        }
+    }
+
     #[derive(serde::Deserialize)]
     struct Row {
         path: String,
     }
 
-    let vault_id_owned = vault_id.to_string();
     let mut resp = state
         .db
         .query("SELECT path FROM vaults WHERE vault_id = $vid LIMIT 1")
-        .bind(("vid", vault_id_owned))
+        .bind(("vid", vault_id.to_string()))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -764,10 +770,17 @@ pub async fn get_vault_path(
         .take(0)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    rows.into_iter()
+    let path = rows.into_iter()
         .next()
         .map(|r| r.path)
-        .ok_or((StatusCode::NOT_FOUND, format!("Vault '{}' not found", vault_id)))
+        .ok_or((StatusCode::NOT_FOUND, format!("Vault '{}' not found", vault_id)))?;
+
+    // Populate cache for future calls
+    if let Ok(mut cache) = state.daemon.vault_path_cache.write() {
+        cache.insert(vault_id.to_string(), path.clone());
+    }
+
+    Ok(path)
 }
 
 fn build_tree(path: &FsPath, root: &FsPath) -> Value {

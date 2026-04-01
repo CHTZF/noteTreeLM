@@ -204,6 +204,11 @@ function AppMain() {
   const { load: loadSettings, settings, savePersonal: saveSettings, saveSystem } = useSettingsStore()
   const { scanVault, setupWatchers, readNote, loadNotes } = useVaultStore()
   const { load: loadGraph } = useGraphStore()
+  const loadGraphDebounced = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const debouncedLoadGraph = useCallback(() => {
+    if (loadGraphDebounced.current) clearTimeout(loadGraphDebounced.current)
+    loadGraphDebounced.current = setTimeout(() => loadGraph(), 800)
+  }, [loadGraph])
   const { currentPath, pendingAnchor } = useEditorStore()
   const { push: navPush, back: navBack, forward: navForward, canGoBack, canGoForward } = useNavigationStore()
   useActivityContext()   // 全域 selectionchange / copy 監聽
@@ -448,7 +453,7 @@ function AppMain() {
       const vaultCleanup = await setupWatchers()
       const graphListeners = await Promise.all(
         ['vault:note-created', 'vault:note-deleted', 'vault:note-renamed'].map(
-          event => listen(event, () => loadGraph())
+          event => listen(event, () => debouncedLoadGraph())
         )
       )
       const vaultChangedUnlisten = await listen<{ creates: string[]; updates: string[] }>(

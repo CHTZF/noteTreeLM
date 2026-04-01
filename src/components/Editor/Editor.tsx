@@ -9,7 +9,7 @@ import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { open as openPath } from '@tauri-apps/plugin-shell'
 import { invoke } from '@tauri-apps/api/core'
 import { useEditorStore } from '../../stores/editorStore'
-import { useVaultStore } from '../../stores/vaultStore'
+import { useVaultStore, getCachedNoteContent } from '../../stores/vaultStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { NOTE_TEMPLATES } from '../../utils/noteTemplates'
 import { wikilinkPlugin } from './plugins/wikilinks'
@@ -57,6 +57,10 @@ export default function Editor({ onOpenNote }: EditorProps) {
   // Ref so the CM6 updateListener always calls the latest version (avoids stale closure)
   const triggerAutoSaveRef = useRef<(content: string) => void>(() => {})
   const handleActionRef = useRef<(action: EditorAction) => void>(() => {})
+  // Guard: true while we are programmatically loading content into CM6.
+  // Prevents updateListener from treating the load dispatch as a user edit and
+  // scheduling an auto-save that would overwrite the previous note with empty content.
+  const isLoadingRef = useRef(false)
   // Compartment to toggle live preview extension dynamically
   const liveCompartment = useRef(new Compartment())
 
@@ -97,23 +101,46 @@ export default function Editor({ onOpenNote }: EditorProps) {
 
   // 載入筆記（帶 cancellation 防止快速切換時 race condition）
   useEffect(() => {
-    if (!currentPath) {
-      // 筆記關閉或刪除時清空 CM6 編輯器
-      if (viewRef.current) {
-        viewRef.current.dispatch({
-          changes: { from: 0, to: viewRef.current.state.doc.length, insert: '' }
-        })
+    // Cancel any pending auto-save from the previous note before switching
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current)
+      saveTimerRef.current = null
+    }
+
+    const loadContent = (text: string) => {
+      isLoadingRef.current = true
+      try {
+        if (viewRef.current) {
+          viewRef.current.dispatch({
+            changes: { from: 0, to: viewRef.current.state.doc.length, insert: text }
+          })
+        }
+      } finally {
+        isLoadingRef.current = false
       }
+    }
+
+    if (!currentPath) {
+      loadContent('')
       return
     }
+
+    // Cache hit: fill synchronously — no flash of previous content
+    const cached = getCachedNoteContent(currentPath)
+    if (cached !== undefined) {
+      loadContent(cached)
+      setContent(cached)
+      setDirty(false)
+      return
+    }
+
+    // Cache miss: clear immediately so stale content from the previous note doesn't linger
+    loadContent('')
+
     let cancelled = false
     readNote(currentPath).then((note) => {
       if (cancelled) return
-      if (viewRef.current) {
-        viewRef.current.dispatch({
-          changes: { from: 0, to: viewRef.current.state.doc.length, insert: note.content }
-        })
-      }
+      loadContent(note.content)
       setContent(note.content)
       setDirty(false)
     }).catch((e) => {
@@ -138,7 +165,7 @@ export default function Editor({ onOpenNote }: EditorProps) {
           liveCompartment.current.of([]), // initially no live preview
           keymap.of([...defaultKeymap, ...historyKeymap]),
           EditorView.updateListener.of((update) => {
-            if (update.docChanged) {
+            if (update.docChanged && !isLoadingRef.current) {
               const newContent = update.state.doc.toString()
               setContent(newContent)
               triggerAutoSaveRef.current(newContent)

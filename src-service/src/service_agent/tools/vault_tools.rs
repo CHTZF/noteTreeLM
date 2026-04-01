@@ -762,6 +762,23 @@ pub(crate) fn build_tools_schema_interactive(tool_names: &[String]) -> Vec<Value
 
 // ── LLM streaming ─────────────────────────────────────────────────────────────
 
+/// Returns the byte offset up to which `s` can safely be emitted without risking
+/// a partial prefix of `tag` at the end.
+/// Works on raw bytes — `tag` must be pure ASCII (guaranteed for `<tool_call>`).
+fn safe_emit_end(s: &str, tag: &str) -> usize {
+    let s_bytes = s.as_bytes();
+    let tag_bytes = tag.as_bytes();
+    let n = s_bytes.len();
+    for suffix_len in 1..=tag_bytes.len().min(n) {
+        let suffix = &s_bytes[n - suffix_len..];
+        if tag_bytes.starts_with(suffix) {
+            // The returned offset is right before ASCII bytes → always a valid char boundary.
+            return n - suffix_len;
+        }
+    }
+    n
+}
+
 /// Stream one LLM round, emitting llm:token events. Returns (text, finish_reason, tool_chunks).
 /// tool_chunks: Vec<(id, name, arguments_str)>
 pub(crate) async fn stream_llm_round(
@@ -791,6 +808,10 @@ pub(crate) async fn stream_llm_round(
     let mut finish_reason = "stop".to_string();
     let mut tool_chunks: Vec<(String, String, String)> = Vec::new();
 
+    // Lookahead buffer: holds content not yet emitted, to avoid streaming partial <tool_call> tags
+    let mut pending_emit = String::new();
+    let mut suppress_emit = false;  // true once we've detected a text-format <tool_call>
+
     while let Some(item) = stream.next().await {
         if cancel.load(Ordering::Relaxed) { break; }
         let bytes = item.map_err(|e| e.to_string())?;
@@ -811,8 +832,27 @@ pub(crate) async fn stream_llm_round(
                         let delta = &choice["delta"];
                         if let Some(content) = delta["content"].as_str() {
                             if !content.is_empty() {
-                                state.daemon.emit("llm:token", json!(content));
                                 full_text.push_str(content);
+                                if !suppress_emit {
+                                    pending_emit.push_str(content);
+                                    if pending_emit.contains("<tool_call>") {
+                                        // Emit only the text before the tag, then suppress
+                                        let pos = pending_emit.find("<tool_call>").unwrap_or(0);
+                                        if pos > 0 {
+                                            state.daemon.emit("llm:token", json!(&pending_emit[..pos]));
+                                        }
+                                        pending_emit.clear();
+                                        suppress_emit = true;
+                                    } else {
+                                        // Safe to emit up to a point where no partial tag can start
+                                        let safe_end = safe_emit_end(&pending_emit, "<tool_call>");
+                                        if safe_end > 0 {
+                                            let chunk = pending_emit[..safe_end].to_string();
+                                            pending_emit = pending_emit[safe_end..].to_string();
+                                            state.daemon.emit("llm:token", json!(chunk));
+                                        }
+                                    }
+                                }
                             }
                         }
                         if let Some(tc_arr) = delta["tool_calls"].as_array() {
@@ -831,6 +871,44 @@ pub(crate) async fn stream_llm_round(
                 }
             }
         }
+    }
+
+    // Flush remaining pending (if stream ended without <tool_call>)
+    if !suppress_emit && !pending_emit.is_empty() {
+        state.daemon.emit("llm:token", json!(pending_emit));
+    }
+
+    // Parse text-format tool calls from full_text (e.g. Qwen/Mistral <tool_call> style)
+    // and strip them from the display text
+    if tool_chunks.is_empty() && full_text.contains("<tool_call>") {
+        let mut clean_text = String::new();
+        let mut rest = full_text.as_str();
+        let mut tc_idx = 0usize;
+        while let Some(start) = rest.find("<tool_call>") {
+            clean_text.push_str(&rest[..start]);
+            let after_open = &rest[start + "<tool_call>".len()..];
+            if let Some(end) = after_open.find("</tool_call>") {
+                let json_str = after_open[..end].trim();
+                if let Ok(tc) = serde_json::from_str::<Value>(json_str) {
+                    let name = tc["name"].as_str().unwrap_or("").to_string();
+                    let args = tc["arguments"].clone();
+                    let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
+                    if !name.is_empty() {
+                        tool_chunks.push((format!("tc_text_{}", tc_idx), name, args_str));
+                        tc_idx += 1;
+                    }
+                }
+                rest = &after_open[end + "</tool_call>".len()..];
+            } else {
+                // Incomplete tag — keep remainder as-is
+                clean_text.push_str("<tool_call>");
+                clean_text.push_str(after_open);
+                rest = "";
+                break;
+            }
+        }
+        clean_text.push_str(rest);
+        full_text = clean_text.trim().to_string();
     }
 
     Ok((full_text, finish_reason, tool_chunks))

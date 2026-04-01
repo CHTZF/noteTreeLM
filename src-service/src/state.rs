@@ -44,6 +44,8 @@ pub struct DaemonState {
     pub agent_sessions: Arc<Mutex<HashMap<String, AgentSession>>>,
     /// Intent centroid cache (confirm / cancel / interrupt embeddings).
     pub intent_centroids: Arc<Mutex<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>>>,
+    /// vault_id → vault_path in-process cache (avoids a DB round-trip on every note read).
+    pub vault_path_cache: Arc<std::sync::RwLock<HashMap<String, String>>>,
 }
 
 impl DaemonState {
@@ -60,6 +62,7 @@ impl DaemonState {
             event_tx,
             agent_sessions: Arc::new(Mutex::new(HashMap::new())),
             intent_centroids: Arc::new(Mutex::new(None)),
+            vault_path_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 

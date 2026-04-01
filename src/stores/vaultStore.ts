@@ -5,9 +5,27 @@ import { Note, FileTreeNode, RenameResult, TrashItem } from '../types/models'
 import { useSettingsStore } from './settingsStore'
 import { api } from '../lib/api'
 
+let loadNotesInflight = false
+let loadNotesPending  = false
+
+// Lazy note content cache: path → content
+// Populated on first read, updated on save, evicted on delete/rename.
+const noteContentCache = new Map<string, string>()
+
+/** Synchronous cache lookup — used by Editor to decide whether to clear first. */
+export function getCachedNoteContent(path: string): string | undefined {
+  return noteContentCache.get(path)
+}
+
+/** Evict one or more paths (e.g. after external rename/delete detected by watcher). */
+export function evictNoteContentCache(...paths: string[]) {
+  for (const p of paths) noteContentCache.delete(p)
+}
+
 interface VaultStore {
   notes: Note[]
   assets: string[]
+  extraFolders: string[]
   fileTree: FileTreeNode[]
   isScanning: boolean
   scanCount: number
@@ -37,22 +55,37 @@ interface VaultStore {
 export const useVaultStore = create<VaultStore>((set, get) => ({
   notes: [],
   assets: [],
+  extraFolders: [],
   fileTree: [],
   isScanning: false,
   scanCount: 0,
 
   loadNotes: async () => {
-    const vaultId = await invoke<string>('get_vault_uuid').catch(() => '')
-    const [notes, extraFolders, assets] = vaultId
-      ? await Promise.all([
-          api.listNotes(vaultId) as Promise<Note[]>,
-          api.listFolders(vaultId).catch(() => [] as string[]),
-          api.listAssets(vaultId).catch(() => [] as string[]),
-        ])
-      : [[] as Note[], [] as string[], [] as string[]]
-    const { settings } = useSettingsStore.getState()
-    const fileTree = get().buildFileTree(notes, extraFolders, assets, settings.sort_orders)
-    set({ notes, assets, fileTree })
+    if (loadNotesInflight) {
+      loadNotesPending = true  // 完成後再跑一次，確保拿到最新資料
+      return
+    }
+    loadNotesInflight = true
+    loadNotesPending  = false
+    try {
+      const vaultId = await invoke<string>('get_vault_uuid').catch(() => '')
+      const [notes, extraFolders, assets] = vaultId
+        ? await Promise.all([
+            api.listNotes(vaultId) as Promise<Note[]>,
+            api.listFolders(vaultId).catch(() => [] as string[]),
+            api.listAssets(vaultId).catch(() => [] as string[]),
+          ])
+        : [[] as Note[], [] as string[], [] as string[]]
+      const { settings } = useSettingsStore.getState()
+      const fileTree = get().buildFileTree(notes, extraFolders, assets, settings.sort_orders)
+      set({ notes, assets, extraFolders, fileTree })
+    } finally {
+      loadNotesInflight = false
+      if (loadNotesPending) {
+        loadNotesPending = false
+        get().loadNotes()  // 跑一次補上被 queue 的呼叫
+      }
+    }
   },
 
   scanVault: async () => {
@@ -77,14 +110,24 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
   },
 
   readNote: async (path) => {
+    // Cache hit: return immediately without a network round-trip
+    const cached = noteContentCache.get(path)
+    if (cached !== undefined) {
+      const meta = get().notes.find(n => n.path === path)
+      return { path, content: cached, title: meta?.title ?? '', word_count: meta?.word_count ?? 0, created_at: meta?.created_at ?? 0, modified_at: meta?.modified_at ?? 0 } as Note
+    }
     const vaultId = await invoke<string>('get_vault_uuid').catch(() => '')
-    if (!vaultId) return invoke<Note>('read_note', { path })
-    return api.readNote(vaultId, path) as Promise<Note>
+    const note: Note = vaultId
+      ? await api.readNote(vaultId, path) as Note
+      : await invoke<Note>('read_note', { path })
+    noteContentCache.set(path, note.content)
+    return note
   },
 
   updateNote: async (path, content) => {
     const vaultId = await invoke<string>('get_vault_uuid')
     await api.updateNote(vaultId, { path, content })
+    noteContentCache.set(path, content)
     set((state) => ({
       notes: state.notes.map((n) =>
         n.path === path ? { ...n, content, modified_at: Date.now() } : n
@@ -94,12 +137,23 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
 
   // 軟刪除：移至垃圾桶
   deleteNote: async (path) => {
+    noteContentCache.delete(path)
+    // Optimistic removal: update UI immediately before the API call returns
+    set(state => {
+      const notes = state.notes.filter(n => n.path !== path)
+      const fileTree = get().buildFileTree(notes, state.extraFolders, state.assets, useSettingsStore.getState().settings.sort_orders)
+      return { notes, fileTree }
+    })
     await api.trashNote(path)
-    await get().loadNotes()
+    get().loadNotes()  // background confirm — don't await
   },
 
   renameNote: async (path, newTitle) => {
     const { new_path } = await api.renameNote(path, newTitle)
+    // Move cache entry to new path so reopening doesn't re-fetch
+    const cached = noteContentCache.get(path)
+    noteContentCache.delete(path)
+    if (cached !== undefined) noteContentCache.set(new_path, cached)
     await get().loadNotes()
     return { new_path, updated_files: [] } as RenameResult
   },
@@ -117,8 +171,16 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
 
   // 軟刪除資料夾：所有筆記移至垃圾桶，實體目錄刪除
   deleteFolder: async (folderPath) => {
+    const prefix = folderPath.endsWith('/') ? folderPath : folderPath + '/'
+    // Optimistic removal: remove all notes under this folder immediately
+    set(state => {
+      const notes = state.notes.filter(n => !n.path.startsWith(prefix) && n.path !== folderPath)
+      const extraFolders = state.extraFolders.filter(f => !f.startsWith(prefix) && f !== folderPath)
+      const fileTree = get().buildFileTree(notes, extraFolders, state.assets, useSettingsStore.getState().settings.sort_orders)
+      return { notes, extraFolders, fileTree }
+    })
     const { count } = await api.trashFolder(folderPath)
-    await get().loadNotes()
+    get().loadNotes()  // background confirm — don't await
     return count
   },
 
@@ -254,7 +316,7 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
     let loadTimer: ReturnType<typeof setTimeout> | null = null
     const debouncedLoad = () => {
       if (loadTimer) clearTimeout(loadTimer)
-      loadTimer = setTimeout(() => { loadTimer = null; get().loadNotes() }, 150)
+      loadTimer = setTimeout(() => { loadTimer = null; get().loadNotes() }, 1000)
     }
 
     let scanTimer: ReturnType<typeof setTimeout> | null = null
@@ -265,7 +327,7 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
         const vid = await invoke<string>('get_vault_uuid').catch(() => '')
         await api.scanVault(vid).catch(() => {})
         await get().loadNotes()
-      }, 150)
+      }, 1000)
     }
 
     const unlisteners = await Promise.all([
