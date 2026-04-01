@@ -121,29 +121,53 @@ pub(crate) async fn save_memory_facts(
         let days = if category == "personal" || category == "rule" { 365i64 } else { 90 };
         let expires_at = now + days * 86400;
 
-        // Dedup: skip if a non-expired fact with same prefix (first 40 chars) already exists
-        let prefix: String = content.chars().take(40).collect::<String>().to_lowercase();
-        let mut check = db
-            .query("SELECT fact_id FROM memory_facts WHERE vault_id = $vid AND string::startsWith(string::lowercase(content), $prefix) AND expires_at > $now LIMIT 1")
-            .bind(("vid", vault_id.to_string()))
-            .bind(("prefix", prefix))
-            .bind(("now", now))
-            .await
-            .map_err(|e| e.to_string())?;
-        let existing: Vec<Value> = check.take(0).map_err(|e| e.to_string())?;
-        if !existing.is_empty() {
-            // Refresh expires_at
-            let fid = existing[0]["fact_id"].as_str().unwrap_or("").to_string();
+        // Compute embedding first (needed for both semantic dedup and storage)
+        let embedding_vec: Option<Vec<f32>> =
+            crate::processing::embedder::embed_text(client, embedding_url, &content).await;
+
+        // Dedup: semantic similarity (cosine > 0.92) when embeddings available;
+        // otherwise fall back to prefix match on first 40 chars.
+        let duplicate_fid: Option<String> = if let Some(ref new_emb) = embedding_vec {
+            // Fetch embeddings of existing non-expired facts for this vault/account
+            #[derive(serde::Deserialize)]
+            struct EmbRow { fact_id: String, embedding: Option<Vec<f32>> }
+            let existing: Vec<EmbRow> = db
+                .query("SELECT fact_id, embedding FROM memory_facts WHERE vault_id = $vid AND account_id = $aid AND expires_at > $now AND embedding IS NOT NONE")
+                .bind(("vid", vault_id.to_string()))
+                .bind(("aid", account_id.to_string()))
+                .bind(("now", now))
+                .await
+                .ok()
+                .and_then(|mut r| r.take(0).ok())
+                .unwrap_or_default();
+            existing.into_iter().find(|row| {
+                row.embedding.as_ref().map(|emb| {
+                    crate::processing::embedder::cosine_sim(new_emb, emb) > 0.92
+                }).unwrap_or(false)
+            }).map(|row| row.fact_id)
+        } else {
+            // Fallback: prefix match
+            let prefix: String = content.chars().take(40).collect::<String>().to_lowercase();
+            let existing: Vec<Value> = db
+                .query("SELECT fact_id FROM memory_facts WHERE vault_id = $vid AND string::startsWith(string::lowercase(content), $prefix) AND expires_at > $now LIMIT 1")
+                .bind(("vid", vault_id.to_string()))
+                .bind(("prefix", prefix))
+                .bind(("now", now))
+                .await
+                .ok()
+                .and_then(|mut r| r.take(0).ok())
+                .unwrap_or_default();
+            existing.first().and_then(|v| v["fact_id"].as_str().map(String::from))
+        };
+
+        if let Some(fid) = duplicate_fid {
+            // Refresh expires_at for the existing fact
             let _ = db.query("UPDATE memory_facts SET expires_at = $exp WHERE fact_id = $fid")
                 .bind(("exp", expires_at))
                 .bind(("fid", fid))
                 .await;
             continue;
         }
-
-        // Compute embedding (stored as native array, not JSON string)
-        let embedding_vec: Option<Vec<f32>> =
-            crate::processing::embedder::embed_text(client, embedding_url, &content).await;
 
         let fact_id = uuid::Uuid::new_v4().to_string();
         let _ = db

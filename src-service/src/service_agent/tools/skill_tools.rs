@@ -120,7 +120,7 @@ pub(crate) async fn run_skill_pass(
             if tool_name == "prefetch_memory" {
                 let kw: String = input.chars().take(120).collect();
                 let keywords = if kw.is_empty() { vec![] } else { vec![kw] };
-                let facts = vault_query_memory_with_limit(db, vault_id, account_id, &keywords, 8).await;
+                let facts = vault_query_memory_with_limit(client, embedding_url, db, vault_id, account_id, &keywords, 8).await;
                 if !facts.is_empty() {
                     let lines: Vec<String> = facts.iter().map(|r| {
                         format!("[{}] {}", r["category"].as_str().unwrap_or("general"), r["content"].as_str().unwrap_or(""))

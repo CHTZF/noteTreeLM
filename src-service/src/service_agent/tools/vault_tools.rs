@@ -78,18 +78,22 @@ pub(crate) async fn vault_search(db: &SurrealDb, vault_id: &str, query: &str) ->
 }
 
 pub(crate) async fn vault_query_memory(
+    client: &reqwest::Client,
+    embedding_url: &Option<String>,
     db: &SurrealDb,
     vault_id: &str,
     account_id: &str,
     keywords: &[String],
     limit: u64,
 ) -> Result<Value, String> {
-    let (text, _) = vault_query_memory_with_ids(db, vault_id, account_id, keywords, limit).await?;
+    let (text, _) = vault_query_memory_with_ids(client, embedding_url, db, vault_id, account_id, keywords, limit).await?;
     Ok(text)
 }
 
 /// Same as vault_query_memory but also returns the matched fact_ids for memory:prefetched.
 pub(crate) async fn vault_query_memory_with_ids(
+    client: &reqwest::Client,
+    embedding_url: &Option<String>,
     db: &SurrealDb,
     vault_id: &str,
     account_id: &str,
@@ -98,7 +102,44 @@ pub(crate) async fn vault_query_memory_with_ids(
 ) -> Result<(Value, Vec<String>), String> {
     let now = chrono::Utc::now().timestamp();
     #[derive(serde::Deserialize)]
-    struct Row { fact_id: Option<String>, content: String, category: String }
+    struct Row { fact_id: Option<String>, content: String, category: String, embedding: Option<Vec<f32>> }
+
+    // Try semantic search first when we have keywords and an embedding server
+    if !keywords.is_empty() {
+        let query_text = keywords.join(" ");
+        if let Some(query_vec) = crate::processing::embedder::embed_text(client, embedding_url, &query_text).await {
+            if !query_vec.is_empty() {
+                let rows: Vec<Row> = db
+                    .query("SELECT fact_id, content, category, embedding FROM memory_facts WHERE vault_id = $vid AND account_id = $aid AND expires_at > $now AND embedding IS NOT NONE")
+                    .bind(("vid", vault_id.to_string()))
+                    .bind(("aid", account_id.to_string()))
+                    .bind(("now", now))
+                    .await
+                    .ok()
+                    .and_then(|mut r| r.take(0).ok())
+                    .unwrap_or_default();
+
+                if !rows.is_empty() {
+                    let mut scored: Vec<(f32, Row)> = rows.into_iter().filter_map(|row| {
+                        let emb = row.embedding.as_ref()?;
+                        if emb.is_empty() { return None; }
+                        let score = crate::processing::embedder::cosine_sim(&query_vec, emb);
+                        Some((score, row))
+                    }).collect();
+                    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                    let top: Vec<Row> = scored.into_iter().take(limit as usize).map(|(_, r)| r).collect();
+                    let fact_ids: Vec<String> = top.iter()
+                        .filter_map(|r| r.fact_id.clone())
+                        .map(|fid| format!("memory:{}:{}", vault_id, fid))
+                        .collect();
+                    let result: Vec<Value> = top.iter().map(|r| json!({"content": r.content, "category": r.category})).collect();
+                    return Ok((json!(result), fact_ids));
+                }
+            }
+        }
+    }
+
+    // Fallback: keyword regex or recency sort
     let rows: Vec<Row> = if keywords.is_empty() {
         let mut r = db
             .query("SELECT fact_id, content, category FROM memory_facts WHERE vault_id = $vid AND account_id = $aid AND expires_at > $now ORDER BY created_at DESC LIMIT $lim")
@@ -383,7 +424,7 @@ pub(crate) async fn dispatch_interactive_tool(
                 .map(|a| a.iter().filter_map(|v| v.as_str()).map(String::from).collect())
                 .unwrap_or_default();
             let limit = args["limit"].as_u64().unwrap_or(5).min(20);
-            vault_query_memory_with_ids(db, vault_id, account_id, &keywords, limit).await.map(|(v, _)| (v, None))
+            vault_query_memory_with_ids(client, embedding_url, db, vault_id, account_id, &keywords, limit).await.map(|(v, _)| (v, None))
         }
 
         // ── Vault write tools (with rollback) ────────────────────────────────

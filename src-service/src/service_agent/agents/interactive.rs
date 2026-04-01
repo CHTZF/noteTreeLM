@@ -39,6 +39,9 @@ pub async fn run_interactive_agent(
     account_id: String,
     vault_path: String,
     conversation_id: String,
+    // Memory facts pre-fetched by run_agent in parallel with skill_pass.
+    // When Some, skip the in-body fetch (step 4b). When None, fetch here (legacy / direct callers).
+    prefetched_memory: Option<(Vec<serde_json::Value>, Vec<String>)>,
 ) -> String {
     let conv_id = conversation_id;
 
@@ -151,20 +154,26 @@ pub async fn run_interactive_agent(
         messages_json.insert(0, json!({"role": "system", "content": sys_content}));
     }
 
-    // 4b. Auto-inject memory facts (prefetch) — query with input keywords, append to system prompt.
+    // 4b. Auto-inject memory facts — use pre-fetched results from run_agent (parallel pre-pass)
+    //     or fall back to fetching here for direct callers that don't provide prefetched_memory.
     if !vault_id.is_empty() && !account_id.is_empty() {
-        let keywords: Vec<String> = input.split_whitespace()
-            .filter(|w| w.chars().count() >= 2)
-            .take(5)
-            .map(String::from)
-            .collect();
-        let facts = super::super::helpers::vault_query_memory_with_limit(
-            &state.db, &vault_id, &account_id, &keywords, 6,
-        ).await;
-        let fact_ids: Vec<String> = facts.iter()
-            .filter_map(|f| f["fact_id"].as_str().filter(|s| !s.is_empty()))
-            .map(|fid| format!("memory:{}:{}", vault_id, fid))
-            .collect();
+        let (facts, fact_ids) = if let Some(pre) = prefetched_memory {
+            pre
+        } else {
+            let keywords: Vec<String> = input.split_whitespace()
+                .filter(|w| w.chars().count() >= 2)
+                .take(5)
+                .map(String::from)
+                .collect();
+            let facts = super::super::helpers::vault_query_memory_with_limit(
+                &client, &embedding_url, &state.db, &vault_id, &account_id, &keywords, 6,
+            ).await;
+            let fact_ids: Vec<String> = facts.iter()
+                .filter_map(|f| f["fact_id"].as_str().filter(|s| !s.is_empty()))
+                .map(|fid| format!("memory:{}:{}", vault_id, fid))
+                .collect();
+            (facts, fact_ids)
+        };
         if !facts.is_empty() {
             let mem_lines: Vec<String> = facts.iter().map(|f| {
                 let cat = f["category"].as_str().unwrap_or("general");
@@ -187,29 +196,76 @@ pub async fn run_interactive_agent(
         }
     }
 
-    // 5. Context sliding window (12000 chars)
+    // 5. Context window management (12000 chars)
+    // When history exceeds the limit, summarize the oldest messages with LLM instead of
+    // silently dropping them — this preserves early context (e.g. user requirements stated
+    // at conversation start) that would otherwise be lost.
     if !tool_names.is_empty() && !vault_path.is_empty() {
         const MAX_HISTORY_CHARS: usize = 12000;
-            let system_part: Vec<Value> = messages_json.iter()
-                .filter(|m| m["role"].as_str() == Some("system"))
-                .cloned().collect();
-            let hist: Vec<Value> = messages_json.into_iter()
-                .filter(|m| m["role"].as_str() != Some("system"))
-                .collect();
-            let total: usize = hist.iter()
-                .map(|m| m["content"].as_str().unwrap_or("").len())
-                .sum();
-            let trimmed = if total > MAX_HISTORY_CHARS {
-                let mut chars = total;
-                let mut drop_n = 0usize;
-                while chars > MAX_HISTORY_CHARS && drop_n + 4 < hist.len() {
-                    chars = chars.saturating_sub(hist[drop_n]["content"].as_str().unwrap_or("").len());
-                    drop_n += 1;
-                }
-                hist[drop_n..].to_vec()
-            } else {
-                hist
+        // Keep tail large enough to fit, with at least 4 messages headroom for new round.
+        const KEEP_RECENT: usize = 6;
+        let system_part: Vec<Value> = messages_json.iter()
+            .filter(|m| m["role"].as_str() == Some("system"))
+            .cloned().collect();
+        let hist: Vec<Value> = messages_json.into_iter()
+            .filter(|m| m["role"].as_str() != Some("system"))
+            .collect();
+        let total: usize = hist.iter()
+            .map(|m| m["content"].as_str().unwrap_or("").len())
+            .sum();
+        let trimmed = if total > MAX_HISTORY_CHARS && hist.len() > KEEP_RECENT {
+            // Split: old messages to summarize + recent messages to keep verbatim
+            let keep_from = hist.len().saturating_sub(KEEP_RECENT);
+            let to_summarize = &hist[..keep_from];
+            let recent = hist[keep_from..].to_vec();
+
+            // Build text for summarization
+            let old_text: String = to_summarize.iter().map(|m| {
+                let role = m["role"].as_str().unwrap_or("user");
+                let content = m["content"].as_str().unwrap_or("");
+                format!("[{}]: {}", role, &content[..content.len().min(500)])
+            }).collect::<Vec<_>>().join("\n\n");
+
+            // Call LLM for summarization (non-streaming, best-effort)
+            let summary_msgs = vec![
+                json!({"role": "system", "content": "你是對話摘要助手。請將以下對話歷史壓縮為 2-5 句重點摘要，保留關鍵需求、決策和上下文。用繁體中文回答，不要加任何前綴。"}),
+                json!({"role": "user", "content": old_text}),
+            ];
+            let summary_body = json!({
+                "messages": summary_msgs,
+                "stream": false,
+                "temperature": 0.1,
+                "max_tokens": 400,
+            });
+            let summary_text = match client
+                .post(format!("{}/v1/chat/completions", llm_url))
+                .json(&summary_body)
+                .send()
+                .await
+                .ok()
+                .and_then(|r| if r.status().is_success() { Some(r) } else { None })
+            {
+                Some(resp) => resp.json::<Value>().await.ok()
+                    .and_then(|j| j["choices"][0]["message"]["content"].as_str().map(String::from))
+                    .unwrap_or_default(),
+                None => String::new(),
             };
+
+            if summary_text.is_empty() {
+                // LLM unavailable — fall back to simple trim
+                recent
+            } else {
+                let summary_msg = json!({
+                    "role": "assistant",
+                    "content": format!("[對話摘要]\n{}", summary_text),
+                });
+                let mut result = vec![summary_msg];
+                result.extend(recent);
+                result
+            }
+        } else {
+            hist
+        };
         messages_json = system_part.into_iter().chain(trimmed.into_iter()).collect();
     }
 
@@ -641,14 +697,47 @@ pub async fn run_agent(
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
 
-    // Skill pre-pass: triggered when agent_def declares "search_skills" in tool_names.
-    let system_injection = if !vault_path.is_empty() && tool_names.contains(&"search_skills".to_string()) {
-        let http_client = reqwest::Client::new();
-        let embedding_url = state.daemon.embedding_url.read().await.clone();
-        let skill = super::super::helpers::run_skill_pass(
-            &http_client, &embedding_url, &state.db, &vault_id, &account_id, &input,
-        ).await;
+    let http_client = reqwest::Client::new();
+    let embedding_url = state.daemon.embedding_url.read().await.clone();
 
+    // Parallel pre-pass: skill search + memory prefetch run concurrently.
+    let do_skill_pass = !vault_path.is_empty() && tool_names.contains(&"search_skills".to_string());
+    let do_memory_prefetch = !vault_id.is_empty() && !account_id.is_empty();
+
+    let keywords: Vec<String> = input.split_whitespace()
+        .filter(|w| w.chars().count() >= 2)
+        .take(5)
+        .map(String::from)
+        .collect();
+
+    let (skill_result, memory_facts) = tokio::join!(
+        async {
+            if do_skill_pass {
+                Some(super::super::helpers::run_skill_pass(
+                    &http_client, &embedding_url, &state.db, &vault_id, &account_id, &input,
+                ).await)
+            } else {
+                None
+            }
+        },
+        async {
+            if do_memory_prefetch {
+                let facts = super::super::helpers::vault_query_memory_with_limit(
+                    &http_client, &embedding_url, &state.db, &vault_id, &account_id, &keywords, 6,
+                ).await;
+                let fact_ids: Vec<String> = facts.iter()
+                    .filter_map(|f| f["fact_id"].as_str().filter(|s| !s.is_empty()))
+                    .map(|fid| format!("memory:{}:{}", vault_id, fid))
+                    .collect();
+                Some((facts, fact_ids))
+            } else {
+                None
+            }
+        }
+    );
+
+    // Process skill pass result
+    let system_injection = if let Some(skill) = skill_result {
         if !skill.skill_titles.is_empty() && streaming {
             let session_id = agent_def["session_id"].as_str().unwrap_or("");
             state.daemon.emit("agent:skills_activated", serde_json::json!({
@@ -657,8 +746,6 @@ pub async fn run_agent(
                 "source": "pre_pass",
             }));
         }
-
-        // Bump trigger_count asynchronously.
         for sid in skill.skill_ids {
             let db = state.db.clone();
             let now = chrono::Utc::now().timestamp();
@@ -670,18 +757,12 @@ pub async fn run_agent(
                     .await;
             });
         }
-
         if !skill.tool_names.is_empty() {
-            // Replace search_skills with matched skill tools; keep other base tools.
             tool_names.retain(|t| t != "search_skills");
             for t in skill.tool_names {
-                if !tool_names.contains(&t) {
-                    tool_names.push(t);
-                }
+                if !tool_names.contains(&t) { tool_names.push(t); }
             }
         }
-        // If no skills matched, search_skills stays so LLM can call it directly.
-
         skill.system_injection
     } else {
         String::new()
@@ -704,5 +785,6 @@ pub async fn run_agent(
         account_id,
         vault_path,
         conversation_id,
+        memory_facts,
     ).await
 }
