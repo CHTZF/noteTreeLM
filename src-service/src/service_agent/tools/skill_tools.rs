@@ -4,7 +4,6 @@ use crate::processing::embedder::cosine_sim;
 use super::super::engine::context::vault_query_memory_with_limit;
 
 pub(crate) struct SkillPassResult {
-    pub tool_names: Vec<String>,
     pub system_injection: String,
     pub skill_titles: Vec<String>,
     pub skill_ids: Vec<String>,
@@ -12,8 +11,6 @@ pub(crate) struct SkillPassResult {
 }
 
 /// A pre-planned tool chain exposed to LLM as a single callable function.
-/// LLM provides all possible params upfront; execution starts from the last
-/// tool whose params are satisfied and falls back to earlier tools as needed.
 #[derive(Clone)]
 pub(crate) struct MetaFunctionSpec {
     pub fn_name: String,
@@ -35,12 +32,36 @@ fn sanitize_skill_fn_name(title: &str, skill_id: &str) -> String {
     }
 }
 
+/// Extract ordered tool names from `@[tool_name]` markers in behavior text.
+/// Preserves first-occurrence order; deduplicates.
+pub(crate) fn extract_chain_from_behavior(behavior: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut rest = behavior;
+    while let Some(start) = rest.find("@[") {
+        rest = &rest[start + 2..];
+        if let Some(end) = rest.find(']') {
+            let name = rest[..end].trim().to_string();
+            if !name.is_empty() && seen.insert(name.clone()) {
+                result.push(name);
+            }
+            rest = &rest[end + 1..];
+        } else {
+            break;
+        }
+    }
+    result
+}
+
+// (skill_id, title, behavior, injection_mode)
+type SkillRow = (String, String, String, String);
+
 /// Keyword fallback: filter active skills by trigger keywords in input.
 pub(crate) async fn search_skills_db(
     db: &SurrealDb,
     account_id: &str,
     input: &str,
-) -> Vec<(String, String, String, Vec<String>, bool, Vec<String>, String)> {
+) -> Vec<SkillRow> {
     let mut resp = match db
         .query("SELECT *, record::id(id) AS id FROM agent_skills WHERE account_id = $aid AND is_active = true")
         .bind(("aid", account_id.to_string()))
@@ -62,25 +83,15 @@ pub(crate) async fn search_skills_db(
     }).map(skill_row_to_tuple).collect()
 }
 
-fn skill_row_to_tuple(s: &Value) -> (String, String, String, Vec<String>, bool, Vec<String>, String) {
-    let skill_id = s["skill_id"].as_str().unwrap_or("").to_string();
-    let title = s["title"].as_str().unwrap_or("").to_string();
-    let behavior = s["behavior"].as_str().unwrap_or("").to_string();
-    let tool_calls: Vec<String> = if let Some(arr) = s["tool_calls"].as_array() {
-        arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
-    } else if let Some(s) = s["tool_calls"].as_str() {
-        serde_json::from_str::<Vec<String>>(s).unwrap_or_default()
-    } else { vec![] };
-    let need_tool_chain = s["need_tool_chain"].as_bool().unwrap_or(false);
-    let tool_chain_order: Vec<String> = if let Some(arr) = s["tool_chain_order"].as_array() {
-        arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
-    } else { vec![] };
+fn skill_row_to_tuple(s: &Value) -> SkillRow {
+    let skill_id      = s["skill_id"].as_str().unwrap_or("").to_string();
+    let title         = s["title"].as_str().unwrap_or("").to_string();
+    let behavior      = s["behavior"].as_str().unwrap_or("").to_string();
     let injection_mode = s["injection_mode"].as_str().unwrap_or("passive").to_string();
-    (skill_id, title, behavior, tool_calls, need_tool_chain, tool_chain_order, injection_mode)
+    (skill_id, title, behavior, injection_mode)
 }
 
-/// Semantic search: embeds input, scores skills with embeddings via cosine, threshold 0.65.
-/// Returns None if embedding unavailable or no skills pass threshold.
+/// Semantic search: embeds input, scores skills via cosine, threshold 0.65.
 async fn semantic_skill_search(
     client: &reqwest::Client,
     embedding_url: &Option<String>,
@@ -88,7 +99,7 @@ async fn semantic_skill_search(
     account_id: &str,
     input: &str,
     threshold: f32,
-) -> Option<Vec<(String, String, String, Vec<String>, bool, Vec<String>, String)>> {
+) -> Option<Vec<SkillRow>> {
     let input_vec = crate::processing::embedder::embed_text(client, embedding_url, input).await?;
     if input_vec.is_empty() { return None; }
 
@@ -130,7 +141,6 @@ pub(crate) async fn run_skill_pass(
 
     if matched.is_empty() {
         return SkillPassResult {
-            tool_names: vec![],
             system_injection: String::new(),
             skill_titles: vec![],
             skill_ids: vec![],
@@ -138,69 +148,85 @@ pub(crate) async fn run_skill_pass(
         };
     }
 
-    // Proactive memory prefetch
+    // Proactive memory prefetch: skill with @[prefetch_memory] and injection_mode=proactive
     let mut proactive_parts: Vec<String> = vec![];
-    for (_, _, _, _, need_chain, chain_order, mode) in &matched {
-        if mode != "proactive" || !*need_chain { continue; }
-        for tool_name in chain_order {
-            if tool_name == "prefetch_memory" {
-                let kw: String = input.chars().take(120).collect();
-                let keywords = if kw.is_empty() { vec![] } else { vec![kw] };
-                let facts = vault_query_memory_with_limit(client, embedding_url, db, vault_id, account_id, &keywords, 8).await;
-                if !facts.is_empty() {
-                    let lines: Vec<String> = facts.iter().map(|r| {
-                        format!("[{}] {}", r["category"].as_str().unwrap_or("general"), r["content"].as_str().unwrap_or(""))
-                    }).collect();
-                    proactive_parts.push(format!("## 相關記憶\n{}", lines.join("\n")));
-                }
+    for (_, _, behavior, mode) in &matched {
+        if mode != "proactive" { continue; }
+        let chain = extract_chain_from_behavior(behavior);
+        if chain.iter().any(|t| t == "prefetch_memory") {
+            let kw: String = input.chars().take(120).collect();
+            let keywords = if kw.is_empty() { vec![] } else { vec![kw] };
+            let facts = vault_query_memory_with_limit(client, embedding_url, db, vault_id, account_id, &keywords, 8).await;
+            if !facts.is_empty() {
+                let lines: Vec<String> = facts.iter().map(|r| {
+                    format!("[{}] {}", r["category"].as_str().unwrap_or("general"), r["content"].as_str().unwrap_or(""))
+                }).collect();
+                proactive_parts.push(format!("## 相關記憶\n{}", lines.join("\n")));
             }
         }
     }
 
-    // Generate meta-functions for skills with tool_chain_order.
-    // These become single callable functions for LLM instead of individual tools.
+    // Generate meta-functions for skills whose behavior contains @[tool] markers.
     let meta_functions: Vec<MetaFunctionSpec> = matched.iter()
-        .filter(|(_, _, _, _, need_chain, chain_order, _)| *need_chain && !chain_order.is_empty())
-        .map(|(skill_id, title, behavior, _, _, chain_order, _)| MetaFunctionSpec {
-            fn_name: sanitize_skill_fn_name(title, skill_id),
-            description: behavior.clone(),
-            chain: chain_order.clone(),
-            fallback_msg: "找不到相關內容，請換個說法再試試。".to_string(),
+        .filter(|(_, _, _, mode)| mode != "proactive")
+        .filter_map(|(skill_id, title, behavior, _)| {
+            let chain = extract_chain_from_behavior(behavior);
+            if chain.is_empty() { return None; }
+            Some(MetaFunctionSpec {
+                fn_name: sanitize_skill_fn_name(title, skill_id),
+                description: behavior.clone(),
+                chain,
+                fallback_msg: "找不到相關內容，請換個說法再試試。".to_string(),
+            })
         })
         .collect();
 
-    // Chain tools are exposed via meta-functions; exclude them from direct tool list.
+    // Chain tool names (exposed via meta-functions, not given to LLM individually).
     let chain_tool_set: std::collections::HashSet<String> = meta_functions.iter()
         .flat_map(|m| m.chain.iter().cloned())
         .collect();
 
-    // Non-chain skills go into skill_text (system injection).
+    // Non-chain skills (no @[tool] in behavior) → system injection text.
     let skill_text: String = matched.iter()
-        .filter(|(_, _, beh, _, need_chain, chain_order, mode)| {
-            !beh.is_empty() && mode != "proactive" && !(*need_chain && !chain_order.is_empty())
+        .filter(|(_, _, behavior, mode)| {
+            mode != "proactive" && extract_chain_from_behavior(behavior).is_empty() && !behavior.is_empty()
         })
-        .map(|(_, title, beh, _, _, _, _)| format!("[技能：{}]\n{}", title, beh))
+        .map(|(_, title, beh, _)| format!("[技能：{}]\n{}", title, beh))
         .collect::<Vec<_>>().join("\n\n");
 
     let mut injection_parts: Vec<String> = vec![];
     let proactive_ctx = proactive_parts.join("\n\n");
     if !proactive_ctx.is_empty() { injection_parts.push(proactive_ctx.chars().take(1000).collect()); }
-    if !skill_text.is_empty() { injection_parts.push(skill_text.chars().take(1500).collect()); }
+    if !skill_text.is_empty() {
+        // Strip @[tool] markers from injected text for readability
+        let clean = strip_tool_markers(&skill_text);
+        injection_parts.push(clean.chars().take(1500).collect());
+    }
 
-    let mut tool_names: Vec<String> = matched.iter()
-        .flat_map(|(_, _, _, tc, need_chain, chain_order, _)| {
-            if *need_chain && !chain_order.is_empty() { vec![] } else { tc.clone() }
-        })
-        .filter(|t| !chain_tool_set.contains(t))
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter().collect();
-    tool_names.sort();
+    // Remove chain tools from the agent's direct tool access — they're covered by meta-functions.
+    let _ = chain_tool_set; // currently no direct tool list from skills
 
     SkillPassResult {
-        tool_names,
         system_injection: injection_parts.join("\n\n"),
-        skill_titles: matched.iter().map(|(_, t, _, _, _, _, _)| t.clone()).collect(),
-        skill_ids: matched.iter().map(|(id, _, _, _, _, _, _)| id.clone()).collect(),
+        skill_titles: matched.iter().map(|(_, t, _, _)| t.clone()).collect(),
+        skill_ids: matched.iter().map(|(id, _, _, _)| id.clone()).collect(),
         meta_functions,
     }
+}
+
+/// Remove `@[tool_name]` markers from text for clean display/injection.
+pub(crate) fn strip_tool_markers(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("@[") {
+        result.push_str(&rest[..start]);
+        rest = &rest[start + 2..];
+        if let Some(end) = rest.find(']') {
+            // Replace @[tool_name] with just tool_name
+            result.push_str(&rest[..end]);
+            rest = &rest[end + 1..];
+        }
+    }
+    result.push_str(rest);
+    result
 }

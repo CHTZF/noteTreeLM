@@ -767,13 +767,6 @@ pub(crate) fn build_tools_schema_interactive(tool_names: &[String]) -> Vec<Value
             }, "required": ["plan"] }
         }}),
         json!({ "type": "function", "function": {
-            "name": "search_skills",
-            "description": "搜尋可用的 agent 技能，了解如何處理特定類型的請求",
-            "parameters": { "type": "object", "properties": {
-                "query": { "type": "string", "description": "要搜尋的技能主題或關鍵字" }
-            }, "required": ["query"] }
-        }}),
-        json!({ "type": "function", "function": {
             "name": "create_agent_skill",
             "description": "建立新的 agent 技能，學習如何處理特定類型的任務",
             "parameters": { "type": "object", "properties": {

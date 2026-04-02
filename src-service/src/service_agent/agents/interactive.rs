@@ -459,7 +459,7 @@ pub(crate) fn build_interactive_registry(
     let all_tool_names = [
         "list_structure", "read_note", "create_note", "update_note", "create_folder",
         "search_vault", "query_memory", "delete_note", "delete_folder", "move_note",
-        "append_to_note", "search_skills", "create_agent_skill", "plan_announce",
+        "append_to_note", "create_agent_skill", "plan_announce",
         "open_note", "get_unprocessed_conversations", "get_conversation_content",
         "save_memory_facts", "mark_conversation_processed", "condense_memory_facts",
     ];
@@ -741,7 +741,8 @@ pub async fn run_agent(
     let embedding_url = state.daemon.embedding_url.read().await.clone();
 
     // Parallel pre-pass: skill search + memory prefetch run concurrently.
-    let do_skill_pass = !vault_path.is_empty() && tool_names.contains(&"search_skills".to_string());
+    let do_skill_pass = !vault_path.is_empty()
+        && agent_def["use_skill_pass"].as_bool().unwrap_or(false);
     let do_memory_prefetch = !vault_id.is_empty() && !account_id.is_empty();
 
     let keywords: Vec<String> = input.split_whitespace()
@@ -795,12 +796,6 @@ pub async fn run_agent(
                     .bind(("sid", sid))
                     .await;
             });
-        }
-        if !skill.tool_names.is_empty() {
-            tool_names.retain(|t| t != "search_skills");
-            for t in skill.tool_names {
-                if !tool_names.contains(&t) { tool_names.push(t); }
-            }
         }
         (skill.system_injection, skill.meta_functions)
     } else {
@@ -1020,7 +1015,7 @@ fn register_meta_fn_tool(
     embedding_url: Option<String>,
     state: crate::api_state::ApiState,
     session_id: String,
-    _tx: Arc<Transaction>,
+    tx: Arc<Transaction>,
     _cancel: Arc<AtomicBool>,
 ) {
     let chain = spec.chain.clone();
@@ -1039,6 +1034,7 @@ fn register_meta_fn_tool(
         let embedding_url = embedding_url.clone();
         let state = state.clone();
         let session_id = session_id.clone();
+        let tx = tx.clone();
 
         Box::pin(async move {
             if chain.is_empty() {
@@ -1047,17 +1043,45 @@ fn register_meta_fn_tool(
 
             // Always execute the chain from step 0. chain[0]'s args come from LLM;
             // subsequent steps derive their args deterministically from previous results.
+            // prev_tool_name tracks the last *effective* tool (plan_announce is skipped).
             let mut prev_result: Option<serde_json::Value> = None;
             let mut prev_args = serde_json::Value::Null;
+            let mut prev_tool_name = String::new();
 
             for i in 0..chain.len() {
                 let tool_name = &chain[i];
 
-                let tool_args = if i == 0 {
+                // plan_announce checkpoint: emit plan summary, wait for user confirmation.
+                // Subsequent write tools in the same chain are pre-approved.
+                // Does not update prev_result/prev_args/prev_tool_name.
+                if tool_name == "plan_announce" {
+                    let remaining: Vec<&str> = chain[i + 1..].iter()
+                        .filter(|t| t.as_str() != "plan_announce")
+                        .map(|s| s.as_str())
+                        .collect();
+                    let plan_text = if remaining.is_empty() {
+                        "執行此操作".to_string()
+                    } else {
+                        format!("即將執行：{}", remaining.join(" → "))
+                    };
+                    state.daemon.emit("agent:write_request", json!({
+                        "session_id": session_id,
+                        "display": plan_text,
+                    }));
+                    match tx.prepare().await {
+                        Err(_) => return Ok(json!(fallback_msg)),
+                        Ok(rx) => match rx.await {
+                            Ok(true) => { tx.pre_approve(); continue; }
+                            _ => return Ok(json!(fallback_msg)),
+                        }
+                    }
+                }
+
+                let tool_args = if prev_result.is_none() {
                     extract_user_tool_args(tool_name, &args)
                 } else {
                     extract_chain_step_args(
-                        &chain[i - 1],
+                        &prev_tool_name,
                         tool_name,
                         prev_result.as_ref().unwrap(),
                         &prev_args,
@@ -1094,6 +1118,7 @@ fn register_meta_fn_tool(
                                     .map(|p| vec![json!(p)]).unwrap_or_default());
                             state.daemon.emit("agent:open_note", json!(paths));
                         }
+                        prev_tool_name = tool_name.clone();
                         prev_args = tool_args;
                         prev_result = Some(v);
                     }
