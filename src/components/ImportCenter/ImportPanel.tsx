@@ -796,10 +796,10 @@ export function SkillsHub() {
     }
   }
 
-  const handleUpdate = async (id: string, title: string, trigger: string, behavior: string, toolCalls: string[], injectionMode: string, agentScope: AgentScope) => {
-    await api.updateAgentSkill(id, { title, trigger, behavior, tool_calls: toolCalls, injection_mode: injectionMode, agent_scope: agentScope })
+  const handleUpdate = async (id: string, title: string, trigger: string, behavior: string, toolCalls: string[], injectionMode: string, agentScope: AgentScope, needToolChain: boolean, toolChainOrder: string[]) => {
+    await api.updateAgentSkill(id, { title, trigger, behavior, tool_calls: toolCalls, injection_mode: injectionMode, agent_scope: agentScope, need_tool_chain: needToolChain, tool_chain_order: toolChainOrder })
     setSkills(prev => prev.map(s =>
-      s.skill_id === id ? { ...s, title, trigger, behavior, tool_calls: toolCalls, injection_mode: injectionMode as 'passive' | 'active', agent_scope: agentScope } : s
+      s.skill_id === id ? { ...s, title, trigger, behavior, tool_calls: toolCalls, injection_mode: injectionMode as 'passive' | 'active', agent_scope: agentScope, need_tool_chain: needToolChain, tool_chain_order: toolChainOrder } : s
     ))
   }
 
@@ -984,8 +984,9 @@ function ChatMessage({
 
 function fmtLastTriggered(ts: number | null): string | null {
   if (!ts) return null
-  const days = Math.floor((Date.now() - ts) / 86400000)
-  if (days === 0) return '今天觸發'
+  // last_triggered_at is stored as Unix seconds by the service
+  const days = Math.floor((Date.now() - ts * 1000) / 86400000)
+  if (days <= 0) return '今天觸發'
   if (days === 1) return '昨天觸發'
   return `${days} 天前觸發`
 }
@@ -1019,7 +1020,7 @@ function SkillCard({
   skill: AgentSkill
   onToggle: (id: string, active: boolean) => Promise<void>
   onDelete: (id: string) => Promise<void>
-  onUpdate?: (id: string, title: string, trigger: string, behavior: string, toolCalls: string[], injectionMode: string, agentScope: AgentScope) => Promise<void>
+  onUpdate?: (id: string, title: string, trigger: string, behavior: string, toolCalls: string[], injectionMode: string, agentScope: AgentScope, needToolChain: boolean, toolChainOrder: string[]) => Promise<void>
 }) {
   const [toggling, setToggling] = useState(false)
   const [editing, setEditing] = useState(false)
@@ -1030,9 +1031,11 @@ function SkillCard({
   const [editTools, setEditTools] = useState<string[]>(skill.tool_calls)
   const [editInjectionMode, setEditInjectionMode] = useState<'passive' | 'active'>(skill.injection_mode ?? 'passive')
   const [editAgentScope, setEditAgentScope] = useState<AgentScope>(skill.agent_scope ?? 'all')
+  const [editNeedChain, setEditNeedChain] = useState(skill.need_tool_chain ?? false)
+  const [editChainOrder, setEditChainOrder] = useState<string[]>(skill.tool_chain_order ?? [])
 
   const daysSinceTrigger = skill.last_triggered_at
-    ? Math.floor((Date.now() - skill.last_triggered_at) / 86400000)
+    ? Math.floor((Date.now() - skill.last_triggered_at * 1000) / 86400000)
     : null
   const isStale = skill.is_active && skill.trigger_count > 0 && daysSinceTrigger !== null && daysSinceTrigger > 90
   const neverTriggered = skill.trigger_count === 0
@@ -1041,7 +1044,7 @@ function SkillCard({
     if (!onUpdate) return
     setSaving(true)
     try {
-      await onUpdate(skill.skill_id, editTitle, editTrigger, editBehavior, editTools, editInjectionMode, editAgentScope)
+      await onUpdate(skill.skill_id, editTitle, editTrigger, editBehavior, editTools, editInjectionMode, editAgentScope, editNeedChain, editChainOrder)
       setEditing(false)
     } finally {
       setSaving(false)
@@ -1157,6 +1160,26 @@ function SkillCard({
               </label>
             ))}
           </div>
+          <div className="import-panel-v2__skill-edit-tools" style={{ marginTop: 6 }}>
+            <span className="import-panel-v2__skill-edit-label">工具鏈</span>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11 }}>
+              <input
+                type="checkbox"
+                checked={editNeedChain}
+                onChange={e => setEditNeedChain(e.target.checked)}
+              />
+              啟用確定性工具鏈
+            </label>
+            {editNeedChain && (
+              <input
+                type="text"
+                value={editChainOrder.join(', ')}
+                onChange={e => setEditChainOrder(e.target.value.split(',').map(s => s.trim()).filter(Boolean))}
+                placeholder="search_vault, open_note"
+                style={{ marginTop: 4, width: '100%', fontSize: 11, padding: '2px 6px', background: 'var(--color-bg-overlay)', border: '1px solid var(--color-border)', borderRadius: 4, color: 'var(--color-text)' }}
+              />
+            )}
+          </div>
           <div className="import-panel-v2__skill-edit-footer">
             <button className="import-panel-v2__skill-save-btn" onClick={handleSaveEdit} disabled={saving}>
               {saving ? <FontAwesomeIcon icon={faSpinner} spin /> : <><FontAwesomeIcon icon={faCheck} /> 儲存</>}
@@ -1169,6 +1192,8 @@ function SkillCard({
               setEditTools(skill.tool_calls)
               setEditInjectionMode(skill.injection_mode ?? 'passive')
               setEditAgentScope(skill.agent_scope ?? 'all')
+              setEditNeedChain(skill.need_tool_chain ?? false)
+              setEditChainOrder(skill.tool_chain_order ?? [])
             }}>取消</button>
           </div>
         </div>
@@ -1196,6 +1221,17 @@ function SkillCard({
                 border: `1px solid ${SCOPE_COLORS[skill.agent_scope ?? 'all']}`,
               }}>
                 {SCOPE_LABELS[skill.agent_scope ?? 'all']}
+              </span>
+            )}
+            {skill.need_tool_chain && skill.tool_chain_order && skill.tool_chain_order.length > 0 && (
+              <span style={{
+                fontSize: 10, padding: '1px 6px', borderRadius: 8,
+                background: 'rgba(16,185,129,0.1)',
+                color: 'var(--color-success)',
+                border: '1px solid var(--color-success)',
+                fontFamily: 'monospace',
+              }}>
+                ⛓ {skill.tool_chain_order.join(' → ')}
               </span>
             )}
           </div>

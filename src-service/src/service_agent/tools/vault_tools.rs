@@ -62,8 +62,65 @@ pub(crate) fn vault_read_note(rel_path: &str, vault_path: &str) -> String {
     }
 }
 
-pub(crate) async fn vault_search(db: &SurrealDb, vault_id: &str, query: &str) -> Result<Value, String> {
+pub(crate) async fn vault_search(
+    client: &reqwest::Client,
+    embedding_url: &Option<String>,
+    db: &SurrealDb,
+    vault_id: &str,
+    query: &str,
+) -> Result<Value, String> {
     if query.is_empty() { return Ok(json!([])); }
+
+    // ── Cosine similarity search on chunks ────────────────────────────────
+    if let Some(vec) = crate::processing::embedder::embed_text(client, embedding_url, query).await {
+        #[derive(serde::Deserialize)]
+        struct ChunkRow { file_path: String, score: f32 }
+        let mut resp = db
+            .query("SELECT file_path, vector::similarity::cosine(embedding, $vec) AS score \
+                    FROM chunks WHERE vault_id = $vid AND embedding IS NOT NONE \
+                    ORDER BY score DESC LIMIT 40")
+            .bind(("vid", vault_id.to_string()))
+            .bind(("vec", vec))
+            .await
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<ChunkRow> = resp.take(0).map_err(|e| e.to_string())?;
+
+        // Dedup by file_path — keep highest score per note.
+        let mut seen: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+        for r in &rows {
+            let entry = seen.entry(r.file_path.clone()).or_insert(f32::NEG_INFINITY);
+            if r.score > *entry { *entry = r.score; }
+        }
+        // Sort paths by score desc, take top 8.
+        let mut ranked: Vec<(String, f32)> = seen.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(8);
+
+        if !ranked.is_empty() {
+            // Fetch titles from notes table for the ranked paths.
+            #[derive(serde::Deserialize)]
+            struct NoteRow { path: String, title: String }
+            let paths: Vec<String> = ranked.iter().map(|(p, _)| p.clone()).collect();
+            let mut nresp = db
+                .query("SELECT path, title FROM notes WHERE vault_id = $vid AND path INSIDE $paths")
+                .bind(("vid", vault_id.to_string()))
+                .bind(("paths", paths.clone()))
+                .await
+                .map_err(|e| e.to_string())?;
+            let notes: Vec<NoteRow> = nresp.take(0).map_err(|e| e.to_string())?;
+            let title_map: std::collections::HashMap<String, String> =
+                notes.into_iter().map(|n| (n.path, n.title)).collect();
+
+            let result: Vec<Value> = ranked.iter().map(|(path, score)| json!({
+                "path": path,
+                "title": title_map.get(path).cloned().unwrap_or_default(),
+                "score": score,
+            })).collect();
+            return Ok(json!(result));
+        }
+    }
+
+    // ── Fallback: regex search (no embedding available or empty results) ──
     #[derive(serde::Deserialize)]
     struct Row { path: String, title: String }
     let mut resp = db
@@ -73,8 +130,7 @@ pub(crate) async fn vault_search(db: &SurrealDb, vault_id: &str, query: &str) ->
         .await
         .map_err(|e| e.to_string())?;
     let rows: Vec<Row> = resp.take(0).map_err(|e| e.to_string())?;
-    let result: Vec<Value> = rows.iter().map(|r| json!({"path": r.path, "title": r.title})).collect();
-    Ok(json!(result))
+    Ok(json!(rows.iter().map(|r| json!({"path": r.path, "title": r.title})).collect::<Vec<_>>()))
 }
 
 pub(crate) async fn vault_query_memory(
@@ -417,7 +473,7 @@ pub(crate) async fn dispatch_interactive_tool(
         }
         "search_vault" => {
             let query = args["query"].as_str().unwrap_or("");
-            vault_search(db, vault_id, query).await.map(|v| (v, None))
+            vault_search(client, embedding_url, db, vault_id, query).await.map(|v| (v, None))
         }
         "query_memory" => {
             let keywords: Vec<String> = args["keywords"].as_array()

@@ -92,9 +92,11 @@ pub async fn update(
     if body.get("trigger").is_some()        { set_parts.push("trigger = $trigger".to_string()); }
     if body.get("behavior").is_some()       { set_parts.push("behavior = $behavior".to_string()); }
     if body.get("is_active").is_some()      { set_parts.push("is_active = $active".to_string()); }
-    if body.get("tool_calls").is_some()     { set_parts.push("tool_calls = $tool_calls".to_string()); }
-    if body.get("injection_mode").is_some() { set_parts.push("injection_mode = $injection_mode".to_string()); }
-    if body.get("agent_scope").is_some()    { set_parts.push("agent_scope = $agent_scope".to_string()); }
+    if body.get("tool_calls").is_some()       { set_parts.push("tool_calls = $tool_calls".to_string()); }
+    if body.get("injection_mode").is_some()   { set_parts.push("injection_mode = $injection_mode".to_string()); }
+    if body.get("agent_scope").is_some()      { set_parts.push("agent_scope = $agent_scope".to_string()); }
+    if body.get("need_tool_chain").is_some()  { set_parts.push("need_tool_chain = $need_tool_chain".to_string()); }
+    if body.get("tool_chain_order").is_some() { set_parts.push("tool_chain_order = $tool_chain_order".to_string()); }
     if semantic_changed                     { set_parts.push("embedding = NONE".to_string()); }
 
     let query = format!(
@@ -109,9 +111,11 @@ pub async fn update(
     if let Some(v) = body["trigger"].as_str()        { qb = qb.bind(("trigger", v.to_string())); }
     if let Some(v) = body["behavior"].as_str()       { qb = qb.bind(("behavior", v.to_string())); }
     if let Some(v) = body["is_active"].as_bool()     { qb = qb.bind(("active", v)); }
-    if let Some(v) = body.get("tool_calls")          { qb = qb.bind(("tool_calls", v.clone())); }
-    if let Some(v) = body["injection_mode"].as_str() { qb = qb.bind(("injection_mode", v.to_string())); }
-    if let Some(v) = body["agent_scope"].as_str()    { qb = qb.bind(("agent_scope", v.to_string())); }
+    if let Some(v) = body.get("tool_calls")           { qb = qb.bind(("tool_calls", v.clone())); }
+    if let Some(v) = body["injection_mode"].as_str()  { qb = qb.bind(("injection_mode", v.to_string())); }
+    if let Some(v) = body["agent_scope"].as_str()     { qb = qb.bind(("agent_scope", v.to_string())); }
+    if let Some(v) = body["need_tool_chain"].as_bool(){ qb = qb.bind(("need_tool_chain", v)); }
+    if let Some(v) = body.get("tool_chain_order")     { qb = qb.bind(("tool_chain_order", v.clone())); }
 
     qb.await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

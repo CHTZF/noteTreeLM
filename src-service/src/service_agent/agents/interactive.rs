@@ -11,6 +11,7 @@ use super::super::engine::planner::Planner;
 use super::super::engine::tool_registry::ToolRegistry;
 use super::super::engine::transaction::Transaction;
 use super::super::types::{EmitEventFn, IsWriteFn, Tool};
+use super::super::helpers::MetaFunctionSpec;
 
 /// Public entry point called from routes/agents.rs for user-facing agent runs.
 /// Now receives raw input + thin params from Tauri; does all pre-processing here.
@@ -26,7 +27,7 @@ use super::super::types::{EmitEventFn, IsWriteFn, Tool};
 ///   agent:skill_suggestion → {query, response_preview}
 ///   agent:plan_announce    → {session_id, plan}
 ///   llm:done               → plain string (full response)
-pub async fn run_interactive_agent(
+pub(crate) async fn run_interactive_agent(
     state: ApiState,
     session_id: String,
     input: String,
@@ -42,72 +43,13 @@ pub async fn run_interactive_agent(
     // Memory facts pre-fetched by run_agent in parallel with skill_pass.
     // When Some, skip the in-body fetch (step 4b). When None, fetch here (legacy / direct callers).
     prefetched_memory: Option<(Vec<serde_json::Value>, Vec<String>)>,
+    // Session cancel flag and transaction — created in run_agent and passed in.
+    cancel: Arc<AtomicBool>,
+    tx: Arc<Transaction>,
+    // Pre-planner meta-functions generated from matched skills' tool_chain_order.
+    meta_functions: Vec<MetaFunctionSpec>,
 ) -> String {
     let conv_id = conversation_id;
-
-    // 0. Write-confirmation intercept:
-    //    If the same conversation already has a session with a Preparing transaction,
-    //    classify input intent and commit/cancel that transaction instead of
-    //    starting a new LLM round.
-    {
-        let pending_tx: Option<Arc<Transaction>> = {
-            let sessions = state.daemon.agent_sessions.lock().await;
-            sessions.get(&conv_id).and_then(|s| s.transaction.clone())
-        };
-        if let Some(pending) = pending_tx {
-            use super::super::engine::transaction::TransactionState;
-            if pending.state().await == TransactionState::Preparing {
-                let embed_fn: super::super::types::EmbedFn = {
-                    let client = reqwest::Client::new();
-                    let llm_url = state.daemon.llm_url.read().await.clone().unwrap_or_default();
-                    Arc::new(move |text: String| {
-                        let client = client.clone();
-                        let llm_url = llm_url.clone();
-                        Box::pin(async move {
-                            super::super::helpers::embed_text_llm(&client, &llm_url, &text).await
-                        })
-                    })
-                };
-                let classifier = super::super::engine::intent_classifier::IntentClassifier::new();
-                let intent = match super::super::engine::intent_classifier::IntentClassifier::compute_centroids_cached(
-                    &state.daemon.intent_centroids,
-                    &embed_fn,
-                ).await {
-                    Some((cc, ccl, ci)) => classifier.classify_with_centroids(&input, &embed_fn, &cc, &ccl, &ci).await,
-                    None => classifier.classify(&input).await,
-                };
-                use super::super::engine::intent_classifier::Intent;
-                match intent {
-                    Intent::Confirm => { let _ = pending.commit().await; }
-                    Intent::Cancel | Intent::Interrupt => { let _ = pending.cancel().await; }
-                    _ => {} // Unrelated new question — fall through to start a fresh LLM round
-                }
-                if matches!(intent, Intent::Confirm | Intent::Cancel | Intent::Interrupt) {
-                    return String::new();
-                }
-            }
-        }
-    }
-
-    // 1. Register session in map (keyed by conversation_id).
-    //    If a previous session for this conversation exists, cancel it first.
-    let cancel = Arc::new(AtomicBool::new(false));
-    let tx = Arc::new(Transaction::new());
-    {
-        let mut sessions = state.daemon.agent_sessions.lock().await;
-        if let Some(old) = sessions.get(&conv_id) {
-            old.cancel.store(true, Ordering::Relaxed);
-            if let Some(ref old_tx) = old.transaction {
-                let _ = old_tx.cancel().await;
-            }
-        }
-        sessions.insert(conv_id.clone(), AgentSession {
-            session_id: session_id.clone(),
-            cancel: Arc::clone(&cancel),
-            transaction: Some(Arc::clone(&tx)),
-            conversation_id: conv_id.clone(),
-        });
-    }
 
     // 2. Resolve llm_url
     let llm_url = match state.daemon.llm_url.read().await.clone() {
@@ -117,6 +59,8 @@ pub async fn run_interactive_agent(
             return String::new();
         }
     };
+
+    let mut tool_names = tool_names; // rebind as mutable for chain filtering below
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(300))
@@ -286,13 +230,30 @@ pub async fn run_interactive_agent(
         super::super::tools::vault_tools::is_interactive_write_tool(name)
     });
 
-    let registry = build_interactive_registry(
+    // Remove chain tools covered by meta-functions from the direct tool list.
+    let chain_tool_set: std::collections::HashSet<String> = meta_functions.iter()
+        .flat_map(|m| m.chain.iter().cloned())
+        .collect();
+    tool_names.retain(|t| !chain_tool_set.contains(t));
+
+    let mut registry = build_interactive_registry(
         &client, &llm_url, &state.db,
         &vault_id, &account_id, &vault_path, &embedding_url,
         &session_id, &state,
         Arc::clone(&tx),
         Arc::clone(&cancel),
     );
+
+    // Register pre-planner meta-function tools.
+    for spec in &meta_functions {
+        register_meta_fn_tool(
+            &mut registry, spec,
+            client.clone(), llm_url.clone(), state.db.clone(),
+            vault_id.clone(), account_id.clone(), vault_path.clone(),
+            embedding_url.clone(), state.clone(), session_id.clone(),
+            Arc::clone(&tx), Arc::clone(&cancel),
+        );
+    }
 
     let dispatcher = Dispatcher::new(
         Arc::new(registry),
@@ -301,11 +262,20 @@ pub async fn run_interactive_agent(
     );
 
     // 7. Tool loop or no-tool LLM
-    let tools_schema = super::super::tools::vault_tools::build_tools_schema_interactive(&tool_names);
+    // Exclude "think" from the main loop schema — it's handled in the pre-think block only.
+    let main_tool_names: Vec<String> = tool_names.iter()
+        .filter(|t| t.as_str() != "think")
+        .cloned()
+        .collect();
+    let mut tools_schema = super::super::tools::vault_tools::build_tools_schema_interactive(&main_tool_names);
+    // Append meta-function schemas so LLM sees them as callable tools.
+    for spec in &meta_functions {
+        tools_schema.push(build_meta_fn_schema(spec));
+    }
     let mut msgs = messages_json.clone();
     let mut full_response = String::new();
 
-    if !tool_names.is_empty() && !vault_path.is_empty() {
+    if (!tool_names.is_empty() || !meta_functions.is_empty()) && !vault_path.is_empty() {
         let tools_value = if tools_schema.is_empty() {
             None
         } else {
@@ -691,6 +661,76 @@ pub async fn run_agent(
     streaming: bool,
     activity_context: Option<String>,
 ) -> String {
+    let conv_id = &conversation_id;
+
+    // Derive session_id early (needed for session registration below).
+    let session_id = agent_def["session_id"].as_str()
+        .map(String::from)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // 0. Write-confirmation intercept: if the same conversation has a Preparing
+    //    transaction, classify input intent and commit/cancel it instead of
+    //    starting a new LLM round.
+    {
+        let pending_tx: Option<Arc<Transaction>> = {
+            let sessions = state.daemon.agent_sessions.lock().await;
+            sessions.get(conv_id).and_then(|s| s.transaction.clone())
+        };
+        if let Some(pending) = pending_tx {
+            use super::super::engine::transaction::TransactionState;
+            if pending.state().await == TransactionState::Preparing {
+                let embed_fn: super::super::types::EmbedFn = {
+                    let client = reqwest::Client::new();
+                    let llm_url = state.daemon.llm_url.read().await.clone().unwrap_or_default();
+                    Arc::new(move |text: String| {
+                        let client = client.clone();
+                        let llm_url = llm_url.clone();
+                        Box::pin(async move {
+                            super::super::helpers::embed_text_llm(&client, &llm_url, &text).await
+                        })
+                    })
+                };
+                let classifier = super::super::engine::intent_classifier::IntentClassifier::new();
+                let intent = match super::super::engine::intent_classifier::IntentClassifier::compute_centroids_cached(
+                    &state.daemon.intent_centroids,
+                    &embed_fn,
+                ).await {
+                    Some((cc, ccl, ci)) => classifier.classify_with_centroids(&input, &embed_fn, &cc, &ccl, &ci).await,
+                    None => classifier.classify(&input).await,
+                };
+                use super::super::engine::intent_classifier::Intent;
+                match intent {
+                    Intent::Confirm => { let _ = pending.commit().await; }
+                    Intent::Cancel | Intent::Interrupt => { let _ = pending.cancel().await; }
+                    _ => {}
+                }
+                if matches!(intent, Intent::Confirm | Intent::Cancel | Intent::Interrupt) {
+                    return String::new();
+                }
+            }
+        }
+    }
+
+    // 1. Register session (cancel flag + transaction).
+    //    Cancel any existing session for this conversation first.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let tx = Arc::new(Transaction::new());
+    {
+        let mut sessions = state.daemon.agent_sessions.lock().await;
+        if let Some(old) = sessions.get(conv_id) {
+            old.cancel.store(true, Ordering::Relaxed);
+            if let Some(ref old_tx) = old.transaction {
+                let _ = old_tx.cancel().await;
+            }
+        }
+        sessions.insert(conv_id.to_string(), AgentSession {
+            session_id: session_id.clone(),
+            cancel: Arc::clone(&cancel),
+            transaction: Some(Arc::clone(&tx)),
+            conversation_id: conv_id.to_string(),
+        });
+    }
+
     let system_prompt = agent_def["system_prompt"].as_str().unwrap_or("").to_string();
     let mut tool_names: Vec<String> = agent_def["tool_names"]
         .as_array()
@@ -736,10 +776,9 @@ pub async fn run_agent(
         }
     );
 
-    // Process skill pass result
-    let system_injection = if let Some(skill) = skill_result {
+    // Process skill pass result: extract system_injection and meta_functions.
+    let (system_injection, meta_functions) = if let Some(skill) = skill_result {
         if !skill.skill_titles.is_empty() && streaming {
-            let session_id = agent_def["session_id"].as_str().unwrap_or("");
             state.daemon.emit("agent:skills_activated", serde_json::json!({
                 "session_id": session_id,
                 "titles": skill.skill_titles,
@@ -763,14 +802,10 @@ pub async fn run_agent(
                 if !tool_names.contains(&t) { tool_names.push(t); }
             }
         }
-        skill.system_injection
+        (skill.system_injection, skill.meta_functions)
     } else {
-        String::new()
+        (String::new(), vec![])
     };
-
-    let session_id = agent_def["session_id"].as_str()
-        .map(String::from)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     run_interactive_agent(
         state,
@@ -786,5 +821,289 @@ pub async fn run_agent(
         vault_path,
         conversation_id,
         memory_facts,
+        cancel,
+        tx,
+        meta_functions,
     ).await
+}
+
+// ── Pre-planner chain execution ───────────────────────────────────────────────
+
+/// Returns all input params for a tool when it is the first step in a chain.
+fn meta_fn_tool_params(tool_name: &str) -> Vec<(&'static str, serde_json::Value)> {
+    match tool_name {
+        "search_vault" => vec![
+            ("query", json!({"type": "string", "description": "搜尋關鍵字"})),
+        ],
+        "open_note" => vec![
+            ("paths", json!({"type": "array", "items": {"type": "string"}, "description": "筆記路徑列表"})),
+        ],
+        "read_note" => vec![
+            ("path", json!({"type": "string", "description": "筆記路徑"})),
+        ],
+        "update_note" => vec![
+            ("path",    json!({"type": "string", "description": "筆記路徑"})),
+            ("content", json!({"type": "string", "description": "完整新內容"})),
+        ],
+        "append_to_note" => vec![
+            ("path",    json!({"type": "string", "description": "筆記路徑"})),
+            ("content", json!({"type": "string", "description": "要追加的內容"})),
+        ],
+        "delete_note" => vec![
+            ("path", json!({"type": "string", "description": "要刪除的筆記路徑"})),
+        ],
+        "update_note_frontmatter" => vec![
+            ("path",   json!({"type": "string", "description": "筆記路徑"})),
+            ("fields", json!({"type": "object", "description": "要更新的 frontmatter 鍵值對，例如 {\"tags\": [\"A\"], \"status\": \"done\"}"})),
+        ],
+        "list_structure" => vec![
+            ("path", json!({"type": "string", "description": "資料夾路徑"})),
+        ],
+        _ => vec![],
+    }
+}
+
+/// Returns only the params that cannot be derived from the previous chain step's result.
+/// These are the residual user-supplied params for non-first chain tools.
+fn meta_fn_residual_params(tool_name: &str) -> Vec<(&'static str, serde_json::Value)> {
+    match tool_name {
+        // path derived from search result — no residual
+        "open_note" | "read_note" | "delete_note" => vec![],
+        "append_to_note" => vec![
+            ("content", json!({"type": "string", "description": "要追加的內容"})),
+        ],
+        "update_note" => vec![
+            ("content", json!({"type": "string", "description": "完整新內容"})),
+        ],
+        "update_note_frontmatter" => vec![
+            ("fields", json!({"type": "object", "description": "要更新的 frontmatter 鍵值對，例如 {\"tags\": [\"A\"], \"status\": \"done\"}"})),
+        ],
+        _ => vec![],
+    }
+}
+
+/// Build the JSON schema for a meta-function.
+/// chain[0]'s params are always required; subsequent tools only expose residual params
+/// (those that cannot be derived from previous step results).
+fn build_meta_fn_schema(spec: &MetaFunctionSpec) -> serde_json::Value {
+    let mut properties = serde_json::Map::new();
+    let mut required: Vec<String> = vec![];
+
+    for (i, tool_name) in spec.chain.iter().enumerate() {
+        let params = if i == 0 {
+            meta_fn_tool_params(tool_name)
+        } else {
+            meta_fn_residual_params(tool_name)
+        };
+        for (param_name, param_schema) in params {
+            let key = format!("{}__{}", tool_name, param_name);
+            if i == 0 { required.push(key.clone()); }
+            properties.insert(key, param_schema);
+        }
+    }
+
+    json!({
+        "type": "function",
+        "function": {
+            "name": spec.fn_name,
+            "description": spec.description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required
+            }
+        }
+    })
+}
+
+/// Extract `tool_name__param` → `param` args for a specific tool from LLM-provided args.
+fn extract_user_tool_args(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
+    let prefix = format!("{}__", tool_name);
+    let mut result = serde_json::Map::new();
+    if let Some(obj) = args.as_object() {
+        for (k, v) in obj {
+            if let Some(param_name) = k.strip_prefix(&prefix) {
+                result.insert(param_name.to_string(), v.clone());
+            }
+        }
+    }
+    serde_json::Value::Object(result)
+}
+
+/// Derive `to_tool`'s input args from `from_tool`'s result and args.
+fn extract_chain_step_args(
+    from_tool: &str,
+    to_tool: &str,
+    from_result: &serde_json::Value,
+    from_args: &serde_json::Value,
+    user_args: &serde_json::Value,
+) -> serde_json::Value {
+    match (from_tool, to_tool) {
+        ("search_vault", "open_note") | ("list_structure", "open_note") => {
+            let paths: Vec<serde_json::Value> = from_result.as_array()
+                .map(|a| a.iter()
+                    .filter_map(|r| r["path"].as_str().map(|p| json!(p)))
+                    .take(1).collect())
+                .unwrap_or_default();
+            json!({"paths": paths})
+        }
+        ("search_vault", "read_note") | ("list_structure", "read_note") => {
+            let path = from_result.as_array()
+                .and_then(|a| a.first())
+                .and_then(|r| r["path"].as_str())
+                .unwrap_or("");
+            json!({"path": path})
+        }
+        ("read_note", "update_note") => {
+            let path = from_args["path"].as_str().unwrap_or("");
+            let content = user_args["update_note__content"].as_str().unwrap_or("");
+            json!({"path": path, "content": content})
+        }
+        ("search_vault", "update_note") => {
+            let path = from_result.as_array()
+                .and_then(|a| a.first())
+                .and_then(|r| r["path"].as_str())
+                .unwrap_or("");
+            let content = user_args["update_note__content"].as_str().unwrap_or("");
+            json!({"path": path, "content": content})
+        }
+        ("search_vault", "append_to_note") | ("list_structure", "append_to_note") => {
+            let path = from_result.as_array()
+                .and_then(|a| a.first())
+                .and_then(|r| r["path"].as_str())
+                .unwrap_or("");
+            let content = user_args["append_to_note__content"].as_str().unwrap_or("");
+            json!({"path": path, "content": content})
+        }
+        ("search_vault", "delete_note") | ("list_structure", "delete_note") => {
+            let path = from_result.as_array()
+                .and_then(|a| a.first())
+                .and_then(|r| r["path"].as_str())
+                .unwrap_or("");
+            json!({"path": path})
+        }
+        ("search_vault", "update_note_frontmatter") | ("list_structure", "update_note_frontmatter") => {
+            let path = from_result.as_array()
+                .and_then(|a| a.first())
+                .and_then(|r| r["path"].as_str())
+                .unwrap_or("");
+            let fields = user_args["update_note_frontmatter__fields"].clone();
+            json!({"path": path, "fields": fields})
+        }
+        _ => json!({}),
+    }
+}
+
+/// True when a tool result counts as "empty" and chain execution should return fallback_msg.
+fn chain_result_is_empty(result: &serde_json::Value, tool_name: &str) -> bool {
+    match tool_name {
+        "search_vault" | "list_structure" => {
+            result.as_array().map(|a| a.is_empty()).unwrap_or(true)
+        }
+        _ => false,
+    }
+}
+
+/// Build and register a pre-planner meta-function tool into the registry.
+/// The closure executes the chain deterministically, starting from the last tool
+/// whose params are satisfied and falling back toward the first if needed.
+#[allow(clippy::too_many_arguments)]
+fn register_meta_fn_tool(
+    registry: &mut super::super::engine::tool_registry::ToolRegistry,
+    spec: &MetaFunctionSpec,
+    client: reqwest::Client,
+    llm_url: String,
+    db: crate::db::SurrealDb,
+    vault_id: String,
+    account_id: String,
+    vault_path: String,
+    embedding_url: Option<String>,
+    state: crate::api_state::ApiState,
+    session_id: String,
+    _tx: Arc<Transaction>,
+    _cancel: Arc<AtomicBool>,
+) {
+    let chain = spec.chain.clone();
+    let fallback_msg = spec.fallback_msg.clone();
+    let fn_name = spec.fn_name.clone();
+
+    let execute: super::super::types::ToolFn = Arc::new(move |args: serde_json::Value| {
+        let chain = chain.clone();
+        let fallback_msg = fallback_msg.clone();
+        let client = client.clone();
+        let llm_url = llm_url.clone();
+        let db = db.clone();
+        let vault_id = vault_id.clone();
+        let account_id = account_id.clone();
+        let vault_path = vault_path.clone();
+        let embedding_url = embedding_url.clone();
+        let state = state.clone();
+        let session_id = session_id.clone();
+
+        Box::pin(async move {
+            if chain.is_empty() {
+                return Ok(json!(fallback_msg));
+            }
+
+            // Always execute the chain from step 0. chain[0]'s args come from LLM;
+            // subsequent steps derive their args deterministically from previous results.
+            let mut prev_result: Option<serde_json::Value> = None;
+            let mut prev_args = serde_json::Value::Null;
+
+            for i in 0..chain.len() {
+                let tool_name = &chain[i];
+
+                let tool_args = if i == 0 {
+                    extract_user_tool_args(tool_name, &args)
+                } else {
+                    extract_chain_step_args(
+                        &chain[i - 1],
+                        tool_name,
+                        prev_result.as_ref().unwrap(),
+                        &prev_args,
+                        &args,
+                    )
+                };
+
+                let result = super::super::tools::vault_tools::dispatch_interactive_tool(
+                    &client, &llm_url, &db,
+                    &vault_id, &account_id, &vault_path, &embedding_url,
+                    tool_name, &tool_args,
+                ).await;
+
+                match result {
+                    Ok((v, _rollback)) => {
+                        // Empty search result mid-chain → return fallback immediately.
+                        if chain_result_is_empty(&v, tool_name) && i < chain.len() - 1 {
+                            return Ok(json!(fallback_msg));
+                        }
+                        // Emit note_refs / open_note SSE events for relevant tools.
+                        let refs = super::super::tools::vault_tools::extract_note_refs(
+                            tool_name, &tool_args, &v, &vault_path,
+                        );
+                        if !refs.is_empty() {
+                            state.daemon.emit("agent:note_refs", json!({
+                                "session_id": session_id,
+                                "paths": refs,
+                            }));
+                        }
+                        if tool_name == "open_note" {
+                            let paths: Vec<serde_json::Value> = tool_args["paths"].as_array()
+                                .cloned()
+                                .unwrap_or_else(|| tool_args["path"].as_str()
+                                    .map(|p| vec![json!(p)]).unwrap_or_default());
+                            state.daemon.emit("agent:open_note", json!(paths));
+                        }
+                        prev_args = tool_args;
+                        prev_result = Some(v);
+                    }
+                    Err(_) => return Ok(json!(fallback_msg)),
+                }
+            }
+
+            Ok(prev_result.unwrap_or(json!(fallback_msg)))
+        })
+    });
+
+    registry.register(fn_name, Tool { execute, rollback: None });
 }

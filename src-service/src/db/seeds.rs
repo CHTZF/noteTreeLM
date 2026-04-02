@@ -68,8 +68,8 @@ const SKILLS: &[BuiltinSkill] = &[
         trigger: "在筆記末尾加、補充內容、追加到筆記、把這個加進去、加到筆記裡、繼續寫到某篇、append to note、add to note、在後面加上、補上去、加一段、繼續記錄、把這段加進",
         behavior: "步驟1：呼叫 search_vault 取得目標筆記的精確路徑。步驟2：呼叫 plan_announce，說明要追加的內容，deferred_tools 填 append_to_note。步驟3：使用者確認後，呼叫 append_to_note（path 使用步驟1的路徑，content 為要追加的文字，會自動加在末尾不覆蓋原有內容）。",
         tools: &["search_vault", "append_to_note", "plan_announce"],
-        need_tool_chain: false,
-        tool_chain_order: &[],
+        need_tool_chain: true,
+        tool_chain_order: &["search_vault", "append_to_note"],
         injection_mode: "passive",
     },
     BuiltinSkill {
@@ -108,8 +108,8 @@ const SKILLS: &[BuiltinSkill] = &[
         trigger: "刪除筆記、移除文件、把某篇刪掉、刪掉這個筆記、清除某個文件、delete note、remove note、trash note、把這篇刪了、幫我刪、不要那篇了、刪除這份文件、清掉",
         behavior: "步驟1：呼叫 search_vault 確認要刪除的筆記精確路徑。步驟2：呼叫 plan_announce，明確告知使用者「將永久刪除 [路徑]，此操作不可復原」，deferred_tools 填 delete_note。步驟3：等使用者明確確認後才呼叫 delete_note。若使用者取消則不執行。",
         tools: &["search_vault", "delete_note", "plan_announce"],
-        need_tool_chain: false,
-        tool_chain_order: &[],
+        need_tool_chain: true,
+        tool_chain_order: &["search_vault", "delete_note"],
         injection_mode: "passive",
     },
     BuiltinSkill {
@@ -218,8 +218,8 @@ const SKILLS: &[BuiltinSkill] = &[
         trigger: "更新標籤、修改屬性、加上標籤、改狀態、標記已完成、更新 frontmatter、add tag、update status、mark as done、幫我加個標籤、把這篇標記為、更新筆記的 tags、改一下 status、幫我更新屬性、修改 metadata、設定優先級",
         behavior: "步驟1：若路徑不確定，呼叫 search_vault 取得目標筆記的精確路徑。步驟2：確認要更新的欄位（如 tags、status、priority、due_date 等）與新值。步驟3：呼叫 update_note_frontmatter（path 填精確路徑，fields 填要更新的鍵值對）。步驟4：回覆使用者已更新的欄位與新值。",
         tools: &["search_vault", "update_note_frontmatter"],
-        need_tool_chain: false,
-        tool_chain_order: &[],
+        need_tool_chain: true,
+        tool_chain_order: &["search_vault", "update_note_frontmatter"],
         injection_mode: "passive",
     },
     BuiltinSkill {
@@ -460,17 +460,19 @@ const AGENTS: &[BuiltinAgent] = &[
 /// 若此 account 已有 builtin 資料則直接回傳（幂等）。
 /// 強制重建請傳 force = true（目前預留，呼叫端永遠傳 false）。
 pub async fn seed_builtins(db: &SurrealDb, account_id: &str) {
-    // 幂等判斷：已有 builtin skill 則跳過
+    // 幂等判斷：count 必須等於 SKILLS.len() 才跳過；少一個就重建
     #[derive(serde::Deserialize)]
     struct CountRow { count: i64 }
     if let Ok(mut r) = db.query(
         "SELECT count() AS count FROM agent_skills WHERE account_id = $aid AND knowledge_item_id = '__builtin__' GROUP ALL"
     ).bind(("aid", account_id.to_string())).await {
         let rows: Vec<CountRow> = r.take(0).unwrap_or_default();
-        if rows.into_iter().next().map(|r| r.count).unwrap_or(0) > 0 {
-            tracing::debug!("seed_builtins: account {} already seeded, skipping", account_id);
+        let existing = rows.into_iter().next().map(|r| r.count).unwrap_or(0) as usize;
+        if existing == SKILLS.len() {
+            tracing::debug!("seed_builtins: account {} already seeded ({} skills), skipping", account_id, existing);
             return;
         }
+        tracing::info!("seed_builtins: account {} has {}/{} builtin skills, rebuilding", account_id, existing, SKILLS.len());
     }
 
     let now = Utc::now().timestamp();

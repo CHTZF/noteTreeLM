@@ -8,6 +8,31 @@ pub(crate) struct SkillPassResult {
     pub system_injection: String,
     pub skill_titles: Vec<String>,
     pub skill_ids: Vec<String>,
+    pub meta_functions: Vec<MetaFunctionSpec>,
+}
+
+/// A pre-planned tool chain exposed to LLM as a single callable function.
+/// LLM provides all possible params upfront; execution starts from the last
+/// tool whose params are satisfied and falls back to earlier tools as needed.
+#[derive(Clone)]
+pub(crate) struct MetaFunctionSpec {
+    pub fn_name: String,
+    pub description: String,
+    pub chain: Vec<String>,
+    pub fallback_msg: String,
+}
+
+fn sanitize_skill_fn_name(title: &str, skill_id: &str) -> String {
+    let ascii: String = title.chars().map(|c| {
+        if c.is_ascii_alphanumeric() { c } else { '_' }
+    }).collect::<String>();
+    let clean = ascii.trim_matches('_');
+    if clean.len() < 2 {
+        let safe_id: String = skill_id.chars().map(|c| if c == '-' { '_' } else { c }).collect();
+        format!("skill_{}", &safe_id[..safe_id.len().min(12)])
+    } else {
+        format!("skill_{}", clean)
+    }
 }
 
 /// Keyword fallback: filter active skills by trigger keywords in input.
@@ -109,6 +134,7 @@ pub(crate) async fn run_skill_pass(
             system_injection: String::new(),
             skill_titles: vec![],
             skill_ids: vec![],
+            meta_functions: vec![],
         };
     }
 
@@ -131,15 +157,29 @@ pub(crate) async fn run_skill_pass(
         }
     }
 
-    let skill_text: String = matched.iter()
-        .filter(|(_, _, beh, _, _, _, mode)| !beh.is_empty() && mode != "proactive")
-        .map(|(_, title, beh, _, need_chain, chain_order, _)| {
-            if *need_chain && !chain_order.is_empty() {
-                format!("[技能：{}]\n{}\n工具執行順序：{}", title, beh, chain_order.join(" → "))
-            } else {
-                format!("[技能：{}]\n{}", title, beh)
-            }
+    // Generate meta-functions for skills with tool_chain_order.
+    // These become single callable functions for LLM instead of individual tools.
+    let meta_functions: Vec<MetaFunctionSpec> = matched.iter()
+        .filter(|(_, _, _, _, need_chain, chain_order, _)| *need_chain && !chain_order.is_empty())
+        .map(|(skill_id, title, behavior, _, _, chain_order, _)| MetaFunctionSpec {
+            fn_name: sanitize_skill_fn_name(title, skill_id),
+            description: behavior.clone(),
+            chain: chain_order.clone(),
+            fallback_msg: "找不到相關內容，請換個說法再試試。".to_string(),
         })
+        .collect();
+
+    // Chain tools are exposed via meta-functions; exclude them from direct tool list.
+    let chain_tool_set: std::collections::HashSet<String> = meta_functions.iter()
+        .flat_map(|m| m.chain.iter().cloned())
+        .collect();
+
+    // Non-chain skills go into skill_text (system injection).
+    let skill_text: String = matched.iter()
+        .filter(|(_, _, beh, _, need_chain, chain_order, mode)| {
+            !beh.is_empty() && mode != "proactive" && !(*need_chain && !chain_order.is_empty())
+        })
+        .map(|(_, title, beh, _, _, _, _)| format!("[技能：{}]\n{}", title, beh))
         .collect::<Vec<_>>().join("\n\n");
 
     let mut injection_parts: Vec<String> = vec![];
@@ -148,7 +188,10 @@ pub(crate) async fn run_skill_pass(
     if !skill_text.is_empty() { injection_parts.push(skill_text.chars().take(1500).collect()); }
 
     let mut tool_names: Vec<String> = matched.iter()
-        .flat_map(|(_, _, _, tc, _, _, _)| tc.clone())
+        .flat_map(|(_, _, _, tc, need_chain, chain_order, _)| {
+            if *need_chain && !chain_order.is_empty() { vec![] } else { tc.clone() }
+        })
+        .filter(|t| !chain_tool_set.contains(t))
         .collect::<std::collections::HashSet<_>>()
         .into_iter().collect();
     tool_names.sort();
@@ -158,5 +201,6 @@ pub(crate) async fn run_skill_pass(
         system_injection: injection_parts.join("\n\n"),
         skill_titles: matched.iter().map(|(_, t, _, _, _, _, _)| t.clone()).collect(),
         skill_ids: matched.iter().map(|(id, _, _, _, _, _, _)| id.clone()).collect(),
+        meta_functions,
     }
 }
