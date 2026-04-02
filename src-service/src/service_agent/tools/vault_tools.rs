@@ -614,16 +614,22 @@ pub(crate) async fn dispatch_interactive_tool(
             let title = args["title"].as_str().unwrap_or("").to_string();
             let trigger = args["trigger"].as_str().unwrap_or("").to_string();
             let behavior = args["behavior"].as_str().unwrap_or("").to_string();
-            let tool_calls: Option<Value> = args.get("tool_calls").cloned();
-            let injection_mode = args["injection_mode"].as_str().unwrap_or("system").to_string();
+            let injection_mode = args["injection_mode"].as_str().unwrap_or("passive").to_string();
             let skill_id = uuid::Uuid::new_v4().to_string();
             let now = chrono::Utc::now().timestamp();
-            db.query("INSERT INTO agent_skills (skill_id, account_id, title, trigger, behavior, tool_calls, is_active, trigger_count, injection_mode, created_at) VALUES ($sid, $aid, $title, $trigger, $behavior, $tc, true, 0, $imode, $now)")
+            db.query("INSERT INTO agent_skills (skill_id, account_id, title, trigger, behavior, is_active, trigger_count, injection_mode, created_at) VALUES ($sid, $aid, $title, $trigger, $behavior, true, 0, $imode, $now)")
                 .bind(("sid", skill_id.clone())).bind(("aid", account_id.to_string()))
                 .bind(("title", title)).bind(("trigger", trigger)).bind(("behavior", behavior))
-                .bind(("tc", tool_calls)).bind(("imode", injection_mode)).bind(("now", now))
+                .bind(("imode", injection_mode)).bind(("now", now))
                 .await
                 .map_err(|e| e.to_string())?;
+            // Trigger embedding in background so the new skill is searchable immediately.
+            let db_c = db.clone();
+            let aid = account_id.to_string();
+            let eu = embedding_url.clone();
+            tokio::spawn(async move {
+                crate::db::seeds::embed_skills_for_account(&db_c, &aid, &eu).await;
+            });
             Ok((json!({ "ok": true, "skill_id": skill_id }), None))
         }
 
@@ -768,13 +774,12 @@ pub(crate) fn build_tools_schema_interactive(tool_names: &[String]) -> Vec<Value
         }}),
         json!({ "type": "function", "function": {
             "name": "create_agent_skill",
-            "description": "建立新的 agent 技能，學習如何處理特定類型的任務",
+            "description": "建立新的 agent 技能。behavior 欄位用自然語言描述，工具鏈用 @[tool_name] 標記（如 @[search_vault] 找筆記後 @[update_note] 更新）。",
             "parameters": { "type": "object", "properties": {
                 "title":          { "type": "string", "description": "技能名稱" },
-                "trigger":        { "type": "string", "description": "觸發條件描述" },
-                "behavior":       { "type": "string", "description": "行為描述（注入到 system prompt 的文字）" },
-                "injection_mode": { "type": "string", "description": "注入模式：system / active / proactive / passive" },
-                "tool_calls":     { "type": "array",  "items": { "type": "string" }, "description": "此技能需要的工具列表" }
+                "trigger":        { "type": "string", "description": "觸發關鍵詞，多個以逗號分隔" },
+                "behavior":       { "type": "string", "description": "行為描述；工具鏈以 @[tool_name] 標記順序，例如：先 @[search_vault] 搜尋，再 @[plan_announce] 確認，最後 @[update_note] 更新" },
+                "injection_mode": { "type": "string", "description": "passive（依關鍵字觸發）/ active（每次觸發）/ proactive（背景預載）" }
             }, "required": ["title", "trigger", "behavior"] }
         }}),
         // ── Memory agent tools ───────────────────────────────────────────────
