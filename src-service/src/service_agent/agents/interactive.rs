@@ -922,7 +922,7 @@ fn build_meta_fn_schema(spec: &MetaFunctionSpec) -> serde_json::Value {
 }
 
 /// Extract `tool_name__param` → `param` args for a specific tool from LLM-provided args.
-fn extract_user_tool_args(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn extract_user_tool_args(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
     let prefix = format!("{}__", tool_name);
     let mut result = serde_json::Map::new();
     if let Some(obj) = args.as_object() {
@@ -936,7 +936,7 @@ fn extract_user_tool_args(tool_name: &str, args: &serde_json::Value) -> serde_js
 }
 
 /// Derive `to_tool`'s input args from `from_tool`'s result and args.
-fn extract_chain_step_args(
+pub(crate) fn extract_chain_step_args(
     from_tool: &str,
     to_tool: &str,
     from_result: &serde_json::Value,
@@ -999,15 +999,6 @@ fn extract_chain_step_args(
     }
 }
 
-/// True when a tool result counts as "empty" and chain execution should return fallback_msg.
-fn chain_result_is_empty(result: &serde_json::Value, tool_name: &str) -> bool {
-    match tool_name {
-        "search_vault" | "list_structure" => {
-            result.as_array().map(|a| a.is_empty()).unwrap_or(true)
-        }
-        _ => false,
-    }
-}
 
 /// When use_skill_pass is true but no skill matched the user's input,
 /// inject a skill-discovery prompt so LLM can guide the user to select an
@@ -1070,9 +1061,8 @@ async fn build_skill_discovery_injection(db: &crate::db::SurrealDb, account_id: 
     )
 }
 
-/// Build and register a pre-planner meta-function tool into the registry.
-/// The closure executes the chain deterministically, starting from the last tool
-/// whose params are satisfied and falling back toward the first if needed.
+/// Register a meta-function tool whose execution is a deterministic ToolGraph
+/// built by Planner::plan_from_meta_function and run by the shared Dispatcher.
 #[allow(clippy::too_many_arguments)]
 fn register_meta_fn_tool(
     registry: &mut super::super::engine::tool_registry::ToolRegistry,
@@ -1087,7 +1077,7 @@ fn register_meta_fn_tool(
     state: crate::api_state::ApiState,
     session_id: String,
     tx: Arc<Transaction>,
-    _cancel: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
 ) {
     let chain = spec.chain.clone();
     let fallback_msg = spec.fallback_msg.clone();
@@ -1106,98 +1096,52 @@ fn register_meta_fn_tool(
         let state = state.clone();
         let session_id = session_id.clone();
         let tx = tx.clone();
+        let cancel = cancel.clone();
 
         Box::pin(async move {
             if chain.is_empty() {
                 return Ok(json!(fallback_msg));
             }
 
-            // Always execute the chain from step 0. chain[0]'s args come from LLM;
-            // subsequent steps derive their args deterministically from previous results.
-            // prev_tool_name tracks the last *effective* tool (plan_announce is skipped).
-            let mut prev_result: Option<serde_json::Value> = None;
-            let mut prev_args = serde_json::Value::Null;
-            let mut prev_tool_name = String::new();
+            // Build a dedicated registry + dispatcher for this chain execution.
+            // The registry already has all vault tools registered via build_interactive_registry.
+            let chain_registry = build_interactive_registry(
+                &client, &llm_url, &db,
+                &vault_id, &account_id, &vault_path, &embedding_url,
+                &session_id, &state,
+                Arc::clone(&tx),
+                Arc::clone(&cancel),
+            );
 
-            for i in 0..chain.len() {
-                let tool_name = &chain[i];
-
-                // plan_announce checkpoint: emit plan summary, wait for user confirmation.
-                // Subsequent write tools in the same chain are pre-approved.
-                // Does not update prev_result/prev_args/prev_tool_name.
-                if tool_name == "plan_announce" {
-                    let remaining: Vec<&str> = chain[i + 1..].iter()
-                        .filter(|t| t.as_str() != "plan_announce")
-                        .map(|s| s.as_str())
-                        .collect();
-                    let plan_text = if remaining.is_empty() {
-                        "執行此操作".to_string()
-                    } else {
-                        format!("即將執行：{}", remaining.join(" → "))
-                    };
-                    state.daemon.emit("agent:write_request", json!({
-                        "session_id": session_id,
-                        "display": plan_text,
-                    }));
-                    match tx.prepare().await {
-                        Err(_) => return Ok(json!(fallback_msg)),
-                        Ok(rx) => match rx.await {
-                            Ok(true) => { tx.pre_approve(); continue; }
-                            _ => return Ok(json!(fallback_msg)),
-                        }
+            let emit_fn: EmitEventFn = {
+                let state_c = state.clone();
+                let sid = session_id.clone();
+                Arc::new(move |event: String, mut payload: serde_json::Value| {
+                    if let serde_json::Value::Object(ref mut m) = payload {
+                        m.insert("session_id".to_string(), json!(sid));
                     }
-                }
+                    state_c.daemon.emit(&event, payload);
+                })
+            };
+            let is_write_fn: IsWriteFn = Arc::new(|name: &str| {
+                super::super::tools::vault_tools::is_interactive_write_tool(name)
+            });
 
-                let tool_args = if prev_result.is_none() {
-                    extract_user_tool_args(tool_name, &args)
-                } else {
-                    extract_chain_step_args(
-                        &prev_tool_name,
-                        tool_name,
-                        prev_result.as_ref().unwrap(),
-                        &prev_args,
-                        &args,
-                    )
-                };
+            let dispatcher = super::super::engine::dispatcher::Dispatcher::new(
+                Arc::new(chain_registry),
+                emit_fn,
+                is_write_fn,
+            );
 
-                let result = super::super::tools::vault_tools::dispatch_interactive_tool(
-                    &client, &llm_url, &db,
-                    &vault_id, &account_id, &vault_path, &embedding_url,
-                    tool_name, &tool_args,
-                ).await;
+            // Planner builds the ToolGraph: chain[0] uses LLM args directly;
+            // subsequent nodes have arg_resolver closures derived from prev results;
+            // plan_announce nodes become is_chain_gate = true checkpoints.
+            let graph = super::super::engine::planner::Planner::plan_from_meta_function(&chain, &args);
 
-                match result {
-                    Ok((v, _rollback)) => {
-                        // Empty search result mid-chain → return fallback immediately.
-                        if chain_result_is_empty(&v, tool_name) && i < chain.len() - 1 {
-                            return Ok(json!(fallback_msg));
-                        }
-                        // Emit note_refs / open_note SSE events for relevant tools.
-                        let refs = super::super::tools::vault_tools::extract_note_refs(
-                            tool_name, &tool_args, &v, &vault_path,
-                        );
-                        if !refs.is_empty() {
-                            state.daemon.emit("agent:note_refs", json!({
-                                "session_id": session_id,
-                                "paths": refs,
-                            }));
-                        }
-                        if tool_name == "open_note" {
-                            let paths: Vec<serde_json::Value> = tool_args["paths"].as_array()
-                                .cloned()
-                                .unwrap_or_else(|| tool_args["path"].as_str()
-                                    .map(|p| vec![json!(p)]).unwrap_or_default());
-                            state.daemon.emit("agent:open_note", json!(paths));
-                        }
-                        prev_tool_name = tool_name.clone();
-                        prev_args = tool_args;
-                        prev_result = Some(v);
-                    }
-                    Err(_) => return Ok(json!(fallback_msg)),
-                }
+            match dispatcher.run(Arc::clone(&tx), graph).await {
+                Ok(results) => Ok(results.into_iter().last().unwrap_or(json!(fallback_msg))),
+                Err(_) => Ok(json!(fallback_msg)),
             }
-
-            Ok(prev_result.unwrap_or(json!(fallback_msg)))
         })
     });
 
