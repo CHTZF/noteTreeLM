@@ -244,12 +244,9 @@ pub(crate) async fn run_interactive_agent(
         Arc::clone(&cancel),
     );
 
-    // Build a lookup map: meta_function fn_name → MetaFunctionSpec
-    // Used at tool-call time to expand chain into a flat ToolGraph.
-    let meta_fn_map: std::collections::HashMap<String, MetaFunctionSpec> = meta_functions
-        .iter()
-        .map(|s| (s.fn_name.clone(), s.clone()))
-        .collect();
+    // If meta_functions exist, LLM schema only contains them → tool loop always
+    // expands via plan_from_meta_function. Determined once before the loop.
+    let has_meta = !meta_functions.is_empty();
 
     let dispatcher = Dispatcher::new(
         Arc::new(registry),
@@ -369,19 +366,25 @@ pub(crate) async fn run_interactive_agent(
                 })).collect();
                 msgs.push(json!({ "role": "assistant", "content": null, "tool_calls": tc_json }));
 
-                // If any call is a meta_function, expand its chain into a flat graph.
-                // Only one meta_function is expected per round (skill pre-pass ensures this).
-                let (graph, result_mapping) =
-                    if let Some((idx, spec)) = tool_chunks.iter().enumerate()
-                        .find_map(|(i, tc)| meta_fn_map.get(&tc.1).map(|s| (i, s)))
-                    {
-                        let user_args: Value = serde_json::from_str(&tool_chunks[idx].2)
-                            .unwrap_or(json!({}));
-                        let g = Planner::plan_from_meta_function(&spec.chain, &user_args);
-                        (g, Some((idx, tool_chunks[idx].0.clone(), tool_chunks[idx].1.clone())))
+                // meta_functions path: LLM called a skill meta-function → expand chain
+                // into a flat ToolGraph. has_meta is fixed before the loop (pre-pass result).
+                let (graph, tc_id, tc_name) = if has_meta {
+                    let tc = &tool_chunks[0];
+                    let spec = meta_functions.iter().find(|s| s.fn_name == tc.1);
+                    let (chain, fallback) = spec
+                        .map(|s| (s.chain.as_slice(), s.fallback_msg.as_str()))
+                        .unwrap_or((&[], "找不到相關內容"));
+                    let user_args: Value = serde_json::from_str(&tc.2).unwrap_or(json!({}));
+                    let g = if chain.is_empty() {
+                        Planner::plan_from_chunks(&tool_chunks)
                     } else {
-                        (Planner::plan_from_chunks(&tool_chunks), None)
+                        Planner::plan_from_meta_function(chain, &user_args)
                     };
+                    let _ = fallback;
+                    (g, Some(tc.0.clone()), Some(tc.1.clone()))
+                } else {
+                    (Planner::plan_from_chunks(&tool_chunks), None, None)
+                };
 
                 let results = match dispatcher.run(Arc::clone(&tx), graph).await {
                     Ok(r) => r,
@@ -391,20 +394,15 @@ pub(crate) async fn run_interactive_agent(
                     }
                 };
 
-                // For meta_function: map the last chain result back to the original call id.
-                let tool_messages = if let Some((_, tc_id, tc_name)) = result_mapping {
+                // meta_function: map last chain result back to the original tool_call_id.
+                let tool_messages = if let (Some(id), Some(name)) = (tc_id, tc_name) {
                     let content = results.into_iter().last()
                         .map(|v| match v {
                             Value::String(s) => s,
                             other => serde_json::to_string(&other).unwrap_or_default(),
                         })
                         .unwrap_or_default();
-                    vec![json!({
-                        "role": "tool",
-                        "tool_call_id": tc_id,
-                        "name": tc_name,
-                        "content": content,
-                    })]
+                    vec![json!({ "role": "tool", "tool_call_id": id, "name": name, "content": content })]
                 } else {
                     Planner::results_to_messages(&tool_chunks, results)
                 };
