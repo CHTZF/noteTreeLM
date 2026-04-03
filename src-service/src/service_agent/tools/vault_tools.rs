@@ -830,13 +830,6 @@ pub(crate) fn build_tools_schema_interactive(tool_names: &[String]) -> Vec<Value
             }, "required": ["name", "input"] }
         }}),
         json!({ "type": "function", "function": {
-            "name": "think",
-            "description": "輸出一句內心獨白（10字以內），在呼叫工具前描述正在想什麼",
-            "parameters": { "type": "object", "properties": {
-                "thought": { "type": "string", "description": "內心獨白" }
-            }, "required": ["thought"] }
-        }}),
-        json!({ "type": "function", "function": {
             "name": "live_respond",
             "description": "輸出語音助理的最終口語回覆（live chat 專用，呼叫後對話結束）",
             "parameters": { "type": "object", "properties": {

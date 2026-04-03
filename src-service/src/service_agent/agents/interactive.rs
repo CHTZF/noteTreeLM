@@ -958,7 +958,6 @@ async fn build_skill_discovery_injection(db: &crate::db::SurrealDb, account_id: 
         "@[update_note_frontmatter] — 更新 frontmatter 欄位",
         "@[plan_announce]     — 宣告計畫並等待使用者確認後繼續",
         "@[web_search]        — 網路搜尋",
-        "@[think]             — 推理思考（不呼叫外部工具）",
         "@[prefetch_memory]   — 預先載入相關記憶（proactive 模式專用）",
     ];
 
