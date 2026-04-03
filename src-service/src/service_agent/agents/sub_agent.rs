@@ -14,7 +14,6 @@ pub(crate) async fn run_sub_agent(
     state: &ApiState,
     vault_id: &str,
     account_id: &str,
-    vault_path: &str,
     parent_session_id: &str,
     agent_name: &str,
     agent_def: serde_json::Value,
@@ -36,7 +35,6 @@ pub(crate) async fn run_sub_agent(
         input.to_string(),
         vault_id.to_string(),
         account_id.to_string(),
-        vault_path.to_string(),
         conversation_id,
         false, // silent — parent is already streaming
         None,

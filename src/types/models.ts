@@ -103,11 +103,8 @@ export interface AgentSkillSuggestion {
   title: string
   trigger: string
   behavior: string
-  tool_calls: string[]
   injection_mode?: 'passive' | 'active'
   agent_scope?: AgentScope
-  need_tool_chain?: boolean
-  tool_chain_order?: string[]
 }
 
 /** 持久化後的技能規範（從 DB 讀取） */
@@ -118,13 +115,11 @@ export interface AgentSkill {
   title: string
   trigger: string
   behavior: string
-  tool_calls: string[]
+  tool_calls?: string[]   // legacy field, superseded by @[tool_name] in behavior
   is_active: boolean
   injection_mode: 'passive' | 'active'  // 被動取用 | 主動注入
   agent_scope: AgentScope               // 適用的 agent 範圍
-  need_tool_chain: boolean
-  tool_chain_order: string[]
   trigger_count: number
-  last_triggered_at: number | null  // ms timestamp，null = 從未觸發
+  last_triggered_at: number | null  // Unix seconds，null = 從未觸發
   created_at: number
 }

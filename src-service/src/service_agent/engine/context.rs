@@ -177,66 +177,27 @@ pub(crate) async fn build_messages(
 }
 
 /// Stage 2: Append memory facts to the system message.
-/// Uses pre-fetched facts if provided; otherwise fetches inline.
-pub(crate) async fn inject_memory(
-    msgs: &mut Vec<Value>,
-    client: &reqwest::Client,
-    embedding_url: &Option<String>,
-    db: &SurrealDb,
-    vault_id: &str,
-    account_id: &str,
-    input: &str,
-    prefetched: Option<(Vec<Value>, Vec<String>)>,
-    streaming: bool,
-    emit: &impl Fn(Vec<String>),
-) {
-    if vault_id.is_empty() || account_id.is_empty() { return; }
-
-    let (facts, fact_ids) = if let Some(pre) = prefetched {
-        pre
-    } else {
-        let keywords: Vec<String> = input.split_whitespace()
-            .filter(|w| w.chars().count() >= 2)
-            .take(5)
-            .map(String::from)
-            .collect();
-        let facts = vault_query_memory_with_limit(
-            client, embedding_url, db, vault_id, account_id, &keywords, 6,
-        ).await;
-        let fact_ids: Vec<String> = facts.iter()
-            .filter_map(|f| f["fact_id"].as_str().filter(|s| !s.is_empty()))
-            .map(|fid| format!("memory:{}:{}", vault_id, fid))
-            .collect();
-        (facts, fact_ids)
-    };
-
-    if !facts.is_empty() {
-        let mem_block = format!("\n\n## 相關記憶\n{}",
-            facts.iter().map(|f| format!("[{}] {}",
-                f["category"].as_str().unwrap_or("general"),
-                f["content"].as_str().unwrap_or("")
-            )).collect::<Vec<_>>().join("\n")
-        );
-        if let Some(sys) = msgs.first_mut().filter(|m| m["role"].as_str() == Some("system")) {
-            let old = sys["content"].as_str().unwrap_or("").to_string();
-            sys["content"] = json!(format!("{}{}", old, mem_block));
-        }
-    }
-    if streaming {
-        emit(fact_ids);
+/// Caller is responsible for pre-fetching facts (see `run_agent` parallel pre-pass).
+pub(crate) fn inject_memory(msgs: &mut Vec<Value>, facts: &[Value]) {
+    if facts.is_empty() { return; }
+    let mem_block = format!("\n\n## 相關記憶\n{}",
+        facts.iter().map(|f| format!("[{}] {}",
+            f["category"].as_str().unwrap_or("general"),
+            f["content"].as_str().unwrap_or("")
+        )).collect::<Vec<_>>().join("\n")
+    );
+    if let Some(sys) = msgs.first_mut().filter(|m| m["role"].as_str() == Some("system")) {
+        let old = sys["content"].as_str().unwrap_or("").to_string();
+        sys["content"] = json!(format!("{}{}", old, mem_block));
     }
 }
 
 /// Stage 3: Trim context window to MAX_HISTORY_CHARS by summarizing oldest messages with LLM.
-/// Only runs when tool_names is non-empty and vault_path is set (agent with tool access).
 pub(crate) async fn trim_context(
     msgs: &mut Vec<Value>,
     client: &reqwest::Client,
     llm_url: &str,
-    has_tools: bool,
-    has_vault: bool,
 ) {
-    if !has_tools || !has_vault { return; }
 
     const MAX_HISTORY_CHARS: usize = 12000;
     const KEEP_RECENT: usize = 6;

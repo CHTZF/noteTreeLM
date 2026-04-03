@@ -30,7 +30,6 @@ pub async fn run(
     let messages: Vec<Value> = body["messages"].as_array().cloned().unwrap_or_default();
     let now = chrono::Utc::now().timestamp();
     let activity_context = body["activity_context"].as_str().map(String::from);
-    let vault_path = body["vault_path"].as_str().unwrap_or("").to_string();
     let conversation_id = body["conversation_id"].as_str()
         .map(String::from)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -65,7 +64,7 @@ pub async fn run(
 
     crate::service_agent::run_agent(
         state, agent_def, input,
-        vault_id, account_id, vault_path, conversation_id.clone(),
+        vault_id, account_id, conversation_id.clone(),
         true,  // streaming
         activity_context,
     ).await;
@@ -139,7 +138,6 @@ pub async fn live_chat(
     let language        = body["language"].as_str().unwrap_or("zh-TW").to_string();
     let note_context    = body["note_context"].as_str().map(String::from);
     let activity_context = body["activity_context"].as_str().map(String::from);
-    let vault_path      = body["vault_path"].as_str().unwrap_or("").to_string();
     let conversation_id = body["conversation_id"].as_str().unwrap_or("").to_string();
 
     // Load live_chat agent_def; fall back to empty def (skill pre-pass will fill tool_names).
@@ -159,7 +157,7 @@ pub async fn live_chat(
     let agent_response = crate::service_agent::run_agent(
         state.clone(), agent_def,
         input.clone(), vault_id.clone(), account_id.clone(),
-        vault_path.clone(), conversation_id.clone(),
+        conversation_id.clone(),
         false,          // non-streaming: no llm:done / skill_suggestion events
         activity_context,
     ).await;

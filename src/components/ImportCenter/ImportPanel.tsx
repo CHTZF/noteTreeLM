@@ -721,10 +721,10 @@ export default function ImportPanel() {
                     setDetailSkills(prev => prev.filter(s => s.skill_id !== id))
                     window.dispatchEvent(new CustomEvent('skills-changed'))
                   }}
-                  onUpdate={async (id, title, trigger, behavior, toolCalls, injectionMode, agentScope) => {
-                    await api.updateAgentSkill(id, { title, trigger, behavior, tool_calls: toolCalls, injection_mode: injectionMode, agent_scope: agentScope })
+                  onUpdate={async (id, title, trigger, behavior, injectionMode, agentScope) => {
+                    await api.updateAgentSkill(id, { title, trigger, behavior, injection_mode: injectionMode, agent_scope: agentScope })
                     setDetailSkills(prev => prev.map(s =>
-                      s.skill_id === id ? { ...s, title, trigger, behavior, tool_calls: toolCalls, injection_mode: injectionMode as 'passive' | 'active', agent_scope: agentScope } : s
+                      s.skill_id === id ? { ...s, title, trigger, behavior, injection_mode: injectionMode as 'passive' | 'active', agent_scope: agentScope } : s
                     ))
                     window.dispatchEvent(new CustomEvent('skills-changed'))
                   }}
@@ -753,7 +753,6 @@ export function SkillsHub() {
   const [newTitle, setNewTitle] = useState('')
   const [newTrigger, setNewTrigger] = useState('')
   const [newBehavior, setNewBehavior] = useState('')
-  const [newTools, setNewTools] = useState<string[]>([])
   const [newInjectionMode, setNewInjectionMode] = useState<'passive' | 'active'>('passive')
   const [newAgentScope, setNewAgentScope] = useState<AgentScope>('all')
 
@@ -782,13 +781,12 @@ export function SkillsHub() {
         title: newTitle.trim(),
         trigger: newTrigger.trim(),
         behavior: newBehavior.trim(),
-        toolCalls: newTools,
         injectionMode: newInjectionMode,
         agentScope: newAgentScope,
       })
       setSkills(prev => [skill, ...prev])
       setShowCreate(false)
-      setNewTitle(''); setNewTrigger(''); setNewBehavior(''); setNewTools([]); setNewInjectionMode('passive'); setNewAgentScope('all')
+      setNewTitle(''); setNewTrigger(''); setNewBehavior(''); setNewInjectionMode('passive'); setNewAgentScope('all')
     } catch (e) {
       toast.error('建立失敗：' + fmtError(e))
     } finally {
@@ -796,10 +794,10 @@ export function SkillsHub() {
     }
   }
 
-  const handleUpdate = async (id: string, title: string, trigger: string, behavior: string, toolCalls: string[], injectionMode: string, agentScope: AgentScope, needToolChain: boolean, toolChainOrder: string[]) => {
-    await api.updateAgentSkill(id, { title, trigger, behavior, tool_calls: toolCalls, injection_mode: injectionMode, agent_scope: agentScope, need_tool_chain: needToolChain, tool_chain_order: toolChainOrder })
+  const handleUpdate = async (id: string, title: string, trigger: string, behavior: string, injectionMode: string, agentScope: AgentScope) => {
+    await api.updateAgentSkill(id, { title, trigger, behavior, injection_mode: injectionMode, agent_scope: agentScope })
     setSkills(prev => prev.map(s =>
-      s.skill_id === id ? { ...s, title, trigger, behavior, tool_calls: toolCalls, injection_mode: injectionMode as 'passive' | 'active', agent_scope: agentScope, need_tool_chain: needToolChain, tool_chain_order: toolChainOrder } : s
+      s.skill_id === id ? { ...s, title, trigger, behavior, injection_mode: injectionMode as 'passive' | 'active', agent_scope: agentScope } : s
     ))
   }
 
@@ -841,21 +839,6 @@ export function SkillsHub() {
             onChange={e => setNewBehavior(e.target.value)}
             rows={3}
           />
-          <div className="import-panel-v2__skill-edit-tools">
-            <span className="import-panel-v2__skill-edit-label">工具</span>
-            {ALLOWED_TOOLS.map(tool => (
-              <label key={tool} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11 }}>
-                <input
-                  type="checkbox"
-                  checked={newTools.includes(tool)}
-                  onChange={e => setNewTools(prev =>
-                    e.target.checked ? [...prev, tool] : prev.filter(t => t !== tool)
-                  )}
-                />
-                {tool}
-              </label>
-            ))}
-          </div>
           <div className="import-panel-v2__skill-edit-tools" style={{ marginTop: 6 }}>
             <span className="import-panel-v2__skill-edit-label">觸發時機</span>
             {(['passive', 'active'] as const).map(mode => (
@@ -982,6 +965,24 @@ function ChatMessage({
 
 // ── SkillCard Sub-component ───────────────────────────────────────────────────
 
+/** Extract ordered @[tool_name] markers from behavior text. */
+function extractChainFromBehavior(behavior: string): string[] {
+  const result: string[] = []
+  const seen = new Set<string>()
+  let rest = behavior
+  while (true) {
+    const start = rest.indexOf('@[')
+    if (start === -1) break
+    rest = rest.slice(start + 2)
+    const end = rest.indexOf(']')
+    if (end === -1) break
+    const name = rest.slice(0, end).trim()
+    if (name && !seen.has(name)) { seen.add(name); result.push(name) }
+    rest = rest.slice(end + 1)
+  }
+  return result
+}
+
 function fmtLastTriggered(ts: number | null): string | null {
   if (!ts) return null
   // last_triggered_at is stored as Unix seconds by the service
@@ -991,13 +992,6 @@ function fmtLastTriggered(ts: number | null): string | null {
   return `${days} 天前觸發`
 }
 
-const ALLOWED_TOOLS = [
-  'search_vault', 'read_note', 'list_structure', 'list_notes_in_folder',
-  'open_note', 'create_note', 'update_note', 'append_to_note',
-  'delete_note', 'delete_folder', 'move_note', 'create_folder',
-  'plan_announce', 'query_memory', 'web_search',
-  'get_current_datetime', 'show_toast',
-] as const
 const ALL_SCOPES: AgentScope[] = ['all', 'main', 'search', 'write', 'research', 'memory']
 const SCOPE_LABELS: Record<AgentScope, string> = {
   all: '全體', main: '主 Agent', search: '搜尋', write: '寫入', research: '研究', memory: '記憶',
@@ -1020,7 +1014,7 @@ function SkillCard({
   skill: AgentSkill
   onToggle: (id: string, active: boolean) => Promise<void>
   onDelete: (id: string) => Promise<void>
-  onUpdate?: (id: string, title: string, trigger: string, behavior: string, toolCalls: string[], injectionMode: string, agentScope: AgentScope, needToolChain: boolean, toolChainOrder: string[]) => Promise<void>
+  onUpdate?: (id: string, title: string, trigger: string, behavior: string, injectionMode: string, agentScope: AgentScope) => Promise<void>
 }) {
   const [toggling, setToggling] = useState(false)
   const [editing, setEditing] = useState(false)
@@ -1028,11 +1022,8 @@ function SkillCard({
   const [editTitle, setEditTitle] = useState(skill.title)
   const [editTrigger, setEditTrigger] = useState(skill.trigger)
   const [editBehavior, setEditBehavior] = useState(skill.behavior)
-  const [editTools, setEditTools] = useState<string[]>(skill.tool_calls)
   const [editInjectionMode, setEditInjectionMode] = useState<'passive' | 'active'>(skill.injection_mode ?? 'passive')
   const [editAgentScope, setEditAgentScope] = useState<AgentScope>(skill.agent_scope ?? 'all')
-  const [editNeedChain, setEditNeedChain] = useState(skill.need_tool_chain ?? false)
-  const [editChainOrder, setEditChainOrder] = useState<string[]>(skill.tool_chain_order ?? [])
 
   const daysSinceTrigger = skill.last_triggered_at
     ? Math.floor((Date.now() - skill.last_triggered_at * 1000) / 86400000)
@@ -1044,7 +1035,7 @@ function SkillCard({
     if (!onUpdate) return
     setSaving(true)
     try {
-      await onUpdate(skill.skill_id, editTitle, editTrigger, editBehavior, editTools, editInjectionMode, editAgentScope, editNeedChain, editChainOrder)
+      await onUpdate(skill.skill_id, editTitle, editTrigger, editBehavior, editInjectionMode, editAgentScope)
       setEditing(false)
     } finally {
       setSaving(false)
@@ -1117,21 +1108,6 @@ function SkillCard({
             rows={3}
             placeholder="應先...，再...，最後..."
           />
-          <div className="import-panel-v2__skill-edit-tools">
-            <span className="import-panel-v2__skill-edit-label">工具</span>
-            {ALLOWED_TOOLS.map(tool => (
-              <label key={tool} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11 }}>
-                <input
-                  type="checkbox"
-                  checked={editTools.includes(tool)}
-                  onChange={e => setEditTools(prev =>
-                    e.target.checked ? [...prev, tool] : prev.filter(t => t !== tool)
-                  )}
-                />
-                {tool}
-              </label>
-            ))}
-          </div>
           <div className="import-panel-v2__skill-edit-tools" style={{ marginTop: 6 }}>
             <span className="import-panel-v2__skill-edit-label">觸發時機</span>
             {(['passive', 'active'] as const).map(mode => (
@@ -1160,26 +1136,6 @@ function SkillCard({
               </label>
             ))}
           </div>
-          <div className="import-panel-v2__skill-edit-tools" style={{ marginTop: 6 }}>
-            <span className="import-panel-v2__skill-edit-label">工具鏈</span>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11 }}>
-              <input
-                type="checkbox"
-                checked={editNeedChain}
-                onChange={e => setEditNeedChain(e.target.checked)}
-              />
-              啟用確定性工具鏈
-            </label>
-            {editNeedChain && (
-              <input
-                type="text"
-                value={editChainOrder.join(', ')}
-                onChange={e => setEditChainOrder(e.target.value.split(',').map(s => s.trim()).filter(Boolean))}
-                placeholder="search_vault, open_note"
-                style={{ marginTop: 4, width: '100%', fontSize: 11, padding: '2px 6px', background: 'var(--color-bg-overlay)', border: '1px solid var(--color-border)', borderRadius: 4, color: 'var(--color-text)' }}
-              />
-            )}
-          </div>
           <div className="import-panel-v2__skill-edit-footer">
             <button className="import-panel-v2__skill-save-btn" onClick={handleSaveEdit} disabled={saving}>
               {saving ? <FontAwesomeIcon icon={faSpinner} spin /> : <><FontAwesomeIcon icon={faCheck} /> 儲存</>}
@@ -1189,11 +1145,8 @@ function SkillCard({
               setEditTitle(skill.title)
               setEditTrigger(skill.trigger)
               setEditBehavior(skill.behavior)
-              setEditTools(skill.tool_calls)
               setEditInjectionMode(skill.injection_mode ?? 'passive')
               setEditAgentScope(skill.agent_scope ?? 'all')
-              setEditNeedChain(skill.need_tool_chain ?? false)
-              setEditChainOrder(skill.tool_chain_order ?? [])
             }}>取消</button>
           </div>
         </div>
@@ -1201,9 +1154,20 @@ function SkillCard({
         <>
           <div className="import-panel-v2__skill-trigger"><strong>觸發：</strong>{skill.trigger}</div>
           <div className="import-panel-v2__skill-behavior"><strong>行為：</strong>{skill.behavior}</div>
-          {skill.tool_calls.length > 0 && (
-            <div className="import-panel-v2__skill-tools">工具：{skill.tool_calls.join('、')}</div>
-          )}
+          {(() => {
+            const chain = extractChainFromBehavior(skill.behavior)
+            return chain.length > 0 ? (
+              <div style={{ marginTop: 4, display: 'flex', gap: 3, flexWrap: 'wrap' }}>
+                {chain.map((t: string, i: number) => (
+                  <span key={i} style={{
+                    fontSize: 10, padding: '1px 6px', borderRadius: 8,
+                    background: 'rgba(16,185,129,0.1)', color: 'var(--color-success)',
+                    border: '1px solid var(--color-success)', fontFamily: 'monospace',
+                  }}>@{t}</span>
+                ))}
+              </div>
+            ) : null
+          })()}
           <div style={{ marginTop: 4, display: 'flex', gap: 4, flexWrap: 'wrap' }}>
             <span style={{
               fontSize: 10, padding: '1px 6px', borderRadius: 8,
@@ -1221,17 +1185,6 @@ function SkillCard({
                 border: `1px solid ${SCOPE_COLORS[skill.agent_scope ?? 'all']}`,
               }}>
                 {SCOPE_LABELS[skill.agent_scope ?? 'all']}
-              </span>
-            )}
-            {skill.need_tool_chain && skill.tool_chain_order && skill.tool_chain_order.length > 0 && (
-              <span style={{
-                fontSize: 10, padding: '1px 6px', borderRadius: 8,
-                background: 'rgba(16,185,129,0.1)',
-                color: 'var(--color-success)',
-                border: '1px solid var(--color-success)',
-                fontFamily: 'monospace',
-              }}>
-                ⛓ {skill.tool_chain_order.join(' → ')}
               </span>
             )}
           </div>

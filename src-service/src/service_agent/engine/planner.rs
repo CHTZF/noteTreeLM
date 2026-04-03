@@ -54,6 +54,25 @@ impl Planner {
         let mut prev_effective_id: Option<String> = None;
         let mut prev_effective_tool: Option<String> = None;
 
+        // When the meta_function schema included a `thought` param (enable_think=true),
+        // the LLM fills it as part of its tool_call. Extract it here and prepend a think node.
+        if let Some(thought) = user_args["thought"].as_str().filter(|s| !s.is_empty()) {
+            let node = ToolNode {
+                call: ToolCall {
+                    id: "chain_think".to_string(),
+                    name: "think".to_string(),
+                    args: json!({ "thought": thought }),
+                },
+                deps: vec![],
+                resolver_dep: None,
+                arg_resolver: None,
+                is_chain_gate: false,
+            };
+            graph.add_node_full("chain_think".to_string(), node);
+            prev_effective_id = Some("chain_think".to_string());
+            // prev_effective_tool stays None → chain[0] still treated as first real tool
+        }
+
         for (i, tool_name) in chain.iter().enumerate() {
             let node_id = format!("chain_{}", i);
 

@@ -236,8 +236,8 @@ const AGENTS: &[BuiltinAgent] = &[
         name: "技能建立助理",
         description: "根據知識描述自動設計並建立 Agent 技能規範",
         kind: "sub",
-        tool_names: &["create_agent_skill"],
-        use_skill_pass: false,
+        tool_names: &[],
+        use_skill_pass: true,
         enable_think: false,
         system_prompt: "你是技能建立助理，專門根據描述設計 Agent 技能規範。\n\
             ## 任務\n\
@@ -252,8 +252,8 @@ const AGENTS: &[BuiltinAgent] = &[
         name: "排程助理",
         description: "幫使用者設定任務提醒、定時通知與週期性排程",
         kind: "sub",
-        tool_names: &["get_current_datetime", "schedule_task"],
-        use_skill_pass: false,
+        tool_names: &[],
+        use_skill_pass: true,
         enable_think: false,
         system_prompt: "你是排程助理，專門幫使用者設定任務提醒與排程。\n\
             ## 工作流程\n\
@@ -273,8 +273,8 @@ const AGENTS: &[BuiltinAgent] = &[
         name: "筆記卡片助理",
         description: "根據知識內容分析並建立 concept/procedure/reference 型筆記卡片",
         kind: "sub",
-        tool_names: &["search_vault", "read_note", "create_note"],
-        use_skill_pass: false,
+        tool_names: &[],
+        use_skill_pass: true,
         enable_think: false,
         system_prompt: "你是筆記卡片助理，專門根據知識內容生成結構化的筆記卡片。\n\
             ## 卡片模板類型\n\
@@ -327,11 +327,8 @@ const AGENTS: &[BuiltinAgent] = &[
         name: "筆記整理助理",
         description: "閱讀多篇筆記並產出摘要、彙整或結構化整理",
         kind: "sub",
-        tool_names: &[
-            "search_vault", "list_notes_in_folder", "list_structure",
-            "read_note", "create_note", "update_note",
-        ],
-        use_skill_pass: false,
+        tool_names: &[],
+        use_skill_pass: true,
         enable_think: false,
         system_prompt: "你是筆記整理助理，專門閱讀多篇筆記並產出摘要或結構化整理。\n\
             ## 工作流程\n\

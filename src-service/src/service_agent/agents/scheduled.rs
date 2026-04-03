@@ -52,27 +52,12 @@ pub async fn execute_scheduled_task(
         }
     };
 
-    // Resolve vault_path from DB
-    let vault_path = {
-        #[derive(serde::Deserialize)]
-        struct Row { path: String }
-        state.db
-            .query("SELECT path FROM vaults WHERE vault_id = $vid LIMIT 1")
-            .bind(("vid", vault_id.clone()))
-            .await
-            .ok()
-            .and_then(|mut r| r.take::<Vec<Row>>(0).ok())
-            .and_then(|rows| rows.into_iter().next())
-            .map(|r| r.path)
-            .unwrap_or_default()
-    };
-
     let initial_msg = agent_prompt.unwrap_or_else(|| description.clone());
     let conversation_id = format!("scheduled_{}_{}", task_id, agent_name);
 
     tracing::info!(
-        "[scheduler] running agent '{}' for task {} vault_path='{}'",
-        agent_name, task_id, vault_path
+        "[scheduler] running agent '{}' for task {} vault_id='{}'",
+        agent_name, task_id, vault_id
     );
 
     let result = super::interactive::run_agent(
@@ -81,7 +66,6 @@ pub async fn execute_scheduled_task(
         initial_msg,
         vault_id.clone(),
         account_id,
-        vault_path,
         conversation_id,
         false, // background — no llm:token SSE
         None,
