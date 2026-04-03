@@ -371,10 +371,19 @@ pub(crate) async fn run_interactive_agent(
                 let (graph, tc_id, tc_name) = if has_meta {
                     let tc = &tool_chunks[0];
                     let spec = meta_functions.iter().find(|s| s.fn_name == tc.1);
+                    if spec.is_none() {
+                        // LLM called an unknown meta_function fn_name — enter discovery mode:
+                        // return discovery context as tool result so LLM can guide the user.
+                        let discovery = build_skill_discovery_injection(&state.db, &account_id).await;
+                        msgs.push(json!({ "role": "tool", "tool_call_id": tc.0, "name": tc.1, "content": discovery }));
+                        if cancel.load(Ordering::Relaxed) { break; }
+                        continue;
+                    }
+                    let spec = spec.unwrap();
                     // Bump trigger_count for the skill LLM actually selected.
-                    if let Some(s) = spec {
+                    {
                         let db = state.db.clone();
-                        let sid = s.skill_id.clone();
+                        let sid = spec.skill_id.clone();
                         let now = chrono::Utc::now().timestamp();
                         tokio::spawn(async move {
                             let _ = db
@@ -382,16 +391,8 @@ pub(crate) async fn run_interactive_agent(
                                 .bind(("now", now)).bind(("sid", sid)).await;
                         });
                     }
-                    let (chain, fallback) = spec
-                        .map(|s| (s.chain.as_slice(), s.fallback_msg.as_str()))
-                        .unwrap_or((&[], "找不到相關內容"));
                     let user_args: Value = serde_json::from_str(&tc.2).unwrap_or(json!({}));
-                    let g = if chain.is_empty() {
-                        Planner::plan_from_chunks(&tool_chunks)
-                    } else {
-                        Planner::plan_from_meta_function(chain, &user_args)
-                    };
-                    let _ = fallback;
+                    let g = Planner::plan_from_meta_function(&spec.chain, &user_args);
                     (g, Some(tc.0.clone()), Some(tc.1.clone()))
                 } else {
                     (Planner::plan_from_chunks(&tool_chunks), None, None)
