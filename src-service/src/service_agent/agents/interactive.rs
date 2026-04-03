@@ -421,6 +421,16 @@ pub(crate) async fn run_interactive_agent(
                 msgs.extend(tool_messages);
 
                 if cancel.load(Ordering::Relaxed) { break; }
+            } else if has_meta && !tool_chunks.is_empty() {
+                // tool_chunks non-empty but fell through (shouldn't happen) → break
+                break;
+            } else if has_meta {
+                // has_meta but LLM returned text without calling any meta_function.
+                // Inject discovery context as a system reminder and retry once.
+                let discovery = build_skill_discovery_injection(&state.db, &account_id).await;
+                msgs.push(json!({ "role": "system", "content": discovery }));
+                if cancel.load(Ordering::Relaxed) { break; }
+                // continue loop — LLM gets another chance with discovery context
             } else {
                 break;
             }
