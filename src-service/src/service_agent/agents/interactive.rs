@@ -244,16 +244,12 @@ pub(crate) async fn run_interactive_agent(
         Arc::clone(&cancel),
     );
 
-    // Register pre-planner meta-function tools.
-    for spec in &meta_functions {
-        register_meta_fn_tool(
-            &mut registry, spec,
-            client.clone(), llm_url.clone(), state.db.clone(),
-            vault_id.clone(), account_id.clone(), vault_path.clone(),
-            embedding_url.clone(), state.clone(), session_id.clone(),
-            Arc::clone(&tx), Arc::clone(&cancel),
-        );
-    }
+    // Build a lookup map: meta_function fn_name → MetaFunctionSpec
+    // Used at tool-call time to expand chain into a flat ToolGraph.
+    let meta_fn_map: std::collections::HashMap<String, MetaFunctionSpec> = meta_functions
+        .iter()
+        .map(|s| (s.fn_name.clone(), s.clone()))
+        .collect();
 
     let dispatcher = Dispatcher::new(
         Arc::new(registry),
@@ -373,7 +369,20 @@ pub(crate) async fn run_interactive_agent(
                 })).collect();
                 msgs.push(json!({ "role": "assistant", "content": null, "tool_calls": tc_json }));
 
-                let graph = Planner::plan_from_chunks(&tool_chunks);
+                // If any call is a meta_function, expand its chain into a flat graph.
+                // Only one meta_function is expected per round (skill pre-pass ensures this).
+                let (graph, result_mapping) =
+                    if let Some((idx, spec)) = tool_chunks.iter().enumerate()
+                        .find_map(|(i, tc)| meta_fn_map.get(&tc.1).map(|s| (i, s)))
+                    {
+                        let user_args: Value = serde_json::from_str(&tool_chunks[idx].2)
+                            .unwrap_or(json!({}));
+                        let g = Planner::plan_from_meta_function(&spec.chain, &user_args);
+                        (g, Some((idx, tool_chunks[idx].0.clone(), tool_chunks[idx].1.clone())))
+                    } else {
+                        (Planner::plan_from_chunks(&tool_chunks), None)
+                    };
+
                 let results = match dispatcher.run(Arc::clone(&tx), graph).await {
                     Ok(r) => r,
                     Err(e) => {
@@ -382,7 +391,24 @@ pub(crate) async fn run_interactive_agent(
                     }
                 };
 
-                msgs.extend(Planner::results_to_messages(&tool_chunks, results));
+                // For meta_function: map the last chain result back to the original call id.
+                let tool_messages = if let Some((_, tc_id, tc_name)) = result_mapping {
+                    let content = results.into_iter().last()
+                        .map(|v| match v {
+                            Value::String(s) => s,
+                            other => serde_json::to_string(&other).unwrap_or_default(),
+                        })
+                        .unwrap_or_default();
+                    vec![json!({
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "name": tc_name,
+                        "content": content,
+                    })]
+                } else {
+                    Planner::results_to_messages(&tool_chunks, results)
+                };
+                msgs.extend(tool_messages);
 
                 if cancel.load(Ordering::Relaxed) { break; }
             } else {
@@ -1061,89 +1087,3 @@ async fn build_skill_discovery_injection(db: &crate::db::SurrealDb, account_id: 
     )
 }
 
-/// Register a meta-function tool whose execution is a deterministic ToolGraph
-/// built by Planner::plan_from_meta_function and run by the shared Dispatcher.
-#[allow(clippy::too_many_arguments)]
-fn register_meta_fn_tool(
-    registry: &mut super::super::engine::tool_registry::ToolRegistry,
-    spec: &MetaFunctionSpec,
-    client: reqwest::Client,
-    llm_url: String,
-    db: crate::db::SurrealDb,
-    vault_id: String,
-    account_id: String,
-    vault_path: String,
-    embedding_url: Option<String>,
-    state: crate::api_state::ApiState,
-    session_id: String,
-    tx: Arc<Transaction>,
-    cancel: Arc<AtomicBool>,
-) {
-    let chain = spec.chain.clone();
-    let fallback_msg = spec.fallback_msg.clone();
-    let fn_name = spec.fn_name.clone();
-
-    let execute: super::super::types::ToolFn = Arc::new(move |args: serde_json::Value| {
-        let chain = chain.clone();
-        let fallback_msg = fallback_msg.clone();
-        let client = client.clone();
-        let llm_url = llm_url.clone();
-        let db = db.clone();
-        let vault_id = vault_id.clone();
-        let account_id = account_id.clone();
-        let vault_path = vault_path.clone();
-        let embedding_url = embedding_url.clone();
-        let state = state.clone();
-        let session_id = session_id.clone();
-        let tx = tx.clone();
-        let cancel = cancel.clone();
-
-        Box::pin(async move {
-            if chain.is_empty() {
-                return Ok(json!(fallback_msg));
-            }
-
-            // Build a dedicated registry + dispatcher for this chain execution.
-            // The registry already has all vault tools registered via build_interactive_registry.
-            let chain_registry = build_interactive_registry(
-                &client, &llm_url, &db,
-                &vault_id, &account_id, &vault_path, &embedding_url,
-                &session_id, &state,
-                Arc::clone(&tx),
-                Arc::clone(&cancel),
-            );
-
-            let emit_fn: EmitEventFn = {
-                let state_c = state.clone();
-                let sid = session_id.clone();
-                Arc::new(move |event: String, mut payload: serde_json::Value| {
-                    if let serde_json::Value::Object(ref mut m) = payload {
-                        m.insert("session_id".to_string(), json!(sid));
-                    }
-                    state_c.daemon.emit(&event, payload);
-                })
-            };
-            let is_write_fn: IsWriteFn = Arc::new(|name: &str| {
-                super::super::tools::vault_tools::is_interactive_write_tool(name)
-            });
-
-            let dispatcher = super::super::engine::dispatcher::Dispatcher::new(
-                Arc::new(chain_registry),
-                emit_fn,
-                is_write_fn,
-            );
-
-            // Planner builds the ToolGraph: chain[0] uses LLM args directly;
-            // subsequent nodes have arg_resolver closures derived from prev results;
-            // plan_announce nodes become is_chain_gate = true checkpoints.
-            let graph = super::super::engine::planner::Planner::plan_from_meta_function(&chain, &args);
-
-            match dispatcher.run(Arc::clone(&tx), graph).await {
-                Ok(results) => Ok(results.into_iter().last().unwrap_or(json!(fallback_msg))),
-                Err(_) => Ok(json!(fallback_msg)),
-            }
-        })
-    });
-
-    registry.register(fn_name, Tool { execute, rollback: None });
-}
