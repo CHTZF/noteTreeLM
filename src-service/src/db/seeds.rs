@@ -25,6 +25,7 @@ struct BuiltinAgent {
     kind: &'static str,
     tool_names: &'static [&'static str],
     use_skill_pass: bool,
+    enable_think: bool,
     system_prompt: &'static str,
     max_rounds: i64,
     trigger: &'static str,
@@ -237,6 +238,7 @@ const AGENTS: &[BuiltinAgent] = &[
         kind: "sub",
         tool_names: &["create_agent_skill"],
         use_skill_pass: false,
+        enable_think: false,
         system_prompt: "你是技能建立助理，專門根據描述設計 Agent 技能規範。\n\
             ## 任務\n\
             根據使用者提供的知識描述或需求，呼叫 create_agent_skill 設計 1-2 個技能規範。\n\
@@ -252,6 +254,7 @@ const AGENTS: &[BuiltinAgent] = &[
         kind: "sub",
         tool_names: &["get_current_datetime", "schedule_task"],
         use_skill_pass: false,
+        enable_think: false,
         system_prompt: "你是排程助理，專門幫使用者設定任務提醒與排程。\n\
             ## 工作流程\n\
             1. 先呼叫 get_current_datetime 確認現在的時間與時區。\n\
@@ -272,6 +275,7 @@ const AGENTS: &[BuiltinAgent] = &[
         kind: "sub",
         tool_names: &["search_vault", "read_note", "create_note", "plan_announce"],
         use_skill_pass: false,
+        enable_think: false,
         system_prompt: "你是筆記卡片助理，專門根據知識內容生成結構化的筆記卡片。\n\
             ## 卡片模板類型\n\
             - **concept**：概念定義卡，包含定義、詳細說明、範例\n\
@@ -293,6 +297,7 @@ const AGENTS: &[BuiltinAgent] = &[
         kind: "scheduled",
         tool_names: &["get_unprocessed_conversations", "get_conversation_content", "save_memory_facts", "mark_conversation_processed", "condense_memory_facts"],
         use_skill_pass: false,
+        enable_think: false,
         system_prompt: "你是記憶管理助理。\n\
             ## 模式判斷\n\
             若使用者訊息中包含「conv_id:」，進入 **單一對話模式**：\n\
@@ -327,6 +332,7 @@ const AGENTS: &[BuiltinAgent] = &[
             "read_note", "create_note", "update_note", "plan_announce",
         ],
         use_skill_pass: false,
+        enable_think: false,
         system_prompt: "你是筆記整理助理，專門閱讀多篇筆記並產出摘要或結構化整理。\n\
             ## 工作流程\n\
             1. 用 search_vault 或 list_notes_in_folder 取得相關筆記清單。\n\
@@ -344,11 +350,10 @@ const AGENTS: &[BuiltinAgent] = &[
         name: "live_chat",
         description: "語音對話助理，以口語化方式回覆並支援工具查詢",
         kind: "chat",
-        tool_names: &["think"],
+        tool_names: &[],
         use_skill_pass: true,
+        enable_think: true,
         system_prompt: "你是語音助理，使用者透過語音與你對話。\
-            第一步呼叫 think 描述你正在想什麼（10字以內）。\
-            第二步若需要查詢資料，呼叫相應的工具（search_vault、read_note、query_memory 等）。\
             回覆規則：口語化繁體中文，簡短自然，不用 Markdown 或列點。\
             若使用者要求操作筆記（建立/修改/刪除），直接執行工具並簡短告知結果。",
         max_rounds: 4,
@@ -359,10 +364,10 @@ const AGENTS: &[BuiltinAgent] = &[
         name: "chat",
         description: "通用筆記助理，可使用工具直接操作 vault",
         kind: "chat",
-        tool_names: &["think", "plan_announce"],
+        tool_names: &["plan_announce"],
         use_skill_pass: true,
+        enable_think: true,
         system_prompt: "你是一個筆記助理，可以直接使用工具完成使用者的請求。\n\
-            每次回覆前先呼叫 think 描述你正在想什麼（10字以內）。\n\
             可用工具：\n\
             - 讀取：search_vault、read_note、list_structure、query_memory\n\
             - 開啟：open_note\n\
@@ -371,8 +376,7 @@ const AGENTS: &[BuiltinAgent] = &[
             規則：\n\
             1. 使用者要「打開」某筆記 → 先 search_vault 找到路徑，再 open_note 打開。\n\
             2. 使用者要「搜尋」或「查看內容」→ search_vault 再 read_note。\n\
-            3. 禁止虛構筆記名稱或路徑；搜尋無結果時直接告知找不到。\n\
-            4. 純閒聊或解釋概念可不使用工具（但仍需呼叫 think）。",
+            3. 禁止虛構筆記名稱或路徑；搜尋無結果時直接告知找不到。",
         max_rounds: 20,
         trigger: "",
     },
@@ -440,10 +444,10 @@ pub async fn seed_builtins(db: &SurrealDb, account_id: &str) {
         let result = db.query(
             "INSERT INTO agent_definitions \
              (def_id, account_id, name, description, kind, skill_ids, tool_names, \
-              use_skill_pass, system_prompt, max_rounds, is_active, is_builtin, trigger, \
+              use_skill_pass, enable_think, system_prompt, max_rounds, is_active, is_builtin, trigger, \
               status, use_count, created_at) \
              VALUES ($did, $aid, $name, $desc, $kind, [], $tools, \
-                     $use_skill_pass, $prompt, $rounds, true, true, $trigger, \
+                     $use_skill_pass, $enable_think, $prompt, $rounds, true, true, $trigger, \
                      'active', 0, $now)"
         )
         .bind(("did",           a.id.to_string()))
@@ -453,6 +457,7 @@ pub async fn seed_builtins(db: &SurrealDb, account_id: &str) {
         .bind(("kind",          a.kind.to_string()))
         .bind(("tools",         tool_names_json))
         .bind(("use_skill_pass",a.use_skill_pass))
+        .bind(("enable_think",  a.enable_think))
         .bind(("prompt",        a.system_prompt.to_string()))
         .bind(("rounds",        a.max_rounds))
         .bind(("trigger",       a.trigger.to_string()))

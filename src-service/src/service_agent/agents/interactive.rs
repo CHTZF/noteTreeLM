@@ -49,6 +49,8 @@ pub(crate) async fn run_interactive_agent(
     tx: Arc<Transaction>,
     // Pre-planner meta-functions generated from matched skills' tool_chain_order.
     meta_functions: Vec<MetaFunctionSpec>,
+    // Whether to run the pre-think step (controlled by agent_def["enable_think"]).
+    enable_think: bool,
 ) -> String {
     let conv_id = conversation_id;
 
@@ -140,11 +142,8 @@ pub(crate) async fn run_interactive_agent(
     );
 
     // 7. Tool loop or no-tool LLM
-    // Exclude "think" from the main loop schema — it's handled in the pre-think block only.
-    let main_tool_names: Vec<String> = tool_names.iter()
-        .filter(|t| t.as_str() != "think")
-        .cloned()
-        .collect();
+    // think is never in tool_names (controlled by enable_think flag).
+    let main_tool_names: Vec<String> = tool_names.clone();
     let mut tools_schema = super::super::tools::vault_tools::build_tools_schema_interactive(&main_tool_names);
     // Append meta-function schemas so LLM sees them as callable tools.
     for spec in &meta_functions {
@@ -162,7 +161,7 @@ pub(crate) async fn run_interactive_agent(
 
         // Pre-think: if think tool is available, call LLM once (non-streaming) to get a thought,
         // emit agent:think, then append the tool call + result to msgs before the main loop.
-        if tool_names.contains(&"think".to_string()) && streaming {
+        if enable_think && streaming {
             let think_schema = json!([{
                 "type": "function",
                 "function": {
@@ -663,10 +662,13 @@ pub async fn run_agent(
     }
 
     let system_prompt = agent_def["system_prompt"].as_str().unwrap_or("").to_string();
+    let enable_think = agent_def["enable_think"].as_bool().unwrap_or(false);
     let mut tool_names: Vec<String> = agent_def["tool_names"]
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
+    // think is controlled by enable_think flag, never via tool_names
+    tool_names.retain(|t| t != "think");
 
     let http_client = reqwest::Client::new();
     let embedding_url = state.daemon.embedding_url.read().await.clone();
@@ -751,6 +753,7 @@ pub async fn run_agent(
         cancel,
         tx,
         meta_functions,
+        enable_think,
     ).await
 }
 
