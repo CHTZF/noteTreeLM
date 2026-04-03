@@ -371,6 +371,17 @@ pub(crate) async fn run_interactive_agent(
                 let (graph, tc_id, tc_name) = if has_meta {
                     let tc = &tool_chunks[0];
                     let spec = meta_functions.iter().find(|s| s.fn_name == tc.1);
+                    // Bump trigger_count for the skill LLM actually selected.
+                    if let Some(s) = spec {
+                        let db = state.db.clone();
+                        let sid = s.skill_id.clone();
+                        let now = chrono::Utc::now().timestamp();
+                        tokio::spawn(async move {
+                            let _ = db
+                                .query("UPDATE agent_skills SET trigger_count = (trigger_count OR 0) + 1, last_triggered_at = $now WHERE skill_id = $sid")
+                                .bind(("now", now)).bind(("sid", sid)).await;
+                        });
+                    }
                     let (chain, fallback) = spec
                         .map(|s| (s.chain.as_slice(), s.fallback_msg.as_str()))
                         .unwrap_or((&[], "找不到相關內容"));
@@ -819,17 +830,8 @@ pub async fn run_agent(
                     "source": "pre_pass",
                 }));
             }
-            for sid in skill.skill_ids {
-                let db = state.db.clone();
-                let now = chrono::Utc::now().timestamp();
-                tokio::spawn(async move {
-                    let _ = db
-                        .query("UPDATE agent_skills SET trigger_count = (trigger_count OR 0) + 1, last_triggered_at = $now WHERE skill_id = $sid")
-                        .bind(("now", now))
-                        .bind(("sid", sid))
-                        .await;
-                });
-            }
+            // trigger_count is bumped only when LLM actually picks the meta_function,
+            // not at pre-pass time — so multiple matched skills aren't over-counted.
             (skill.system_injection, skill.meta_functions)
         }
     } else {

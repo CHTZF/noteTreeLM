@@ -17,6 +17,8 @@ pub(crate) struct MetaFunctionSpec {
     pub description: String,
     pub chain: Vec<String>,
     pub fallback_msg: String,
+    /// The skill_id this meta-function was derived from, for trigger_count tracking.
+    pub skill_id: String,
 }
 
 fn sanitize_skill_fn_name(title: &str, skill_id: &str) -> String {
@@ -177,6 +179,7 @@ pub(crate) async fn run_skill_pass(
                 description: behavior.clone(),
                 chain,
                 fallback_msg: "找不到相關內容，請換個說法再試試。".to_string(),
+                skill_id: skill_id.clone(),
             })
         })
         .collect();
