@@ -156,7 +156,8 @@ pub(crate) async fn build_messages(
 
     let anti_hallucination = "\n\n必須實際呼叫工具完成任務；禁止假裝或虛構結果。\
                                若搜尋無結果，直接說明找不到。\
-                               回覆中引用筆記時，請包含完整的 vault 相對路徑。";
+                               回覆中引用筆記時，請包含完整的 vault 相對路徑。\
+                               工具結果中含有 __cite_id__ 欄位；最終文字回覆的第一句必須以 [cite:id1,id2] 格式引用所依據的工具結果，若本輪未使用任何工具則輸出 [cite:none]。";
     let sys_base = if let Some(ac) = activity_context {
         format!("{}\n\n[使用者活動紀錄]\n{}", system, ac)
     } else {

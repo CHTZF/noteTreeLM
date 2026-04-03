@@ -6,32 +6,8 @@ use super::super::engine::context::vault_query_memory_with_limit;
 pub(crate) struct SkillPassResult {
     pub system_injection: String,
     pub skill_titles: Vec<String>,
-    pub skill_ids: Vec<String>,
-    pub meta_functions: Vec<MetaFunctionSpec>,
-}
-
-/// A pre-planned tool chain exposed to LLM as a single callable function.
-#[derive(Clone)]
-pub(crate) struct MetaFunctionSpec {
-    pub fn_name: String,
-    pub description: String,
-    pub chain: Vec<String>,
-    pub fallback_msg: String,
-    /// The skill_id this meta-function was derived from, for trigger_count tracking.
-    pub skill_id: String,
-}
-
-fn sanitize_skill_fn_name(title: &str, skill_id: &str) -> String {
-    let ascii: String = title.chars().map(|c| {
-        if c.is_ascii_alphanumeric() { c } else { '_' }
-    }).collect::<String>();
-    let clean = ascii.trim_matches('_');
-    if clean.len() < 2 {
-        let safe_id: String = skill_id.chars().map(|c| if c == '-' { '_' } else { c }).collect();
-        format!("skill_{}", &safe_id[..safe_id.len().min(12)])
-    } else {
-        format!("skill_{}", clean)
-    }
+    /// Tools required by matched skills' chains — caller should add these to tool_names.
+    pub skill_tool_names: Vec<String>,
 }
 
 /// Extract ordered tool names from `@[tool_name]` markers in behavior text.
@@ -145,8 +121,7 @@ pub(crate) async fn run_skill_pass(
         return SkillPassResult {
             system_injection: String::new(),
             skill_titles: vec![],
-            skill_ids: vec![],
-            meta_functions: vec![],
+            skill_tool_names: vec![],
         };
     }
 
@@ -168,52 +143,46 @@ pub(crate) async fn run_skill_pass(
         }
     }
 
-    // Generate meta-functions for skills whose behavior contains @[tool] markers.
-    let meta_functions: Vec<MetaFunctionSpec> = matched.iter()
-        .filter(|(_, _, _, mode)| mode != "proactive")
-        .filter_map(|(skill_id, title, behavior, _)| {
-            let chain = extract_chain_from_behavior(behavior);
-            if chain.is_empty() { return None; }
-            Some(MetaFunctionSpec {
-                fn_name: sanitize_skill_fn_name(title, skill_id),
-                description: behavior.clone(),
-                chain,
-                fallback_msg: "找不到相關內容，請換個說法再試試。".to_string(),
-                skill_id: skill_id.clone(),
-            })
-        })
-        .collect();
-
-    // Chain tool names (exposed via meta-functions, not given to LLM individually).
-    let chain_tool_set: std::collections::HashSet<String> = meta_functions.iter()
-        .flat_map(|m| m.chain.iter().cloned())
-        .collect();
-
-    // Non-chain skills (no @[tool] in behavior) → system injection text.
-    let skill_text: String = matched.iter()
-        .filter(|(_, _, behavior, mode)| {
-            mode != "proactive" && extract_chain_from_behavior(behavior).is_empty() && !behavior.is_empty()
-        })
-        .map(|(_, title, beh, _)| format!("[技能：{}]\n{}", title, beh))
-        .collect::<Vec<_>>().join("\n\n");
-
+    // Collect tool names and injection text from all non-proactive skills.
+    let mut chain_tool_set: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut injection_parts: Vec<String> = vec![];
+
     let proactive_ctx = proactive_parts.join("\n\n");
     if !proactive_ctx.is_empty() { injection_parts.push(proactive_ctx.chars().take(1000).collect()); }
-    if !skill_text.is_empty() {
-        // Strip @[tool] markers from injected text for readability
-        let clean = strip_tool_markers(&skill_text);
-        injection_parts.push(clean.chars().take(1500).collect());
+
+    for (_, title, behavior, mode) in &matched {
+        if mode == "proactive" { continue; }
+        let chain = extract_chain_from_behavior(behavior);
+        if chain.is_empty() {
+            // No tool markers — inject raw behavior text as guidance.
+            if !behavior.is_empty() {
+                let clean = strip_tool_markers(behavior);
+                injection_parts.push(format!("[技能：{}]\n{}", title, clean).chars().take(500).collect());
+            }
+        } else {
+            // Chain skill: inject as ordered operation hint for LLM, expose tools via skill_tool_names.
+            chain.iter().for_each(|t| { chain_tool_set.insert(t.clone()); });
+            let step_hint = chain.iter()
+                .filter(|t| t.as_str() != "plan_announce")
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" → ");
+            if !step_hint.is_empty() {
+                let clean_desc = strip_tool_markers(behavior);
+                injection_parts.push(
+                    format!("[技能：{}]\n建議操作順序：{}\n{}", title, step_hint, clean_desc)
+                        .chars().take(600).collect()
+                );
+            }
+        }
     }
 
-    // Remove chain tools from the agent's direct tool access — they're covered by meta-functions.
-    let _ = chain_tool_set; // currently no direct tool list from skills
+    let skill_tool_names: Vec<String> = chain_tool_set.into_iter().collect();
 
     SkillPassResult {
-        system_injection: injection_parts.join("\n\n"),
+        system_injection: injection_parts.join("\n\n").chars().take(2000).collect(),
         skill_titles: matched.iter().map(|(_, t, _, _)| t.clone()).collect(),
-        skill_ids: matched.iter().map(|(id, _, _, _)| id.clone()).collect(),
-        meta_functions,
+        skill_tool_names,
     }
 }
 

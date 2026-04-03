@@ -20,14 +20,30 @@ pub struct ServiceEvent {
     pub payload: serde_json::Value,
 }
 
+/// A single tool execution record within a session.
+/// Stored in AgentSession.tool_calls keyed by tool_call_id.
+#[derive(Debug, Clone)]
+pub struct ToolCallRecord {
+    /// Tool name (e.g. "search_vault", "read_note")
+    pub name: String,
+    /// Args passed to the tool
+    pub args: serde_json::Value,
+    /// Result returned by the tool
+    pub result: serde_json::Value,
+}
+
 /// Per-session state for interactive agent runs.
 /// `cancel` — set true to abort the agent loop.
 /// `transaction` — Arc<Transaction> managed by Executor; commit/cancel resolved by POST /agent/confirm.
+/// `tool_calls` — accumulates all tool executions for the session lifetime:
+///   - write tools read this to verify paths were previously seen by a read tool
+///   - citation interceptor reads this to validate [cite:id] references
 pub struct AgentSession {
     pub session_id: String,
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
     pub transaction: Option<Arc<crate::service_agent::engine::transaction::Transaction>>,
     pub conversation_id: String,
+    pub tool_calls: Arc<Mutex<HashMap<String, ToolCallRecord>>>,
 }
 
 #[derive(Clone)]

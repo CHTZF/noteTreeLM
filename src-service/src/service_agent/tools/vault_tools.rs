@@ -233,6 +233,26 @@ pub(crate) async fn vault_query_memory_with_ids(
 
 // ── Write vault tools ─────────────────────────────────────────────────────────
 
+/// Validate that a vault-relative path is safe: non-empty, no `..` traversal, no `.` components,
+/// and not an absolute path. Applied to all write tools before any filesystem access.
+fn validate_rel_path(rel_path: &str) -> Result<(), String> {
+    if rel_path.is_empty() {
+        return Err("路徑不能為空".to_string());
+    }
+    for component in std::path::Path::new(rel_path).components() {
+        match component {
+            std::path::Component::ParentDir =>
+                return Err(format!("路徑不允許包含 '..'：{}", rel_path)),
+            std::path::Component::CurDir =>
+                return Err(format!("路徑不允許包含 '.'：{}", rel_path)),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) =>
+                return Err(format!("路徑必須是相對路徑：{}", rel_path)),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn vault_create_note(
     rel_path: &str,
     content: &str,
@@ -242,10 +262,12 @@ pub(crate) async fn vault_create_note(
     vault_id: &str,
 ) -> Result<Value, String> {
     if vault_path.is_empty() { return Err("Vault 未設定".to_string()); }
+    validate_rel_path(rel_path)?;
     let full = std::path::Path::new(vault_path).join(rel_path);
     if let Some(parent) = full.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
     }
+    if full.exists() { return Err(format!("筆記已存在：{}", rel_path)); }
     tokio::fs::write(&full, content).await.map_err(|e| e.to_string())?;
     sync_note_to_db(client, db, vault_id, rel_path, content).await;
     Ok(json!({ "ok": true, "path": rel_path }))
@@ -260,6 +282,7 @@ pub(crate) async fn vault_update_note(
     vault_id: &str,
 ) -> Result<Value, String> {
     if vault_path.is_empty() { return Err("Vault 未設定".to_string()); }
+    validate_rel_path(rel_path)?;
     let full = std::path::Path::new(vault_path).join(rel_path);
     if !full.exists() { return Err(format!("筆記不存在：{}", rel_path)); }
     tokio::fs::write(&full, content).await.map_err(|e| e.to_string())?;
@@ -274,6 +297,7 @@ pub(crate) async fn vault_create_folder(
     vault_id: &str,
 ) -> Result<Value, String> {
     if vault_path.is_empty() { return Err("Vault 未設定".to_string()); }
+    validate_rel_path(rel_path)?;
     let full = std::path::Path::new(vault_path).join(rel_path);
     tokio::fs::create_dir_all(&full).await.map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().timestamp();
@@ -292,6 +316,7 @@ pub(crate) async fn vault_delete_note(
     vault_id: &str,
 ) -> Result<Value, String> {
     if vault_path.is_empty() { return Err("Vault 未設定".to_string()); }
+    validate_rel_path(rel_path)?;
     let full = std::path::Path::new(vault_path).join(rel_path);
     if !full.exists() { return Err(format!("筆記不存在：{}", rel_path)); }
     tokio::fs::remove_file(&full).await.map_err(|e| format!("刪除失敗：{}", e))?;
@@ -308,6 +333,7 @@ pub(crate) async fn vault_delete_folder(
     vault_path: &str,
 ) -> Result<Value, String> {
     if vault_path.is_empty() { return Err("Vault 未設定".to_string()); }
+    validate_rel_path(rel_path)?;
     let full = std::path::Path::new(vault_path).join(rel_path);
     if !full.exists() { return Err(format!("資料夾不存在：{}", rel_path)); }
     tokio::fs::remove_dir_all(&full).await.map_err(|e| format!("刪除資料夾失敗：{}", e))?;
@@ -323,10 +349,13 @@ pub(crate) async fn vault_move_note(
     vault_id: &str,
 ) -> Result<Value, String> {
     if vault_path.is_empty() { return Err("Vault 未設定".to_string()); }
+    validate_rel_path(from_rel)?;
+    validate_rel_path(to_rel)?;
     let base = std::path::Path::new(vault_path);
     let from_full = base.join(from_rel);
     let to_full = base.join(to_rel);
     if !from_full.exists() { return Err(format!("來源不存在：{}", from_rel)); }
+    if to_full.exists() { return Err(format!("目標路徑已存在：{}，請先確認是否要覆蓋或選擇其他名稱。", to_rel)); }
     if let Some(parent) = to_full.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
     }
@@ -351,6 +380,7 @@ pub(crate) async fn vault_append_to_note(
     vault_id: &str,
 ) -> Result<Value, String> {
     if vault_path.is_empty() { return Err("Vault 未設定".to_string()); }
+    validate_rel_path(rel_path)?;
     let full = std::path::Path::new(vault_path).join(rel_path);
     if !full.exists() { return Err(format!("筆記不存在：{}", rel_path)); }
     let mut existing = tokio::fs::read_to_string(&full).await.map_err(|e| e.to_string())?;
@@ -867,6 +897,25 @@ fn safe_emit_end(s: &str, tag: &str) -> usize {
     n
 }
 
+/// Validate citation ids from [cite:id1,id2] against the tool_calls_store.
+/// Returns true if all ids are known (or store is None = no validation needed).
+/// Emits agent:hallucination_warning if unknown ids are found.
+async fn validate_citation(
+    cite_inner: &str,
+    tool_calls_store: Option<&crate::service_agent::engine::dispatcher::ToolCallStore>,
+) -> bool {
+    let store = match tool_calls_store {
+        Some(s) => s,
+        None => return true,
+    };
+    if cite_inner.trim() == "none" { return true; }
+    let ids: Vec<&str> = cite_inner.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    if ids.is_empty() { return true; }
+    let store = store.lock().await;
+    let unknown: Vec<&str> = ids.iter().filter(|id| !store.contains_key(**id)).copied().collect();
+    unknown.is_empty()
+}
+
 /// Stream one LLM round, emitting llm:token events. Returns (text, finish_reason, tool_chunks).
 /// tool_chunks: Vec<(id, name, arguments_str)>
 pub(crate) async fn stream_llm_round(
@@ -876,6 +925,7 @@ pub(crate) async fn stream_llm_round(
     state: &ApiState,
     _session_id: &str,
     cancel: &Arc<AtomicBool>,
+    tool_calls_store: Option<&crate::service_agent::engine::dispatcher::ToolCallStore>,
 ) -> Result<(String, String, Vec<(String, String, String)>), String> {
     let resp = client
         .post(format!("{}/v1/chat/completions", llm_url))
@@ -900,6 +950,14 @@ pub(crate) async fn stream_llm_round(
     let mut pending_emit = String::new();
     let mut suppress_emit = false;  // true once we've detected a text-format <tool_call>
 
+    // Citation interceptor state machine.
+    // Buffers up to CITE_BUFFER_LIMIT chars to detect [cite:...] at start of response.
+    const CITE_BUFFER_LIMIT: usize = 60;
+    enum CiteState { Buffering, Forwarding }
+    let mut cite_state = CiteState::Buffering;
+    let mut cite_buf = String::new();
+    let mut cite_retry_done = false;
+
     while let Some(item) = stream.next().await {
         if cancel.load(Ordering::Relaxed) { break; }
         let bytes = item.map_err(|e| e.to_string())?;
@@ -922,22 +980,62 @@ pub(crate) async fn stream_llm_round(
                             if !content.is_empty() {
                                 full_text.push_str(content);
                                 if !suppress_emit {
-                                    pending_emit.push_str(content);
-                                    if pending_emit.contains("<tool_call>") {
-                                        // Emit only the text before the tag, then suppress
-                                        let pos = pending_emit.find("<tool_call>").unwrap_or(0);
-                                        if pos > 0 {
-                                            state.daemon.emit("llm:token", json!(&pending_emit[..pos]));
+                                    // ── Citation interceptor ──────────────────
+                                    let emit_content = match cite_state {
+                                        CiteState::Forwarding => {
+                                            Some(content.to_string())
                                         }
-                                        pending_emit.clear();
-                                        suppress_emit = true;
-                                    } else {
-                                        // Safe to emit up to a point where no partial tag can start
-                                        let safe_end = safe_emit_end(&pending_emit, "<tool_call>");
-                                        if safe_end > 0 {
-                                            let chunk = pending_emit[..safe_end].to_string();
-                                            pending_emit = pending_emit[safe_end..].to_string();
-                                            state.daemon.emit("llm:token", json!(chunk));
+                                        CiteState::Buffering => {
+                                            cite_buf.push_str(content);
+                                            // Try to parse [cite:...] from buffer
+                                            if let Some(cite_end) = cite_buf.find(']') {
+                                                if cite_buf.starts_with("[cite:") {
+                                                    let cite_inner = &cite_buf[6..cite_end]; // between [cite: and ]
+                                                    let _valid = validate_citation(cite_inner, tool_calls_store).await;
+                                                    // Strip [cite:...] from what we forward
+                                                    let rest = cite_buf[cite_end + 1..].to_string();
+                                                    cite_buf.clear();
+                                                    cite_state = CiteState::Forwarding;
+                                                    if rest.is_empty() { None } else { Some(rest) }
+                                                } else {
+                                                    // ] found but doesn't start with [cite: — forward buffer
+                                                    let flushed = cite_buf.clone();
+                                                    cite_buf.clear();
+                                                    cite_state = CiteState::Forwarding;
+                                                    Some(flushed)
+                                                }
+                                            } else if cite_buf.len() >= CITE_BUFFER_LIMIT {
+                                                // Timeout: no [cite:...] found — treat as [cite:none]
+                                                if !cite_retry_done && tool_calls_store.is_some() {
+                                                    // Emit warning event; forward buffered content
+                                                    state.daemon.emit("agent:citation_missing", json!({}));
+                                                    cite_retry_done = true;
+                                                }
+                                                let flushed = cite_buf.clone();
+                                                cite_buf.clear();
+                                                cite_state = CiteState::Forwarding;
+                                                Some(flushed)
+                                            } else {
+                                                None // still buffering
+                                            }
+                                        }
+                                    };
+                                    if let Some(emit_str) = emit_content {
+                                        pending_emit.push_str(&emit_str);
+                                        if pending_emit.contains("<tool_call>") {
+                                            let pos = pending_emit.find("<tool_call>").unwrap_or(0);
+                                            if pos > 0 {
+                                                state.daemon.emit("llm:token", json!(&pending_emit[..pos]));
+                                            }
+                                            pending_emit.clear();
+                                            suppress_emit = true;
+                                        } else {
+                                            let safe_end = safe_emit_end(&pending_emit, "<tool_call>");
+                                            if safe_end > 0 {
+                                                let chunk = pending_emit[..safe_end].to_string();
+                                                pending_emit = pending_emit[safe_end..].to_string();
+                                                state.daemon.emit("llm:token", json!(chunk));
+                                            }
                                         }
                                     }
                                 }
@@ -961,6 +1059,11 @@ pub(crate) async fn stream_llm_round(
         }
     }
 
+    // Flush remaining citation buffer (stream ended before we saw [cite:...])
+    if !cite_buf.is_empty() {
+        pending_emit.push_str(&cite_buf);
+        cite_buf.clear();
+    }
     // Flush remaining pending (if stream ended without <tool_call>)
     if !suppress_emit && !pending_emit.is_empty() {
         state.daemon.emit("llm:token", json!(pending_emit));

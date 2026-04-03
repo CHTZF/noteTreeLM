@@ -12,7 +12,6 @@ use super::super::engine::tool_registry::ToolRegistry;
 use super::super::engine::transaction::Transaction;
 use super::super::engine::context::{build_messages, inject_memory, trim_context};
 use super::super::types::{EmitEventFn, IsWriteFn, Tool};
-use super::super::helpers::MetaFunctionSpec;
 
 /// Public entry point called from routes/agents.rs for user-facing agent runs.
 /// Now receives raw input + thin params from Tauri; does all pre-processing here.
@@ -34,7 +33,8 @@ pub(crate) async fn run_interactive_agent(
     input: String,
     system: String,
     streaming: bool,               // true = emit llm:token SSE; false = silent (background/sub-agent)
-    tool_names: Vec<String>,       // pre-resolved by caller (runner or run_agent)
+    tool_names: Vec<String>,       // pre-resolved by caller; must NOT contain "think"
+    enable_think: bool,            // if true, force Round 0 to call think via tool_choice
     system_injection: String,      // extra text appended to system prompt (from skill pass)
     activity_context: Option<String>,
     vault_id: String,
@@ -46,10 +46,8 @@ pub(crate) async fn run_interactive_agent(
     // Session cancel flag and transaction — created in run_agent and passed in.
     cancel: Arc<AtomicBool>,
     tx: Arc<Transaction>,
-    // Pre-planner meta-functions generated from matched skills' tool_chain_order.
-    meta_functions: Vec<MetaFunctionSpec>,
-    // Whether to run the pre-think step (controlled by agent_def["enable_think"]).
-    enable_think: bool,
+    // Per-session tool execution evidence store (shared with AgentSession).
+    tool_calls_store: Arc<tokio::sync::Mutex<std::collections::HashMap<String, crate::state::ToolCallRecord>>>,
 ) -> String {
     let conv_id = conversation_id;
     let vault_path = state.resolve_vault_path(&vault_id).await;
@@ -63,7 +61,7 @@ pub(crate) async fn run_interactive_agent(
         }
     };
 
-    let mut tool_names = tool_names; // rebind as mutable for chain filtering below
+    let tool_names = tool_names;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(300))
@@ -107,141 +105,71 @@ pub(crate) async fn run_interactive_agent(
         super::super::tools::vault_tools::is_interactive_write_tool(name)
     });
 
-    // Remove chain tools covered by meta-functions from the direct tool list.
-    let chain_tool_set: std::collections::HashSet<String> = meta_functions.iter()
-        .flat_map(|m| m.chain.iter().cloned())
-        .collect();
-    tool_names.retain(|t| !chain_tool_set.contains(t));
-
-    let mut registry = build_interactive_registry(
+    let registry = build_interactive_registry(
         &client, &llm_url, &state.db,
         &vault_id, &account_id, &vault_path, &embedding_url,
         &session_id, &state,
         Arc::clone(&tx),
         Arc::clone(&cancel),
+        Arc::clone(&tool_calls_store),
     );
-
-    // If meta_functions exist, LLM schema only contains them → tool loop always
-    // expands via plan_from_meta_function. Determined once before the loop.
-    let has_meta = !meta_functions.is_empty();
 
     let dispatcher = Dispatcher::new(
         Arc::new(registry),
         Arc::clone(&emit_fn_closure),
         Arc::clone(&is_write_fn),
+        Arc::clone(&tool_calls_store),
     );
 
-    // 7. Tool loop — two independent paths based on pre-pass result:
-    //    A) has_meta: skill chain path (meta_functions only, no direct tools)
-    //    B) !has_meta && tool_names non-empty: direct tool path (plan_from_chunks)
-    //    C) neither: pure LLM (no tools, no vault, or no pre-pass)
+    // 7. Tool loop:
+    //    B) tool_names non-empty: ReAct path (plan_from_chunks, verified_paths enforced in tools)
+    //    C) no tools: pure LLM
     let mut msgs = messages_json.clone();
     let mut full_response = String::new();
 
-    // ── Path A: meta_function (skill chain) ──────────────────────────────────
-    if has_meta {
-        let meta_schema: Vec<Value> = meta_functions.iter()
-            .map(|s| build_meta_fn_schema(s, enable_think))
-            .collect();
-        let tools_value = Some(json!(meta_schema));
-
-        let mut unknown_fn_retried = false;
-        for _round in 0..super::super::MAX_ROUNDS {
-            if cancel.load(Ordering::Relaxed) { break; }
-
-            let (text, tool_chunks) = if streaming {
-                match super::super::tools::vault_tools::stream_llm_round(
-                    &client, &llm_url,
-                    json!({ "messages": msgs, "tools": tools_value, "tool_choice": "auto",
-                             "stream": true, "temperature": 0.7, "max_tokens": 2048 }),
-                    &state, &session_id, &cancel,
-                ).await {
-                    Ok((t, _, chunks)) => (t, chunks),
-                    Err(e) => { tracing::warn!("[interactive/meta] stream error: {}", e); break; }
-                }
-            } else {
-                match super::super::tools::vault_tools::call_llm_once(
-                    &client, &llm_url, &msgs, tools_value.clone(), &cancel,
-                ).await {
-                    Ok(r) => r,
-                    Err(e) => { tracing::warn!("[interactive/meta] llm error: {}", e); break; }
-                }
-            };
-
-            if !text.is_empty() { full_response = text; }
-
-            if !tool_chunks.is_empty() {
-                let tc = &tool_chunks[0];
-                msgs.push(json!({ "role": "assistant", "content": "",
-                    "tool_calls": [{ "id": tc.0, "type": "function",
-                        "function": { "name": tc.1, "arguments": tc.2 } }] }));
-
-                let spec = meta_functions.iter().find(|s| s.fn_name == tc.1);
-                if spec.is_none() {
-                    if unknown_fn_retried {
-                        // LLM hallucinated a second time — give up.
-                        break;
-                    }
-                    let discovery = build_skill_discovery_injection(&state.db, &account_id).await;
-                    msgs.push(json!({ "role": "tool", "tool_call_id": tc.0, "name": tc.1, "content": discovery }));
-                    unknown_fn_retried = true;
-                    if cancel.load(Ordering::Relaxed) { break; }
-                    continue;
-                }
-                let spec = spec.unwrap();
-                {
-                    let db = state.db.clone();
-                    let sid = spec.skill_id.clone();
-                    let now = chrono::Utc::now().timestamp();
-                    tokio::spawn(async move {
-                        let _ = db
-                            .query("UPDATE agent_skills SET trigger_count = (trigger_count OR 0) + 1, last_triggered_at = $now WHERE skill_id = $sid")
-                            .bind(("now", now)).bind(("sid", sid)).await;
-                    });
-                }
-                let user_args: Value = resolve_context_refs(
-                    &serde_json::from_str(&tc.2).unwrap_or(json!({})),
-                    &msgs,
-                );
-                let graph = Planner::plan_from_meta_function(&spec.chain, &user_args);
-                let results = match dispatcher.run(Arc::clone(&tx), graph).await {
-                    Ok(r) => r,
-                    Err(e) => { tracing::warn!("[interactive/meta] dispatcher error: {}", e); break; }
-                };
-                let content = results.into_iter().last()
-                    .map(|v| match v { Value::String(s) => s, o => serde_json::to_string(&o).unwrap_or_default() })
-                    .unwrap_or_default();
-                msgs.push(json!({ "role": "tool", "tool_call_id": tc.0, "name": tc.1, "content": content }));
-                if cancel.load(Ordering::Relaxed) { break; }
-            } else {
-                // LLM chose to respond with text rather than call a meta_function — accept it.
-                break;
-            }
-        }
-
-    // ── Path B: direct tools (plan_from_chunks) ───────────────────────────────
-    } else if !tool_names.is_empty() {
+    // ── Path B: direct tools (ReAct / plan_from_chunks) ──────────────────────
+    if !tool_names.is_empty() {
         let tools_schema = super::super::tools::vault_tools::build_tools_schema_interactive(&tool_names);
         let tools_value = if tools_schema.is_empty() { None } else { Some(json!(tools_schema)) };
 
-        for _round in 0..super::super::MAX_ROUNDS {
+        // When enable_think=true, force Round 0 to call think via tool_choice.
+        // think is NOT in tool_names so subsequent rounds cannot call it.
+        let think_schema = if enable_think {
+            Some(super::super::tools::vault_tools::build_tools_schema_interactive(&["think".to_string()]))
+        } else {
+            None
+        };
+
+        for round in 0..super::super::MAX_ROUNDS {
             if cancel.load(Ordering::Relaxed) { break; }
 
+            // Round 0 with enable_think: use think-only schema + forced tool_choice.
+            // Subsequent rounds use the normal tools schema with tool_choice: auto.
+            let (round_tools, round_choice) = if round == 0 {
+                if let Some(ref ts) = think_schema {
+                    (Some(json!(ts)), json!({ "type": "function", "function": { "name": "think" } }))
+                } else {
+                    (tools_value.clone(), json!("auto"))
+                }
+            } else {
+                (tools_value.clone(), json!("auto"))
+            };
+
             let (text, tool_chunks) = if streaming {
-                let body = match &tools_value {
-                    Some(tv) => json!({ "messages": msgs, "tools": tv, "tool_choice": "auto",
+                let body = match &round_tools {
+                    Some(tv) => json!({ "messages": msgs, "tools": tv, "tool_choice": round_choice,
                                        "stream": true, "temperature": 0.7, "max_tokens": 2048 }),
                     None     => json!({ "messages": msgs, "stream": true, "temperature": 0.7, "max_tokens": 2048 }),
                 };
                 match super::super::tools::vault_tools::stream_llm_round(
-                    &client, &llm_url, body, &state, &session_id, &cancel,
+                    &client, &llm_url, body, &state, &session_id, &cancel, Some(&tool_calls_store),
                 ).await {
                     Ok((t, _, chunks)) => (t, chunks),
                     Err(e) => { tracing::warn!("[interactive/tools] stream error: {}", e); break; }
                 }
             } else {
                 match super::super::tools::vault_tools::call_llm_once(
-                    &client, &llm_url, &msgs, tools_value.clone(), &cancel,
+                    &client, &llm_url, &msgs, round_tools, &cancel,
                 ).await {
                     Ok(r) => r,
                     Err(e) => { tracing::warn!("[interactive/tools] llm error: {}", e); break; }
@@ -274,7 +202,7 @@ pub(crate) async fn run_interactive_agent(
             match super::super::tools::vault_tools::stream_llm_round(
                 &client, &llm_url,
                 json!({ "messages": msgs, "stream": true, "temperature": 0.7, "max_tokens": 2048 }),
-                &state, &session_id, &cancel,
+                &state, &session_id, &cancel, None, // Path C: pure chat, no citation validation
             ).await {
                 Ok((text, _, _)) => { full_response = text; }
                 Err(e) => { tracing::warn!("[interactive/pure] stream error: {}", e); }
@@ -340,6 +268,7 @@ pub(crate) fn build_interactive_registry(
     state: &ApiState,
     _tx: Arc<Transaction>,
     cancel: Arc<AtomicBool>,
+    tool_calls_store: Arc<tokio::sync::Mutex<std::collections::HashMap<String, crate::state::ToolCallRecord>>>,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
 
@@ -352,7 +281,22 @@ pub(crate) fn build_interactive_registry(
         "save_memory_facts", "mark_conversation_processed", "condense_memory_facts",
     ];
 
+    // Write tools that legitimately need no prior-evidence guard:
+    // - create_note / create_folder: creating new resources, nothing to verify beforehand
+    // - create_agent_skill: DB-only write, no filesystem path involved
+    const GUARD_EXEMPT_WRITE_TOOLS: &[&str] = &["create_note", "create_folder", "create_agent_skill"];
+
     for &name in &all_tool_names {
+        // Compile-time safety net: every interactive write tool must either have a
+        // tool_guard_spec entry or be explicitly listed as exempt. Fires only in debug builds.
+        debug_assert!(
+            !super::super::tools::vault_tools::is_interactive_write_tool(name)
+                || tool_guard_spec(name).is_some()
+                || GUARD_EXEMPT_WRITE_TOOLS.contains(&name),
+            "write tool '{}' has no tool_guard_spec entry and is not in GUARD_EXEMPT_WRITE_TOOLS",
+            name
+        );
+
         let client = client.clone();
         let llm_url = llm_url.to_string();
         let db = db.clone();
@@ -363,6 +307,7 @@ pub(crate) fn build_interactive_registry(
         let session_id = session_id.to_string();
         let state_c = state.clone();
         let name_owned = name.to_string();
+        let tool_calls_store_c = Arc::clone(&tool_calls_store);
 
         let execute: super::super::types::ToolFn = Arc::new(move |args: Value| {
             let client = client.clone();
@@ -375,16 +320,60 @@ pub(crate) fn build_interactive_registry(
             let session_id = session_id.clone();
             let state_c = state_c.clone();
             let name = name_owned.clone();
+            let tool_calls_store = Arc::clone(&tool_calls_store_c);
 
             Box::pin(async move {
-                // Special: plan_announce — emit SSE before returning
+                // Special: plan_announce — emit SSE only; transaction is not involved.
+                // Subsequent write tools each trigger their own confirmation via is_write_fn.
                 if name == "plan_announce" {
                     let plan = args["plan"].as_str().unwrap_or("").to_string();
                     state_c.daemon.emit("agent:plan_announce", json!({
                         "session_id": session_id,
                         "plan": plan,
                     }));
-                    return Ok(json!("✅ 已確認計畫，請立即執行"));
+                    return Ok(json!("✅ 已記錄計畫，請立即執行"));
+                }
+
+                // ── Declarative precondition guard ─────────────────────────
+                if let Some(spec) = tool_guard_spec(&name) {
+                    let raw_path = (spec.path_extractor)(&args);
+                    if raw_path.is_empty() {
+                        return Ok(json!("路徑參數不能為空，請提供有效的路徑後再試。"));
+                    }
+                    {
+                        let target = if spec.is_folder {
+                            raw_path.to_lowercase()
+                        } else {
+                            norm_path(&raw_path)
+                        };
+                        let store = tool_calls_store.lock().await;
+                        let path_ok = check_path_seen(&store, &target, spec.is_folder);
+                        let content_ok = !matches!(spec.require, GuardLevel::ContentRead)
+                            || check_content_read(&store, &target);
+                        let was_searched = has_search_result(&store, spec.is_folder);
+                        drop(store);
+
+                        if !path_ok {
+                            let hint = if spec.is_folder {
+                                if was_searched {
+                                    format!("list_structure 結果中找不到資料夾 '{}'，請確認名稱是否正確。", raw_path)
+                                } else {
+                                    format!("資料夾 '{}' 尚未驗證存在，請先呼叫 list_structure 確認。", raw_path)
+                                }
+                            } else if was_searched {
+                                format!("搜尋結果中找不到 '{}'，請確認筆記名稱或換個關鍵字再搜尋。", raw_path)
+                            } else {
+                                format!("路徑 '{}' 尚未驗證存在，請先使用 search_vault 或 list_structure 確認。", raw_path)
+                            };
+                            return Ok(json!(hint));
+                        }
+                        if !content_ok {
+                            return Ok(json!(format!(
+                                "尚未成功讀取 '{}' 的內容（讀取失敗或未呼叫 read_note）。請先呼叫 read_note 確認內容後再修改。",
+                                raw_path
+                            )));
+                        }
+                    }
                 }
 
                 let result = super::super::tools::vault_tools::dispatch_interactive_tool(
@@ -597,10 +586,12 @@ pub async fn run_agent(
         }
     }
 
-    // 1. Register session (cancel flag + transaction).
+    // 1. Register session (cancel flag + transaction + tool_calls evidence store).
     //    Cancel any existing session for this conversation first.
     let cancel = Arc::new(AtomicBool::new(false));
     let tx = Arc::new(Transaction::new());
+    let tool_calls_store: Arc<tokio::sync::Mutex<std::collections::HashMap<String, crate::state::ToolCallRecord>>> =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     {
         let mut sessions = state.daemon.agent_sessions.lock().await;
         if let Some(old) = sessions.get(conv_id) {
@@ -614,6 +605,7 @@ pub async fn run_agent(
             cancel: Arc::clone(&cancel),
             transaction: Some(Arc::clone(&tx)),
             conversation_id: conv_id.to_string(),
+            tool_calls: Arc::clone(&tool_calls_store),
         });
     }
 
@@ -623,7 +615,7 @@ pub async fn run_agent(
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
-    // think is controlled by enable_think flag, never via tool_names
+    // think is never in tool_names; it is injected as a forced Round-0 call via enable_think.
     tool_names.retain(|t| t != "think");
 
     let http_client = reqwest::Client::new();
@@ -666,8 +658,8 @@ pub async fn run_agent(
         }
     );
 
-    // Process skill pass result: extract system_injection and meta_functions.
-    let (system_injection, meta_functions) = if let Some(skill) = skill_result {
+    // Process skill pass result: extract system_injection and add skill's chain tools.
+    let system_injection = if let Some(skill) = skill_result {
         if skill.skill_titles.is_empty() {
             // No skill matched and use_skill_pass is true → skill discovery mode.
             // Fetch existing skills to give LLM context; enable create_agent_skill.
@@ -675,7 +667,7 @@ pub async fn run_agent(
             if !tool_names.contains(&"create_agent_skill".to_string()) {
                 tool_names.push("create_agent_skill".to_string());
             }
-            (discovery, vec![])
+            discovery
         } else {
             if streaming {
                 state.daemon.emit("agent:skills_activated", serde_json::json!({
@@ -684,12 +676,16 @@ pub async fn run_agent(
                     "source": "pre_pass",
                 }));
             }
-            // trigger_count is bumped only when LLM actually picks the meta_function,
-            // not at pre-pass time — so multiple matched skills aren't over-counted.
-            (skill.system_injection, skill.meta_functions)
+            // Add tools required by skill chains to the agent's direct tool access.
+            for t in skill.skill_tool_names {
+                if !tool_names.contains(&t) {
+                    tool_names.push(t);
+                }
+            }
+            skill.system_injection
         }
     } else {
-        (String::new(), vec![])
+        String::new()
     };
 
     run_interactive_agent(
@@ -699,6 +695,7 @@ pub async fn run_agent(
         system_prompt,
         streaming,
         tool_names,
+        enable_think,
         system_injection,
         activity_context,
         vault_id,
@@ -707,319 +704,137 @@ pub async fn run_agent(
         memory_facts,
         cancel,
         tx,
-        meta_functions,
-        enable_think,
+        tool_calls_store,
     ).await
 }
 
-// ── Context reference resolution ─────────────────────────────────────────────
-
-const CONTEXT_REF_CONTENT_THRESHOLD: usize = 120;
-
-/// If `args` contains `context_from`/`context_to`, locate those strings in the
-/// conversation history (optionally filtered by role) and replace them with a
-/// resolved `content` field.
-///
-/// - `context_from_role` / `context_to_role`: narrow search to a specific role
-///   ("user" or "assistant"), reducing false-match risk.
-/// - Role labels (`[user]`, `[assistant]`) are stripped from extracted content.
-/// - If `content` is already provided and exceeds CONTEXT_REF_CONTENT_THRESHOLD,
-///   logs a warning (LLM should have used markers instead).
-/// - Removes all context_* fields from returned args.
-fn resolve_context_refs(args: &Value, msgs: &[Value]) -> Value {
-    let from_text = match args["context_from"].as_str().filter(|s| !s.is_empty()) {
-        Some(s) => s,
-        None => {
-            // No markers — check if direct content is suspiciously large.
-            if let Some(c) = args["content"].as_str() {
-                if c.len() > CONTEXT_REF_CONTENT_THRESHOLD {
-                    tracing::warn!(
-                        "[resolve_context_refs] content is {} chars (>{}) — LLM should use context_from/context_to",
-                        c.len(), CONTEXT_REF_CONTENT_THRESHOLD
-                    );
-                }
-            }
-            return args.clone();
-        }
-    };
-    let to_text       = args["context_to"].as_str().unwrap_or("");
-    let from_role     = args["context_from_role"].as_str();
-    let to_role       = args["context_to_role"].as_str();
-
-    let non_system: Vec<&Value> = msgs.iter()
-        .filter(|m| m["role"].as_str() != Some("system"))
-        .collect();
-
-    // Find the message index + char offset where from_text first appears (role filtered).
-    let find_in = |text: &str, role_filter: Option<&str>, use_rfind: bool| -> Option<(usize, usize)> {
-        let candidates: Vec<(usize, &Value)> = non_system.iter().enumerate()
-            .filter(|(_, m)| role_filter.map_or(true, |r| m["role"].as_str() == Some(r)))
-            .map(|(i, m)| (i, *m))
-            .collect();
-        if use_rfind {
-            for (msg_idx, msg) in candidates.iter().rev() {
-                let content = msg["content"].as_str().unwrap_or("");
-                if let Some(offset) = content.rfind(text) {
-                    return Some((*msg_idx, offset));
-                }
-            }
-        } else {
-            for (msg_idx, msg) in &candidates {
-                let content = msg["content"].as_str().unwrap_or("");
-                if let Some(offset) = content.find(text) {
-                    return Some((*msg_idx, offset));
-                }
-            }
-        }
-        None
-    };
-
-    let (from_msg, from_offset) = find_in(from_text, from_role, false)
-        .unwrap_or((0, 0));
-
-    let (to_msg, to_offset) = if to_text.is_empty() {
-        (non_system.len().saturating_sub(1),
-         non_system.last().and_then(|m| m["content"].as_str()).map(|s| s.len()).unwrap_or(0))
-    } else {
-        find_in(to_text, to_role, true)
-            .map(|(mi, off)| (mi, off + to_text.len()))
-            .unwrap_or_else(|| {
-                let last = non_system.len().saturating_sub(1);
-                let len = non_system.last().and_then(|m| m["content"].as_str()).map(|s| s.len()).unwrap_or(0);
-                (last, len)
-            })
-    };
-
-    // Collect content from from_msg:from_offset to to_msg:to_offset, stripping role prefixes.
-    let mut parts: Vec<String> = Vec::new();
-    for idx in from_msg..=to_msg.min(non_system.len().saturating_sub(1)) {
-        let raw = non_system[idx]["content"].as_str().unwrap_or("");
-        let slice = if idx == from_msg && idx == to_msg {
-            &raw[from_offset.min(raw.len())..to_offset.min(raw.len())]
-        } else if idx == from_msg {
-            &raw[from_offset.min(raw.len())..]
-        } else if idx == to_msg {
-            &raw[..to_offset.min(raw.len())]
-        } else {
-            raw
-        };
-        if !slice.is_empty() {
-            parts.push(slice.to_string());
-        }
-    }
-    let content = parts.join("\n\n");
-
-    let mut resolved = args.clone();
-    let obj = resolved.as_object_mut().unwrap();
-    obj.insert("content".to_string(), json!(content));
-    obj.remove("context_from");
-    obj.remove("context_to");
-    obj.remove("context_from_role");
-    obj.remove("context_to_role");
-    resolved
-}
-
-// ── Pre-planner chain execution ───────────────────────────────────────────────
-
-/// Returns all input params for a tool when it is the first step in a chain.
-fn meta_fn_tool_params(tool_name: &str) -> Vec<(&'static str, serde_json::Value)> {
-    match tool_name {
-        "create_note" => vec![
-            ("path",              json!({"type": "string", "description": "筆記路徑（含副檔名）"})),
-            ("content",           json!({"type": "string", "description": "筆記內容（120字以內直接填寫；超過120字必須改用 context_from/context_to）"})),
-            ("context_from",      json!({"type": "string", "description": "（超過120字時必填）要擷取的對話內容起始文字，前60字"})),
-            ("context_from_role", json!({"type": "string", "enum": ["user", "assistant"], "description": "context_from 所在訊息的角色，用於精確定位"})),
-            ("context_to",        json!({"type": "string", "description": "（可選）要擷取的對話內容結束文字，後60字；省略則擷取到對話末尾"})),
-            ("context_to_role",   json!({"type": "string", "enum": ["user", "assistant"], "description": "context_to 所在訊息的角色"})),
-        ],
-        "search_vault" => vec![
-            ("query", json!({"type": "string", "description": "搜尋關鍵字"})),
-        ],
-        "open_note" => vec![
-            ("paths", json!({"type": "array", "items": {"type": "string"}, "description": "筆記路徑列表"})),
-        ],
-        "read_note" => vec![
-            ("path", json!({"type": "string", "description": "筆記路徑"})),
-        ],
-        "update_note" => vec![
-            ("path",              json!({"type": "string", "description": "筆記路徑"})),
-            ("content",           json!({"type": "string", "description": "完整新內容（120字以內直接填寫；超過120字必須改用 context_from/context_to）"})),
-            ("context_from",      json!({"type": "string", "description": "（超過120字時必填）要擷取的對話內容起始文字，前60字"})),
-            ("context_from_role", json!({"type": "string", "enum": ["user", "assistant"], "description": "context_from 所在訊息的角色，用於精確定位"})),
-            ("context_to",        json!({"type": "string", "description": "（可選）要擷取的對話內容結束文字，後60字；省略則擷取到對話末尾"})),
-            ("context_to_role",   json!({"type": "string", "enum": ["user", "assistant"], "description": "context_to 所在訊息的角色"})),
-        ],
-        "append_to_note" => vec![
-            ("path",              json!({"type": "string", "description": "筆記路徑"})),
-            ("content",           json!({"type": "string", "description": "要追加的內容（120字以內直接填寫；超過120字必須改用 context_from/context_to）"})),
-            ("context_from",      json!({"type": "string", "description": "（超過120字時必填）要擷取的對話內容起始文字，前60字"})),
-            ("context_from_role", json!({"type": "string", "enum": ["user", "assistant"], "description": "context_from 所在訊息的角色，用於精確定位"})),
-            ("context_to",        json!({"type": "string", "description": "（可選）要擷取的對話內容結束文字，後60字；省略則擷取到對話末尾"})),
-            ("context_to_role",   json!({"type": "string", "enum": ["user", "assistant"], "description": "context_to 所在訊息的角色"})),
-        ],
-        "delete_note" => vec![
-            ("path", json!({"type": "string", "description": "要刪除的筆記路徑"})),
-        ],
-        "update_note_frontmatter" => vec![
-            ("path",   json!({"type": "string", "description": "筆記路徑"})),
-            ("fields", json!({"type": "object", "description": "要更新的 frontmatter 鍵值對，例如 {\"tags\": [\"A\"], \"status\": \"done\"}"})),
-        ],
-        "list_structure" => vec![
-            ("path", json!({"type": "string", "description": "資料夾路徑"})),
-        ],
-        _ => vec![],
+/// Returns true if a read_note result value indicates a failure (file not found, empty vault, etc.).
+/// vault_tools::vault_read_note always returns Ok(String), so errors are encoded as specific prefixes.
+fn is_read_note_error(result: &serde_json::Value) -> bool {
+    match result.as_str() {
+        Some(s) => s.starts_with("讀取失敗：") || s == "Vault 未設定" || s == "路徑為空" || s.is_empty(),
+        None => true, // unexpected type → treat as error
     }
 }
 
-/// Returns only the params that cannot be derived from the previous chain step's result.
-/// These are the residual user-supplied params for non-first chain tools.
-fn meta_fn_residual_params(tool_name: &str) -> Vec<(&'static str, serde_json::Value)> {
-    match tool_name {
-        // path derived from search result — no residual
-        "open_note" | "read_note" | "delete_note" => vec![],
-        "append_to_note" => vec![
-            ("content",           json!({"type": "string", "description": "要追加的內容（120字以內直接填寫；超過120字必須改用 context_from/context_to）"})),
-            ("context_from",      json!({"type": "string", "description": "（超過120字時必填）對話起始文字，前60字"})),
-            ("context_from_role", json!({"type": "string", "enum": ["user", "assistant"], "description": "context_from 所在訊息的角色"})),
-            ("context_to",        json!({"type": "string", "description": "（可選）對話結束文字，後60字"})),
-            ("context_to_role",   json!({"type": "string", "enum": ["user", "assistant"], "description": "context_to 所在訊息的角色"})),
-        ],
-        "update_note" => vec![
-            ("content",           json!({"type": "string", "description": "完整新內容（120字以內直接填寫；超過120字必須改用 context_from/context_to）"})),
-            ("context_from",      json!({"type": "string", "description": "（超過120字時必填）對話起始文字，前60字"})),
-            ("context_from_role", json!({"type": "string", "enum": ["user", "assistant"], "description": "context_from 所在訊息的角色"})),
-            ("context_to",        json!({"type": "string", "description": "（可選）對話結束文字，後60字"})),
-            ("context_to_role",   json!({"type": "string", "enum": ["user", "assistant"], "description": "context_to 所在訊息的角色"})),
-        ],
-        "update_note_frontmatter" => vec![
-            ("fields", json!({"type": "object", "description": "要更新的 frontmatter 鍵值對，例如 {\"tags\": [\"A\"], \"status\": \"done\"}"})),
-        ],
-        _ => vec![],
+// ── Declarative tool guard ──────────────────────────────────────────────────────
+
+/// Evidence level required before a write tool may execute.
+enum GuardLevel {
+    /// Path must appear in a prior tool's result or verified args.
+    PathSeen,
+    /// Additionally, read_note must have returned non-error content for this path.
+    ContentRead,
+}
+
+/// Declarative precondition spec for a guarded write tool.
+struct ToolGuardSpec {
+    /// Extract the target path from the tool's args.
+    path_extractor: fn(&Value) -> String,
+    /// Minimum evidence required.
+    require: GuardLevel,
+    /// If true, target is a folder path (skip .md normalization; use text search in list_structure).
+    is_folder: bool,
+}
+
+/// Returns a guard spec for tools that require prior evidence, or None if unguarded.
+/// To add a new guarded tool, add a match arm here — no other changes needed.
+fn tool_guard_spec(name: &str) -> Option<ToolGuardSpec> {
+    match name {
+        "delete_note" => Some(ToolGuardSpec {
+            path_extractor: |args| args["path"].as_str().unwrap_or("").to_string(),
+            require: GuardLevel::PathSeen,
+            is_folder: false,
+        }),
+        "move_note" => Some(ToolGuardSpec {
+            path_extractor: |args| args["from"].as_str().unwrap_or("").to_string(),
+            require: GuardLevel::PathSeen,
+            is_folder: false,
+        }),
+        "update_note" | "append_to_note" => Some(ToolGuardSpec {
+            path_extractor: |args| args["path"].as_str().unwrap_or("").to_string(),
+            require: GuardLevel::ContentRead,
+            is_folder: false,
+        }),
+        "delete_folder" => Some(ToolGuardSpec {
+            path_extractor: |args| args["path"].as_str().unwrap_or("").to_string(),
+            require: GuardLevel::PathSeen,
+            is_folder: true,
+        }),
+        _ => None,
     }
 }
 
-/// Build the JSON schema for a meta-function.
-/// chain[0]'s params are always required; subsequent tools only expose residual params
-/// (those that cannot be derived from previous step results).
-fn build_meta_fn_schema(spec: &MetaFunctionSpec, enable_think: bool) -> serde_json::Value {
-    let mut properties = serde_json::Map::new();
-    let mut required: Vec<String> = vec![];
+/// Normalize a vault path: lowercase first, then ensure .md suffix.
+/// Lowercasing before the ends_with check avoids "FOO.MD" → "foo.md.md" double-extension.
+fn norm_path(p: &str) -> String {
+    let lower = p.to_lowercase();
+    if lower.ends_with(".md") { lower } else { format!("{}.md", lower) }
+}
 
-    // When enable_think=true, LLM fills a `thought` param describing what it's about to do.
-    // plan_from_meta_function picks this up and prepends a think node in the ToolGraph.
-    if enable_think {
-        properties.insert("thought".to_string(), json!({
-            "type": "string",
-            "description": "一句話描述即將執行的動作（10字以內）"
-        }));
-        required.push("thought".to_string());
-    }
+type StoreMap = std::collections::HashMap<String, crate::state::ToolCallRecord>;
 
-    for (i, tool_name) in spec.chain.iter().enumerate() {
-        let params = if i == 0 {
-            meta_fn_tool_params(tool_name)
-        } else {
-            meta_fn_residual_params(tool_name)
-        };
-        for (param_name, param_schema) in params {
-            let key = format!("{}__{}", tool_name, param_name);
-            if i == 0 { required.push(key.clone()); }
-            properties.insert(key, param_schema);
+/// Check whether `target` (already normalized) appears in any prior tool's evidence.
+/// `is_folder`: skip note-only sources and use text substring for list_structure.
+fn check_path_seen(store: &StoreMap, target: &str, is_folder: bool) -> bool {
+    store.values().any(|rec| match rec.name.as_str() {
+        "search_vault" => {
+            // Returns JSON array [{path, title}]; only relevant for notes.
+            !is_folder && rec.result.as_array().map(|a| a.iter().any(|r|
+                r["path"].as_str().map(|p| norm_path(p) == target).unwrap_or(false)
+            )).unwrap_or(false)
         }
-    }
-
-    json!({
-        "type": "function",
-        "function": {
-            "name": spec.fn_name,
-            "description": spec.description,
-            "parameters": {
-                "type": "object",
-                "properties": properties,
-                "required": required
-            }
+        "list_structure" => {
+            // Returns plain text (indented tree).
+            // Notes: check exact path substring ("notes/foo.md").
+            // Folders: check "foldername/" to avoid prefix false-positives
+            //   e.g. "note" must NOT match "notes/foo.md", only "note/" would match "note/foo.md".
+            rec.result.as_str().map(|text| {
+                let text_lower = text.to_lowercase();
+                if is_folder {
+                    text_lower.contains(&format!("{}/", target))
+                } else {
+                    text_lower.contains(target)
+                }
+            }).unwrap_or(false)
         }
+        "read_note" => {
+            !is_folder
+            && rec.args["path"].as_str().map(|p| norm_path(p) == target).unwrap_or(false)
+            && !is_read_note_error(&rec.result)
+        }
+        "open_note" => {
+            !is_folder && (
+                rec.args["path"].as_str().map(|p| norm_path(p) == target).unwrap_or(false)
+                || rec.args["paths"].as_array().map(|a| a.iter().any(|p|
+                    p.as_str().map(|p| norm_path(p) == target).unwrap_or(false)
+                )).unwrap_or(false)
+            )
+        }
+        _ => false,
     })
 }
 
-/// Extract `tool_name__param` → `param` args for a specific tool from LLM-provided args.
-pub(crate) fn extract_user_tool_args(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
-    let prefix = format!("{}__", tool_name);
-    let mut result = serde_json::Map::new();
-    if let Some(obj) = args.as_object() {
-        for (k, v) in obj {
-            if let Some(param_name) = k.strip_prefix(&prefix) {
-                result.insert(param_name.to_string(), v.clone());
-            }
-        }
-    }
-    serde_json::Value::Object(result)
+/// Check whether read_note succeeded for `target` (non-error content exists in store).
+fn check_content_read(store: &StoreMap, target: &str) -> bool {
+    store.values().any(|rec|
+        rec.name == "read_note"
+        && rec.args["path"].as_str().map(|p| norm_path(p) == target).unwrap_or(false)
+        && !is_read_note_error(&rec.result)
+    )
 }
 
-/// Derive `to_tool`'s input args from `from_tool`'s result and args.
-pub(crate) fn extract_chain_step_args(
-    from_tool: &str,
-    to_tool: &str,
-    from_result: &serde_json::Value,
-    from_args: &serde_json::Value,
-    user_args: &serde_json::Value,
-) -> serde_json::Value {
-    match (from_tool, to_tool) {
-        ("search_vault", "open_note") | ("list_structure", "open_note") => {
-            let paths: Vec<serde_json::Value> = from_result.as_array()
-                .map(|a| a.iter()
-                    .filter_map(|r| r["path"].as_str().map(|p| json!(p)))
-                    .take(1).collect())
-                .unwrap_or_default();
-            json!({"paths": paths})
+/// Check whether a relevant discovery tool was called (to give better error hints).
+/// For folder guards only `list_structure` counts; for note guards either counts.
+fn has_search_result(store: &StoreMap, is_folder: bool) -> bool {
+    store.values().any(|rec| {
+        if is_folder {
+            rec.name == "list_structure"
+        } else {
+            matches!(rec.name.as_str(), "search_vault" | "list_structure")
         }
-        ("search_vault", "read_note") | ("list_structure", "read_note") => {
-            let path = from_result.as_array()
-                .and_then(|a| a.first())
-                .and_then(|r| r["path"].as_str())
-                .unwrap_or("");
-            json!({"path": path})
-        }
-        ("read_note", "update_note") => {
-            let path = from_args["path"].as_str().unwrap_or("");
-            let content = user_args["update_note__content"].as_str().unwrap_or("");
-            json!({"path": path, "content": content})
-        }
-        ("search_vault", "update_note") => {
-            let path = from_result.as_array()
-                .and_then(|a| a.first())
-                .and_then(|r| r["path"].as_str())
-                .unwrap_or("");
-            let content = user_args["update_note__content"].as_str().unwrap_or("");
-            json!({"path": path, "content": content})
-        }
-        ("search_vault", "append_to_note") | ("list_structure", "append_to_note") => {
-            let path = from_result.as_array()
-                .and_then(|a| a.first())
-                .and_then(|r| r["path"].as_str())
-                .unwrap_or("");
-            let content = user_args["append_to_note__content"].as_str().unwrap_or("");
-            json!({"path": path, "content": content})
-        }
-        ("search_vault", "delete_note") | ("list_structure", "delete_note") => {
-            let path = from_result.as_array()
-                .and_then(|a| a.first())
-                .and_then(|r| r["path"].as_str())
-                .unwrap_or("");
-            json!({"path": path})
-        }
-        ("search_vault", "update_note_frontmatter") | ("list_structure", "update_note_frontmatter") => {
-            let path = from_result.as_array()
-                .and_then(|a| a.first())
-                .and_then(|r| r["path"].as_str())
-                .unwrap_or("");
-            let fields = user_args["update_note_frontmatter__fields"].clone();
-            json!({"path": path, "fields": fields})
-        }
-        _ => json!({}),
-    }
+    })
 }
-
 
 /// When use_skill_pass is true but no skill matched the user's input,
 /// inject a skill-discovery prompt so LLM can guide the user to select an
@@ -1027,7 +842,7 @@ pub(crate) fn extract_chain_step_args(
 async fn build_skill_discovery_injection(db: &crate::db::SurrealDb, account_id: &str) -> String {
     // Fetch existing active skills (title + trigger) for LLM context.
     let existing_skills: Vec<String> = {
-        let mut resp = db
+        let resp = db
             .query("SELECT title, trigger FROM agent_skills WHERE account_id = $aid AND is_active = true ORDER BY trigger_count DESC LIMIT 20")
             .bind(("aid", account_id.to_string()))
             .await

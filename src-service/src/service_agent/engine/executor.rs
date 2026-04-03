@@ -9,11 +9,14 @@ use super::graph::ToolGraph;
 use super::tool_registry::ToolRegistry;
 use super::transaction::{Transaction, TransactionState};
 use super::super::types::{EmitEventFn, IsWriteFn, ToolCall};
+use super::dispatcher::ToolCallStore;
+use crate::state::ToolCallRecord;
 
 pub struct Executor {
     registry: Arc<ToolRegistry>,
     emit_fn: EmitEventFn,
     is_write_fn: IsWriteFn,
+    tool_calls: ToolCallStore,
 }
 
 impl Executor {
@@ -22,8 +25,9 @@ impl Executor {
         registry: Arc<ToolRegistry>,
         emit_fn: EmitEventFn,
         is_write_fn: IsWriteFn,
+        tool_calls: ToolCallStore,
     ) -> Self {
-        Self { registry, emit_fn, is_write_fn }
+        Self { registry, emit_fn, is_write_fn, tool_calls }
     }
 
     pub async fn execute_graph(
@@ -149,18 +153,29 @@ impl Executor {
                 match result {
                     Ok(v) => {
                         tx.record_tool(&node.call.name).await;
+                        // Record in per-session tool_calls store for citation + path verification.
+                        {
+                            let mut store = self.tool_calls.lock().await;
+                            store.insert(node.call.id.clone(), ToolCallRecord {
+                                name: node.call.name.clone(),
+                                args: actual_args.clone(),
+                                result: v.clone(),
+                            });
+                        }
+                        // Annotate result with cite_id so LLM can reference it in final reply.
+                        let v_cited = annotate_cite_id(v, &node.call.id);
                         // Empty search result mid-chain: abort chain, return fallback sentinel.
                         let has_dependents = graph.nodes.values()
                             .any(|n| n.deps.contains(id));
                         if has_dependents && is_search_tool(&node.call.name)
-                            && v.as_array().map(|a| a.is_empty()).unwrap_or(false)
+                            && v_cited.as_array().map(|a| a.is_empty()).unwrap_or(false)
                         {
                             results.push(json!("__chain_empty__"));
                             should_cancel = true;
                             break;
                         }
-                        node_results.insert(id.clone(), (v.clone(), actual_args));
-                        results.push(v);
+                        node_results.insert(id.clone(), (v_cited.clone(), actual_args));
+                        results.push(v_cited);
                         completed.insert(id.clone());
                         executed.push(node.call.clone());
                         progress = true;
@@ -200,6 +215,7 @@ impl Executor {
         let emit_fn = Arc::clone(&self.emit_fn);
         let is_write_fn = Arc::clone(&self.is_write_fn);
 
+        let tool_calls = Arc::clone(&self.tool_calls);
         tokio::spawn(async move {
             let mut completed: HashSet<String> = HashSet::new();
             let mut executed: Vec<ToolCall> = Vec::new();
@@ -287,8 +303,18 @@ impl Executor {
                         match result {
                             Ok(v) => {
                                 tx.record_tool(&node.call.name).await;
-                                node_results.insert(id.clone(), (v.clone(), actual_args));
-                                let _ = sender.send(Ok(v.clone())).await;
+                                // Record in per-session tool_calls store.
+                                {
+                                    let mut store = tool_calls.lock().await;
+                                    store.insert(node.call.id.clone(), ToolCallRecord {
+                                        name: node.call.name.clone(),
+                                        args: actual_args.clone(),
+                                        result: v.clone(),
+                                    });
+                                }
+                                let v_cited = annotate_cite_id(v, &node.call.id);
+                                node_results.insert(id.clone(), (v_cited.clone(), actual_args));
+                                let _ = sender.send(Ok(v_cited.clone())).await;
                                 completed.insert(id.clone());
                                 executed.push(node.call.clone());
                                 progress = true;
@@ -374,4 +400,21 @@ fn topo_sort(graph: &ToolGraph) -> Vec<String> {
 
 fn is_search_tool(name: &str) -> bool {
     matches!(name, "search_vault" | "list_structure")
+}
+
+/// Inject `__cite_id__` into a tool result so LLM can reference it in the final reply.
+/// - Object → add field directly.
+/// - Array  → wrap as `{ "__cite_id__": id, "items": [...] }`.
+/// - String → wrap as `{ "__cite_id__": id, "content": "..." }`.
+/// - Other  → return as-is (e.g. write-tool confirmations are not cited).
+fn annotate_cite_id(v: Value, cite_id: &str) -> Value {
+    match v {
+        Value::Object(mut map) => {
+            map.insert("__cite_id__".to_string(), json!(cite_id));
+            Value::Object(map)
+        }
+        Value::Array(arr) => json!({ "__cite_id__": cite_id, "items": arr }),
+        Value::String(s)  => json!({ "__cite_id__": cite_id, "content": s }),
+        other => other,
+    }
 }

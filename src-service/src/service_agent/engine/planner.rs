@@ -1,8 +1,5 @@
-use std::sync::Arc;
-
-use super::graph::{ToolGraph, ToolNode, ArgResolver};
+use super::graph::ToolGraph;
 use super::super::types::ToolCall;
-use super::super::agents::interactive::{extract_user_tool_args, extract_chain_step_args};
 
 use serde_json::{json, Value};
 
@@ -37,113 +34,6 @@ impl Planner {
                 deps,
             );
             prev = Some(eid);
-        }
-
-        graph
-    }
-
-    /// Build a deterministic linear ToolGraph from a skill chain and the LLM-supplied args.
-    ///
-    /// - chain[0]: args from `extract_user_tool_args`; no resolver needed.
-    /// - `plan_announce` nodes: `is_chain_gate = true`; plan text derived from
-    ///   remaining chain steps; no resolver_dep.
-    /// - chain[i>0] (non-gate): arg_resolver calls `extract_chain_step_args` using
-    ///   the previous *effective* node's result/args (skips plan_announce nodes).
-    pub fn plan_from_meta_function(chain: &[String], user_args: &Value) -> ToolGraph {
-        let mut graph = ToolGraph::new();
-        let mut prev_effective_id: Option<String> = None;
-        let mut prev_effective_tool: Option<String> = None;
-
-        // When the meta_function schema included a `thought` param (enable_think=true),
-        // the LLM fills it as part of its tool_call. Extract it here and prepend a think node.
-        if let Some(thought) = user_args["thought"].as_str().filter(|s| !s.is_empty()) {
-            let node = ToolNode {
-                call: ToolCall {
-                    id: "chain_think".to_string(),
-                    name: "think".to_string(),
-                    args: json!({ "thought": thought }),
-                },
-                deps: vec![],
-                resolver_dep: None,
-                arg_resolver: None,
-                is_chain_gate: false,
-            };
-            graph.add_node_full("chain_think".to_string(), node);
-            prev_effective_id = Some("chain_think".to_string());
-            // prev_effective_tool stays None → chain[0] still treated as first real tool
-        }
-
-        for (i, tool_name) in chain.iter().enumerate() {
-            let node_id = format!("chain_{}", i);
-
-            if tool_name == "plan_announce" {
-                // Build plan text from remaining non-gate steps
-                let remaining: Vec<&str> = chain[i + 1..].iter()
-                    .filter(|t| t.as_str() != "plan_announce")
-                    .map(|s| s.as_str())
-                    .collect();
-                let plan_text = if remaining.is_empty() {
-                    "即將執行操作".to_string()
-                } else {
-                    format!("即將執行：{}", remaining.join(" → "))
-                };
-                let deps = prev_effective_id.iter().cloned().collect();
-                let node = ToolNode {
-                    call: ToolCall {
-                        id: node_id.clone(),
-                        name: tool_name.clone(),
-                        args: json!({ "plan": plan_text }),
-                    },
-                    deps,
-                    resolver_dep: None,
-                    arg_resolver: None,
-                    is_chain_gate: true,
-                };
-                graph.add_node_full(node_id.clone(), node);
-                // plan_announce does NOT update prev_effective_id/tool
-                // (it has no result; deps chain still needs to pass through it)
-                // but we DO make it a dep for the next node
-                prev_effective_id = Some(node_id);
-                // prev_effective_tool stays the same
-                continue;
-            }
-
-            if i == 0 || prev_effective_tool.is_none() {
-                // First real tool: args come from LLM user_args
-                let args = extract_user_tool_args(tool_name, user_args);
-                let node = ToolNode {
-                    call: ToolCall { id: node_id.clone(), name: tool_name.clone(), args },
-                    deps: prev_effective_id.iter().cloned().collect(),
-                    resolver_dep: None,
-                    arg_resolver: None,
-                    is_chain_gate: false,
-                };
-                graph.add_node_full(node_id.clone(), node);
-            } else {
-                // Subsequent real tool: args derived from previous effective tool's result
-                let from_tool = prev_effective_tool.clone().unwrap();
-                let to_tool = tool_name.clone();
-                let user_args_c = user_args.clone();
-                let resolver: ArgResolver = Arc::new(move |prev_result: &Value, prev_args: &Value| {
-                    extract_chain_step_args(&from_tool, &to_tool, prev_result, prev_args, &user_args_c)
-                });
-                let deps: Vec<String> = prev_effective_id.iter().cloned().collect();
-                let node = ToolNode {
-                    call: ToolCall {
-                        id: node_id.clone(),
-                        name: tool_name.clone(),
-                        args: Value::Null,
-                    },
-                    deps,
-                    resolver_dep: prev_effective_id.clone(),
-                    arg_resolver: Some(resolver),
-                    is_chain_gate: false,
-                };
-                graph.add_node_full(node_id.clone(), node);
-            }
-
-            prev_effective_id = Some(node_id);
-            prev_effective_tool = Some(tool_name.clone());
         }
 
         graph
