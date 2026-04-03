@@ -10,6 +10,7 @@ use super::super::engine::dispatcher::Dispatcher;
 use super::super::engine::planner::Planner;
 use super::super::engine::tool_registry::ToolRegistry;
 use super::super::engine::transaction::Transaction;
+use super::super::engine::context::{build_messages, inject_memory, trim_context};
 use super::super::types::{EmitEventFn, IsWriteFn, Tool};
 use super::super::helpers::MetaFunctionSpec;
 
@@ -68,150 +69,34 @@ pub(crate) async fn run_interactive_agent(
         .unwrap_or_default();
     let embedding_url = state.daemon.embedding_url.read().await.clone();
 
-    // 3. Load messages from DB (always authoritative — runner upserts before spawn).
-    let mut messages_json: Vec<Value> = {
-        let mut v = super::super::helpers::load_messages_db(&state.db, &conv_id).await;
-        if v.last().and_then(|m| m["role"].as_str()) != Some("user") {
-            v.push(json!({"role": "user", "content": input}));
-        }
-        v
-    };
+    // 3. Build messages: load history + user input + system prompt assembly
+    let mut messages_json = build_messages(
+        &state.db, &conv_id, &input,
+        &system, activity_context.as_deref(), &system_injection,
+    ).await;
 
-    // 4. Assemble system prompt (base + activity + anti-hallucination + skill injection)
-    let anti_hallucination = "\n\n必須實際呼叫工具完成任務；禁止假裝或虛構結果。\
-                               若搜尋無結果，直接說明找不到。\
-                               回覆中引用筆記時，請包含完整的 vault 相對路徑。";
-    let sys_with_activity = if let Some(ref ac) = activity_context {
-        format!("{}\n\n[使用者活動紀錄]\n{}", system, ac)
-    } else {
-        system.clone()
-    };
-    let sys_content = if system_injection.is_empty() {
-        format!("{}{}", sys_with_activity, anti_hallucination)
-    } else {
-        format!("{}{}\n\n{}", sys_with_activity, anti_hallucination, system_injection)
-    };
-
-    if messages_json.first().and_then(|m| m["role"].as_str()) == Some("system") {
-        messages_json[0] = json!({"role": "system", "content": sys_content});
-    } else {
-        messages_json.insert(0, json!({"role": "system", "content": sys_content}));
-    }
-
-    // 4b. Auto-inject memory facts — use pre-fetched results from run_agent (parallel pre-pass)
-    //     or fall back to fetching here for direct callers that don't provide prefetched_memory.
-    if !vault_id.is_empty() && !account_id.is_empty() {
-        let (facts, fact_ids) = if let Some(pre) = prefetched_memory {
-            pre
-        } else {
-            let keywords: Vec<String> = input.split_whitespace()
-                .filter(|w| w.chars().count() >= 2)
-                .take(5)
-                .map(String::from)
-                .collect();
-            let facts = super::super::helpers::vault_query_memory_with_limit(
-                &client, &embedding_url, &state.db, &vault_id, &account_id, &keywords, 6,
-            ).await;
-            let fact_ids: Vec<String> = facts.iter()
-                .filter_map(|f| f["fact_id"].as_str().filter(|s| !s.is_empty()))
-                .map(|fid| format!("memory:{}:{}", vault_id, fid))
-                .collect();
-            (facts, fact_ids)
-        };
-        if !facts.is_empty() {
-            let mem_lines: Vec<String> = facts.iter().map(|f| {
-                let cat = f["category"].as_str().unwrap_or("general");
-                let content = f["content"].as_str().unwrap_or("");
-                format!("[{}] {}", cat, content)
-            }).collect();
-            let mem_block = format!("\n\n## 相關記憶\n{}", mem_lines.join("\n"));
-            if let Some(sys_msg) = messages_json.first_mut() {
-                if sys_msg["role"].as_str() == Some("system") {
-                    let old = sys_msg["content"].as_str().unwrap_or("").to_string();
-                    sys_msg["content"] = json!(format!("{}{}", old, mem_block));
-                }
-            }
-        }
-        if streaming {
-            state.daemon.emit("memory:prefetched", json!({
+    // 4. Inject memory facts (pre-fetched or inline)
+    let state_c = state.clone();
+    inject_memory(
+        &mut messages_json,
+        &client, &embedding_url, &state.db,
+        &vault_id, &account_id, &input,
+        prefetched_memory,
+        streaming,
+        &move |fact_ids| {
+            state_c.daemon.emit("memory:prefetched", json!({
                 "node_ids": fact_ids,
                 "source": "chat",
             }));
-        }
-    }
+        },
+    ).await;
 
-    // 5. Context window management (12000 chars)
-    // When history exceeds the limit, summarize the oldest messages with LLM instead of
-    // silently dropping them — this preserves early context (e.g. user requirements stated
-    // at conversation start) that would otherwise be lost.
-    if !tool_names.is_empty() && !vault_path.is_empty() {
-        const MAX_HISTORY_CHARS: usize = 12000;
-        // Keep tail large enough to fit, with at least 4 messages headroom for new round.
-        const KEEP_RECENT: usize = 6;
-        let system_part: Vec<Value> = messages_json.iter()
-            .filter(|m| m["role"].as_str() == Some("system"))
-            .cloned().collect();
-        let hist: Vec<Value> = messages_json.into_iter()
-            .filter(|m| m["role"].as_str() != Some("system"))
-            .collect();
-        let total: usize = hist.iter()
-            .map(|m| m["content"].as_str().unwrap_or("").len())
-            .sum();
-        let trimmed = if total > MAX_HISTORY_CHARS && hist.len() > KEEP_RECENT {
-            // Split: old messages to summarize + recent messages to keep verbatim
-            let keep_from = hist.len().saturating_sub(KEEP_RECENT);
-            let to_summarize = &hist[..keep_from];
-            let recent = hist[keep_from..].to_vec();
-
-            // Build text for summarization
-            let old_text: String = to_summarize.iter().map(|m| {
-                let role = m["role"].as_str().unwrap_or("user");
-                let content = m["content"].as_str().unwrap_or("");
-                format!("[{}]: {}", role, &content[..content.len().min(500)])
-            }).collect::<Vec<_>>().join("\n\n");
-
-            // Call LLM for summarization (non-streaming, best-effort)
-            let summary_msgs = vec![
-                json!({"role": "system", "content": "你是對話摘要助手。請將以下對話歷史壓縮為 2-5 句重點摘要，保留關鍵需求、決策和上下文。用繁體中文回答，不要加任何前綴。"}),
-                json!({"role": "user", "content": old_text}),
-            ];
-            let summary_body = json!({
-                "messages": summary_msgs,
-                "stream": false,
-                "temperature": 0.1,
-                "max_tokens": 400,
-            });
-            let summary_text = match client
-                .post(format!("{}/v1/chat/completions", llm_url))
-                .json(&summary_body)
-                .send()
-                .await
-                .ok()
-                .and_then(|r| if r.status().is_success() { Some(r) } else { None })
-            {
-                Some(resp) => resp.json::<Value>().await.ok()
-                    .and_then(|j| j["choices"][0]["message"]["content"].as_str().map(String::from))
-                    .unwrap_or_default(),
-                None => String::new(),
-            };
-
-            if summary_text.is_empty() {
-                // LLM unavailable — fall back to simple trim
-                recent
-            } else {
-                let summary_msg = json!({
-                    "role": "assistant",
-                    "content": format!("[對話摘要]\n{}", summary_text),
-                });
-                let mut result = vec![summary_msg];
-                result.extend(recent);
-                result
-            }
-        } else {
-            hist
-        };
-        messages_json = system_part.into_iter().chain(trimmed.into_iter()).collect();
-    }
+    // 5. Trim context window (summarize oldest messages when over limit)
+    trim_context(
+        &mut messages_json,
+        &client, &llm_url,
+        !tool_names.is_empty(), !vault_path.is_empty(),
+    ).await;
 
     // 6. Build ToolRegistry + Dispatcher
     let emit_fn_closure: EmitEventFn = {
