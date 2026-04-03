@@ -273,7 +273,7 @@ const AGENTS: &[BuiltinAgent] = &[
         name: "筆記卡片助理",
         description: "根據知識內容分析並建立 concept/procedure/reference 型筆記卡片",
         kind: "sub",
-        tool_names: &["search_vault", "read_note", "create_note", "plan_announce"],
+        tool_names: &["search_vault", "read_note", "create_note"],
         use_skill_pass: false,
         enable_think: false,
         system_prompt: "你是筆記卡片助理，專門根據知識內容生成結構化的筆記卡片。\n\
@@ -284,7 +284,7 @@ const AGENTS: &[BuiltinAgent] = &[
             ## 工作流程\n\
             1. 若使用者指定筆記，呼叫 search_vault 或 read_note 取得原始內容。\n\
             2. 分析內容，決定適合哪些模板類型（通常 2-3 張）。\n\
-            3. 呼叫 plan_announce 列出將建立的卡片清單，deferred_tools 填 create_note。\n\
+            3. 列出將建立的卡片清單，請使用者確認。\n\
             4. 使用者確認後，逐一呼叫 create_note（路徑格式：cards/[標題].md）。\n\
             5. 回覆使用者已建立的卡片列表。",
         max_rounds: 5,
@@ -329,7 +329,7 @@ const AGENTS: &[BuiltinAgent] = &[
         kind: "sub",
         tool_names: &[
             "search_vault", "list_notes_in_folder", "list_structure",
-            "read_note", "create_note", "update_note", "plan_announce",
+            "read_note", "create_note", "update_note",
         ],
         use_skill_pass: false,
         enable_think: false,
@@ -338,7 +338,7 @@ const AGENTS: &[BuiltinAgent] = &[
             1. 用 search_vault 或 list_notes_in_folder 取得相關筆記清單。\n\
             2. 對清單中每篇筆記呼叫 read_note 讀取完整內容。\n\
             3. 彙整後輸出結構化摘要（分節標題、要點、結論）。\n\
-            4. 若使用者希望儲存整理成果，呼叫 plan_announce 說明計畫，使用者確認後再 create_note 或 update_note 寫入。\n\
+            4. 若使用者希望儲存整理成果，先說明計畫請使用者確認，確認後再 create_note 或 update_note 寫入。\n\
             ## 注意\n\
             - 摘要要忠實反映筆記原意，不要自行發明內容。\n\
             - 若筆記數量超過 10 篇，先列出清單讓使用者確認範圍再逐一閱讀。",
@@ -364,7 +364,7 @@ const AGENTS: &[BuiltinAgent] = &[
         name: "chat",
         description: "通用筆記助理，可使用工具直接操作 vault",
         kind: "chat",
-        tool_names: &["plan_announce"],
+        tool_names: &[],
         use_skill_pass: true,
         enable_think: true,
         system_prompt: "你是一個筆記助理，可以直接使用工具完成使用者的請求。\n\
