@@ -49,6 +49,9 @@ pub(crate) async fn run_interactive_agent(
     // Memory facts pre-fetched by run_agent in parallel with skill_pass.
     // When Some, skip the in-body fetch (step 4b). When None, fetch here (legacy / direct callers).
     prefetched_memory: Option<(Vec<serde_json::Value>, Vec<String>)>,
+    // Skill titles matched during the pre-pass in run_agent (fired before emitter exists).
+    // Injected into ObservabilityEmitter so SessionTrace.skill_activations is populated.
+    prefetched_skill_activations: Vec<String>,
     // Session cancel flag and transaction — created in run_agent and passed in.
     cancel: Arc<AtomicBool>,
     tx: Arc<Transaction>,
@@ -114,6 +117,9 @@ pub(crate) async fn run_interactive_agent(
         })
     };
     let emitter = ObservabilityEmitter::new(raw_emit);
+    // Inject pre-pass skill titles: agent:skills_activated was emitted by run_agent
+    // before this emitter existed, so the intercept path in as_emit_fn() never fired.
+    emitter.record_skill_activations(&prefetched_skill_activations);
     let emit_fn_closure: EmitEventFn = emitter.as_emit_fn();
 
     // Build VaultEnv once; all tool handlers share it via Arc.
@@ -507,6 +513,7 @@ pub async fn run_agent(
     );
 
     // Process skill pass result: extract system_injection and add skill's chain tools.
+    let mut activated_skill_titles: Vec<String> = Vec::new();
     let system_injection = if let Some(skill) = skill_result {
         if skill.skill_titles.is_empty() {
             // No skill matched and use_skill_pass is true → skill discovery mode.
@@ -524,6 +531,8 @@ pub async fn run_agent(
                     "source": "pre_pass",
                 }));
             }
+            // Stash titles so run_interactive_agent can inject them into ObservabilityEmitter.
+            activated_skill_titles = skill.skill_titles;
             // Add tools required by skill chains to the agent's direct tool access.
             for t in skill.skill_tool_names {
                 if !tool_names.contains(&t) {
@@ -550,6 +559,7 @@ pub async fn run_agent(
         account_id,
         conversation_id,
         memory_facts,
+        activated_skill_titles,
         cancel,
         tx,
         working_memory,

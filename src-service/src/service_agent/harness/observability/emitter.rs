@@ -91,6 +91,19 @@ impl ObservabilityEmitter {
         }
     }
 
+    /// Bulk-append skill activation titles.
+    ///
+    /// Called by `run_interactive_agent` with titles discovered during the pre-pass
+    /// skill search in `run_agent`. The pre-pass fires before the emitter is wired
+    /// into Dispatcher, so `agent:skills_activated` events are not intercepted via
+    /// `as_emit_fn()` — they must be injected here instead.
+    pub(crate) fn record_skill_activations(&self, titles: &[String]) {
+        if titles.is_empty() { return; }
+        if let Ok(mut s) = self.state.lock() {
+            s.skill_activations.extend_from_slice(titles);
+        }
+    }
+
     /// Assemble the final [`SessionTrace`] from accumulated state + `WorkingMemory`.
     ///
     /// Collects all `ToolCallRecord` entries (with timing + guard outcomes) from

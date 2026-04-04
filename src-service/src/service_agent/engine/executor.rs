@@ -11,6 +11,7 @@ use super::transaction::{Transaction, TransactionState};
 use super::super::types::{EmitEventFn, IsWriteFn, ToolCall};
 use super::super::harness::memory::working::WorkingMemory;
 use crate::state::GuardOutcome;
+use crate::service_agent::harness::governance::policy::GUARD_EXEMPT_WRITE_TOOLS;
 
 pub struct Executor {
     registry: Arc<ToolRegistry>,
@@ -157,7 +158,7 @@ impl Executor {
                     Ok(v) => {
                         tx.record_tool(&node.call.name).await;
                         // Detect guard-blocked sentinel; unwrap to plain hint for LLM.
-                        let (guard_outcome, v) = extract_guard_outcome(v);
+                        let (guard_outcome, v) = extract_guard_outcome(v, &node.call.name);
                         // Record in per-session working memory for citation + path guard verification.
                         self.working_memory.record(
                             node.call.id.clone(),
@@ -313,7 +314,7 @@ impl Executor {
                             Ok(v) => {
                                 tx.record_tool(&node.call.name).await;
                                 // Detect guard-blocked sentinel; unwrap to plain hint for LLM.
-                                let (guard_outcome, v) = extract_guard_outcome(v);
+                                let (guard_outcome, v) = extract_guard_outcome(v, &node.call.name);
                                 // Record in per-session working memory.
                                 tool_calls.record(
                                     node.call.id.clone(),
@@ -414,18 +415,23 @@ fn is_search_tool(name: &str) -> bool {
     matches!(name, "search_vault" | "list_structure")
 }
 
-/// Detect the `__guard_blocked__` sentinel injected by the registry execute closure.
+/// Detect the `__guard_blocked__` sentinel injected by the registry execute closure,
+/// and classify the outcome for `WorkingMemory::record()`.
 ///
-/// When a precondition guard blocks a tool, the closure returns:
-///   `Ok(json!({ "__guard_blocked__": true, "__guard_hint__": "<hint>" }))`
+/// | Result value                        | GuardOutcome returned        |
+/// |-------------------------------------|------------------------------|
+/// | `{ "__guard_blocked__": true, … }`  | `Blocked(hint)`              |
+/// | normal value, tool is exempt        | `Exempt`                     |
+/// | normal value, tool has guard → pass | `Passed`                     |
 ///
-/// This function extracts that case and returns:
-/// - `(GuardOutcome::Blocked(hint), Value::String(hint))` — blocked; unwrapped hint for LLM
-/// - `(GuardOutcome::Passed, v)` — normal result; returned unchanged
-fn extract_guard_outcome(v: Value) -> (GuardOutcome, Value) {
+/// `tool_name` is used to identify exempt tools (those in `GUARD_EXEMPT_WRITE_TOOLS`)
+/// so `GuardOutcome::Exempt` is emitted instead of `Passed` for creation-style tools.
+fn extract_guard_outcome(v: Value, tool_name: &str) -> (GuardOutcome, Value) {
     if v.get("__guard_blocked__").and_then(|b| b.as_bool()).unwrap_or(false) {
         let hint = v["__guard_hint__"].as_str().unwrap_or("guard blocked").to_string();
         (GuardOutcome::Blocked(hint.clone()), Value::String(hint))
+    } else if GUARD_EXEMPT_WRITE_TOOLS.contains(&tool_name) {
+        (GuardOutcome::Exempt, v)
     } else {
         (GuardOutcome::Passed, v)
     }
