@@ -137,10 +137,13 @@ pub(crate) async fn vault_query_memory_with_limit(
     })).collect()
 }
 
-// ── Context pipeline stages ──────────────────────────────────────────────────
+// ── Context pipeline stages (superseded by harness::context_pipeline) ────────
+//
+// These functions are kept as thin shims so that any external callers (scheduled
+// agents, tests) continue to compile without changes. New code should use
+// `harness::context_pipeline::ContextPipeline` directly.
 
-/// Stage 1: Load messages from DB, ensure last message is user input,
-/// then prepend the fully assembled system prompt.
+#[allow(dead_code)]
 pub(crate) async fn build_messages(
     db: &SurrealDb,
     conv_id: &str,
@@ -149,36 +152,27 @@ pub(crate) async fn build_messages(
     activity_context: Option<&str>,
     system_injection: &str,
 ) -> Vec<Value> {
-    let mut msgs = load_messages_db(db, conv_id).await;
-    if msgs.last().and_then(|m| m["role"].as_str()) != Some("user") {
-        msgs.push(json!({"role": "user", "content": input}));
-    }
-
-    let anti_hallucination = "\n\n必須實際呼叫工具完成任務；禁止假裝或虛構結果。\
-                               若搜尋無結果，直接說明找不到。\
-                               回覆中引用筆記時，請包含完整的 vault 相對路徑。\
-                               工具結果中含有 __cite_id__ 欄位；最終文字回覆的第一句必須以 [cite:id1,id2] 格式引用所依據的工具結果，若本輪未使用任何工具則輸出 [cite:none]。";
-    let sys_base = if let Some(ac) = activity_context {
-        format!("{}\n\n[使用者活動紀錄]\n{}", system, ac)
-    } else {
-        system.to_string()
-    };
-    let sys_content = if system_injection.is_empty() {
-        format!("{}{}", sys_base, anti_hallucination)
-    } else {
-        format!("{}{}\n\n{}", sys_base, anti_hallucination, system_injection)
-    };
-
-    if msgs.first().and_then(|m| m["role"].as_str()) == Some("system") {
-        msgs[0] = json!({"role": "system", "content": sys_content});
-    } else {
-        msgs.insert(0, json!({"role": "system", "content": sys_content}));
-    }
-    msgs
+    use crate::service_agent::harness::context_pipeline::{ContextBudget, ContextInput, ContextPipeline};
+    // Use a dummy client/url — history trim won't fire unless history is very long.
+    let client = reqwest::Client::new();
+    let pipeline = ContextPipeline::new(ContextBudget::default());
+    let built = pipeline.build(
+        ContextInput {
+            db,
+            conv_id,
+            user_input: input,
+            system_prompt: system,
+            skill_injection: system_injection,
+            activity_context,
+            memory_facts: &[],
+        },
+        &client,
+        "",   // llm_url — trim won't fire at empty url
+    ).await;
+    built.messages
 }
 
-/// Stage 2: Append memory facts to the system message.
-/// Caller is responsible for pre-fetching facts (see `run_agent` parallel pre-pass).
+#[allow(dead_code)]
 pub(crate) fn inject_memory(msgs: &mut Vec<Value>, facts: &[Value]) {
     if facts.is_empty() { return; }
     let mem_block = format!("\n\n## 相關記憶\n{}",
@@ -193,66 +187,14 @@ pub(crate) fn inject_memory(msgs: &mut Vec<Value>, facts: &[Value]) {
     }
 }
 
-/// Stage 3: Trim context window to MAX_HISTORY_CHARS by summarizing oldest messages with LLM.
+#[allow(dead_code)]
 pub(crate) async fn trim_context(
-    msgs: &mut Vec<Value>,
-    client: &reqwest::Client,
-    llm_url: &str,
+    _msgs: &mut Vec<Value>,
+    _client: &reqwest::Client,
+    _llm_url: &str,
 ) {
-
-    const MAX_HISTORY_CHARS: usize = 12000;
-    const KEEP_RECENT: usize = 6;
-
-    let system_part: Vec<Value> = msgs.iter()
-        .filter(|m| m["role"].as_str() == Some("system"))
-        .cloned().collect();
-    let hist: Vec<Value> = msgs.iter()
-        .filter(|m| m["role"].as_str() != Some("system"))
-        .cloned().collect();
-
-    let total: usize = hist.iter()
-        .map(|m| m["content"].as_str().unwrap_or("").len())
-        .sum();
-
-    if total <= MAX_HISTORY_CHARS || hist.len() <= KEEP_RECENT {
-        return;
-    }
-
-    let keep_from = hist.len().saturating_sub(KEEP_RECENT);
-    let old_text: String = hist[..keep_from].iter().map(|m| {
-        let role = m["role"].as_str().unwrap_or("user");
-        let content = m["content"].as_str().unwrap_or("");
-        format!("[{}]: {}", role, &content[..content.len().min(500)])
-    }).collect::<Vec<_>>().join("\n\n");
-    let recent = hist[keep_from..].to_vec();
-
-    let summary_text = async {
-        let resp = client
-            .post(format!("{}/v1/chat/completions", llm_url))
-            .json(&json!({
-                "messages": [
-                    {"role": "system", "content": "你是對話摘要助手。請將以下對話歷史壓縮為 2-5 句重點摘要，保留關鍵需求、決策和上下文。用繁體中文回答，不要加任何前綴。"},
-                    {"role": "user", "content": old_text},
-                ],
-                "stream": false,
-                "temperature": 0.1,
-                "max_tokens": 400,
-            }))
-            .send().await.ok()?;
-        if !resp.status().is_success() { return None; }
-        let j: Value = resp.json().await.ok()?;
-        j["choices"][0]["message"]["content"].as_str().map(String::from)
-    }.await.unwrap_or_default();
-
-    let trimmed = if summary_text.is_empty() {
-        recent
-    } else {
-        let mut result = vec![json!({"role": "assistant", "content": format!("[對話摘要]\n{}", summary_text)})];
-        result.extend(recent);
-        result
-    };
-
-    *msgs = system_part.into_iter().chain(trimmed).collect();
+    // Trimming is now handled inside ContextPipeline::build().
+    // This shim is a no-op kept for compilation compatibility.
 }
 
 /// Detect whether a response contains a reusable structured framework.

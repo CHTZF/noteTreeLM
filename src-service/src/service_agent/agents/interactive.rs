@@ -10,7 +10,7 @@ use super::super::engine::dispatcher::Dispatcher;
 use super::super::engine::planner::Planner;
 use super::super::engine::tool_registry::ToolRegistry;
 use super::super::engine::transaction::Transaction;
-use super::super::engine::context::{build_messages, inject_memory, trim_context};
+use super::super::harness::context_pipeline::{ContextBudget, ContextInput, ContextPipeline};
 use super::super::types::{EmitEventFn, IsWriteFn, Tool};
 use super::super::harness::env::VaultEnv;
 use super::super::harness::tool_def::{ALL_TOOL_DEFS, GuardLevel, build_tools_schema};
@@ -71,24 +71,31 @@ pub(crate) async fn run_interactive_agent(
         .unwrap_or_default();
     let embedding_url = state.daemon.embedding_url.read().await.clone();
 
-    // 3. Build messages: load history + user input + system prompt assembly
-    let mut messages_json = build_messages(
-        &state.db, &conv_id, &input,
-        &system, activity_context.as_deref(), &system_injection,
-    ).await;
-
-    // 4. Inject memory facts (always from pre-fetched parallel pass)
+    // 3-5. Assemble context via pipeline (system + memory + history + trim in one pass).
     let (mem_facts, mem_fact_ids) = prefetched_memory.unwrap_or_default();
-    inject_memory(&mut messages_json, &mem_facts);
+
+    let pipeline = ContextPipeline::new(ContextBudget::default());
+    let built = pipeline.build(
+        ContextInput {
+            db:               &state.db,
+            conv_id:          &conv_id,
+            user_input:       &input,
+            system_prompt:    &system,
+            skill_injection:  &system_injection,
+            activity_context: activity_context.as_deref(),
+            memory_facts:     &mem_facts,
+        },
+        &client,
+        &llm_url,
+    ).await;
+    let mut messages_json = built.messages;
+
     if streaming && !mem_fact_ids.is_empty() {
         state.daemon.emit("memory:prefetched", json!({
             "node_ids": mem_fact_ids,
             "source": "chat",
         }));
     }
-
-    // 5. Trim context window (summarize oldest messages when over limit)
-    trim_context(&mut messages_json, &client, &llm_url).await;
 
     // 6. Build ToolRegistry + Dispatcher
     let emit_fn_closure: EmitEventFn = {
