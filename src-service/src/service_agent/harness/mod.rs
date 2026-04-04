@@ -1,3 +1,4 @@
+pub(crate) mod agent_def;
 pub(crate) mod env;
 pub(crate) mod governance;
 pub(crate) mod memory;
