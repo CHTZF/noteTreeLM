@@ -4,6 +4,7 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use crate::api_state::ApiState;
 use crate::db::SurrealDb;
+use crate::service_agent::harness::env::VaultEnv;
 
 // ── Rollback infrastructure ───────────────────────────────────────────────────
 
@@ -460,17 +461,21 @@ pub(crate) type DispatchResult = Result<(Value, Option<RollbackEntry>), String>;
 
 /// Tool dispatcher for interactive agent (vault tools + agent tools + memory tools).
 /// Returns (result_value, optional_rollback_entry).
+///
+/// Takes a `&VaultEnv` instead of 9 individual parameters; callers construct VaultEnv once
+/// and share it via Arc across all tool executions in a session.
 pub(crate) async fn dispatch_interactive_tool(
-    client: &reqwest::Client,
-    llm_url: &str,
-    db: &SurrealDb,
-    vault_id: &str,
-    account_id: &str,
-    vault_path: &str,
-    embedding_url: &Option<String>,
+    env: &VaultEnv,
     name: &str,
     args: &Value,
 ) -> DispatchResult {
+    let client        = &env.client;
+    let llm_url       = env.llm_url.as_str();
+    let db            = &env.db;
+    let vault_id      = env.vault_id.as_str();
+    let account_id    = env.account_id.as_str();
+    let vault_path    = env.vault_path.as_str();
+    let embedding_url = &env.embedding_url;
     match name {
         // ── Special tools (SSE side-effects emitted by the calling closure) ──
         "plan_announce" => {
@@ -699,9 +704,15 @@ pub(crate) async fn dispatch_interactive_tool(
 // ── Tool schemas ──────────────────────────────────────────────────────────────
 
 /// Build the tools schema for interactive agent.
-/// Includes vault tools, agent tools, and memory tools.
-/// `open_note` and `plan_announce` are always included.
+/// Delegates to harness::tool_def::build_tools_schema which derives schemas from ToolDef.
+#[allow(dead_code)]
 pub(crate) fn build_tools_schema_interactive(tool_names: &[String]) -> Vec<Value> {
+    crate::service_agent::harness::tool_def::build_tools_schema(tool_names)
+}
+
+/// Old implementation kept inline for reference; superseded by ToolDef-derived schemas above.
+#[allow(dead_code)]
+fn build_tools_schema_interactive_legacy(tool_names: &[String]) -> Vec<Value> {
     let all_tools: Vec<Value> = vec![
         // ── Read tools ───────────────────────────────────────────────────────
         json!({ "type": "function", "function": {

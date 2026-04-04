@@ -12,6 +12,8 @@ use super::super::engine::tool_registry::ToolRegistry;
 use super::super::engine::transaction::Transaction;
 use super::super::engine::context::{build_messages, inject_memory, trim_context};
 use super::super::types::{EmitEventFn, IsWriteFn, Tool};
+use super::super::harness::env::VaultEnv;
+use super::super::harness::tool_def::{ALL_TOOL_DEFS, GuardLevel, build_tools_schema};
 
 /// Public entry point called from routes/agents.rs for user-facing agent runs.
 /// Now receives raw input + thin params from Tauri; does all pre-processing here.
@@ -101,18 +103,29 @@ pub(crate) async fn run_interactive_agent(
         })
     };
 
-    let is_write_fn: IsWriteFn = Arc::new(|name: &str| {
-        super::super::tools::vault_tools::is_interactive_write_tool(name)
+    // Build VaultEnv once; all tool handlers share it via Arc.
+    let env = Arc::new(VaultEnv {
+        client:           client.clone(),
+        llm_url:          llm_url.clone(),
+        db:               state.db.clone(),
+        vault_id:         vault_id.clone(),
+        account_id:       account_id.clone(),
+        vault_path:       vault_path.clone(),
+        embedding_url:    embedding_url.clone(),
+        session_id:       session_id.clone(),
+        state:            state.clone(),
+        cancel:           Arc::clone(&cancel),
+        tool_calls_store: Arc::clone(&tool_calls_store),
     });
 
-    let registry = build_interactive_registry(
-        &client, &llm_url, &state.db,
-        &vault_id, &account_id, &vault_path, &embedding_url,
-        &session_id, &state,
-        Arc::clone(&tx),
-        Arc::clone(&cancel),
-        Arc::clone(&tool_calls_store),
-    );
+    let is_write_fn: IsWriteFn = Arc::new(|name: &str| {
+        // Derive is_write from the ToolDef registry — single source of truth.
+        super::super::harness::tool_def::find_tool_def(name)
+            .map(|d| d.is_write)
+            .unwrap_or(false)
+    });
+
+    let registry = build_interactive_registry(Arc::clone(&env));
 
     let dispatcher = Dispatcher::new(
         Arc::new(registry),
@@ -129,13 +142,13 @@ pub(crate) async fn run_interactive_agent(
 
     // ── Path B: direct tools (ReAct / plan_from_chunks) ──────────────────────
     if !tool_names.is_empty() {
-        let tools_schema = super::super::tools::vault_tools::build_tools_schema_interactive(&tool_names);
+        let tools_schema = build_tools_schema(&tool_names);
         let tools_value = if tools_schema.is_empty() { None } else { Some(json!(tools_schema)) };
 
         // When enable_think=true, force Round 0 to call think via tool_choice.
         // think is NOT in tool_names so subsequent rounds cannot call it.
         let think_schema = if enable_think {
-            Some(super::super::tools::vault_tools::build_tools_schema_interactive(&["think".to_string()]))
+            Some(build_tools_schema(&["think".to_string()]))
         } else {
             None
         };
@@ -254,222 +267,78 @@ pub(crate) async fn run_interactive_agent(
     full_response
 }
 
-/// Build a ToolRegistry where every closure calls `dispatch_interactive_tool`.
-/// Special tools (plan_announce, open_note) emit their own SSE from within the closure.
-pub(crate) fn build_interactive_registry(
-    client: &reqwest::Client,
-    llm_url: &str,
-    db: &crate::db::SurrealDb,
-    vault_id: &str,
-    account_id: &str,
-    vault_path: &str,
-    embedding_url: &Option<String>,
-    session_id: &str,
-    state: &ApiState,
-    _tx: Arc<Transaction>,
-    cancel: Arc<AtomicBool>,
-    tool_calls_store: Arc<tokio::sync::Mutex<std::collections::HashMap<String, crate::state::ToolCallRecord>>>,
-) -> ToolRegistry {
+/// Build a ToolRegistry from the static ALL_TOOL_DEFS list.
+/// Each closure captures a single `Arc<VaultEnv>` instead of ~10 individual variables.
+/// Guard evaluation and post-dispatch SSE are driven by ToolDef metadata.
+pub(crate) fn build_interactive_registry(env: Arc<VaultEnv>) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
 
-    let all_tool_names = [
-        "think",
-        "list_structure", "read_note", "create_note", "update_note", "create_folder",
-        "search_vault", "query_memory", "delete_note", "delete_folder", "move_note",
-        "append_to_note", "create_agent_skill", "plan_announce",
-        "open_note", "get_unprocessed_conversations", "get_conversation_content",
-        "save_memory_facts", "mark_conversation_processed", "condense_memory_facts",
-    ];
-
-    // Write tools that legitimately need no prior-evidence guard:
-    // - create_note / create_folder: creating new resources, nothing to verify beforehand
-    // - create_agent_skill: DB-only write, no filesystem path involved
-    const GUARD_EXEMPT_WRITE_TOOLS: &[&str] = &["create_note", "create_folder", "create_agent_skill"];
-
-    for &name in &all_tool_names {
-        // Compile-time safety net: every interactive write tool must either have a
-        // tool_guard_spec entry or be explicitly listed as exempt. Fires only in debug builds.
-        debug_assert!(
-            !super::super::tools::vault_tools::is_interactive_write_tool(name)
-                || tool_guard_spec(name).is_some()
-                || GUARD_EXEMPT_WRITE_TOOLS.contains(&name),
-            "write tool '{}' has no tool_guard_spec entry and is not in GUARD_EXEMPT_WRITE_TOOLS",
-            name
-        );
-
-        let client = client.clone();
-        let llm_url = llm_url.to_string();
-        let db = db.clone();
-        let vault_id = vault_id.to_string();
-        let account_id = account_id.to_string();
-        let vault_path = vault_path.to_string();
-        let embedding_url = embedding_url.clone();
-        let session_id = session_id.to_string();
-        let state_c = state.clone();
-        let name_owned = name.to_string();
-        let tool_calls_store_c = Arc::clone(&tool_calls_store);
+    for def in ALL_TOOL_DEFS {
+        let env_c = Arc::clone(&env);
+        let def   = *def; // ToolDef is Copy
 
         let execute: super::super::types::ToolFn = Arc::new(move |args: Value| {
-            let client = client.clone();
-            let llm_url = llm_url.clone();
-            let db = db.clone();
-            let vault_id = vault_id.clone();
-            let account_id = account_id.clone();
-            let vault_path = vault_path.clone();
-            let embedding_url = embedding_url.clone();
-            let session_id = session_id.clone();
-            let state_c = state_c.clone();
-            let name = name_owned.clone();
-            let tool_calls_store = Arc::clone(&tool_calls_store_c);
-
+            let env = Arc::clone(&env_c);
             Box::pin(async move {
-                // Special: plan_announce — emit SSE only; transaction is not involved.
-                // Subsequent write tools each trigger their own confirmation via is_write_fn.
-                if name == "plan_announce" {
-                    let plan = args["plan"].as_str().unwrap_or("").to_string();
-                    state_c.daemon.emit("agent:plan_announce", json!({
-                        "session_id": session_id,
-                        "plan": plan,
-                    }));
-                    return Ok(json!("✅ 已記錄計畫，請立即執行"));
-                }
-
                 // ── Declarative precondition guard ─────────────────────────
-                if let Some(spec) = tool_guard_spec(&name) {
+                if let Some(spec) = def.guard {
                     let raw_path = (spec.path_extractor)(&args);
                     if raw_path.is_empty() {
                         return Ok(json!("路徑參數不能為空，請提供有效的路徑後再試。"));
                     }
-                    {
-                        let target = if spec.is_folder {
-                            raw_path.to_lowercase()
-                        } else {
-                            norm_path(&raw_path)
-                        };
-                        let store = tool_calls_store.lock().await;
-                        let path_ok = check_path_seen(&store, &target, spec.is_folder);
-                        let content_ok = !matches!(spec.require, GuardLevel::ContentRead)
-                            || check_content_read(&store, &target);
-                        let was_searched = has_search_result(&store, spec.is_folder);
-                        drop(store);
+                    let target = if spec.is_folder {
+                        raw_path.to_lowercase()
+                    } else {
+                        norm_path(&raw_path)
+                    };
+                    let store = env.tool_calls_store.lock().await;
+                    let path_ok      = check_path_seen(&store, &target, spec.is_folder);
+                    let content_ok   = !matches!(spec.require, GuardLevel::ContentRead)
+                        || check_content_read(&store, &target);
+                    let was_searched = has_search_result(&store, spec.is_folder);
+                    drop(store);
 
-                        if !path_ok {
-                            let hint = if spec.is_folder {
-                                if was_searched {
-                                    format!("list_structure 結果中找不到資料夾 '{}'，請確認名稱是否正確。", raw_path)
-                                } else {
-                                    format!("資料夾 '{}' 尚未驗證存在，請先呼叫 list_structure 確認。", raw_path)
-                                }
-                            } else if was_searched {
-                                format!("搜尋結果中找不到 '{}'，請確認筆記名稱或換個關鍵字再搜尋。", raw_path)
+                    if !path_ok {
+                        let hint = if spec.is_folder {
+                            if was_searched {
+                                format!("list_structure 結果中找不到資料夾 '{}'，請確認名稱是否正確。", raw_path)
                             } else {
-                                format!("路徑 '{}' 尚未驗證存在，請先使用 search_vault 或 list_structure 確認。", raw_path)
-                            };
-                            return Ok(json!(hint));
-                        }
-                        if !content_ok {
-                            return Ok(json!(format!(
-                                "尚未成功讀取 '{}' 的內容（讀取失敗或未呼叫 read_note）。請先呼叫 read_note 確認內容後再修改。",
-                                raw_path
-                            )));
-                        }
-                    }
-                }
-
-                let result = super::super::tools::vault_tools::dispatch_interactive_tool(
-                    &client, &llm_url, &db,
-                    &vault_id, &account_id, &vault_path, &embedding_url,
-                    &name, &args,
-                ).await;
-
-                match result {
-                    Ok((v, _rollback)) => {
-                        // Post-dispatch: emit note_refs
-                        let refs = super::super::tools::vault_tools::extract_note_refs(&name, &args, &v, &vault_path);
-                        if !refs.is_empty() {
-                            state_c.daemon.emit("agent:note_refs", json!({
-                                "session_id": session_id,
-                                "paths": refs,
-                            }));
-                        }
-                        // Special: search_skills — emit which skills were found
-                        if name == "search_skills" {
-                            if let Some(arr) = v.as_array() {
-                                let titles: Vec<String> = arr.iter()
-                                    .filter_map(|s| s["title"].as_str().map(String::from))
-                                    .collect();
-                                if !titles.is_empty() {
-                                    state_c.daemon.emit("agent:skills_activated", json!({
-                                        "session_id": session_id,
-                                        "titles": titles,
-                                        "source": "search_skills",
-                                    }));
-                                }
+                                format!("資料夾 '{}' 尚未驗證存在，請先呼叫 list_structure 確認。", raw_path)
                             }
-                        }
-                        // Special: open_note — also emit agent:open_note
-                        if name == "open_note" {
-                            let paths: Vec<Value> = args["paths"].as_array()
-                                .cloned()
-                                .unwrap_or_else(|| {
-                                    args["path"].as_str()
-                                        .map(|p| vec![json!(p)])
-                                        .unwrap_or_default()
-                                });
-                            state_c.daemon.emit("agent:open_note", json!(paths));
-                        }
-                        Ok(v)
+                        } else if was_searched {
+                            format!("搜尋結果中找不到 '{}'，請確認筆記名稱或換個關鍵字再搜尋。", raw_path)
+                        } else {
+                            format!("路徑 '{}' 尚未驗證存在，請先使用 search_vault 或 list_structure 確認。", raw_path)
+                        };
+                        return Ok(json!(hint));
                     }
-                    Err(e) => Err(e),
+                    if !content_ok {
+                        return Ok(json!(format!(
+                            "尚未成功讀取 '{}' 的內容（讀取失敗或未呼叫 read_note）。請先呼叫 read_note 確認內容後再修改。",
+                            raw_path
+                        )));
+                    }
                 }
+
+                // ── Execute via ToolDef handler ─────────────────────────────
+                let result = (def.handler)(Arc::clone(&env), args.clone()).await?;
+
+                // ── Post-dispatch: emit agent:note_refs for read/search tools ─
+                let refs = super::super::tools::vault_tools::extract_note_refs(
+                    def.name, &args, &result, &env.vault_path,
+                );
+                if !refs.is_empty() {
+                    env.state.daemon.emit("agent:note_refs", json!({
+                        "session_id": env.session_id,
+                        "paths": refs,
+                    }));
+                }
+
+                Ok(result)
             })
         });
 
-        registry.register(name.to_string(), Tool { execute, rollback: None });
-    }
-
-    // ── call_agent tool ──────────────────────────────────────────────────────────
-    {
-        let db         = db.clone();
-        let vault_id   = vault_id.to_string();
-        let account_id = account_id.to_string();
-        let session_id = session_id.to_string();
-        let state_c    = state.clone();
-        let cancel_c   = Arc::clone(&cancel);
-
-        let execute: super::super::types::ToolFn = Arc::new(move |args: Value| {
-            let db         = db.clone();
-            let vault_id   = vault_id.clone();
-            let account_id = account_id.clone();
-            let session_id = session_id.clone();
-            let state_c    = state_c.clone();
-            let cancel_c   = Arc::clone(&cancel_c);
-
-            Box::pin(async move {
-                let agent_name = args["name"].as_str().unwrap_or("").to_string();
-                let input      = args["input"].as_str().unwrap_or("").to_string();
-                if agent_name.is_empty() {
-                    return Err("call_agent: missing agent name".into());
-                }
-
-                let def = match super::super::helpers::load_agent_def(&db, &agent_name, &account_id).await {
-                    Some(d) => d,
-                    None => return Err(format!("call_agent: agent '{}' not found", agent_name)),
-                };
-
-                let result = super::sub_agent::run_sub_agent(
-                    &state_c,
-                    &vault_id, &account_id,
-                    &session_id, &agent_name,
-                    def, &input,
-                    cancel_c,
-                ).await;
-
-                Ok(serde_json::json!(result))
-            })
-        });
-
-        registry.register("call_agent".to_string(), Tool { execute, rollback: None });
+        registry.register(def.name.to_string(), Tool { execute, rollback: None });
     }
 
     registry
@@ -718,52 +587,6 @@ fn is_read_note_error(result: &serde_json::Value) -> bool {
 }
 
 // ── Declarative tool guard ──────────────────────────────────────────────────────
-
-/// Evidence level required before a write tool may execute.
-enum GuardLevel {
-    /// Path must appear in a prior tool's result or verified args.
-    PathSeen,
-    /// Additionally, read_note must have returned non-error content for this path.
-    ContentRead,
-}
-
-/// Declarative precondition spec for a guarded write tool.
-struct ToolGuardSpec {
-    /// Extract the target path from the tool's args.
-    path_extractor: fn(&Value) -> String,
-    /// Minimum evidence required.
-    require: GuardLevel,
-    /// If true, target is a folder path (skip .md normalization; use text search in list_structure).
-    is_folder: bool,
-}
-
-/// Returns a guard spec for tools that require prior evidence, or None if unguarded.
-/// To add a new guarded tool, add a match arm here — no other changes needed.
-fn tool_guard_spec(name: &str) -> Option<ToolGuardSpec> {
-    match name {
-        "delete_note" => Some(ToolGuardSpec {
-            path_extractor: |args| args["path"].as_str().unwrap_or("").to_string(),
-            require: GuardLevel::PathSeen,
-            is_folder: false,
-        }),
-        "move_note" => Some(ToolGuardSpec {
-            path_extractor: |args| args["from"].as_str().unwrap_or("").to_string(),
-            require: GuardLevel::PathSeen,
-            is_folder: false,
-        }),
-        "update_note" | "append_to_note" => Some(ToolGuardSpec {
-            path_extractor: |args| args["path"].as_str().unwrap_or("").to_string(),
-            require: GuardLevel::ContentRead,
-            is_folder: false,
-        }),
-        "delete_folder" => Some(ToolGuardSpec {
-            path_extractor: |args| args["path"].as_str().unwrap_or("").to_string(),
-            require: GuardLevel::PathSeen,
-            is_folder: true,
-        }),
-        _ => None,
-    }
-}
 
 /// Normalize a vault path: lowercase first, then ensure .md suffix.
 /// Lowercasing before the ends_with check avoids "FOO.MD" → "foo.md.md" double-extension.

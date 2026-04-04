@@ -3,6 +3,9 @@ pub const MAX_ROUNDS: usize = 20;
 // ── 基礎型別 ─────────────────────────────────────────────────────────────────
 pub mod types;
 
+// ── Harness（環境綁定 + 工具定義）────────────────────────────────────────────
+pub(crate) mod harness;
+
 // ── 執行引擎（含 context, intent_classifier） ────────────────────────────────
 pub mod engine;
 
