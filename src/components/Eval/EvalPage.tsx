@@ -1,0 +1,207 @@
+import { useState, useEffect, useCallback } from 'react'
+import { api, type EvalCaseSummary, type EvalCaseResult, type EvalSuiteResult } from '../../lib/api'
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+type RunState = 'idle' | 'running' | 'done'
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function statusBadge(status: EvalCaseSummary['status']) {
+  const map: Record<string, string> = {
+    enabled:        'bg-green-100 text-green-800',
+    disabled:       'bg-gray-100 text-gray-500',
+    pending_review: 'bg-yellow-100 text-yellow-800',
+  }
+  const label: Record<string, string> = {
+    enabled:        '啟用',
+    disabled:       '停用',
+    pending_review: '待審核',
+  }
+  return (
+    <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${map[status] ?? ''}`}>
+      {label[status] ?? status}
+    </span>
+  )
+}
+
+function lastRunBadge(result: EvalCaseSummary['last_run_result']) {
+  if (!result) return <span className="text-xs text-gray-400">未執行</span>
+  return result === 'passed'
+    ? <span className="text-xs text-green-600 font-medium">✓ 通過</span>
+    : <span className="text-xs text-red-500 font-medium">✗ 失敗</span>
+}
+
+function sourceBadge(source: EvalCaseSummary['source']) {
+  return source === 'seed'
+    ? <span className="text-xs text-blue-500">seed</span>
+    : <span className="text-xs text-purple-500">llm</span>
+}
+
+// ── Main Component ────────────────────────────────────────────────────────────
+
+export default function EvalPage() {
+  const [cases, setCases]             = useState<EvalCaseSummary[]>([])
+  const [loading, setLoading]         = useState(true)
+  const [runState, setRunState]       = useState<RunState>('idle')
+  const [suiteResult, setSuiteResult] = useState<EvalSuiteResult | null>(null)
+  const [analysisState, setAnalysisState] = useState<'idle' | 'running' | 'done'>('idle')
+  const [resultMap, setResultMap]     = useState<Record<string, EvalCaseResult>>({})
+
+  const loadCases = useCallback(async () => {
+    try {
+      const data = await api.listEvalCases()
+      setCases(data.cases)
+    } catch (e) {
+      console.error('listEvalCases failed', e)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { loadCases() }, [loadCases])
+
+  async function handleToggle(caseId: string, currentStatus: EvalCaseSummary['status']) {
+    const newEnabled = currentStatus !== 'enabled'
+    try {
+      await api.toggleEvalCase(caseId, newEnabled)
+      setCases(prev => prev.map(c =>
+        c.case_id === caseId
+          ? { ...c, status: newEnabled ? 'enabled' : 'disabled' }
+          : c
+      ))
+    } catch (e) {
+      console.error('toggleEvalCase failed', e)
+    }
+  }
+
+  async function handleRunAll() {
+    setRunState('running')
+    setSuiteResult(null)
+    setResultMap({})
+    try {
+      const result = await api.runEvalSuite()
+      setSuiteResult(result)
+      const map: Record<string, EvalCaseResult> = {}
+      for (const r of result.results) map[r.name] = r
+      setResultMap(map)
+      // Refresh last_run_result in list
+      await loadCases()
+    } catch (e) {
+      console.error('runEvalSuite failed', e)
+    } finally {
+      setRunState('done')
+    }
+  }
+
+  async function handleTraceAnalysis() {
+    setAnalysisState('running')
+    try {
+      await api.runTraceAnalysis()
+      setAnalysisState('done')
+      // Reload cases after a short delay (analysis runs in background)
+      setTimeout(loadCases, 3000)
+    } catch (e) {
+      console.error('runTraceAnalysis failed', e)
+      setAnalysisState('idle')
+    }
+  }
+
+  const enabledCount = cases.filter(c => c.status === 'enabled').length
+  const pendingCount = cases.filter(c => c.status === 'pending_review').length
+
+  return (
+    <div className="p-6 max-w-4xl mx-auto space-y-6">
+
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-xl font-semibold text-gray-900">Eval Suite</h1>
+          <p className="text-sm text-gray-500 mt-0.5">
+            {cases.length} cases · {enabledCount} 啟用
+            {pendingCount > 0 && <span className="ml-2 text-yellow-600">{pendingCount} 待審核</span>}
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={handleTraceAnalysis}
+            disabled={analysisState === 'running'}
+            className="px-3 py-1.5 text-sm border border-purple-300 text-purple-700 rounded hover:bg-purple-50 disabled:opacity-50"
+          >
+            {analysisState === 'running' ? '分析中…' : analysisState === 'done' ? '✓ 已提案' : '分析 Traces'}
+          </button>
+          <button
+            onClick={handleRunAll}
+            disabled={runState === 'running' || enabledCount === 0}
+            className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
+          >
+            {runState === 'running' ? '執行中…' : 'Run All'}
+          </button>
+        </div>
+      </div>
+
+      {/* Suite summary */}
+      {suiteResult && (
+        <div className={`rounded-lg p-4 text-sm ${suiteResult.failed === 0 ? 'bg-green-50 border border-green-200' : 'bg-red-50 border border-red-200'}`}>
+          <span className="font-medium">
+            {suiteResult.failed === 0
+              ? `✓ 全部通過 (${suiteResult.passed}/${suiteResult.total})`
+              : `✗ ${suiteResult.failed} 個失敗 (${suiteResult.passed}/${suiteResult.total} 通過)`}
+          </span>
+        </div>
+      )}
+
+      {/* Case list */}
+      {loading ? (
+        <p className="text-sm text-gray-400">載入中…</p>
+      ) : cases.length === 0 ? (
+        <p className="text-sm text-gray-400">尚無 eval cases。點擊「分析 Traces」讓 trace_analyst 提案。</p>
+      ) : (
+        <div className="space-y-2">
+          {cases.map(c => {
+            const runResult = resultMap[c.name]
+            return (
+              <div key={c.case_id} className="border border-gray-200 rounded-lg p-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-sm font-medium text-gray-800 truncate">{c.name}</span>
+                      {sourceBadge(c.source)}
+                      {statusBadge(c.status)}
+                      {lastRunBadge(c.last_run_result)}
+                      {runResult && !runResult.passed && (
+                        <span className="text-xs text-red-500">✗ 本次</span>
+                      )}
+                      {runResult && runResult.passed && (
+                        <span className="text-xs text-green-600">✓ 本次</span>
+                      )}
+                    </div>
+                    <p className="text-xs text-gray-400 mt-0.5">{c.step_count} steps</p>
+                    {/* Failure details */}
+                    {runResult && !runResult.passed && runResult.failures.length > 0 && (
+                      <ul className="mt-1.5 space-y-0.5">
+                        {runResult.failures.map((f, i) => (
+                          <li key={i} className="text-xs text-red-600 font-mono bg-red-50 px-2 py-0.5 rounded">{f}</li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                  <button
+                    onClick={() => handleToggle(c.case_id, c.status)}
+                    className={`shrink-0 text-xs px-2 py-1 rounded border ${
+                      c.status === 'enabled'
+                        ? 'border-green-300 text-green-700 hover:bg-green-50'
+                        : 'border-gray-300 text-gray-500 hover:bg-gray-50'
+                    }`}
+                  >
+                    {c.status === 'enabled' ? '停用' : '啟用'}
+                  </button>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}

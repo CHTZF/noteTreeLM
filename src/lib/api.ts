@@ -323,4 +323,46 @@ export const api = {
 
   // Health
   health: () => fetch('http://127.0.0.1:7787/health').then(r => r.ok),
+
+  // Eval harness
+  runTraceAnalysis: async (input?: string) => {
+    const vaultId = await getVaultId()
+    return request<{ session_id: string }>('POST', `/vaults/${encodeURIComponent(vaultId)}/eval/trace-analysis`, { input })
+  },
+  listEvalCases: async () => {
+    const vaultId = await getVaultId()
+    return request<{ cases: EvalCaseSummary[] }>('GET', `/vaults/${encodeURIComponent(vaultId)}/eval/cases`)
+  },
+  toggleEvalCase: async (caseId: string, enabled: boolean) => {
+    const vaultId = await getVaultId()
+    return request<{ case_id: string; status: string }>('PATCH', `/vaults/${encodeURIComponent(vaultId)}/eval/cases/${encodeURIComponent(caseId)}/toggle`, { enabled })
+  },
+  runEvalSuite: async () => {
+    const vaultId = await getVaultId()
+    return request<EvalSuiteResult>('POST', `/vaults/${encodeURIComponent(vaultId)}/eval/run`)
+  },
+}
+
+export interface EvalCaseSummary {
+  case_id: string
+  name: string
+  description?: string
+  source: 'seed' | 'llm_proposed'
+  status: 'enabled' | 'disabled' | 'pending_review'
+  last_run_result: 'passed' | 'failed' | null
+  last_run_at: number | null
+  step_count: number
+}
+
+export interface EvalCaseResult {
+  name: string
+  passed: boolean
+  failures: string[]
+}
+
+export interface EvalSuiteResult {
+  total: number
+  passed: number
+  failed: number
+  results: EvalCaseResult[]
 }

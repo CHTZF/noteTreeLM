@@ -484,6 +484,11 @@ pub async fn seed_builtins(db: &SurrealDb, account_id: &str) {
     for v in vaults {
         ensure_memory_schedule(db, &v.vault_id, account_id).await;
     }
+
+    // Seed harness built-in agents (trace_analyst, etc.) and eval cases.
+    // These use conditional INSERT so frontend edits are preserved across restarts.
+    crate::service_agent::harness::seed_agents::seed_builtin_agents(db, account_id).await;
+    crate::service_agent::harness::eval::cases::seed_eval_cases(db, account_id).await;
 }
 
 /// Idempotently ensures a periodic memory_agent scheduled task exists for (vault_id, account_id).

@@ -8,6 +8,8 @@ use crate::state::{GuardOutcome, ToolCallRecord};
 /// with the full tool-call evidence collected by [`WorkingMemory`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SessionTrace {
+    /// Conversation ID linking this trace to its episodic message history.
+    pub conv_id: String,
     /// Unix timestamp (seconds) when the agent session started.
     pub started_at: i64,
     /// Unix timestamp (seconds) when the session ended.

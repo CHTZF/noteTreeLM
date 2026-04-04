@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use crate::state::GuardOutcome;
 use crate::service_agent::harness::observability::trace::SessionTrace;
 
@@ -8,7 +9,10 @@ use crate::service_agent::harness::observability::trace::SessionTrace;
 ///
 /// **Layer 3 (performance budget):**
 /// - `RoundCountLe`, `TotalToolMsLe`, `LlmLatencyMeanLe`
-#[derive(Debug)]
+///
+/// Serialised with adjacently-tagged format: `{"type": "BlockedCountEq", "value": 2}`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value")]
 pub(crate) enum TraceAssertion {
     // ── Layer 2: behavioral ──────────────────────────────────────────────────
 
@@ -25,7 +29,7 @@ pub(crate) enum TraceAssertion {
     GuardAt { index: usize, expected: GuardOutcomeKind },
 
     /// The call at `index` must have this tool name.
-    ToolAt { index: usize, name: &'static str },
+    ToolAt { index: usize, name: String },
 
     // ── Layer 3: performance budget ──────────────────────────────────────────
 
@@ -42,7 +46,7 @@ pub(crate) enum TraceAssertion {
 
 /// Simplified guard outcome kind for use in assertions.
 /// Avoids owning the hint `String` inside `GuardOutcome::Blocked`.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) enum GuardOutcomeKind {
     Passed,
     Blocked,
@@ -60,6 +64,7 @@ impl From<&GuardOutcome> for GuardOutcomeKind {
 }
 
 /// Result of running an [`EvalCase`].
+#[derive(Serialize, Deserialize)]
 pub(crate) struct EvalResult {
     /// The assembled session trace.
     pub trace:    SessionTrace,

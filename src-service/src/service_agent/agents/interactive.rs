@@ -280,8 +280,8 @@ pub(crate) async fn run_interactive_agent(
         episodic.set_title_if_blank(&conv_id, &to_save).await;
     }
 
-    // 11. Assemble + emit session trace for observability.
-    let trace = emitter.finish(&working_memory).await;
+    // 11. Assemble + emit session trace for observability, then persist to DB.
+    let trace = emitter.finish(&working_memory, &conv_id).await;
     tracing::debug!(
         "[session:trace] session={} rounds={} tools={} blocked={} tool_ms={}ms",
         session_id,
@@ -296,6 +296,9 @@ pub(crate) async fn run_interactive_agent(
             serde_json::to_value(&trace).unwrap_or_default(),
         );
     }
+    super::super::harness::observability::trace_store::save_session_trace(
+        &state.db, &vault_id, &account_id, &trace,
+    ).await;
 
     full_response
 }

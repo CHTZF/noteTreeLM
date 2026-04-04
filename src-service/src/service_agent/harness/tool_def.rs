@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use super::env::VaultEnv;
 use super::governance::guard::{GuardLevel, ToolGuardSpec, norm_path};
 use crate::service_agent::types::ToolFuture;
-use super::tools::{memory_tools, vault_tools};
+use super::tools::{memory_tools, vault_tools, trace_tools};
 
 // ── ToolDef ───────────────────────────────────────────────────────────────────
 
@@ -95,6 +95,11 @@ pub(crate) static ALL_TOOL_DEFS: &[ToolDef] = &[
     ToolDef { name: "save_memory_facts",             schema_fn: schema_save_memory_facts,             is_write: true,  guard: None, handler: handle_save_memory_facts,             rollback: None },
     ToolDef { name: "mark_conversation_processed",   schema_fn: schema_mark_conversation_processed,   is_write: true,  guard: None, handler: handle_mark_conversation_processed,   rollback: None },
     ToolDef { name: "condense_memory_facts",         schema_fn: schema_condense_memory_facts,         is_write: true,  guard: None, handler: handle_condense_memory_facts,         rollback: None },
+
+    // ── Trace analyst tools (trace_analyst agent only) ───────────────────────
+    ToolDef { name: "list_session_traces",            schema_fn: trace_tools::schema_list_session_traces,            is_write: false, guard: None, handler: trace_tools::handle_list_session_traces,            rollback: None },
+    ToolDef { name: "read_session_with_conversation", schema_fn: trace_tools::schema_read_session_with_conversation, is_write: false, guard: None, handler: trace_tools::handle_read_session_with_conversation, rollback: None },
+    ToolDef { name: "propose_eval_case",              schema_fn: trace_tools::schema_propose_eval_case,              is_write: true,  guard: None, handler: trace_tools::handle_propose_eval_case,              rollback: None },
 ];
 
 /// Convenience: look up a ToolDef by name.

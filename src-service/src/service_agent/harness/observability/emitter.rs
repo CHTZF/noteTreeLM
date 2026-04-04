@@ -108,7 +108,7 @@ impl ObservabilityEmitter {
     ///
     /// Collects all `ToolCallRecord` entries (with timing + guard outcomes) from
     /// `working_memory` and combines them with the emitter-tracked metadata.
-    pub(crate) async fn finish(&self, working_memory: &WorkingMemory) -> SessionTrace {
+    pub(crate) async fn finish(&self, working_memory: &WorkingMemory, conv_id: &str) -> SessionTrace {
         let (started_at, round_count, skill_activations, llm_latency_ms) = {
             let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
             (s.started_at, s.round_count, s.skill_activations.clone(), s.llm_latency_ms.clone())
@@ -119,6 +119,7 @@ impl ObservabilityEmitter {
             .await;
 
         SessionTrace {
+            conv_id: conv_id.to_string(),
             started_at,
             ended_at: chrono::Utc::now().timestamp(),
             round_count,

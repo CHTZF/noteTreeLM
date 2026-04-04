@@ -6,17 +6,19 @@
 /// | 2     | Tool sequence + guard + working_memory    | `EvalRunner` + mock registry|
 /// | 3     | Performance budget on SessionTrace        | `TraceAssertion` thresholds |
 ///
-/// The entire module is `#[cfg(test)]`-only: it compiles only for `cargo test`
-/// and has zero cost in release builds.
+/// The module is available at runtime (not cfg(test)-only) so that
+/// `load_enabled_cases` / `run_eval_suite` can be called from Tauri commands.
+/// Static `#[tokio::test]` cases in `cases.rs` remain for dev-time regression.
 
 pub(crate) mod assertions;
 pub(crate) mod runner;
-#[cfg(test)]
-mod cases;
+pub(crate) mod cases;
 
 pub(crate) use assertions::{EvalResult, GuardOutcomeKind, TraceAssertion};
+#[allow(unused_imports)]
 pub(crate) use runner::EvalRunner;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// A single tool call the mock LLM would produce, paired with its predefined result.
@@ -24,7 +26,7 @@ use serde_json::Value;
 /// `mock_result` bypasses real I/O — the eval registry returns it directly after the
 /// guard passes. If the guard blocks, the sentinel is returned instead and the
 /// `mock_result` is never used.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct MockToolCall {
     /// Optional LLM-assigned call id. Leave empty to auto-generate "eval_NN".
     pub id:          String,
@@ -43,8 +45,9 @@ impl MockToolCall {
 }
 
 /// A complete eval scenario: a named sequence of mock tool calls + assertions on the trace.
+#[derive(Serialize, Deserialize)]
 pub(crate) struct EvalCase {
-    pub name:          &'static str,
+    pub name:          String,
     pub tool_sequence: Vec<MockToolCall>,
     pub assertions:    Vec<TraceAssertion>,
 }

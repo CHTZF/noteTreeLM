@@ -9,6 +9,7 @@ use crate::api_state::ApiState;
 use crate::routes::auth::extract_bearer;
 
 mod definitions;
+mod eval;
 mod runner;
 mod skills;
 mod tools;
@@ -46,6 +47,11 @@ pub fn router() -> Router<ApiState> {
         .route("/vaults/:vid/agent/cancel", post(runner::cancel))
         .route("/vaults/:vid/agent/confirm", post(runner::confirm))
         .route("/vaults/:vid/agent/live_chat", post(runner::live_chat))
+        // ── Eval harness ─────────────────────────────────────────────────────
+        .route("/vaults/:vid/eval/trace-analysis", post(eval::run_trace_analysis))
+        .route("/vaults/:vid/eval/cases",           get(eval::list_eval_cases))
+        .route("/vaults/:vid/eval/cases/:case_id/toggle", axum::routing::patch(eval::toggle_eval_case))
+        .route("/vaults/:vid/eval/run",             post(eval::run_eval_suite))
 }
 
 /// Resolve account_id from Bearer token.

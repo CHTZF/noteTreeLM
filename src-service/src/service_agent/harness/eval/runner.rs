@@ -3,12 +3,12 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
+use crate::db::SurrealDb;
 use crate::service_agent::engine::executor::Executor;
 use crate::service_agent::engine::planner::Planner;
 use crate::service_agent::engine::tool_registry::ToolRegistry;
 use crate::service_agent::engine::transaction::Transaction;
 use crate::service_agent::harness::governance::guard::evaluate_guard;
-use crate::service_agent::harness::governance::policy::is_interactive_write_tool;
 use crate::service_agent::harness::memory::working::WorkingMemory;
 use crate::service_agent::harness::observability::trace::SessionTrace;
 use crate::service_agent::harness::tool_def::find_tool_def;
@@ -75,6 +75,7 @@ impl EvalRunner {
         let tool_calls = pairs.into_iter().map(|(_, v)| v).collect();
 
         let trace = SessionTrace {
+            conv_id:           String::new(), // eval traces are not tied to a real conversation
             started_at:        0,
             ended_at:          0,
             round_count:       1, // single simulated round
@@ -85,6 +86,43 @@ impl EvalRunner {
 
         EvalResult::evaluate(trace, &case.assertions)
     }
+}
+
+/// Load all `status = "enabled"` eval cases from `proposed_eval_cases` table,
+/// run each through [`EvalRunner::run`], and return `(case_name, EvalResult)` pairs.
+pub(crate) async fn load_enabled_cases(
+    db: &SurrealDb,
+    account_id: &str,
+) -> Vec<(String, EvalResult)> {
+    let mut resp = match db
+        .query("SELECT * FROM proposed_eval_cases WHERE account_id = $aid AND status = 'enabled'")
+        .bind(("aid", account_id.to_string()))
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("[eval] load_enabled_cases query error: {}", e);
+            return vec![];
+        }
+    };
+
+    let rows: Vec<Value> = resp.take(0).unwrap_or_default();
+    let mut results = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let name = row["name"].as_str().unwrap_or("unnamed").to_string();
+        let case: EvalCase = match serde_json::from_value(row.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("[eval] deserialise case '{}' failed: {}", name, e);
+                continue;
+            }
+        };
+        let result = EvalRunner::run(&case).await;
+        results.push((name, result));
+    }
+
+    results
 }
 
 /// Build an eval-specific `ToolRegistry`.
