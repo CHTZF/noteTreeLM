@@ -1286,3 +1286,14 @@ pub(crate) async fn call_llm_once(
     }
     Ok((content, tool_chunks))
 }
+
+/// Detect whether a response contains a reusable structured framework.
+/// Used by interactive.rs to decide whether to emit `agent:skill_suggestion`.
+pub(crate) fn detect_response_framework(text: &str) -> bool {
+    let has_numbered = (text.contains("1.") || text.contains("1、") || text.contains("①"))
+        && (text.contains("2.") || text.contains("2、") || text.contains("②"));
+    let has_sequential = (text.contains("先") && text.contains("再") && text.contains("最後"))
+        || (text.contains("首先") && text.contains("接著"));
+    let has_framework_kw = text.contains("步驟") || text.contains("流程") || text.contains("規範");
+    text.len() > 300 && (has_numbered || has_sequential || has_framework_kw)
+}

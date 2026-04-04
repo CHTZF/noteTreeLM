@@ -22,7 +22,7 @@
 
 use serde_json::{json, Value};
 use crate::db::SurrealDb;
-use super::super::engine::context::load_messages_db;
+use super::memory::episodic::EpisodicMemory;
 
 // ── Budget ────────────────────────────────────────────────────────────────────
 
@@ -111,7 +111,7 @@ impl ContextPipeline {
         let system_chars_used = system_content.len();
 
         // ── Stage 2: History ───────────────────────────────────────────────
-        let mut history = load_messages_db(input.db, input.conv_id).await;
+        let mut history = EpisodicMemory::new(input.db.clone()).load(input.conv_id).await;
 
         // Ensure current user input is the last message.
         if history.last().and_then(|m| m["role"].as_str()) != Some("user") {

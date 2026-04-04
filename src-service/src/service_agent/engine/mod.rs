@@ -4,5 +4,5 @@ pub mod tool_registry;
 pub mod executor;
 pub mod dispatcher;
 pub mod planner;
-pub mod context;
+pub mod agent_def;
 pub mod intent_classifier;
