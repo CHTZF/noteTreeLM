@@ -4124,6 +4124,7 @@ dependencies = [
 name = "notetreelm-service"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "axum",
  "axum-server",
  "base64 0.22.1",
@@ -4132,6 +4133,7 @@ dependencies = [
  "dirs 5.0.1",
  "futures-util",
  "hex",
+ "hkdf",
  "hostname",
  "jsonwebtoken",
  "local-ip-address",

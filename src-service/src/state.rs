@@ -20,9 +20,21 @@ pub struct ServiceEvent {
     pub payload: serde_json::Value,
 }
 
+/// Guard evaluation outcome for a single tool execution.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "reason")]
+pub enum GuardOutcome {
+    /// Guard passed (or tool has no guard spec).
+    Passed,
+    /// Guard blocked execution; inner string is the hint returned to the LLM.
+    Blocked(String),
+    /// Tool is explicitly exempt from guard evaluation.
+    Exempt,
+}
+
 /// A single tool execution record within a session.
 /// Stored in AgentSession.tool_calls keyed by tool_call_id.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolCallRecord {
     /// Tool name (e.g. "search_vault", "read_note")
     pub name: String,
@@ -30,6 +42,12 @@ pub struct ToolCallRecord {
     pub args: serde_json::Value,
     /// Result returned by the tool
     pub result: serde_json::Value,
+    /// Unix timestamp (seconds) when the tool call started.
+    pub started_at: i64,
+    /// Wall-clock execution duration in milliseconds.
+    pub duration_ms: u64,
+    /// Guard evaluation outcome for this call.
+    pub guard_outcome: GuardOutcome,
 }
 
 /// Per-session state for interactive agent runs.

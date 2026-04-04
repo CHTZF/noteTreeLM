@@ -3,30 +3,9 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use super::env::VaultEnv;
+use super::governance::guard::{GuardLevel, ToolGuardSpec, norm_path};
 use crate::service_agent::types::ToolFuture;
 use crate::service_agent::tools::{memory_tools, vault_tools};
-
-// ── Guard types (co-located with tool definitions) ────────────────────────────
-
-/// Evidence tier required before a guarded write tool may execute.
-#[derive(Copy, Clone)]
-pub(crate) enum GuardLevel {
-    /// Path must appear in a prior tool's result (search/list result array, or read/open args).
-    PathSeen,
-    /// Additionally, read_note must have returned non-error content for this exact path.
-    ContentRead,
-}
-
-/// Declarative precondition spec. All fields are fn pointers → ToolDef stays Copy.
-#[derive(Copy, Clone)]
-pub(crate) struct ToolGuardSpec {
-    /// Extract the target path string from the tool's args.
-    pub path_extractor: fn(&Value) -> String,
-    /// Minimum evidence level required.
-    pub require: GuardLevel,
-    /// If true, target is a folder (skip .md normalisation; match "folder/" in list_structure text).
-    pub is_folder: bool,
-}
 
 // ── ToolDef ───────────────────────────────────────────────────────────────────
 
@@ -34,8 +13,8 @@ pub(crate) struct ToolGuardSpec {
 /// Using fn pointer (not Box<dyn Fn>) keeps ToolDef Copy and zero-allocation.
 pub(crate) type HandlerFn = fn(Arc<VaultEnv>, Value) -> ToolFuture;
 
-/// A single tool's complete definition: schema + guard + write-flag + handler, all co-located.
-/// Adding a new tool means adding ONE entry here — no other files need touching.
+/// A single tool's complete definition: schema + guard + write-flag + handler + rollback,
+/// all co-located. Adding a new tool means adding ONE entry here — no other files need touching.
 #[derive(Copy, Clone)]
 pub(crate) struct ToolDef {
     pub name:      &'static str,
@@ -46,6 +25,9 @@ pub(crate) struct ToolDef {
     /// If Some, the guard is evaluated before executing the handler.
     pub guard:     Option<ToolGuardSpec>,
     pub handler:   HandlerFn,
+    /// If Some, called (in reverse order) when a Transaction is cancelled after this tool ran.
+    /// Receives the *same* args that were passed to `handler`.
+    pub rollback:  Option<HandlerFn>,
 }
 
 // ── Static tool registry ──────────────────────────────────────────────────────
@@ -54,39 +36,65 @@ pub(crate) struct ToolDef {
 /// Schema, guard spec, write flag, and handler are defined together for each tool.
 pub(crate) static ALL_TOOL_DEFS: &[ToolDef] = &[
     // ── Think (forced Round-0 reasoning; never in tool_names) ────────────────
-    ToolDef { name: "think",          schema_fn: schema_think,          is_write: false, guard: None, handler: handle_think },
+    ToolDef { name: "think",          schema_fn: schema_think,          is_write: false, guard: None, handler: handle_think,          rollback: None },
 
     // ── Vault read tools ─────────────────────────────────────────────────────
-    ToolDef { name: "list_structure", schema_fn: schema_list_structure, is_write: false, guard: None, handler: handle_list_structure },
-    ToolDef { name: "read_note",      schema_fn: schema_read_note,      is_write: false, guard: None, handler: handle_read_note },
-    ToolDef { name: "search_vault",   schema_fn: schema_search_vault,   is_write: false, guard: None, handler: handle_search_vault },
-    ToolDef { name: "query_memory",   schema_fn: schema_query_memory,   is_write: false, guard: None, handler: handle_query_memory },
+    ToolDef { name: "list_structure", schema_fn: schema_list_structure, is_write: false, guard: None, handler: handle_list_structure, rollback: None },
+    ToolDef { name: "read_note",      schema_fn: schema_read_note,      is_write: false, guard: None, handler: handle_read_note,      rollback: None },
+    ToolDef { name: "search_vault",   schema_fn: schema_search_vault,   is_write: false, guard: None, handler: handle_search_vault,   rollback: None },
+    ToolDef { name: "query_memory",          schema_fn: schema_query_memory,          is_write: false, guard: None, handler: handle_query_memory,          rollback: None },
+    ToolDef { name: "get_current_datetime",  schema_fn: schema_get_current_datetime,  is_write: false, guard: None, handler: handle_get_current_datetime,  rollback: None },
+    ToolDef { name: "list_recent_notes",     schema_fn: schema_list_recent_notes,     is_write: false, guard: None, handler: handle_list_recent_notes,     rollback: None },
+    ToolDef { name: "search_by_tag",         schema_fn: schema_search_by_tag,         is_write: false, guard: None, handler: handle_search_by_tag,         rollback: None },
+    ToolDef { name: "get_vault_stats",       schema_fn: schema_get_vault_stats,       is_write: false, guard: None, handler: handle_get_vault_stats,       rollback: None },
+    ToolDef { name: "get_note_backlinks",    schema_fn: schema_get_note_backlinks,    is_write: false, guard: None, handler: handle_get_note_backlinks,    rollback: None },
+    ToolDef { name: "find_orphan_notes",     schema_fn: schema_find_orphan_notes,     is_write: false, guard: None, handler: handle_find_orphan_notes,     rollback: None },
 
     // ── Vault write tools ────────────────────────────────────────────────────
-    ToolDef { name: "create_note",    schema_fn: schema_create_note,    is_write: true,  guard: None,                  handler: handle_create_note },
-    ToolDef { name: "create_folder",  schema_fn: schema_create_folder,  is_write: true,  guard: None,                  handler: handle_create_folder },
-    ToolDef { name: "update_note",    schema_fn: schema_update_note,    is_write: true,  guard: Some(GUARD_UPDATE_NOTE),    handler: handle_update_note },
-    ToolDef { name: "append_to_note", schema_fn: schema_append_to_note, is_write: true,  guard: Some(GUARD_APPEND_TO_NOTE), handler: handle_append_to_note },
-    ToolDef { name: "delete_note",    schema_fn: schema_delete_note,    is_write: true,  guard: Some(GUARD_DELETE_NOTE),    handler: handle_delete_note },
-    ToolDef { name: "delete_folder",  schema_fn: schema_delete_folder,  is_write: true,  guard: Some(GUARD_DELETE_FOLDER),  handler: handle_delete_folder },
-    ToolDef { name: "move_note",      schema_fn: schema_move_note,      is_write: true,  guard: Some(GUARD_MOVE_NOTE),      handler: handle_move_note },
+    // create_note: rollback = delete the file (if it didn't exist before).
+    ToolDef { name: "create_note",    schema_fn: schema_create_note,    is_write: true,  guard: None,                       handler: handle_create_note,    rollback: Some(rollback_create_note) },
+    // create_folder: rollback = remove the directory.
+    ToolDef { name: "create_folder",  schema_fn: schema_create_folder,  is_write: true,  guard: None,                       handler: handle_create_folder,  rollback: Some(rollback_create_folder) },
+    // update_note: rollback = restore previous content (read before write in handler).
+    ToolDef { name: "update_note",    schema_fn: schema_update_note,    is_write: true,  guard: Some(GUARD_UPDATE_NOTE),    handler: handle_update_note,    rollback: Some(rollback_overwrite_note) },
+    // append_to_note: rollback = restore previous content (read before append in handler).
+    ToolDef { name: "append_to_note", schema_fn: schema_append_to_note, is_write: true,  guard: Some(GUARD_APPEND_TO_NOTE), handler: handle_append_to_note, rollback: Some(rollback_overwrite_note) },
+    // delete_note: rollback = restore deleted content (read before delete in handler).
+    ToolDef { name: "delete_note",    schema_fn: schema_delete_note,    is_write: true,  guard: Some(GUARD_DELETE_NOTE),    handler: handle_delete_note,    rollback: Some(rollback_restore_note) },
+    // delete_folder: not safely reversible (contents are gone); no rollback.
+    ToolDef { name: "delete_folder",  schema_fn: schema_delete_folder,  is_write: true,  guard: Some(GUARD_DELETE_FOLDER),  handler: handle_delete_folder,  rollback: None },
+    // move_note: rollback = move back.
+    ToolDef { name: "move_note",               schema_fn: schema_move_note,               is_write: true,  guard: Some(GUARD_MOVE_NOTE),          handler: handle_move_note,               rollback: Some(rollback_move_note) },
+    // update_note_frontmatter: rollback = restore previous content.
+    ToolDef { name: "update_note_frontmatter", schema_fn: schema_update_note_frontmatter, is_write: true,  guard: Some(GUARD_UPDATE_FRONTMATTER), handler: handle_update_note_frontmatter, rollback: Some(rollback_overwrite_note) },
+    // link_notes: rollback = restore source note content.
+    ToolDef { name: "link_notes",            schema_fn: schema_link_notes,            is_write: true,  guard: Some(GUARD_LINK_NOTES),   handler: handle_link_notes,            rollback: Some(rollback_link_notes) },
+    // compress_to_knowledge: rollback = delete the created knowledge note.
+    ToolDef { name: "compress_to_knowledge", schema_fn: schema_compress_to_knowledge, is_write: true,  guard: None,                     handler: handle_compress_to_knowledge, rollback: Some(rollback_compress_to_knowledge) },
+    // generate_moc: rollback = restore previous _moc.md or delete if newly created.
+    ToolDef { name: "generate_moc",          schema_fn: schema_generate_moc,          is_write: true,  guard: Some(GUARD_GENERATE_MOC), handler: handle_generate_moc,          rollback: Some(rollback_generate_moc) },
+    // schedule_task: rollback = delete the created task note.
+    ToolDef { name: "schedule_task",         schema_fn: schema_schedule_task,         is_write: true,  guard: None,                     handler: handle_schedule_task,         rollback: Some(rollback_schedule_task) },
+
+    // ── Web search (Brave Search API) ────────────────────────────────────────
+    ToolDef { name: "web_search",          schema_fn: schema_web_search,          is_write: false, guard: None, handler: handle_web_search,          rollback: None },
 
     // ── Skill search (live_chat agent) ───────────────────────────────────────
-    ToolDef { name: "search_skills",       schema_fn: schema_search_skills,       is_write: false, guard: None, handler: handle_search_skills },
+    ToolDef { name: "search_skills",       schema_fn: schema_search_skills,       is_write: false, guard: None, handler: handle_search_skills,       rollback: None },
 
     // ── Agent / UI tools ─────────────────────────────────────────────────────
-    ToolDef { name: "plan_announce",       schema_fn: schema_plan_announce,       is_write: false, guard: None, handler: handle_plan_announce },
-    ToolDef { name: "open_note",           schema_fn: schema_open_note,           is_write: false, guard: None, handler: handle_open_note },
-    ToolDef { name: "create_agent_skill",  schema_fn: schema_create_agent_skill,  is_write: true,  guard: None, handler: handle_create_agent_skill },
-    ToolDef { name: "call_agent",          schema_fn: schema_call_agent,          is_write: false, guard: None, handler: handle_call_agent },
-    ToolDef { name: "live_respond",        schema_fn: schema_live_respond,        is_write: false, guard: None, handler: handle_live_respond },
+    ToolDef { name: "plan_announce",       schema_fn: schema_plan_announce,       is_write: false, guard: None, handler: handle_plan_announce,       rollback: None },
+    ToolDef { name: "open_note",           schema_fn: schema_open_note,           is_write: false, guard: None, handler: handle_open_note,           rollback: None },
+    ToolDef { name: "create_agent_skill",  schema_fn: schema_create_agent_skill,  is_write: true,  guard: None, handler: handle_create_agent_skill,  rollback: None },
+    ToolDef { name: "call_agent",          schema_fn: schema_call_agent,          is_write: false, guard: None, handler: handle_call_agent,          rollback: None },
+    ToolDef { name: "live_respond",        schema_fn: schema_live_respond,        is_write: false, guard: None, handler: handle_live_respond,        rollback: None },
 
     // ── Memory agent tools ───────────────────────────────────────────────────
-    ToolDef { name: "get_unprocessed_conversations", schema_fn: schema_get_unprocessed_conversations, is_write: false, guard: None, handler: handle_get_unprocessed_conversations },
-    ToolDef { name: "get_conversation_content",      schema_fn: schema_get_conversation_content,      is_write: false, guard: None, handler: handle_get_conversation_content },
-    ToolDef { name: "save_memory_facts",             schema_fn: schema_save_memory_facts,             is_write: true,  guard: None, handler: handle_save_memory_facts },
-    ToolDef { name: "mark_conversation_processed",   schema_fn: schema_mark_conversation_processed,   is_write: true,  guard: None, handler: handle_mark_conversation_processed },
-    ToolDef { name: "condense_memory_facts",         schema_fn: schema_condense_memory_facts,         is_write: true,  guard: None, handler: handle_condense_memory_facts },
+    ToolDef { name: "get_unprocessed_conversations", schema_fn: schema_get_unprocessed_conversations, is_write: false, guard: None, handler: handle_get_unprocessed_conversations, rollback: None },
+    ToolDef { name: "get_conversation_content",      schema_fn: schema_get_conversation_content,      is_write: false, guard: None, handler: handle_get_conversation_content,      rollback: None },
+    ToolDef { name: "save_memory_facts",             schema_fn: schema_save_memory_facts,             is_write: true,  guard: None, handler: handle_save_memory_facts,             rollback: None },
+    ToolDef { name: "mark_conversation_processed",   schema_fn: schema_mark_conversation_processed,   is_write: true,  guard: None, handler: handle_mark_conversation_processed,   rollback: None },
+    ToolDef { name: "condense_memory_facts",         schema_fn: schema_condense_memory_facts,         is_write: true,  guard: None, handler: handle_condense_memory_facts,         rollback: None },
 ];
 
 /// Convenience: look up a ToolDef by name.
@@ -130,6 +138,25 @@ const GUARD_MOVE_NOTE: ToolGuardSpec = ToolGuardSpec {
     require:        GuardLevel::PathSeen,
     is_folder:      false,
 };
+const GUARD_UPDATE_FRONTMATTER: ToolGuardSpec = ToolGuardSpec {
+    path_extractor: |args| args["path"].as_str().unwrap_or("").to_string(),
+    require:        GuardLevel::ContentRead,
+    is_folder:      false,
+};
+const GUARD_LINK_NOTES: ToolGuardSpec = ToolGuardSpec {
+    path_extractor: |args| {
+        let p = args["source"].as_str().unwrap_or("");
+        let lower = p.to_lowercase();
+        if lower.ends_with(".md") { lower } else { format!("{}.md", lower) }
+    },
+    require:    GuardLevel::ContentRead,
+    is_folder:  false,
+};
+const GUARD_GENERATE_MOC: ToolGuardSpec = ToolGuardSpec {
+    path_extractor: |args| args["path"].as_str().unwrap_or("").to_string(),
+    require:    GuardLevel::PathSeen,
+    is_folder:  true,
+};
 
 // ── Schema functions (one per tool) ──────────────────────────────────────────
 
@@ -162,6 +189,14 @@ fn schema_search_vault() -> Value { json!({ "type": "function", "function": {
     "description": "在 vault 中搜尋相關筆記",
     "parameters": { "type": "object", "properties": {
         "query": { "type": "string", "description": "搜尋關鍵字" }
+    }, "required": ["query"] }
+}})}
+
+fn schema_web_search() -> Value { json!({ "type": "function", "function": {
+    "name": "web_search",
+    "description": "在網路上搜尋最新資訊（使用 Brave Search API）。當本地 vault 缺乏相關內容、或需要最新資訊時使用。不要用來查詢 Vault 筆記（請用 search_vault）。",
+    "parameters": { "type": "object", "properties": {
+        "query": { "type": "string", "description": "搜尋關鍵字或問題（建議使用具體關鍵字）" }
     }, "required": ["query"] }
 }})}
 
@@ -232,6 +267,95 @@ fn schema_move_note() -> Value { json!({ "type": "function", "function": {
         "from": { "type": "string", "description": "來源路徑（可省略 .md）" },
         "to":   { "type": "string", "description": "目標路徑（可省略 .md）" }
     }, "required": ["from", "to"] }
+}})}
+
+fn schema_update_note_frontmatter() -> Value { json!({ "type": "function", "function": {
+    "name": "update_note_frontmatter",
+    "description": "局部更新筆記的 YAML frontmatter 欄位，不覆蓋正文。若筆記無 frontmatter 則自動加上。",
+    "parameters": { "type": "object", "properties": {
+        "path":   { "type": "string", "description": "筆記路徑（可省略 .md）" },
+        "fields": { "type": "object", "description": "要更新的鍵值對，例如 {\"tags\": [\"a\",\"b\"], \"status\": \"done\"}" }
+    }, "required": ["path", "fields"] }
+}})}
+
+fn schema_get_current_datetime() -> Value { json!({ "type": "function", "function": {
+    "name": "get_current_datetime",
+    "description": "回傳目前的本地日期和時間字串",
+    "parameters": { "type": "object", "properties": {}, "required": [] }
+}})}
+
+fn schema_list_recent_notes() -> Value { json!({ "type": "function", "function": {
+    "name": "list_recent_notes",
+    "description": "列出最近修改的筆記，依更新時間降序排列",
+    "parameters": { "type": "object", "properties": {
+        "limit": { "type": "number", "description": "最多幾條，預設 10，最多 50" }
+    }, "required": [] }
+}})}
+
+fn schema_search_by_tag() -> Value { json!({ "type": "function", "function": {
+    "name": "search_by_tag",
+    "description": "搜尋含有指定 tag 的筆記（支援 #tag 行內標籤與 frontmatter tags 欄位）",
+    "parameters": { "type": "object", "properties": {
+        "tag": { "type": "string", "description": "要搜尋的標籤名稱（不含 #）" }
+    }, "required": ["tag"] }
+}})}
+
+fn schema_get_vault_stats() -> Value { json!({ "type": "function", "function": {
+    "name": "get_vault_stats",
+    "description": "取得 vault 的統計資訊：筆記數量、資料夾數量",
+    "parameters": { "type": "object", "properties": {}, "required": [] }
+}})}
+
+fn schema_get_note_backlinks() -> Value { json!({ "type": "function", "function": {
+    "name": "get_note_backlinks",
+    "description": "找出所有包含 [[notename]] wikilink 連結到指定筆記的其他筆記（反向連結）",
+    "parameters": { "type": "object", "properties": {
+        "path": { "type": "string", "description": "目標筆記路徑（可省略 .md）" }
+    }, "required": ["path"] }
+}})}
+
+fn schema_find_orphan_notes() -> Value { json!({ "type": "function", "function": {
+    "name": "find_orphan_notes",
+    "description": "找出沒有被任何其他筆記 wikilink 引用的孤立筆記",
+    "parameters": { "type": "object", "properties": {}, "required": [] }
+}})}
+
+fn schema_link_notes() -> Value { json!({ "type": "function", "function": {
+    "name": "link_notes",
+    "description": "在筆記 A 的「相關筆記」區塊中插入 [[筆記B]] wikilink，建立筆記間的雙向連結。",
+    "parameters": { "type": "object", "properties": {
+        "source": { "type": "string", "description": "要插入連結的筆記路徑（需已讀取）" },
+        "target": { "type": "string", "description": "要被連結的目標筆記路徑" }
+    }, "required": ["source", "target"] }
+}})}
+
+fn schema_compress_to_knowledge() -> Value { json!({ "type": "function", "function": {
+    "name": "compress_to_knowledge",
+    "description": "將重要的洞見或知識摘要儲存到 knowledge/ 資料夾，作為可查詢的長期知識庫。",
+    "parameters": { "type": "object", "properties": {
+        "title":   { "type": "string", "description": "知識筆記的標題（作為檔名）" },
+        "content": { "type": "string", "description": "知識摘要內容（Markdown）" },
+        "tags":    { "type": "array", "items": { "type": "string" }, "description": "標籤列表（選填）" }
+    }, "required": ["title", "content"] }
+}})}
+
+fn schema_generate_moc() -> Value { json!({ "type": "function", "function": {
+    "name": "generate_moc",
+    "description": "為指定資料夾生成 Map of Contents（目錄索引），列出所有筆記的 wikilink，輸出至 _moc.md。",
+    "parameters": { "type": "object", "properties": {
+        "path":  { "type": "string", "description": "要生成 MOC 的資料夾路徑" },
+        "title": { "type": "string", "description": "MOC 標題（省略則使用資料夾名稱）" }
+    }, "required": ["path"] }
+}})}
+
+fn schema_schedule_task() -> Value { json!({ "type": "function", "function": {
+    "name": "schedule_task",
+    "description": "建立一個待辦任務，儲存到 tasks/ 資料夾，包含截止日期和狀態追蹤。",
+    "parameters": { "type": "object", "properties": {
+        "title":       { "type": "string", "description": "任務標題" },
+        "description": { "type": "string", "description": "任務描述或執行步驟" },
+        "due_date":    { "type": "string", "description": "截止日期（YYYY-MM-DD 格式，選填）" }
+    }, "required": ["title", "description"] }
 }})}
 
 fn schema_search_skills() -> Value { json!({ "type": "function", "function": {
@@ -378,6 +502,23 @@ fn handle_search_vault(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
+fn handle_web_search(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let query = args["query"].as_str().unwrap_or("").to_string();
+        if query.is_empty() {
+            return Ok(json!("查詢不能為空"));
+        }
+        let session_id = env.session_id.clone();
+        let state_ref = env.state.clone();
+        vault_tools::vault_web_search(
+            &env.client, &env.db,
+            |event, payload| state_ref.daemon.emit(event, payload),
+            &session_id,
+            &query,
+        ).await
+    })
+}
+
 fn handle_query_memory(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let keywords: Vec<String> = args["keywords"].as_array()
@@ -406,9 +547,13 @@ fn handle_create_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 fn handle_update_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path    = norm_path(args["path"].as_str().unwrap_or(""));
-        let content = args["content"].as_str().unwrap_or("");
+        let content = args["content"].as_str().unwrap_or("").to_string();
+        // Snapshot original content before overwriting so rollback can restore it.
+        let full = std::path::Path::new(&env.vault_path).join(&path);
+        let original = tokio::fs::read_to_string(&full).await.unwrap_or_default();
+        env.write_snapshots.lock().await.insert(path.clone(), original);
         vault_tools::vault_update_note(
-            &path, content, &env.vault_path, &env.client, &env.db, &env.vault_id,
+            &path, &content, &env.vault_path, &env.client, &env.db, &env.vault_id,
         ).await
     })
 }
@@ -416,9 +561,13 @@ fn handle_update_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 fn handle_append_to_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path    = norm_path(args["path"].as_str().unwrap_or(""));
-        let content = args["content"].as_str().unwrap_or("");
+        let content = args["content"].as_str().unwrap_or("").to_string();
+        // Snapshot original content before appending so rollback can restore it.
+        let full = std::path::Path::new(&env.vault_path).join(&path);
+        let original = tokio::fs::read_to_string(&full).await.unwrap_or_default();
+        env.write_snapshots.lock().await.insert(path.clone(), original);
         vault_tools::vault_append_to_note(
-            &path, content, &env.vault_path, &env.client, &env.db, &env.vault_id,
+            &path, &content, &env.vault_path, &env.client, &env.db, &env.vault_id,
         ).await
     })
 }
@@ -435,6 +584,10 @@ fn handle_create_folder(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 fn handle_delete_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path = norm_path(args["path"].as_str().unwrap_or(""));
+        // Snapshot original content before deleting so rollback can restore it.
+        let full = std::path::Path::new(&env.vault_path).join(&path);
+        let original = tokio::fs::read_to_string(&full).await.unwrap_or_default();
+        env.write_snapshots.lock().await.insert(path.clone(), original);
         vault_tools::vault_delete_note(
             &path, &env.vault_path, &env.db, &env.vault_id,
         ).await
@@ -456,6 +609,20 @@ fn handle_move_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
         let to   = norm_path(args["to"].as_str().unwrap_or(""));
         vault_tools::vault_move_note(
             &from, &to, &env.vault_path, &env.client, &env.db, &env.vault_id,
+        ).await
+    })
+}
+
+fn handle_update_note_frontmatter(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let path   = norm_path(args["path"].as_str().unwrap_or(""));
+        let fields = args["fields"].clone();
+        // Snapshot original content before modifying so rollback can restore it.
+        let full = std::path::Path::new(&env.vault_path).join(&path);
+        let original = tokio::fs::read_to_string(&full).await.unwrap_or_default();
+        env.write_snapshots.lock().await.insert(path.clone(), original);
+        vault_tools::vault_update_note_frontmatter(
+            &path, &fields, &env.vault_path, &env.client, &env.db, &env.vault_id,
         ).await
     })
 }
@@ -489,6 +656,100 @@ fn handle_create_agent_skill(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
             crate::db::seeds::embed_skills_for_account(&db_c, &aid, &eu).await;
         });
         Ok(json!({ "ok": true, "skill_id": skill_id }))
+    })
+}
+
+fn handle_get_current_datetime(_env: Arc<VaultEnv>, _args: Value) -> ToolFuture {
+    Box::pin(async {
+        let now = chrono::Local::now();
+        Ok(Value::String(now.format("%Y-%m-%d %H:%M:%S %z").to_string()))
+    })
+}
+
+fn handle_list_recent_notes(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let limit = args["limit"].as_u64().unwrap_or(10);
+        vault_tools::vault_list_recent_notes(&env.db, &env.vault_id, limit).await
+    })
+}
+
+fn handle_search_by_tag(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let tag = args["tag"].as_str().unwrap_or("");
+        vault_tools::vault_search_by_tag(&env.db, &env.vault_id, tag).await
+    })
+}
+
+fn handle_get_vault_stats(env: Arc<VaultEnv>, _args: Value) -> ToolFuture {
+    Box::pin(async move {
+        vault_tools::vault_get_stats(&env.db, &env.vault_id, &env.vault_path).await
+    })
+}
+
+fn handle_get_note_backlinks(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let path = norm_path(args["path"].as_str().unwrap_or(""));
+        vault_tools::vault_get_note_backlinks(&env.db, &env.vault_id, &path).await
+    })
+}
+
+fn handle_find_orphan_notes(env: Arc<VaultEnv>, _args: Value) -> ToolFuture {
+    Box::pin(async move {
+        vault_tools::vault_find_orphan_notes(&env.db, &env.vault_id).await
+    })
+}
+
+fn handle_link_notes(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let source = norm_path(args["source"].as_str().unwrap_or(""));
+        let target = norm_path(args["target"].as_str().unwrap_or(""));
+        // Snapshot source content before modification for rollback.
+        let full = std::path::Path::new(&env.vault_path).join(&source);
+        let original = tokio::fs::read_to_string(&full).await.unwrap_or_default();
+        env.write_snapshots.lock().await.insert(source.clone(), original);
+        vault_tools::vault_link_notes(
+            &source, &target, &env.vault_path, &env.client, &env.db, &env.vault_id,
+        ).await
+    })
+}
+
+fn handle_compress_to_knowledge(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let title   = args["title"].as_str().unwrap_or("").to_string();
+        let content = args["content"].as_str().unwrap_or("").to_string();
+        let tags: Vec<String> = args["tags"].as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        vault_tools::vault_compress_to_knowledge(
+            &title, &content, &tags, &env.vault_path, &env.client, &env.db, &env.vault_id,
+        ).await
+    })
+}
+
+fn handle_generate_moc(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let folder = args["path"].as_str().unwrap_or("").to_string();
+        let title  = args["title"].as_str().map(String::from);
+        // Snapshot existing _moc.md (empty string if not present) so rollback can decide.
+        let moc_rel = format!("{}/_moc.md", folder);
+        let full = std::path::Path::new(&env.vault_path).join(&moc_rel);
+        let original = tokio::fs::read_to_string(&full).await.unwrap_or_default();
+        env.write_snapshots.lock().await.insert(moc_rel, original);
+        vault_tools::vault_generate_moc(
+            &folder, title.as_deref(), &env.vault_path, &env.client, &env.db, &env.vault_id,
+        ).await
+    })
+}
+
+fn handle_schedule_task(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let title       = args["title"].as_str().unwrap_or("").to_string();
+        let description = args["description"].as_str().unwrap_or("").to_string();
+        let due_date    = args["due_date"].as_str().map(String::from);
+        vault_tools::vault_schedule_task(
+            &title, &description, due_date.as_deref(),
+            &env.vault_path, &env.client, &env.db, &env.vault_id,
+        ).await
     })
 }
 
@@ -660,12 +921,142 @@ fn handle_condense_memory_facts(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-// ── Path helper ───────────────────────────────────────────────────────────────
+// ── Rollback handlers ─────────────────────────────────────────────────────────
+//
+// Each fn receives the *original tool args* (same Value passed to the forward handler).
+// For update/append/delete: the forward handler snapshots pre-write content into
+// env.write_snapshots (keyed by normalized path) before mutating the file;
+// the rollback fn reads from the snapshot to restore.
+// For create_note / create_folder: args alone are sufficient (just delete/rmdir).
 
-/// Ensure a path has a .md suffix (lowercase-first to avoid "FOO.MD" → "foo.md.md").
-/// pub(crate) so guard functions in interactive.rs (and eventually harness/guard.rs) can share it.
-#[inline]
-pub(crate) fn norm_path(p: &str) -> String {
-    let lower = p.to_lowercase();
-    if lower.ends_with(".md") { lower } else { format!("{}.md", lower) }
+/// Rollback create_note: delete the newly created file.
+fn rollback_create_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let path = norm_path(args["path"].as_str().unwrap_or(""));
+        if path == ".md" { return Ok(json!(null)); }
+        let full = std::path::Path::new(&env.vault_path).join(&path);
+        let _ = tokio::fs::remove_file(&full).await;
+        Ok(json!(null))
+    })
 }
+
+/// Rollback create_folder: remove the directory.
+fn rollback_create_folder(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let path = args["path"].as_str().unwrap_or("");
+        if path.is_empty() { return Ok(json!(null)); }
+        let full = std::path::Path::new(&env.vault_path).join(path);
+        let _ = tokio::fs::remove_dir_all(&full).await;
+        Ok(json!(null))
+    })
+}
+
+/// Rollback update_note / append_to_note: restore original content.
+/// The forward handler snapshotted the pre-write content in env.write_snapshots.
+/// If no snapshot exists (e.g. file was new) the rollback is a no-op.
+fn rollback_overwrite_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let path     = norm_path(args["path"].as_str().unwrap_or(""));
+        let original = match env.write_snapshots.lock().await.get(&path).cloned() {
+            Some(s) => s,
+            None    => return Ok(json!(null)),
+        };
+        let full = std::path::Path::new(&env.vault_path).join(&path);
+        let _ = tokio::fs::write(&full, &original).await;
+        vault_tools::sync_note_to_db(&env.client, &env.db, &env.vault_id, &path, &original).await;
+        Ok(json!(null))
+    })
+}
+
+/// Rollback delete_note: restore the deleted file.
+/// The forward handler snapshotted the pre-delete content in env.write_snapshots.
+fn rollback_restore_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let path     = norm_path(args["path"].as_str().unwrap_or(""));
+        let original = match env.write_snapshots.lock().await.get(&path).cloned() {
+            Some(s) => s,
+            None    => return Ok(json!(null)),
+        };
+        let full = std::path::Path::new(&env.vault_path).join(&path);
+        if let Some(parent) = full.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let _ = tokio::fs::write(&full, &original).await;
+        vault_tools::sync_note_to_db(&env.client, &env.db, &env.vault_id, &path, &original).await;
+        Ok(json!(null))
+    })
+}
+
+/// Rollback move_note: move back (to → from).
+/// args contains "from" (original source) and "to" (original dest, now current location).
+fn rollback_move_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let from = norm_path(args["from"].as_str().unwrap_or(""));
+        let to   = norm_path(args["to"].as_str().unwrap_or(""));
+        if from == ".md" || to == ".md" { return Ok(json!(null)); }
+        // After the forward move: file is at `to`. Move it back to `from`.
+        vault_tools::vault_move_note(
+            &to, &from, &env.vault_path, &env.client, &env.db, &env.vault_id,
+        ).await.ok();
+        Ok(json!(null))
+    })
+}
+
+/// Rollback link_notes: restore source note's original content from snapshot.
+fn rollback_link_notes(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let source = norm_path(args["source"].as_str().unwrap_or(""));
+        let original = match env.write_snapshots.lock().await.get(&source).cloned() {
+            Some(s) => s,
+            None    => return Ok(json!(null)),
+        };
+        let full = std::path::Path::new(&env.vault_path).join(&source);
+        let _ = tokio::fs::write(&full, &original).await;
+        vault_tools::sync_note_to_db(&env.client, &env.db, &env.vault_id, &source, &original).await;
+        Ok(json!(null))
+    })
+}
+
+/// Rollback compress_to_knowledge: delete the created knowledge note.
+fn rollback_compress_to_knowledge(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let title = args["title"].as_str().unwrap_or("");
+        if title.is_empty() { return Ok(json!(null)); }
+        let safe = title.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_").to_lowercase();
+        let full = std::path::Path::new(&env.vault_path).join(format!("knowledge/{}.md", safe));
+        let _ = tokio::fs::remove_file(&full).await;
+        Ok(json!(null))
+    })
+}
+
+/// Rollback generate_moc: restore previous _moc.md if it existed, or delete if newly created.
+fn rollback_generate_moc(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let folder = args["path"].as_str().unwrap_or("").to_string();
+        if folder.is_empty() { return Ok(json!(null)); }
+        let moc_rel = format!("{}/_moc.md", folder);
+        let original = env.write_snapshots.lock().await.get(&moc_rel).cloned();
+        let full = std::path::Path::new(&env.vault_path).join(&moc_rel);
+        match original {
+            Some(s) if !s.is_empty() => {
+                let _ = tokio::fs::write(&full, &s).await;
+                vault_tools::sync_note_to_db(&env.client, &env.db, &env.vault_id, &moc_rel, &s).await;
+            }
+            _ => { let _ = tokio::fs::remove_file(&full).await; }
+        }
+        Ok(json!(null))
+    })
+}
+
+/// Rollback schedule_task: delete the created task note.
+fn rollback_schedule_task(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let title = args["title"].as_str().unwrap_or("");
+        if title.is_empty() { return Ok(json!(null)); }
+        let safe = title.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_").to_lowercase();
+        let full = std::path::Path::new(&env.vault_path).join(format!("tasks/{}.md", safe));
+        let _ = tokio::fs::remove_file(&full).await;
+        Ok(json!(null))
+    })
+}
+

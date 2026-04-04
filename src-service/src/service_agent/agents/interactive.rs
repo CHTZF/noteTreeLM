@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use serde_json::{json, Value};
 use crate::api_state::ApiState;
-use crate::db::SurrealDb;
 use crate::state::AgentSession;
 
 use super::super::engine::dispatcher::Dispatcher;
@@ -13,7 +12,12 @@ use super::super::engine::transaction::Transaction;
 use super::super::harness::context_pipeline::{ContextBudget, ContextInput, ContextPipeline};
 use super::super::types::{EmitEventFn, IsWriteFn, Tool};
 use super::super::harness::env::VaultEnv;
-use super::super::harness::tool_def::{ALL_TOOL_DEFS, GuardLevel, build_tools_schema, norm_path};
+use super::super::harness::memory::episodic::EpisodicMemory;
+use super::super::harness::memory::working::WorkingMemory;
+use super::super::harness::observability::emitter::ObservabilityEmitter;
+use super::super::harness::tool_def::{ALL_TOOL_DEFS, build_tools_schema};
+use super::super::harness::governance::guard::evaluate_guard;
+use super::super::harness::governance::policy::{assert_guard_coverage, is_interactive_write_tool};
 
 /// Public entry point called from routes/agents.rs for user-facing agent runs.
 /// Now receives raw input + thin params from Tauri; does all pre-processing here.
@@ -48,8 +52,8 @@ pub(crate) async fn run_interactive_agent(
     // Session cancel flag and transaction — created in run_agent and passed in.
     cancel: Arc<AtomicBool>,
     tx: Arc<Transaction>,
-    // Per-session tool execution evidence store (shared with AgentSession).
-    tool_calls_store: Arc<tokio::sync::Mutex<std::collections::HashMap<String, crate::state::ToolCallRecord>>>,
+    // Per-session tool execution evidence; unified write+query interface.
+    working_memory: WorkingMemory,
 ) -> String {
     let conv_id = conversation_id;
     let vault_path = state.resolve_vault_path(&vault_id).await;
@@ -62,8 +66,6 @@ pub(crate) async fn run_interactive_agent(
             return String::new();
         }
     };
-
-    let tool_names = tool_names;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(300))
@@ -98,7 +100,9 @@ pub(crate) async fn run_interactive_agent(
     }
 
     // 6. Build ToolRegistry + Dispatcher
-    let emit_fn_closure: EmitEventFn = {
+    //    Wrap the raw emit closure in ObservabilityEmitter so all SSE events are
+    //    intercepted for session trace accumulation.
+    let raw_emit: EmitEventFn = {
         let state_c = state.clone();
         let session_id_c = session_id.clone();
         Arc::new(move |event: String, mut payload: Value| {
@@ -109,6 +113,8 @@ pub(crate) async fn run_interactive_agent(
             state_c.daemon.emit(&event, payload);
         })
     };
+    let emitter = ObservabilityEmitter::new(raw_emit);
+    let emit_fn_closure: EmitEventFn = emitter.as_emit_fn();
 
     // Build VaultEnv once; all tool handlers share it via Arc.
     let env = Arc::new(VaultEnv {
@@ -120,17 +126,13 @@ pub(crate) async fn run_interactive_agent(
         vault_path:       vault_path.clone(),
         embedding_url:    embedding_url.clone(),
         session_id:       session_id.clone(),
-        state:            state.clone(),
-        cancel:           Arc::clone(&cancel),
-        tool_calls_store: Arc::clone(&tool_calls_store),
+        state:           state.clone(),
+        cancel:          Arc::clone(&cancel),
+        working_memory:  working_memory.clone(),
+        write_snapshots: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     });
 
-    let is_write_fn: IsWriteFn = Arc::new(|name: &str| {
-        // Derive is_write from the ToolDef registry — single source of truth.
-        super::super::harness::tool_def::find_tool_def(name)
-            .map(|d| d.is_write)
-            .unwrap_or(false)
-    });
+    let is_write_fn: IsWriteFn = Arc::new(is_interactive_write_tool);
 
     let registry = build_interactive_registry(Arc::clone(&env));
 
@@ -138,7 +140,7 @@ pub(crate) async fn run_interactive_agent(
         Arc::new(registry),
         Arc::clone(&emit_fn_closure),
         Arc::clone(&is_write_fn),
-        Arc::clone(&tool_calls_store),
+        working_memory.clone(),
     );
 
     // 7. Tool loop:
@@ -162,6 +164,7 @@ pub(crate) async fn run_interactive_agent(
 
         for round in 0..super::super::MAX_ROUNDS {
             if cancel.load(Ordering::Relaxed) { break; }
+            emitter.increment_round();
 
             // Round 0 with enable_think: use think-only schema + forced tool_choice.
             // Subsequent rounds use the normal tools schema with tool_choice: auto.
@@ -175,6 +178,7 @@ pub(crate) async fn run_interactive_agent(
                 (tools_value.clone(), json!("auto"))
             };
 
+            let llm_t0 = std::time::Instant::now();
             let (text, tool_chunks) = if streaming {
                 let body = match &round_tools {
                     Some(tv) => json!({ "messages": msgs, "tools": tv, "tool_choice": round_choice,
@@ -182,7 +186,7 @@ pub(crate) async fn run_interactive_agent(
                     None     => json!({ "messages": msgs, "stream": true, "temperature": 0.7, "max_tokens": 2048 }),
                 };
                 match super::super::tools::vault_tools::stream_llm_round(
-                    &client, &llm_url, body, &state, &session_id, &cancel, Some(&tool_calls_store),
+                    &client, &llm_url, body, &state, &session_id, &cancel, Some(&working_memory),
                 ).await {
                     Ok((t, _, chunks)) => (t, chunks),
                     Err(e) => { tracing::warn!("[interactive/tools] stream error: {}", e); break; }
@@ -195,6 +199,7 @@ pub(crate) async fn run_interactive_agent(
                     Err(e) => { tracing::warn!("[interactive/tools] llm error: {}", e); break; }
                 }
             };
+            emitter.record_llm_latency(llm_t0.elapsed().as_millis() as u64);
 
             if !text.is_empty() { full_response = text; }
 
@@ -218,6 +223,8 @@ pub(crate) async fn run_interactive_agent(
 
     // ── Path C: pure LLM (no tools / no vault) ────────────────────────────────
     } else {
+        emitter.increment_round();
+        let llm_t0 = std::time::Instant::now();
         if streaming {
             match super::super::tools::vault_tools::stream_llm_round(
                 &client, &llm_url,
@@ -233,6 +240,7 @@ pub(crate) async fn run_interactive_agent(
                 Err(e) => { tracing::warn!("[interactive/pure] llm error: {}", e); }
             }
         }
+        emitter.record_llm_latency(llm_t0.elapsed().as_millis() as u64);
     }
 
     if streaming {
@@ -247,7 +255,7 @@ pub(crate) async fn run_interactive_agent(
         }
     }
 
-    // 10. Persist conversation to DB
+    // 10. Persist conversation to DB via EpisodicMemory
     {
         // Only persist user + assistant text messages; tool_call/tool_result rows are
         // ephemeral within a single turn and can be large (full note content).
@@ -261,14 +269,26 @@ pub(crate) async fn run_interactive_agent(
         if !full_response.is_empty() {
             to_save.push(json!({ "role": "assistant", "content": full_response }));
         }
-        let now = chrono::Utc::now().timestamp();
-        let _ = state.db
-            .query("UPDATE conversations SET messages_json = $msgs, updated_at = $now WHERE record::id(id) = $cid")
-            .bind(("msgs", serde_json::to_string(&to_save).unwrap_or_else(|_| "[]".to_string())))
-            .bind(("now", now))
-            .bind(("cid", conv_id.clone()))
-            .await;
-        maybe_set_conv_title(&state.db, &conv_id, &to_save).await;
+        let episodic = EpisodicMemory::new(state.db.clone());
+        episodic.append(&conv_id, &to_save).await;
+        episodic.set_title_if_blank(&conv_id, &to_save).await;
+    }
+
+    // 11. Assemble + emit session trace for observability.
+    let trace = emitter.finish(&working_memory).await;
+    tracing::debug!(
+        "[session:trace] session={} rounds={} tools={} blocked={} tool_ms={}ms",
+        session_id,
+        trace.round_count,
+        trace.total_calls(),
+        trace.blocked_calls(),
+        trace.total_tool_ms(),
+    );
+    if streaming {
+        state.daemon.emit(
+            "session:trace",
+            serde_json::to_value(&trace).unwrap_or_default(),
+        );
     }
 
     full_response
@@ -280,69 +300,27 @@ pub(crate) async fn run_interactive_agent(
 pub(crate) fn build_interactive_registry(env: Arc<VaultEnv>) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
 
-    // Guard coverage check: every destructive write tool must have a guard spec.
-    // Creation tools and memory-write tools are exempt because they operate on
-    // new/non-vault paths where path-existence pre-checks don't apply.
-    // If you add a new modifying write tool (update/delete/move) without a guard,
-    // this assert fires in debug builds.
-    const GUARD_EXEMPT_WRITE_TOOLS: &[&str] = &[
-        "create_note", "create_folder", "create_agent_skill",
-        "save_memory_facts", "mark_conversation_processed", "condense_memory_facts",
-    ];
-    for def in ALL_TOOL_DEFS {
-        debug_assert!(
-            !def.is_write
-                || def.guard.is_some()
-                || GUARD_EXEMPT_WRITE_TOOLS.contains(&def.name),
-            "write tool '{}' has no guard spec and is not in GUARD_EXEMPT_WRITE_TOOLS",
-            def.name
-        );
-    }
+    // Assert that every destructive write tool has a guard spec or is in the exempt list.
+    // Fires only in debug builds; catches omissions at registry construction time.
+    assert_guard_coverage();
 
     for def in ALL_TOOL_DEFS {
-        let env_c = Arc::clone(&env);
-        let def   = *def; // ToolDef is Copy
+        let env_exec = Arc::clone(&env);
+        let env_rb   = Arc::clone(&env);
+        let def      = *def; // ToolDef is Copy
 
         let execute: super::super::types::ToolFn = Arc::new(move |args: Value| {
-            let env = Arc::clone(&env_c);
+            let env = Arc::clone(&env_exec);
             Box::pin(async move {
                 // ── Declarative precondition guard ─────────────────────────
-                if let Some(spec) = def.guard {
-                    let raw_path = (spec.path_extractor)(&args);
-                    if raw_path.is_empty() {
-                        return Ok(json!("路徑參數不能為空，請提供有效的路徑後再試。"));
-                    }
-                    let target = if spec.is_folder {
-                        raw_path.to_lowercase()
-                    } else {
-                        norm_path(&raw_path)
-                    };
-                    let store = env.tool_calls_store.lock().await;
-                    let path_ok      = check_path_seen(&store, &target, spec.is_folder);
-                    let content_ok   = !matches!(spec.require, GuardLevel::ContentRead)
-                        || check_content_read(&store, &target);
-                    let was_searched = has_search_result(&store, spec.is_folder);
-                    drop(store);
-
-                    if !path_ok {
-                        let hint = if spec.is_folder {
-                            if was_searched {
-                                format!("list_structure 結果中找不到資料夾 '{}'，請確認名稱是否正確。", raw_path)
-                            } else {
-                                format!("資料夾 '{}' 尚未驗證存在，請先呼叫 list_structure 確認。", raw_path)
-                            }
-                        } else if was_searched {
-                            format!("搜尋結果中找不到 '{}'，請確認筆記名稱或換個關鍵字再搜尋。", raw_path)
-                        } else {
-                            format!("路徑 '{}' 尚未驗證存在，請先使用 search_vault 或 list_structure 確認。", raw_path)
-                        };
-                        return Ok(json!(hint));
-                    }
-                    if !content_ok {
-                        return Ok(json!(format!(
-                            "尚未成功讀取 '{}' 的內容（讀取失敗或未呼叫 read_note）。請先呼叫 read_note 確認內容後再修改。",
-                            raw_path
-                        )));
+                if let Some(ref spec) = def.guard {
+                    let hint = env.working_memory.with_records(|store| {
+                        evaluate_guard(spec, &args, store)
+                    }).await;
+                    if let Some(h) = hint {
+                        // Return a sentinel object so executor can detect GuardOutcome::Blocked
+                        // and unwrap the hint string before forwarding to the LLM.
+                        return Ok(json!({ "__guard_blocked__": true, "__guard_hint__": h }));
                     }
                 }
 
@@ -364,7 +342,18 @@ pub(crate) fn build_interactive_registry(env: Arc<VaultEnv>) -> ToolRegistry {
             })
         });
 
-        registry.register(def.name.to_string(), Tool { execute, rollback: None });
+        // Wire up rollback fn if the ToolDef declares one.
+        // Closes over env_rb so the rollback fn has filesystem + DB access.
+        let rollback: Option<super::super::types::ToolFn> = def.rollback.map(|rb_fn| {
+            let env_r = env_rb.clone();
+            let boxed: super::super::types::ToolFn = Arc::new(move |args: Value| {
+                let env = Arc::clone(&env_r);
+                rb_fn(env, args)
+            });
+            boxed
+        });
+
+        registry.register(def.name.to_string(), Tool { execute, rollback });
     }
 
     registry
@@ -373,43 +362,6 @@ pub(crate) fn build_interactive_registry(env: Arc<VaultEnv>) -> ToolRegistry {
 pub async fn cleanup_session(state: &ApiState, conv_id: &str) {
     let mut sessions = state.daemon.agent_sessions.lock().await;
     sessions.remove(conv_id);
-}
-
-/// Set conversation title from first user message if title is still empty / default.
-async fn maybe_set_conv_title(db: &SurrealDb, conv_id: &str, messages: &[Value]) {
-    #[derive(serde::Deserialize)]
-    struct Row { title: String }
-    let current_title = db
-        .query("SELECT title FROM conversations WHERE record::id(id) = $cid LIMIT 1")
-        .bind(("cid", conv_id.to_string()))
-        .await
-        .ok()
-        .and_then(|mut r| r.take::<Vec<Row>>(0).ok())
-        .and_then(|rows| rows.into_iter().next())
-        .map(|r| r.title)
-        .unwrap_or_default();
-
-    if !current_title.is_empty() && current_title != "New Conversation" && current_title != "新對話" {
-        return;
-    }
-
-    let auto_title = messages.iter()
-        .find(|m| m["role"].as_str() == Some("user"))
-        .and_then(|m| m["content"].as_str())
-        .map(|c| {
-            let chars: String = c.chars().take(20).collect();
-            if c.chars().count() > 20 { format!("{}…", chars) } else { chars }
-        });
-
-    if let Some(title) = auto_title {
-        let now = chrono::Utc::now().timestamp();
-        let _ = db
-            .query("UPDATE conversations SET title = $title, updated_at = $now WHERE record::id(id) = $cid")
-            .bind(("title", title))
-            .bind(("now", now))
-            .bind(("cid", conv_id.to_string()))
-            .await;
-    }
 }
 
 // ── Unified agent runner ───────────────────────────────────────────────────────
@@ -485,8 +437,7 @@ pub async fn run_agent(
     //    Cancel any existing session for this conversation first.
     let cancel = Arc::new(AtomicBool::new(false));
     let tx = Arc::new(Transaction::new());
-    let tool_calls_store: Arc<tokio::sync::Mutex<std::collections::HashMap<String, crate::state::ToolCallRecord>>> =
-        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let working_memory = WorkingMemory::new();
     {
         let mut sessions = state.daemon.agent_sessions.lock().await;
         if let Some(old) = sessions.get(conv_id) {
@@ -500,7 +451,9 @@ pub async fn run_agent(
             cancel: Arc::clone(&cancel),
             transaction: Some(Arc::clone(&tx)),
             conversation_id: conv_id.to_string(),
-            tool_calls: Arc::clone(&tool_calls_store),
+            // Bridge: AgentSession keeps the raw Arc handle for observability/route access;
+            // all writes go through WorkingMemory typed methods.
+            tool_calls: working_memory.as_raw().clone(),
         });
     }
 
@@ -599,83 +552,8 @@ pub async fn run_agent(
         memory_facts,
         cancel,
         tx,
-        tool_calls_store,
+        working_memory,
     ).await
-}
-
-/// Returns true if a read_note result value indicates a failure (file not found, empty vault, etc.).
-/// vault_tools::vault_read_note always returns Ok(String), so errors are encoded as specific prefixes.
-fn is_read_note_error(result: &serde_json::Value) -> bool {
-    match result.as_str() {
-        Some(s) => s.starts_with("讀取失敗：") || s == "Vault 未設定" || s == "路徑為空" || s.is_empty(),
-        None => true, // unexpected type → treat as error
-    }
-}
-
-// ── Declarative tool guard ──────────────────────────────────────────────────────
-
-type StoreMap = std::collections::HashMap<String, crate::state::ToolCallRecord>;
-
-/// Check whether `target` (already normalized) appears in any prior tool's evidence.
-/// `is_folder`: skip note-only sources and use text substring for list_structure.
-fn check_path_seen(store: &StoreMap, target: &str, is_folder: bool) -> bool {
-    store.values().any(|rec| match rec.name.as_str() {
-        "search_vault" => {
-            // Returns JSON array [{path, title}]; only relevant for notes.
-            !is_folder && rec.result.as_array().map(|a| a.iter().any(|r|
-                r["path"].as_str().map(|p| norm_path(p) == target).unwrap_or(false)
-            )).unwrap_or(false)
-        }
-        "list_structure" => {
-            // Returns plain text (indented tree).
-            // Notes: check exact path substring ("notes/foo.md").
-            // Folders: check "foldername/" to avoid prefix false-positives
-            //   e.g. "note" must NOT match "notes/foo.md", only "note/" would match "note/foo.md".
-            rec.result.as_str().map(|text| {
-                let text_lower = text.to_lowercase();
-                if is_folder {
-                    text_lower.contains(&format!("{}/", target))
-                } else {
-                    text_lower.contains(target)
-                }
-            }).unwrap_or(false)
-        }
-        "read_note" => {
-            !is_folder
-            && rec.args["path"].as_str().map(|p| norm_path(p) == target).unwrap_or(false)
-            && !is_read_note_error(&rec.result)
-        }
-        "open_note" => {
-            !is_folder && (
-                rec.args["path"].as_str().map(|p| norm_path(p) == target).unwrap_or(false)
-                || rec.args["paths"].as_array().map(|a| a.iter().any(|p|
-                    p.as_str().map(|p| norm_path(p) == target).unwrap_or(false)
-                )).unwrap_or(false)
-            )
-        }
-        _ => false,
-    })
-}
-
-/// Check whether read_note succeeded for `target` (non-error content exists in store).
-fn check_content_read(store: &StoreMap, target: &str) -> bool {
-    store.values().any(|rec|
-        rec.name == "read_note"
-        && rec.args["path"].as_str().map(|p| norm_path(p) == target).unwrap_or(false)
-        && !is_read_note_error(&rec.result)
-    )
-}
-
-/// Check whether a relevant discovery tool was called (to give better error hints).
-/// For folder guards only `list_structure` counts; for note guards either counts.
-fn has_search_result(store: &StoreMap, is_folder: bool) -> bool {
-    store.values().any(|rec| {
-        if is_folder {
-            rec.name == "list_structure"
-        } else {
-            matches!(rec.name.as_str(), "search_vault" | "list_structure")
-        }
-    })
 }
 
 /// When use_skill_pass is true but no skill matched the user's input,

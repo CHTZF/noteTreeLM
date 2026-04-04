@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -9,25 +9,25 @@ use super::graph::ToolGraph;
 use super::tool_registry::ToolRegistry;
 use super::transaction::{Transaction, TransactionState};
 use super::super::types::{EmitEventFn, IsWriteFn, ToolCall};
-use super::dispatcher::ToolCallStore;
-use crate::state::ToolCallRecord;
+use super::super::harness::memory::working::WorkingMemory;
+use crate::state::GuardOutcome;
 
 pub struct Executor {
     registry: Arc<ToolRegistry>,
     emit_fn: EmitEventFn,
     is_write_fn: IsWriteFn,
-    tool_calls: ToolCallStore,
+    working_memory: WorkingMemory,
 }
 
 impl Executor {
 
-    pub fn new(
+    pub(crate) fn new(
         registry: Arc<ToolRegistry>,
         emit_fn: EmitEventFn,
         is_write_fn: IsWriteFn,
-        tool_calls: ToolCallStore,
+        working_memory: WorkingMemory,
     ) -> Self {
-        Self { registry, emit_fn, is_write_fn, tool_calls }
+        Self { registry, emit_fn, is_write_fn, working_memory }
     }
 
     pub async fn execute_graph(
@@ -148,20 +148,26 @@ impl Executor {
                     .get(&node.call.name)
                     .ok_or_else(|| format!("tool not found: {}", node.call.name))?;
 
+                let started_at = chrono::Utc::now().timestamp();
+                let t0 = Instant::now();
                 let result = (tool.execute)(actual_args.clone()).await;
+                let duration_ms = t0.elapsed().as_millis() as u64;
 
                 match result {
                     Ok(v) => {
                         tx.record_tool(&node.call.name).await;
-                        // Record in per-session tool_calls store for citation + path verification.
-                        {
-                            let mut store = self.tool_calls.lock().await;
-                            store.insert(node.call.id.clone(), ToolCallRecord {
-                                name: node.call.name.clone(),
-                                args: actual_args.clone(),
-                                result: v.clone(),
-                            });
-                        }
+                        // Detect guard-blocked sentinel; unwrap to plain hint for LLM.
+                        let (guard_outcome, v) = extract_guard_outcome(v);
+                        // Record in per-session working memory for citation + path guard verification.
+                        self.working_memory.record(
+                            node.call.id.clone(),
+                            node.call.name.clone(),
+                            actual_args.clone(),
+                            v.clone(),
+                            started_at,
+                            duration_ms,
+                            guard_outcome,
+                        ).await;
                         // Annotate result with cite_id so LLM can reference it in final reply.
                         let v_cited = annotate_cite_id(v, &node.call.id);
                         // Empty search result mid-chain: abort chain, return fallback sentinel.
@@ -215,7 +221,7 @@ impl Executor {
         let emit_fn = Arc::clone(&self.emit_fn);
         let is_write_fn = Arc::clone(&self.is_write_fn);
 
-        let tool_calls = Arc::clone(&self.tool_calls);
+        let tool_calls = self.working_memory.clone();
         tokio::spawn(async move {
             let mut completed: HashSet<String> = HashSet::new();
             let mut executed: Vec<ToolCall> = Vec::new();
@@ -299,19 +305,25 @@ impl Executor {
                     }
 
                     if let Some(tool) = registry.get(&node.call.name) {
+                        let started_at = chrono::Utc::now().timestamp();
+                        let t0 = Instant::now();
                         let result = (tool.execute)(actual_args.clone()).await;
+                        let duration_ms = t0.elapsed().as_millis() as u64;
                         match result {
                             Ok(v) => {
                                 tx.record_tool(&node.call.name).await;
-                                // Record in per-session tool_calls store.
-                                {
-                                    let mut store = tool_calls.lock().await;
-                                    store.insert(node.call.id.clone(), ToolCallRecord {
-                                        name: node.call.name.clone(),
-                                        args: actual_args.clone(),
-                                        result: v.clone(),
-                                    });
-                                }
+                                // Detect guard-blocked sentinel; unwrap to plain hint for LLM.
+                                let (guard_outcome, v) = extract_guard_outcome(v);
+                                // Record in per-session working memory.
+                                tool_calls.record(
+                                    node.call.id.clone(),
+                                    node.call.name.clone(),
+                                    actual_args.clone(),
+                                    v.clone(),
+                                    started_at,
+                                    duration_ms,
+                                    guard_outcome,
+                                ).await;
                                 let v_cited = annotate_cite_id(v, &node.call.id);
                                 node_results.insert(id.clone(), (v_cited.clone(), actual_args));
                                 let _ = sender.send(Ok(v_cited.clone())).await;
@@ -400,6 +412,23 @@ fn topo_sort(graph: &ToolGraph) -> Vec<String> {
 
 fn is_search_tool(name: &str) -> bool {
     matches!(name, "search_vault" | "list_structure")
+}
+
+/// Detect the `__guard_blocked__` sentinel injected by the registry execute closure.
+///
+/// When a precondition guard blocks a tool, the closure returns:
+///   `Ok(json!({ "__guard_blocked__": true, "__guard_hint__": "<hint>" }))`
+///
+/// This function extracts that case and returns:
+/// - `(GuardOutcome::Blocked(hint), Value::String(hint))` — blocked; unwrapped hint for LLM
+/// - `(GuardOutcome::Passed, v)` — normal result; returned unchanged
+fn extract_guard_outcome(v: Value) -> (GuardOutcome, Value) {
+    if v.get("__guard_blocked__").and_then(|b| b.as_bool()).unwrap_or(false) {
+        let hint = v["__guard_hint__"].as_str().unwrap_or("guard blocked").to_string();
+        (GuardOutcome::Blocked(hint.clone()), Value::String(hint))
+    } else {
+        (GuardOutcome::Passed, v)
+    }
 }
 
 /// Inject `__cite_id__` into a tool result so LLM can reference it in the final reply.

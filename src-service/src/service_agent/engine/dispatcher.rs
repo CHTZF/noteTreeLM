@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -9,26 +8,24 @@ use super::graph::ToolGraph;
 use super::tool_registry::ToolRegistry;
 use super::transaction::Transaction;
 use super::super::types::{EmitEventFn, IsWriteFn};
-use crate::state::ToolCallRecord;
-
-pub type ToolCallStore = Arc<tokio::sync::Mutex<HashMap<String, ToolCallRecord>>>;
+use super::super::harness::memory::working::WorkingMemory;
 
 pub struct Dispatcher {
     registry: Arc<ToolRegistry>,
     emit_fn: EmitEventFn,
     is_write_fn: IsWriteFn,
-    tool_calls: ToolCallStore,
+    working_memory: WorkingMemory,
 }
 
 impl Dispatcher {
 
-    pub fn new(
+    pub(crate) fn new(
         registry: Arc<ToolRegistry>,
         emit_fn: EmitEventFn,
         is_write_fn: IsWriteFn,
-        tool_calls: ToolCallStore,
+        working_memory: WorkingMemory,
     ) -> Self {
-        Self { registry, emit_fn, is_write_fn, tool_calls }
+        Self { registry, emit_fn, is_write_fn, working_memory }
     }
 
     /// 同步執行（tx 生命週期由 Agent 管理）
@@ -41,7 +38,7 @@ impl Dispatcher {
             Arc::clone(&self.registry),
             Arc::clone(&self.emit_fn),
             Arc::clone(&self.is_write_fn),
-            Arc::clone(&self.tool_calls),
+            self.working_memory.clone(),
         );
         executor.execute_graph(graph, tx).await
     }
@@ -56,7 +53,7 @@ impl Dispatcher {
             Arc::clone(&self.registry),
             Arc::clone(&self.emit_fn),
             Arc::clone(&self.is_write_fn),
-            Arc::clone(&self.tool_calls),
+            self.working_memory.clone(),
         );
         executor.execute_graph_stream(graph, tx)
     }

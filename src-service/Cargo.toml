@@ -41,6 +41,10 @@ bcrypt = "0.15"
 rand = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 
+# Crypto (API key decryption — mirrors Tauri-side crypto module)
+aes-gcm = "0.10"
+hkdf = "0.12"
+
 # DB
 surrealdb = { version = "2", features = ["kv-surrealkv"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
