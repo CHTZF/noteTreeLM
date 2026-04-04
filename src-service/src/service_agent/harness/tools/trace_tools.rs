@@ -98,13 +98,11 @@ pub(crate) fn schema_propose_eval_case() -> Value {
 
 pub(crate) fn handle_list_session_traces(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     Box::pin(async move {
-        let limit = args["limit"].as_u64().unwrap_or(20).min(50);
+        let limit = args["limit"].as_u64().unwrap_or(20).min(50) as usize;
         let mut resp = env.db
             .query(
                 "SELECT meta::id(id) AS trace_id, conv_id, started_at, ended_at, \
-                 round_count, skill_activations, \
-                 array::len(tool_calls) AS total_calls, \
-                 array::len(array::filter(tool_calls, |$t| $t.guard_outcome.type = 'Blocked')) AS blocked_calls \
+                 round_count, skill_activations, tool_calls \
                  FROM session_traces \
                  WHERE account_id = $aid \
                  ORDER BY started_at DESC \
@@ -116,7 +114,24 @@ pub(crate) fn handle_list_session_traces(env: Arc<VaultEnv>, args: Value) -> Too
             .map_err(|e| format!("list_session_traces query error: {}", e))?;
 
         let rows: Vec<Value> = resp.take(0).unwrap_or_default();
-        Ok(json!(rows))
+
+        // Compute total_calls and blocked_calls in Rust to avoid SurrealQL array::filter issues.
+        let summaries: Vec<Value> = rows.into_iter().map(|mut row| {
+            let tool_calls = row["tool_calls"].as_array().cloned().unwrap_or_default();
+            let total_calls = tool_calls.len();
+            let blocked_calls = tool_calls.iter().filter(|t| {
+                t["guard_outcome"]["type"].as_str() == Some("Blocked")
+            }).count();
+            // Remove raw tool_calls array from summary to keep payload small.
+            if let Some(obj) = row.as_object_mut() {
+                obj.remove("tool_calls");
+                obj.insert("total_calls".to_string(),   json!(total_calls));
+                obj.insert("blocked_calls".to_string(), json!(blocked_calls));
+            }
+            row
+        }).collect();
+
+        Ok(json!(summaries))
     })
 }
 
@@ -141,18 +156,31 @@ pub(crate) fn handle_read_session_with_conversation(env: Arc<VaultEnv>, args: Va
             None => return Ok(json!({"error": format!("trace '{}' not found", trace_id)})),
         };
 
-        // Load conversation messages via conv_id
+        // Load conversation messages via conv_id.
+        // Conversations are stored as `conversations.messages_json` (a JSON string blob),
+        // not a separate messages table.
         let conv_id = trace["conv_id"].as_str().unwrap_or("").to_string();
         let messages: Vec<Value> = if conv_id.is_empty() {
             vec![]
         } else {
+            #[derive(serde::Deserialize)]
+            struct ConvRow { messages_json: Option<String> }
             match env.db
-                .query("SELECT role, content FROM messages WHERE conversation_id = $cid ORDER BY created_at ASC LIMIT 100")
+                .query("SELECT messages_json FROM conversations WHERE record::id(id) = $cid LIMIT 1")
                 .bind(("cid", conv_id.clone()))
                 .await
             {
-                Ok(mut r) => r.take(0).unwrap_or_default(),
-                Err(_)    => vec![],
+                Ok(mut r) => {
+                    let rows: Vec<ConvRow> = r.take(0).unwrap_or_default();
+                    rows.into_iter().next()
+                        .and_then(|row| row.messages_json)
+                        .and_then(|s| serde_json::from_str::<Vec<Value>>(&s).ok())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|m| m["role"].as_str() != Some("system"))
+                        .collect()
+                }
+                Err(_) => vec![],
             }
         };
 

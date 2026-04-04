@@ -29,6 +29,7 @@ use serde_json::Value;
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct MockToolCall {
     /// Optional LLM-assigned call id. Leave empty to auto-generate "eval_NN".
+    #[serde(default)]
     pub id:          String,
     /// Tool name — must match an entry in ALL_TOOL_DEFS for the guard to apply.
     pub name:        String,
