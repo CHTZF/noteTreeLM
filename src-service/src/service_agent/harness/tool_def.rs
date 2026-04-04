@@ -71,6 +71,9 @@ pub(crate) static ALL_TOOL_DEFS: &[ToolDef] = &[
     ToolDef { name: "delete_folder",  schema_fn: schema_delete_folder,  is_write: true,  guard: Some(GUARD_DELETE_FOLDER),  handler: handle_delete_folder },
     ToolDef { name: "move_note",      schema_fn: schema_move_note,      is_write: true,  guard: Some(GUARD_MOVE_NOTE),      handler: handle_move_note },
 
+    // ── Skill search (live_chat agent) ───────────────────────────────────────
+    ToolDef { name: "search_skills",       schema_fn: schema_search_skills,       is_write: false, guard: None, handler: handle_search_skills },
+
     // ── Agent / UI tools ─────────────────────────────────────────────────────
     ToolDef { name: "plan_announce",       schema_fn: schema_plan_announce,       is_write: false, guard: None, handler: handle_plan_announce },
     ToolDef { name: "open_note",           schema_fn: schema_open_note,           is_write: false, guard: None, handler: handle_open_note },
@@ -231,6 +234,14 @@ fn schema_move_note() -> Value { json!({ "type": "function", "function": {
     }, "required": ["from", "to"] }
 }})}
 
+fn schema_search_skills() -> Value { json!({ "type": "function", "function": {
+    "name": "search_skills",
+    "description": "搜尋已建立的 agent 技能，找出符合當前意圖的行為與工具鏈",
+    "parameters": { "type": "object", "properties": {
+        "query": { "type": "string", "description": "搜尋關鍵字或描述" }
+    }, "required": ["query"] }
+}})}
+
 fn schema_plan_announce() -> Value { json!({ "type": "function", "function": {
     "name": "plan_announce",
     "description": "在執行寫入操作前，向使用者宣告計畫。呼叫後自動繼續執行，不需確認。",
@@ -351,7 +362,7 @@ fn handle_list_structure(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 fn handle_read_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let raw = args["path"].as_str().unwrap_or("");
-        let path = norm_md(raw);
+        let path = norm_path(raw);
         Ok(Value::String(
             vault_tools::vault_read_note(&path, &env.vault_path)
         ))
@@ -384,7 +395,7 @@ fn handle_query_memory(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 
 fn handle_create_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     Box::pin(async move {
-        let path    = norm_md(args["path"].as_str().unwrap_or(""));
+        let path    = norm_path(args["path"].as_str().unwrap_or(""));
         let content = args["content"].as_str().unwrap_or("");
         vault_tools::vault_create_note(
             &path, content, &env.vault_path, &env.client, &env.db, &env.vault_id,
@@ -394,7 +405,7 @@ fn handle_create_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 
 fn handle_update_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     Box::pin(async move {
-        let path    = norm_md(args["path"].as_str().unwrap_or(""));
+        let path    = norm_path(args["path"].as_str().unwrap_or(""));
         let content = args["content"].as_str().unwrap_or("");
         vault_tools::vault_update_note(
             &path, content, &env.vault_path, &env.client, &env.db, &env.vault_id,
@@ -404,7 +415,7 @@ fn handle_update_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 
 fn handle_append_to_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     Box::pin(async move {
-        let path    = norm_md(args["path"].as_str().unwrap_or(""));
+        let path    = norm_path(args["path"].as_str().unwrap_or(""));
         let content = args["content"].as_str().unwrap_or("");
         vault_tools::vault_append_to_note(
             &path, content, &env.vault_path, &env.client, &env.db, &env.vault_id,
@@ -423,7 +434,7 @@ fn handle_create_folder(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 
 fn handle_delete_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     Box::pin(async move {
-        let path = norm_md(args["path"].as_str().unwrap_or(""));
+        let path = norm_path(args["path"].as_str().unwrap_or(""));
         vault_tools::vault_delete_note(
             &path, &env.vault_path, &env.db, &env.vault_id,
         ).await
@@ -441,8 +452,8 @@ fn handle_delete_folder(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 
 fn handle_move_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     Box::pin(async move {
-        let from = norm_md(args["from"].as_str().unwrap_or(""));
-        let to   = norm_md(args["to"].as_str().unwrap_or(""));
+        let from = norm_path(args["from"].as_str().unwrap_or(""));
+        let to   = norm_path(args["to"].as_str().unwrap_or(""));
         vault_tools::vault_move_note(
             &from, &to, &env.vault_path, &env.client, &env.db, &env.vault_id,
         ).await
@@ -478,6 +489,68 @@ fn handle_create_agent_skill(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
             crate::db::seeds::embed_skills_for_account(&db_c, &aid, &eu).await;
         });
         Ok(json!({ "ok": true, "skill_id": skill_id }))
+    })
+}
+
+// ── Skill search ─────────────────────────────────────────────────────────────
+
+fn handle_search_skills(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let query = args["query"].as_str().unwrap_or("").to_string();
+
+        #[derive(serde::Deserialize)]
+        struct Row {
+            title:      String,
+            behavior:   String,
+            tool_calls: Option<Value>,
+            embedding:  Option<Value>,
+        }
+
+        let mut resp = env.db
+            .query("SELECT title, behavior, tool_calls, embedding \
+                    FROM agent_skills WHERE account_id = $aid AND is_active = true LIMIT 30")
+            .bind(("aid", env.account_id.clone()))
+            .await
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<Row> = resp.take(0).map_err(|e| e.to_string())?;
+
+        // Semantic search when we have a non-empty query and an embedding server.
+        let q_vec = if !query.is_empty() {
+            crate::processing::embedder::embed_text(&env.client, &env.embedding_url, &query).await
+        } else {
+            None
+        };
+
+        let results: Vec<Value> = if let Some(ref qv) = q_vec {
+            let mut scored: Vec<(f32, &Row)> = rows.iter().filter_map(|r| {
+                let emb: Vec<f32> = r.embedding.as_ref()?.as_array()?
+                    .iter().filter_map(|v| v.as_f64().map(|f| f as f32))
+                    .collect();
+                if emb.is_empty() { return None; }
+                let score = crate::processing::embedder::cosine_sim(qv, &emb);
+                if score >= 0.60 { Some((score, r)) } else { None }
+            }).collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            scored.into_iter().take(10).map(|(_, r)| json!({
+                "title": r.title,
+                "behavior": r.behavior,
+                "required_tools": r.tool_calls,
+            })).collect()
+        } else {
+            let q_lower = query.to_lowercase();
+            rows.iter()
+                .filter(|r| q_lower.is_empty()
+                    || r.title.to_lowercase().contains(&q_lower)
+                    || r.behavior.to_lowercase().contains(&q_lower))
+                .take(10)
+                .map(|r| json!({
+                    "title": r.title,
+                    "behavior": r.behavior,
+                    "required_tools": r.tool_calls,
+                }))
+                .collect()
+        };
+        Ok(json!(results))
     })
 }
 
@@ -590,8 +663,9 @@ fn handle_condense_memory_facts(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 // ── Path helper ───────────────────────────────────────────────────────────────
 
 /// Ensure a path has a .md suffix (lowercase-first to avoid "FOO.MD" → "foo.md.md").
+/// pub(crate) so guard functions in interactive.rs (and eventually harness/guard.rs) can share it.
 #[inline]
-fn norm_md(p: &str) -> String {
+pub(crate) fn norm_path(p: &str) -> String {
     let lower = p.to_lowercase();
     if lower.ends_with(".md") { lower } else { format!("{}.md", lower) }
 }

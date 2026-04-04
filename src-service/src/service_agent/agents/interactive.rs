@@ -13,7 +13,7 @@ use super::super::engine::transaction::Transaction;
 use super::super::harness::context_pipeline::{ContextBudget, ContextInput, ContextPipeline};
 use super::super::types::{EmitEventFn, IsWriteFn, Tool};
 use super::super::harness::env::VaultEnv;
-use super::super::harness::tool_def::{ALL_TOOL_DEFS, GuardLevel, build_tools_schema};
+use super::super::harness::tool_def::{ALL_TOOL_DEFS, GuardLevel, build_tools_schema, norm_path};
 
 /// Public entry point called from routes/agents.rs for user-facing agent runs.
 /// Now receives raw input + thin params from Tauri; does all pre-processing here.
@@ -613,13 +613,6 @@ fn is_read_note_error(result: &serde_json::Value) -> bool {
 }
 
 // ── Declarative tool guard ──────────────────────────────────────────────────────
-
-/// Normalize a vault path: lowercase first, then ensure .md suffix.
-/// Lowercasing before the ends_with check avoids "FOO.MD" → "foo.md.md" double-extension.
-fn norm_path(p: &str) -> String {
-    let lower = p.to_lowercase();
-    if lower.ends_with(".md") { lower } else { format!("{}.md", lower) }
-}
 
 type StoreMap = std::collections::HashMap<String, crate::state::ToolCallRecord>;
 
