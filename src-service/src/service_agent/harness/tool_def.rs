@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use super::env::VaultEnv;
 use super::governance::guard::{GuardLevel, ToolGuardSpec, norm_path};
 use crate::service_agent::types::ToolFuture;
-use crate::service_agent::tools::{memory_tools, vault_tools};
+use super::tools::{memory_tools, vault_tools};
 
 // ── ToolDef ───────────────────────────────────────────────────────────────────
 

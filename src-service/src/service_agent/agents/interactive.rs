@@ -191,14 +191,14 @@ pub(crate) async fn run_interactive_agent(
                                        "stream": true, "temperature": 0.7, "max_tokens": 2048 }),
                     None     => json!({ "messages": msgs, "stream": true, "temperature": 0.7, "max_tokens": 2048 }),
                 };
-                match super::super::tools::vault_tools::stream_llm_round(
+                match super::super::harness::tools::vault_tools::stream_llm_round(
                     &client, &llm_url, body, &state, &session_id, &cancel, Some(&working_memory),
                 ).await {
                     Ok((t, _, chunks)) => (t, chunks),
                     Err(e) => { tracing::warn!("[interactive/tools] stream error: {}", e); break; }
                 }
             } else {
-                match super::super::tools::vault_tools::call_llm_once(
+                match super::super::harness::tools::vault_tools::call_llm_once(
                     &client, &llm_url, &msgs, round_tools, &cancel,
                 ).await {
                     Ok(r) => r,
@@ -232,7 +232,7 @@ pub(crate) async fn run_interactive_agent(
         emitter.increment_round();
         let llm_t0 = std::time::Instant::now();
         if streaming {
-            match super::super::tools::vault_tools::stream_llm_round(
+            match super::super::harness::tools::vault_tools::stream_llm_round(
                 &client, &llm_url,
                 json!({ "messages": msgs, "stream": true, "temperature": 0.7, "max_tokens": 2048 }),
                 &state, &session_id, &cancel, None, // Path C: pure chat, no citation validation
@@ -241,7 +241,7 @@ pub(crate) async fn run_interactive_agent(
                 Err(e) => { tracing::warn!("[interactive/pure] stream error: {}", e); }
             }
         } else {
-            match super::super::tools::vault_tools::call_llm_once(&client, &llm_url, &msgs, None, &cancel).await {
+            match super::super::harness::tools::vault_tools::call_llm_once(&client, &llm_url, &msgs, None, &cancel).await {
                 Ok((text, _)) => { full_response = text; }
                 Err(e) => { tracing::warn!("[interactive/pure] llm error: {}", e); }
             }
@@ -334,7 +334,7 @@ pub(crate) fn build_interactive_registry(env: Arc<VaultEnv>) -> ToolRegistry {
                 let result = (def.handler)(Arc::clone(&env), args.clone()).await?;
 
                 // ── Post-dispatch: emit agent:note_refs for read/search tools ─
-                let refs = super::super::tools::vault_tools::extract_note_refs(
+                let refs = super::super::harness::tools::vault_tools::extract_note_refs(
                     def.name, &args, &result, &env.vault_path,
                 );
                 if !refs.is_empty() {

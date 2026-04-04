@@ -1,7 +1,7 @@
 use serde_json::Value;
 use crate::db::SurrealDb;
 use crate::processing::embedder::cosine_sim;
-use super::super::engine::context::vault_query_memory_with_limit;
+use crate::service_agent::engine::context::vault_query_memory_with_limit;
 
 pub(crate) struct SkillPassResult {
     pub system_injection: String,

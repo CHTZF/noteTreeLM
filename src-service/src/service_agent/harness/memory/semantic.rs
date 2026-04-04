@@ -68,7 +68,7 @@ impl SemanticMemory {
         conv_id:    &str,
         facts:      Vec<Value>,
     ) -> Result<Value, String> {
-        crate::service_agent::tools::memory_tools::save_memory_facts(
+        crate::service_agent::harness::tools::memory_tools::save_memory_facts(
             &self.client,
             &self.db,
             vault_id,
