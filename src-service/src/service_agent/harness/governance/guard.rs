@@ -2,6 +2,7 @@ use serde_json::Value;
 
 // ── Guard types ───────────────────────────────────────────────────────────────
 
+
 /// Evidence tier required before a guarded write tool may execute.
 #[derive(Copy, Clone)]
 pub(crate) enum GuardLevel {
@@ -163,4 +164,195 @@ pub(crate) fn evaluate_guard(spec: &ToolGuardSpec, args: &Value, store: &StoreMa
         ));
     }
     None
+}
+
+// ── Layer 1: Guard regression tests ──────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use crate::state::{GuardOutcome, ToolCallRecord};
+
+    // ── Test helpers ─────────────────────────────────────────────────────────
+
+    fn make_store(records: Vec<ToolCallRecord>) -> StoreMap {
+        records.into_iter().enumerate()
+            .map(|(i, r)| (format!("call_{}", i), r))
+            .collect()
+    }
+
+    fn rec(name: &str, args: serde_json::Value, result: serde_json::Value) -> ToolCallRecord {
+        ToolCallRecord {
+            name: name.to_string(),
+            args,
+            result,
+            started_at:    0,
+            duration_ms:   0,
+            guard_outcome: GuardOutcome::Passed,
+        }
+    }
+
+    // Guard spec: note path — PathSeen level.
+    const GUARD_PATH: ToolGuardSpec = ToolGuardSpec {
+        path_extractor: |args| args["path"].as_str().unwrap_or("").to_string(),
+        require:        GuardLevel::PathSeen,
+        is_folder:      false,
+    };
+
+    // Guard spec: note path — ContentRead level.
+    const GUARD_CONTENT: ToolGuardSpec = ToolGuardSpec {
+        path_extractor: |args| args["path"].as_str().unwrap_or("").to_string(),
+        require:        GuardLevel::ContentRead,
+        is_folder:      false,
+    };
+
+    // Guard spec: folder path.
+    const GUARD_FOLDER: ToolGuardSpec = ToolGuardSpec {
+        path_extractor: |args| args["path"].as_str().unwrap_or("").to_string(),
+        require:        GuardLevel::PathSeen,
+        is_folder:      true,
+    };
+
+    // ── Test cases ────────────────────────────────────────────────────────────
+
+    /// Empty path → always blocked with "路徑不能為空" hint.
+    #[test]
+    fn empty_path_is_blocked() {
+        let store = make_store(vec![]);
+        let result = evaluate_guard(&GUARD_PATH, &json!({"path": ""}), &store);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("不能為空"));
+    }
+
+    /// No relevant prior tool calls → blocked.
+    #[test]
+    fn empty_store_blocks() {
+        let store = make_store(vec![]);
+        let result = evaluate_guard(&GUARD_PATH, &json!({"path": "notes/foo.md"}), &store);
+        assert!(result.is_some());
+    }
+
+    /// search_vault result containing the target path → PathSeen passes.
+    #[test]
+    fn search_vault_path_seen_passes() {
+        let store = make_store(vec![rec(
+            "search_vault",
+            json!({"query": "foo"}),
+            json!([{"path": "notes/foo.md", "content": "…"}]),
+        )]);
+        let result = evaluate_guard(&GUARD_PATH, &json!({"path": "notes/foo.md"}), &store);
+        assert!(result.is_none(), "should pass but got: {:?}", result);
+    }
+
+    /// search_vault result with DIFFERENT path → blocked.
+    #[test]
+    fn search_vault_wrong_path_still_blocked() {
+        let store = make_store(vec![rec(
+            "search_vault",
+            json!({"query": "foo"}),
+            json!([{"path": "notes/other.md", "content": "…"}]),
+        )]);
+        let result = evaluate_guard(&GUARD_PATH, &json!({"path": "notes/foo.md"}), &store);
+        assert!(result.is_some());
+    }
+
+    /// list_structure text containing the path → PathSeen passes.
+    #[test]
+    fn list_structure_path_seen_passes() {
+        let store = make_store(vec![rec(
+            "list_structure",
+            json!({}),
+            json!("notes/\n  notes/foo.md\n  notes/bar.md"),
+        )]);
+        let result = evaluate_guard(&GUARD_PATH, &json!({"path": "notes/foo.md"}), &store);
+        assert!(result.is_none(), "should pass but got: {:?}", result);
+    }
+
+    /// Successful read_note for path → PathSeen passes.
+    #[test]
+    fn read_note_path_seen_passes() {
+        let store = make_store(vec![rec(
+            "read_note",
+            json!({"path": "notes/foo.md"}),
+            json!("# Foo\nsome content"),
+        )]);
+        let result = evaluate_guard(&GUARD_PATH, &json!({"path": "notes/foo.md"}), &store);
+        assert!(result.is_none(), "should pass but got: {:?}", result);
+    }
+
+    /// read_note returning an error string → does NOT count as PathSeen.
+    #[test]
+    fn read_note_error_does_not_count_as_path_seen() {
+        let store = make_store(vec![rec(
+            "read_note",
+            json!({"path": "notes/foo.md"}),
+            json!("讀取失敗：file not found"),
+        )]);
+        let result = evaluate_guard(&GUARD_PATH, &json!({"path": "notes/foo.md"}), &store);
+        assert!(result.is_some(), "error read_note should not satisfy path guard");
+    }
+
+    /// ContentRead guard: only search_vault (path seen) but no successful read_note → blocked.
+    #[test]
+    fn content_guard_blocks_when_only_search_found() {
+        let store = make_store(vec![rec(
+            "search_vault",
+            json!({"query": "foo"}),
+            json!([{"path": "notes/foo.md"}]),
+        )]);
+        let result = evaluate_guard(&GUARD_CONTENT, &json!({"path": "notes/foo.md"}), &store);
+        assert!(result.is_some());
+        let hint = result.unwrap();
+        assert!(hint.contains("read_note"), "hint should mention read_note, got: {}", hint);
+    }
+
+    /// ContentRead guard: successful read_note → passes.
+    #[test]
+    fn content_guard_passes_with_successful_read_note() {
+        let store = make_store(vec![rec(
+            "read_note",
+            json!({"path": "notes/foo.md"}),
+            json!("# Foo\ncontent here"),
+        )]);
+        let result = evaluate_guard(&GUARD_CONTENT, &json!({"path": "notes/foo.md"}), &store);
+        assert!(result.is_none(), "should pass but got: {:?}", result);
+    }
+
+    /// Folder guard: list_structure text contains "archive/" → PathSeen passes.
+    #[test]
+    fn folder_guard_passes_via_list_structure() {
+        let store = make_store(vec![rec(
+            "list_structure",
+            json!({}),
+            json!("vault/\n  archive/\n    archive/old.md"),
+        )]);
+        let result = evaluate_guard(&GUARD_FOLDER, &json!({"path": "archive"}), &store);
+        assert!(result.is_none(), "should pass but got: {:?}", result);
+    }
+
+    /// Folder guard: list_structure text does NOT contain "missingfolder/" → blocked.
+    #[test]
+    fn folder_guard_blocks_when_not_in_list_structure() {
+        let store = make_store(vec![rec(
+            "list_structure",
+            json!({}),
+            json!("vault/\n  archive/\n    archive/old.md"),
+        )]);
+        let result = evaluate_guard(&GUARD_FOLDER, &json!({"path": "missing_folder"}), &store);
+        assert!(result.is_some());
+    }
+
+    /// Path with .md suffix and without are treated as equivalent after norm_path.
+    #[test]
+    fn path_normalisation_is_case_insensitive() {
+        let store = make_store(vec![rec(
+            "read_note",
+            json!({"path": "Notes/Foo.MD"}),  // uppercase
+            json!("content"),
+        )]);
+        // Query with lowercase + no extension → after norm_path both become "notes/foo.md"
+        let result = evaluate_guard(&GUARD_PATH, &json!({"path": "notes/foo"}), &store);
+        assert!(result.is_none(), "should pass after norm_path, got: {:?}", result);
+    }
 }
