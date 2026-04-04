@@ -88,7 +88,7 @@ pub(crate) async fn run_interactive_agent(
         &client,
         &llm_url,
     ).await;
-    let mut messages_json = built.messages;
+    let messages_json = built.messages;
 
     if streaming && !mem_fact_ids.is_empty() {
         state.daemon.emit("memory:prefetched", json!({
@@ -279,6 +279,25 @@ pub(crate) async fn run_interactive_agent(
 /// Guard evaluation and post-dispatch SSE are driven by ToolDef metadata.
 pub(crate) fn build_interactive_registry(env: Arc<VaultEnv>) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
+
+    // Guard coverage check: every destructive write tool must have a guard spec.
+    // Creation tools and memory-write tools are exempt because they operate on
+    // new/non-vault paths where path-existence pre-checks don't apply.
+    // If you add a new modifying write tool (update/delete/move) without a guard,
+    // this assert fires in debug builds.
+    const GUARD_EXEMPT_WRITE_TOOLS: &[&str] = &[
+        "create_note", "create_folder", "create_agent_skill",
+        "save_memory_facts", "mark_conversation_processed", "condense_memory_facts",
+    ];
+    for def in ALL_TOOL_DEFS {
+        debug_assert!(
+            !def.is_write
+                || def.guard.is_some()
+                || GUARD_EXEMPT_WRITE_TOOLS.contains(&def.name),
+            "write tool '{}' has no guard spec and is not in GUARD_EXEMPT_WRITE_TOOLS",
+            def.name
+        );
+    }
 
     for def in ALL_TOOL_DEFS {
         let env_c = Arc::clone(&env);

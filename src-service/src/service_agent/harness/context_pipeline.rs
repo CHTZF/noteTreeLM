@@ -71,6 +71,9 @@ pub(crate) struct ContextInput<'a> {
 // ── Output ────────────────────────────────────────────────────────────────────
 
 /// Result of running the context pipeline: the assembled message list + diagnostics.
+/// Diagnostic fields (system_chars_used, history_chars_before_trim, was_trimmed) are
+/// reserved for Phase 5 observability and not yet read in normal execution paths.
+#[allow(dead_code)]
 pub(crate) struct BuiltContext {
     /// Final message list ready to send to the LLM.
     pub messages: Vec<Value>,

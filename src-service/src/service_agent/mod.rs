@@ -25,5 +25,5 @@ pub(crate) mod helpers {
     pub(crate) use super::tools::skill_tools::run_skill_pass;
     #[allow(unused_imports)]
     pub(crate) use super::tools::skill_tools::SkillPassResult;
-    pub(crate) use crate::processing::embedder::{cosine_sim, embed_text_llm};
+    pub(crate) use crate::processing::embedder::embed_text_llm;
 }

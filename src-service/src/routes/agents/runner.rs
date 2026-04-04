@@ -184,7 +184,7 @@ pub async fn live_chat(
         .map(|nc| format!("\n[當前開啟的筆記]\n{}", nc))
         .unwrap_or_default();
 
-    let live_respond_schema = crate::service_agent::tools::vault_tools::build_tools_schema_interactive(
+    let live_respond_schema = crate::service_agent::harness::tool_def::build_tools_schema(
         &["live_respond".to_string()],
     );
     let client = reqwest::Client::new();

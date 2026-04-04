@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 
 use super::env::VaultEnv;
 use crate::service_agent::types::ToolFuture;
+use crate::service_agent::tools::{memory_tools, vault_tools};
 
 // ── Guard types (co-located with tool definitions) ────────────────────────────
 
@@ -319,45 +320,168 @@ fn schema_condense_memory_facts() -> Value { json!({ "type": "function", "functi
     }, "required": [] }
 }})}
 
-// ── Handler functions (one per tool) ─────────────────────────────────────────
+// ── Handler functions (one per tool, self-contained) ─────────────────────────
 //
-// Simple tools delegate to dispatch_interactive_tool via the name macro.
-// Special tools (plan_announce, open_note, call_agent) handle SSE / recursion directly.
+// Each handler receives Arc<VaultEnv> + args and calls the appropriate vault
+// function directly. No intermediary dispatcher — adding a new tool means
+// adding ONE ToolDef entry here and nothing else.
 
-/// Macro: generate a handler fn that calls dispatch_interactive_tool with a literal name.
-macro_rules! make_handler {
-    ($fn_name:ident, $tool_name:literal) => {
-        fn $fn_name(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
-            Box::pin(async move {
-                crate::service_agent::tools::vault_tools::dispatch_interactive_tool(
-                    &env, $tool_name, &args,
-                ).await.map(|(v, _)| v)
-            })
-        }
-    };
+// ── No-op tools ──────────────────────────────────────────────────────────────
+
+fn handle_think(_env: Arc<VaultEnv>, _args: Value) -> ToolFuture {
+    Box::pin(async { Ok(json!("✅")) })
 }
 
-make_handler!(handle_think,                        "think");
-make_handler!(handle_list_structure,               "list_structure");
-make_handler!(handle_read_note,                    "read_note");
-make_handler!(handle_search_vault,                 "search_vault");
-make_handler!(handle_query_memory,                 "query_memory");
-make_handler!(handle_create_note,                  "create_note");
-make_handler!(handle_create_folder,                "create_folder");
-make_handler!(handle_update_note,                  "update_note");
-make_handler!(handle_append_to_note,               "append_to_note");
-make_handler!(handle_delete_note,                  "delete_note");
-make_handler!(handle_delete_folder,                "delete_folder");
-make_handler!(handle_move_note,                    "move_note");
-make_handler!(handle_create_agent_skill,           "create_agent_skill");
-make_handler!(handle_live_respond,                 "live_respond");
-make_handler!(handle_get_unprocessed_conversations,"get_unprocessed_conversations");
-make_handler!(handle_get_conversation_content,     "get_conversation_content");
-make_handler!(handle_save_memory_facts,            "save_memory_facts");
-make_handler!(handle_mark_conversation_processed,  "mark_conversation_processed");
-make_handler!(handle_condense_memory_facts,        "condense_memory_facts");
+fn handle_live_respond(_env: Arc<VaultEnv>, _args: Value) -> ToolFuture {
+    // Args (speech/action/content) are consumed by the SSE layer in runner.rs.
+    Box::pin(async { Ok(json!("✅")) })
+}
 
-// ── Special handlers ─────────────────────────────────────────────────────────
+// ── Read tools ────────────────────────────────────────────────────────────────
+
+fn handle_list_structure(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let path = args["path"].as_str().unwrap_or("");
+        Ok(Value::String(
+            vault_tools::vault_list_structure(path, &env.vault_path)
+        ))
+    })
+}
+
+fn handle_read_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let raw = args["path"].as_str().unwrap_or("");
+        let path = norm_md(raw);
+        Ok(Value::String(
+            vault_tools::vault_read_note(&path, &env.vault_path)
+        ))
+    })
+}
+
+fn handle_search_vault(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let query = args["query"].as_str().unwrap_or("");
+        vault_tools::vault_search(
+            &env.client, &env.embedding_url, &env.db, &env.vault_id, query,
+        ).await
+    })
+}
+
+fn handle_query_memory(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let keywords: Vec<String> = args["keywords"].as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).map(String::from).collect())
+            .unwrap_or_default();
+        let limit = args["limit"].as_u64().unwrap_or(5).min(20);
+        vault_tools::vault_query_memory_with_ids(
+            &env.client, &env.embedding_url, &env.db, &env.vault_id, &env.account_id,
+            &keywords, limit,
+        ).await.map(|(v, _)| v)
+    })
+}
+
+// ── Write tools ───────────────────────────────────────────────────────────────
+
+fn handle_create_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let path    = norm_md(args["path"].as_str().unwrap_or(""));
+        let content = args["content"].as_str().unwrap_or("");
+        vault_tools::vault_create_note(
+            &path, content, &env.vault_path, &env.client, &env.db, &env.vault_id,
+        ).await
+    })
+}
+
+fn handle_update_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let path    = norm_md(args["path"].as_str().unwrap_or(""));
+        let content = args["content"].as_str().unwrap_or("");
+        vault_tools::vault_update_note(
+            &path, content, &env.vault_path, &env.client, &env.db, &env.vault_id,
+        ).await
+    })
+}
+
+fn handle_append_to_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let path    = norm_md(args["path"].as_str().unwrap_or(""));
+        let content = args["content"].as_str().unwrap_or("");
+        vault_tools::vault_append_to_note(
+            &path, content, &env.vault_path, &env.client, &env.db, &env.vault_id,
+        ).await
+    })
+}
+
+fn handle_create_folder(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let path = args["path"].as_str().unwrap_or("");
+        vault_tools::vault_create_folder(
+            path, &env.vault_path, &env.db, &env.vault_id,
+        ).await
+    })
+}
+
+fn handle_delete_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let path = norm_md(args["path"].as_str().unwrap_or(""));
+        vault_tools::vault_delete_note(
+            &path, &env.vault_path, &env.db, &env.vault_id,
+        ).await
+    })
+}
+
+fn handle_delete_folder(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let path = args["path"].as_str().unwrap_or("");
+        vault_tools::vault_delete_folder(
+            path, &env.vault_path,
+        ).await
+    })
+}
+
+fn handle_move_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let from = norm_md(args["from"].as_str().unwrap_or(""));
+        let to   = norm_md(args["to"].as_str().unwrap_or(""));
+        vault_tools::vault_move_note(
+            &from, &to, &env.vault_path, &env.client, &env.db, &env.vault_id,
+        ).await
+    })
+}
+
+fn handle_create_agent_skill(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let title          = args["title"].as_str().unwrap_or("").to_string();
+        let trigger        = args["trigger"].as_str().unwrap_or("").to_string();
+        let behavior       = args["behavior"].as_str().unwrap_or("").to_string();
+        let injection_mode = args["injection_mode"].as_str().unwrap_or("passive").to_string();
+        let skill_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        env.db
+            .query("INSERT INTO agent_skills (skill_id, account_id, title, trigger, behavior, \
+                    is_active, trigger_count, injection_mode, created_at) \
+                    VALUES ($sid, $aid, $title, $trigger, $behavior, true, 0, $imode, $now)")
+            .bind(("sid",   skill_id.clone()))
+            .bind(("aid",   env.account_id.clone()))
+            .bind(("title", title))
+            .bind(("trigger", trigger))
+            .bind(("behavior", behavior))
+            .bind(("imode", injection_mode))
+            .bind(("now",   now))
+            .await
+            .map_err(|e| e.to_string())?;
+        // Trigger embedding in background so the new skill is searchable immediately.
+        let db_c = env.db.clone();
+        let aid  = env.account_id.clone();
+        let eu   = env.embedding_url.clone();
+        tokio::spawn(async move {
+            crate::db::seeds::embed_skills_for_account(&db_c, &aid, &eu).await;
+        });
+        Ok(json!({ "ok": true, "skill_id": skill_id }))
+    })
+}
+
+// ── Agent / UI tools ──────────────────────────────────────────────────────────
 
 /// plan_announce: emit SSE only — no filesystem/DB side effects.
 fn handle_plan_announce(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
@@ -409,4 +533,65 @@ fn handle_call_agent(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
         ).await;
         Ok(json!(result))
     })
+}
+
+// ── Memory agent tools ────────────────────────────────────────────────────────
+
+fn handle_get_unprocessed_conversations(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let limit = args["limit"].as_i64().unwrap_or(20);
+        memory_tools::get_unprocessed_conversations(
+            &env.db, &env.vault_id, &env.account_id, limit,
+        ).await
+    })
+}
+
+fn handle_get_conversation_content(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let conv_id    = args["conversation_id"].as_str().unwrap_or("").to_string();
+        let skip       = args["skip_count"].as_i64().unwrap_or(0);
+        let char_limit = args["char_limit"].as_i64().unwrap_or(500);
+        memory_tools::get_conversation_content(
+            &env.db, &conv_id, skip, char_limit,
+        ).await
+    })
+}
+
+fn handle_save_memory_facts(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let conv_id = args["conversation_id"].as_str().unwrap_or("").to_string();
+        let facts   = args["facts"].as_array().cloned().unwrap_or_default();
+        memory_tools::save_memory_facts(
+            &env.client, &env.db, &env.vault_id, &env.account_id, &conv_id, facts,
+            &env.embedding_url,
+        ).await
+    })
+}
+
+fn handle_mark_conversation_processed(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let conv_id = args["conversation_id"].as_str().unwrap_or("").to_string();
+        memory_tools::mark_conversation_processed(
+            &env.db, &conv_id,
+        ).await
+    })
+}
+
+fn handle_condense_memory_facts(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let category = args["category"].as_str().map(String::from);
+        memory_tools::condense_memory_facts(
+            &env.client, &env.llm_url, &env.db, &env.vault_id, &env.account_id,
+            category, &env.embedding_url,
+        ).await
+    })
+}
+
+// ── Path helper ───────────────────────────────────────────────────────────────
+
+/// Ensure a path has a .md suffix (lowercase-first to avoid "FOO.MD" → "foo.md.md").
+#[inline]
+fn norm_md(p: &str) -> String {
+    let lower = p.to_lowercase();
+    if lower.ends_with(".md") { lower } else { format!("{}.md", lower) }
 }
