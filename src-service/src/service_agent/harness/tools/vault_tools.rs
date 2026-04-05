@@ -1124,7 +1124,14 @@ pub(crate) async fn stream_llm_round(
                                             if let Some(cite_end) = cite_buf.find(']') {
                                                 if cite_buf.starts_with("[cite:") {
                                                     let cite_inner = &cite_buf[6..cite_end]; // between [cite: and ]
-                                                    let _valid = validate_citation(cite_inner, working_memory).await;
+                                                    let valid = validate_citation(cite_inner, working_memory).await;
+                                                    if !valid {
+                                                        tracing::warn!(
+                                                            "[citation] invalid cite ids: [cite:{}]",
+                                                            cite_inner
+                                                        );
+                                                        state.daemon.emit("agent:citation_missing", json!({}));
+                                                    }
                                                     // Strip [cite:...] from what we forward
                                                     let rest = cite_buf[cite_end + 1..].to_string();
                                                     cite_buf.clear();

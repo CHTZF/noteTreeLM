@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use serde_json::Value;
-use tokio::sync::mpsc;
 
 use super::executor::Executor;
 use super::graph::ToolGraph;
@@ -28,7 +27,6 @@ impl Dispatcher {
         Self { registry, emit_fn, is_write_fn, working_memory }
     }
 
-    /// 同步執行（tx 生命週期由 Agent 管理）
     pub async fn run(
         &self,
         tx: Arc<Transaction>,
@@ -41,20 +39,5 @@ impl Dispatcher {
             self.working_memory.clone(),
         );
         executor.execute_graph(graph, tx).await
-    }
-
-    /// Streaming 執行（tx 生命週期由 Agent 管理）
-    pub fn run_stream(
-        &self,
-        tx: Arc<Transaction>,
-        graph: ToolGraph,
-    ) -> mpsc::Receiver<Result<Value, String>> {
-        let executor = Executor::new(
-            Arc::clone(&self.registry),
-            Arc::clone(&self.emit_fn),
-            Arc::clone(&self.is_write_fn),
-            self.working_memory.clone(),
-        );
-        executor.execute_graph_stream(graph, tx)
     }
 }

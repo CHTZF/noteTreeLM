@@ -302,12 +302,6 @@ pub(crate) async fn run_interactive_agent(
         trace.blocked_calls(),
         trace.total_tool_ms(),
     );
-    if streaming {
-        state.daemon.emit(
-            "session:trace",
-            serde_json::to_value(&trace).unwrap_or_default(),
-        );
-    }
     super::super::harness::observability::trace_store::save_session_trace(
         &state.db, &vault_id, &account_id, &trace,
     ).await;

@@ -438,6 +438,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     let unlistenSkillFound: (() => void) = () => {}
     let unlistenSkillNotFound: (() => void) = () => {}
     let unlistenThink: (() => void) = () => {}
+    let unlistenPlanAnnounce: (() => void) = () => {}
+    let unlistenCitationMissing: (() => void) = () => {}
 
     // Clear previous suggestions at the start of each send
     setNoteSuggestions([])
@@ -483,6 +485,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         unlistenSkillNotFound,
         unlistenThink,
         unlistenWriteTimeout,
+        unlistenPlanAnnounce,
+        unlistenCitationMissing,
       ] = await Promise.all([
         listen<{ session_id?: string; display?: string } | string>('agent:tool_call', (event) => {
           const display = typeof event.payload === 'string'
@@ -597,6 +601,12 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
           setPendingWriteDisplay(null)
           setMessages(prev => [...prev, { role: 'notice' as const, content: '⏱ 確認逾時，操作已取消' }])
         }),
+        listen<{ session_id: string; plan: string }>('agent:plan_announce', (e) => {
+          setMessages(prev => [...prev, { role: 'notice' as const, content: `📋 計畫：${e.payload.plan}` }])
+        }),
+        listen<Record<string, never>>('agent:citation_missing', () => {
+          console.warn('[citation] LLM response missing or invalid [cite:...] tag')
+        }),
       ])
 
       log('  呼叫 invoke("invoke_agent")')
@@ -656,6 +666,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       unlistenSkillNotFound()
       unlistenThink()
       unlistenWriteTimeout()
+      unlistenPlanAnnounce()
+      unlistenCitationMissing()
       setPendingWriteDisplay(null)
       setIsStreaming(false)
       isStreamingRef.current = false

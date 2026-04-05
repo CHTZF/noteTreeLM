@@ -280,6 +280,9 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
     const unlistenWriteTimeout = await listen<{ display: string }>('agent:write_timeout', () => {
       setThinkingText('')
     })
+    const unlistenPlanAnnounce = await listen<{ session_id: string; plan: string }>('agent:plan_announce', (e) => {
+      setThinkingText(e.payload.plan)
+    })
     // Note refs
     let localNoteRefs: { label: string; absPath: string }[] = []
     const unlistenNoteRefs = await listen<{ paths: string[] }>('agent:note_refs', (e) => {
@@ -301,7 +304,7 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
     })
 
     const cleanup = () => {
-      unlistenThink(); unlistenWriteReq(); unlistenWriteTimeout(); unlistenNoteRefs(); unlistenOpenNote()
+      unlistenThink(); unlistenWriteReq(); unlistenWriteTimeout(); unlistenPlanAnnounce(); unlistenNoteRefs(); unlistenOpenNote()
       setThinkingText('')
     }
 
