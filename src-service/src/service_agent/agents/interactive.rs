@@ -41,6 +41,7 @@ pub(crate) async fn run_interactive_agent(
     streaming: bool,               // true = emit llm:token SSE; false = silent (background/sub-agent)
     tool_names: Vec<String>,       // pre-resolved by caller; must NOT contain "think"
     enable_think: bool,            // if true, force Round 0 to call think via tool_choice
+    max_rounds: usize,             // per-agent round cap (from agent_def); capped by MAX_ROUNDS
     system_injection: String,      // extra text appended to system prompt (from skill pass)
     activity_context: Option<String>,
     vault_id: String,
@@ -168,7 +169,7 @@ pub(crate) async fn run_interactive_agent(
             None
         };
 
-        for round in 0..super::super::MAX_ROUNDS {
+        for round in 0..max_rounds.min(super::super::MAX_ROUNDS) {
             if cancel.load(Ordering::Relaxed) { break; }
             emitter.increment_round();
 
@@ -468,6 +469,8 @@ pub async fn run_agent(
 
     let system_prompt = agent_def["system_prompt"].as_str().unwrap_or("").to_string();
     let enable_think = agent_def["enable_think"].as_bool().unwrap_or(false);
+    let max_rounds = agent_def["max_rounds"].as_u64().unwrap_or(super::super::MAX_ROUNDS as u64) as usize;
+    let is_background = agent_def["kind"].as_str() == Some("background");
     let mut tool_names: Vec<String> = agent_def["tool_names"]
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
@@ -479,9 +482,11 @@ pub async fn run_agent(
     let embedding_url = state.daemon.embedding_url.read().await.clone();
 
     // Parallel pre-pass: skill search + memory prefetch run concurrently.
+    // Background agents skip memory prefetch — their input is a fixed admin command,
+    // not a user query, so semantic memory lookup produces irrelevant results.
     let do_skill_pass = !vault_path.is_empty()
         && agent_def["use_skill_pass"].as_bool().unwrap_or(false);
-    let do_memory_prefetch = !vault_id.is_empty() && !account_id.is_empty();
+    let do_memory_prefetch = !is_background && !vault_id.is_empty() && !account_id.is_empty();
 
     let keywords: Vec<String> = input.split_whitespace()
         .filter(|w| w.chars().count() >= 2)
@@ -548,25 +553,35 @@ pub async fn run_agent(
         String::new()
     };
 
-    run_interactive_agent(
-        state,
+    let result = run_interactive_agent(
+        state.clone(),
         session_id,
         input,
         system_prompt,
         streaming,
         tool_names,
         enable_think,
+        max_rounds,
         system_injection,
         activity_context,
         vault_id,
         account_id,
-        conversation_id,
+        conversation_id.clone(),
         memory_facts,
         activated_skill_titles,
         cancel,
         tx,
         working_memory,
-    ).await
+    ).await;
+
+    // Background agents use a one-shot UUID conversation_id that will never be
+    // reused — clean up the session entry immediately to avoid memory growth.
+    if is_background {
+        let mut sessions = state.daemon.agent_sessions.lock().await;
+        sessions.remove(&conversation_id);
+    }
+
+    result
 }
 
 /// When use_skill_pass is true but no skill matched the user's input,
