@@ -53,4 +53,9 @@ pub(crate) struct EvalCase {
     pub description:   String,
     pub tool_sequence: Vec<MockToolCall>,
     pub assertions:    Vec<TraceAssertion>,
+    /// Monotonically increasing version for seed cases.
+    /// `seed_eval_cases` updates an existing seed row when stored version < code version,
+    /// preserving user-controlled fields (status). Defaults to 0 for user-created cases.
+    #[serde(default)]
+    pub seed_version:  u32,
 }

@@ -40,10 +40,18 @@ pub(crate) async fn run_sub_agent(
         None,
     ).await;
 
-    state.daemon.emit("sub_agent:done", json!({
-        "parent_session_id": parent_session_id,
-        "agent_name": agent_name,
-    }));
+    if result.is_empty() {
+        state.daemon.emit("sub_agent:error", json!({
+            "parent_session_id": parent_session_id,
+            "agent_name": agent_name,
+            "reason": "no response from LLM",
+        }));
+    } else {
+        state.daemon.emit("sub_agent:done", json!({
+            "parent_session_id": parent_session_id,
+            "agent_name": agent_name,
+        }));
+    }
 
     result
 }

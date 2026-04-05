@@ -29,6 +29,7 @@ fn seed_cases() -> Vec<EvalCase> {
                 TraceAssertion::ToolAt { index: 1, name: "update_note".to_string() },
                 TraceAssertion::GuardAt { index: 1, expected: GuardOutcomeKind::Passed },
             ],
+            seed_version: 1,
         },
 
         EvalCase {
@@ -42,6 +43,7 @@ fn seed_cases() -> Vec<EvalCase> {
                 TraceAssertion::TotalCallsEq(1),
                 TraceAssertion::GuardAt { index: 0, expected: GuardOutcomeKind::Blocked },
             ],
+            seed_version: 1,
         },
 
         EvalCase {
@@ -55,6 +57,7 @@ fn seed_cases() -> Vec<EvalCase> {
                 TraceAssertion::BlockedCountEq(1),
                 TraceAssertion::GuardAt { index: 1, expected: GuardOutcomeKind::Blocked },
             ],
+            seed_version: 1,
         },
 
         EvalCase {
@@ -69,6 +72,7 @@ fn seed_cases() -> Vec<EvalCase> {
                 TraceAssertion::TotalCallsEq(2),
                 TraceAssertion::GuardAt { index: 1, expected: GuardOutcomeKind::Passed },
             ],
+            seed_version: 1,
         },
 
         EvalCase {
@@ -81,6 +85,7 @@ fn seed_cases() -> Vec<EvalCase> {
                 TraceAssertion::BlockedCountEq(1),
                 TraceAssertion::GuardAt { index: 0, expected: GuardOutcomeKind::Blocked },
             ],
+            seed_version: 1,
         },
 
         EvalCase {
@@ -95,6 +100,7 @@ fn seed_cases() -> Vec<EvalCase> {
                 TraceAssertion::TotalCallsEq(2),
                 TraceAssertion::GuardAt { index: 1, expected: GuardOutcomeKind::Passed },
             ],
+            seed_version: 1,
         },
 
         EvalCase {
@@ -108,6 +114,7 @@ fn seed_cases() -> Vec<EvalCase> {
                 TraceAssertion::TotalCallsEq(1),
                 TraceAssertion::GuardAt { index: 0, expected: GuardOutcomeKind::Exempt },
             ],
+            seed_version: 1,
         },
 
         EvalCase {
@@ -121,6 +128,7 @@ fn seed_cases() -> Vec<EvalCase> {
                 TraceAssertion::BlockedCountEq(1),
                 TraceAssertion::GuardAt { index: 1, expected: GuardOutcomeKind::Blocked },
             ],
+            seed_version: 1,
         },
 
         // ── Layer 3: performance budget ──────────────────────────────────────
@@ -137,6 +145,7 @@ fn seed_cases() -> Vec<EvalCase> {
                 TraceAssertion::RoundCountLe(3),
                 TraceAssertion::TotalToolMsLe(5_000),
             ],
+            seed_version: 1,
         },
 
         EvalCase {
@@ -149,47 +158,72 @@ fn seed_cases() -> Vec<EvalCase> {
                 TraceAssertion::BlockedCountEq(1),
                 TraceAssertion::TotalToolMsLe(1_000),
             ],
+            seed_version: 1,
         },
     ]
 }
 
 /// Upsert all seed eval cases into `proposed_eval_cases` table.
 ///
-/// Uses `name` as the idempotency key — if a case with the same name already
-/// exists (regardless of status) it is left untouched, so manual status changes
-/// made via the frontend are preserved across restarts.
+/// - If a case with the same name doesn't exist → INSERT (status defaults to "enabled").
+/// - If a case exists AND its stored `seed_version` < code `seed_version` → UPDATE content
+///   fields (tool_sequence, assertions, description, seed_version) while preserving status.
+///   This mirrors the `system_prompt_version` mechanism used for agent_definitions.
 pub(crate) async fn seed_eval_cases(db: &SurrealDb, account_id: &str) {
     for case in seed_cases() {
-        let payload = match serde_json::to_value(&case) {
-            Ok(mut v) => {
-                if let Some(obj) = v.as_object_mut() {
-                    obj.insert("account_id".to_string(),  json!(account_id));
-                    obj.insert("source".to_string(),      json!("seed"));
-                    obj.insert("status".to_string(),      json!("enabled"));
-                    obj.insert("last_run_result".to_string(), serde_json::Value::Null);
-                    obj.insert("last_run_at".to_string(),     serde_json::Value::Null);
-                }
-                v
-            }
-            Err(e) => {
-                tracing::warn!("[seed_eval_cases] serialise '{}' failed: {}", case.name, e);
-                continue;
-            }
-        };
-
-        // INSERT only if no case with this name + account already exists.
-        if let Err(e) = db
-            .query(
-                "IF (SELECT count() FROM proposed_eval_cases WHERE account_id = $aid AND name = $name GROUP ALL)[0].count = 0 \
-                 THEN (CREATE proposed_eval_cases CONTENT $data) \
-                 END"
-            )
+        // Query existing row: id + seed_version (defaults to 0 if field absent).
+        #[derive(serde::Deserialize)]
+        struct ExistingRow { id: serde_json::Value, #[serde(default)] seed_version: u32 }
+        let mut resp = match db
+            .query("SELECT id, seed_version FROM proposed_eval_cases WHERE account_id = $aid AND name = $name LIMIT 1")
             .bind(("aid",  account_id.to_string()))
             .bind(("name", case.name.clone()))
-            .bind(("data", payload))
             .await
         {
-            tracing::warn!("[seed_eval_cases] upsert '{}' error: {}", case.name, e);
+            Ok(r) => r,
+            Err(e) => { tracing::warn!("[seed_eval_cases] query '{}' error: {}", case.name, e); continue; }
+        };
+        let existing: Vec<ExistingRow> = resp.take(0).unwrap_or_default();
+
+        if existing.is_empty() {
+            // INSERT new case.
+            let payload = match serde_json::to_value(&case) {
+                Ok(mut v) => {
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("account_id".to_string(), json!(account_id));
+                        obj.insert("source".to_string(),     json!("seed"));
+                        obj.insert("status".to_string(),     json!("enabled"));
+                        obj.insert("last_run_result".to_string(), serde_json::Value::Null);
+                        obj.insert("last_run_at".to_string(),     serde_json::Value::Null);
+                    }
+                    v
+                }
+                Err(e) => { tracing::warn!("[seed_eval_cases] serialise '{}' failed: {}", case.name, e); continue; }
+            };
+            if let Err(e) = db.query("CREATE proposed_eval_cases CONTENT $data")
+                .bind(("data", payload))
+                .await
+            {
+                tracing::warn!("[seed_eval_cases] insert '{}' error: {}", case.name, e);
+            }
+        } else if existing[0].seed_version < case.seed_version {
+            // UPDATE content fields; preserve status and last_run fields.
+            let row_id = &existing[0].id;
+            let tool_seq = serde_json::to_value(&case.tool_sequence).unwrap_or_default();
+            let assertions = serde_json::to_value(&case.assertions).unwrap_or_default();
+            if let Err(e) = db
+                .query("UPDATE $rid MERGE { description: $desc, tool_sequence: $ts, assertions: $as, seed_version: $ver }")
+                .bind(("rid",  row_id.clone()))
+                .bind(("desc", case.description.clone()))
+                .bind(("ts",   tool_seq))
+                .bind(("as",   assertions))
+                .bind(("ver",  case.seed_version))
+                .await
+            {
+                tracing::warn!("[seed_eval_cases] update '{}' error: {}", case.name, e);
+            } else {
+                tracing::info!("[seed_eval_cases] updated '{}' to seed_version={}", case.name, case.seed_version);
+            }
         }
     }
 }
