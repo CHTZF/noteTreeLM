@@ -428,6 +428,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     let unlistenDone: (() => void) = () => {}
     let unlistenToolCall: (() => void) = () => {}
     let unlistenWriteReq: (() => void) = () => {}
+    let unlistenWriteTimeout: (() => void) = () => {}
     let unlistenNoteRefs: (() => void) = () => {}
     let unlistenOpenNote: (() => void) = () => {}
     let unlistenWebRefs: (() => void) = () => {}
@@ -481,6 +482,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         unlistenSkillFound,
         unlistenSkillNotFound,
         unlistenThink,
+        unlistenWriteTimeout,
       ] = await Promise.all([
         listen<{ session_id?: string; display?: string } | string>('agent:tool_call', (event) => {
           const display = typeof event.payload === 'string'
@@ -591,6 +593,10 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         listen<{ thought: string }>('agent:think', (e) => {
           setMessages(prev => [...prev, { role: 'think' as const, content: e.payload.thought }])
         }),
+        listen<{ display: string }>('agent:write_timeout', () => {
+          setPendingWriteDisplay(null)
+          setMessages(prev => [...prev, { role: 'notice' as const, content: '⏱ 確認逾時，操作已取消' }])
+        }),
       ])
 
       log('  呼叫 invoke("invoke_agent")')
@@ -649,6 +655,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       unlistenSkillFound()
       unlistenSkillNotFound()
       unlistenThink()
+      unlistenWriteTimeout()
       setPendingWriteDisplay(null)
       setIsStreaming(false)
       isStreamingRef.current = false

@@ -98,6 +98,13 @@ pub(crate) async fn run_interactive_agent(
         &client,
         &llm_url,
     ).await;
+    if built.was_trimmed {
+        tracing::debug!(
+            "[context] history trimmed: before={}chars system={}chars",
+            built.history_chars_before_trim,
+            built.system_chars_used,
+        );
+    }
     let messages_json = built.messages;
 
     if streaming && !mem_fact_ids.is_empty() {

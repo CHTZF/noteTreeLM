@@ -30,7 +30,9 @@ use super::memory::episodic::EpisodicMemory;
 /// Tune these constants to match your model's context window.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ContextBudget {
-    /// Max chars for the entire system message (base + injections + memory).
+    /// Budget chars available for skill injection (step 1e).
+    /// The base system prompt, citation protocol, and memory block are NOT capped by this value —
+    /// only the skill_injection appended at the end is truncated when the budget is exceeded.
     pub system_chars:  usize,
     /// Max chars for the memory block injected into the system message.
     pub memory_chars:  usize,
@@ -179,10 +181,22 @@ impl ContextPipeline {
             let so_far: usize = parts.iter().map(|s| s.len()).sum();
             let remaining = self.budget.system_chars.saturating_sub(so_far);
             if remaining > 50 {
+                let full_len = input.skill_injection.chars().count();
                 let capped: String = input.skill_injection.chars()
                     .take(remaining)
                     .collect();
+                if capped.len() < full_len {
+                    tracing::warn!(
+                        "[context] skill injection truncated: {}/{} chars kept (system_chars budget={})",
+                        capped.len(), full_len, self.budget.system_chars
+                    );
+                }
                 parts.push(capped);
+            } else {
+                tracing::warn!(
+                    "[context] skill injection dropped: no budget remaining (so_far={} system_chars={})",
+                    so_far, self.budget.system_chars
+                );
             }
         }
 

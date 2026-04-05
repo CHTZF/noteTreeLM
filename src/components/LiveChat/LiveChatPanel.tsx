@@ -275,6 +275,11 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
     const unlistenWriteReq = await listen<string>('agent:write_request', () => {
       invoke('confirm_write_tool', { approved: true }).catch(() => {})
     })
+    // Write confirmation timeout — voice mode auto-approves so this is rare,
+    // but still needs cleanup to avoid stale state.
+    const unlistenWriteTimeout = await listen<{ display: string }>('agent:write_timeout', () => {
+      setThinkingText('')
+    })
     // Note refs
     let localNoteRefs: { label: string; absPath: string }[] = []
     const unlistenNoteRefs = await listen<{ paths: string[] }>('agent:note_refs', (e) => {
@@ -296,7 +301,7 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
     })
 
     const cleanup = () => {
-      unlistenThink(); unlistenWriteReq(); unlistenNoteRefs(); unlistenOpenNote()
+      unlistenThink(); unlistenWriteReq(); unlistenWriteTimeout(); unlistenNoteRefs(); unlistenOpenNote()
       setThinkingText('')
     }
 
