@@ -1,4 +1,5 @@
 use serde_json::Value;
+use crate::state::GuardHint;
 
 // ── Guard types ───────────────────────────────────────────────────────────────
 
@@ -126,11 +127,11 @@ pub(crate) fn has_search_result(store: &StoreMap, is_folder: bool) -> bool {
 
 /// Evaluate a `ToolGuardSpec` against the current tool evidence store.
 /// Returns `None` if the guard passes (execution may proceed).
-/// Returns `Some(hint)` with a user-facing message if blocked.
-pub(crate) fn evaluate_guard(spec: &ToolGuardSpec, args: &Value, store: &StoreMap) -> Option<String> {
+/// Returns `Some(GuardHint)` with a structured block reason if blocked.
+pub(crate) fn evaluate_guard(spec: &ToolGuardSpec, args: &Value, store: &StoreMap) -> Option<GuardHint> {
     let raw_path = (spec.path_extractor)(args);
     if raw_path.is_empty() {
-        return Some("路徑參數不能為空，請提供有效的路徑後再試。".to_string());
+        return Some(GuardHint::new("路徑參數不能為空，請提供有效的路徑後再試。"));
     }
     let target = if spec.is_folder {
         raw_path.to_lowercase()
@@ -146,22 +147,29 @@ pub(crate) fn evaluate_guard(spec: &ToolGuardSpec, args: &Value, store: &StoreMa
     if !path_ok {
         let hint = if spec.is_folder {
             if was_searched {
-                format!("list_structure 結果中找不到資料夾 '{}'，請確認名稱是否正確。", raw_path)
+                GuardHint::new(format!("list_structure 結果中找不到資料夾 '{}'，請確認名稱是否正確。", raw_path))
+                    .with_tool("list_structure", &raw_path)
             } else {
-                format!("資料夾 '{}' 尚未驗證存在，請先呼叫 list_structure 確認。", raw_path)
+                GuardHint::new(format!("資料夾 '{}' 尚未驗證存在，請先呼叫 list_structure 確認。", raw_path))
+                    .with_tool("list_structure", &raw_path)
             }
         } else if was_searched {
-            format!("搜尋結果中找不到 '{}'，請確認筆記名稱或換個關鍵字再搜尋。", raw_path)
+            GuardHint::new(format!("搜尋結果中找不到 '{}'，請確認筆記名稱或換個關鍵字再搜尋。", raw_path))
+                .with_tool("search_vault", &raw_path)
         } else {
-            format!("路徑 '{}' 尚未驗證存在，請先使用 search_vault 或 list_structure 確認。", raw_path)
+            GuardHint::new(format!("路徑 '{}' 尚未驗證存在，請先使用 search_vault 或 list_structure 確認。", raw_path))
+                .with_tool("search_vault", &raw_path)
         };
         return Some(hint);
     }
     if !content_ok {
-        return Some(format!(
-            "尚未成功讀取 '{}' 的內容（讀取失敗或未呼叫 read_note）。請先呼叫 read_note 確認內容後再修改。",
-            raw_path
-        ));
+        return Some(
+            GuardHint::new(format!(
+                "尚未成功讀取 '{}' 的內容（讀取失敗或未呼叫 read_note）。請先呼叫 read_note 確認內容後再修改。",
+                raw_path
+            ))
+            .with_tool("read_note", &raw_path)
+        );
     }
     None
 }
@@ -222,7 +230,7 @@ mod tests {
         let store = make_store(vec![]);
         let result = evaluate_guard(&GUARD_PATH, &json!({"path": ""}), &store);
         assert!(result.is_some());
-        assert!(result.unwrap().contains("不能為空"));
+        assert!(result.unwrap().message.contains("不能為空"));
     }
 
     /// No relevant prior tool calls → blocked.
@@ -304,7 +312,8 @@ mod tests {
         let result = evaluate_guard(&GUARD_CONTENT, &json!({"path": "notes/foo.md"}), &store);
         assert!(result.is_some());
         let hint = result.unwrap();
-        assert!(hint.contains("read_note"), "hint should mention read_note, got: {}", hint);
+        assert!(hint.message.contains("read_note"), "hint should mention read_note, got: {}", hint.message);
+        assert_eq!(hint.required_tool.as_deref(), Some("read_note"));
     }
 
     /// ContentRead guard: successful read_note → passes.

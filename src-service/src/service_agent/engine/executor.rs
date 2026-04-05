@@ -283,8 +283,13 @@ fn is_search_tool(name: &str) -> bool {
 /// so `GuardOutcome::Exempt` is emitted instead of `Passed` for creation-style tools.
 fn extract_guard_outcome(v: Value, tool_name: &str) -> (GuardOutcome, Value) {
     if v.get("__guard_blocked__").and_then(|b| b.as_bool()).unwrap_or(false) {
-        let hint = v["__guard_hint__"].as_str().unwrap_or("guard blocked").to_string();
-        (GuardOutcome::Blocked(hint.clone()), Value::String(hint))
+        let message       = v["__guard_hint__"].as_str().unwrap_or("guard blocked").to_string();
+        let required_tool = v["__guard_required_tool__"].as_str().map(String::from);
+        let required_path = v["__guard_required_path__"].as_str().map(String::from);
+        let hint = crate::state::GuardHint { message: message.clone(), required_tool, required_path };
+        // Forward only the human-readable message to the LLM; the structured fields
+        // are stored in WorkingMemory for get_session_state and trace_analyst.
+        (GuardOutcome::Blocked(hint), Value::String(message))
     } else if GUARD_EXEMPT_WRITE_TOOLS.contains(&tool_name) {
         (GuardOutcome::Exempt, v)
     } else {

@@ -7,6 +7,9 @@ use crate::service_agent::harness::observability::trace::SessionTrace;
 /// **Layer 2 (behavioral):**
 /// - `NoBlockedCalls`, `BlockedCountEq`, `GuardAt`, `ToolAt`, `TotalCallsEq`
 ///
+/// **Layer 2b (stall detection):**
+/// - `NoRepeatedCalls`, `RepeatedCallCountEq`
+///
 /// **Layer 3 (performance budget):**
 /// - `RoundCountLe`, `TotalToolMsLe`, `LlmLatencyMeanLe`
 ///
@@ -30,6 +33,14 @@ pub(crate) enum TraceAssertion {
 
     /// The call at `index` must have this tool name.
     ToolAt { index: usize, name: String },
+
+    // ── Layer 2b: stall detection ────────────────────────────────────────────
+
+    /// No (tool_name, arg) pair should appear ≥ 2 times — stall warning must not trigger.
+    NoRepeatedCalls,
+
+    /// Exactly `n` distinct (tool_name, arg) pairs were called ≥ 2 times.
+    RepeatedCallCountEq(usize),
 
     // ── Layer 3: performance budget ──────────────────────────────────────────
 
@@ -144,6 +155,18 @@ fn check(trace: &SessionTrace, assertion: &TraceAssertion) -> Option<String> {
                     } else { None }
                 }
             }
+        }
+
+        TraceAssertion::NoRepeatedCalls => {
+            if trace.repeated_call_count > 0 {
+                Some(format!("NoRepeatedCalls: {} repeated (tool, arg) pair(s) found", trace.repeated_call_count))
+            } else { None }
+        }
+
+        TraceAssertion::RepeatedCallCountEq(expected) => {
+            if trace.repeated_call_count != *expected {
+                Some(format!("RepeatedCallCountEq({}): got {}", expected, trace.repeated_call_count))
+            } else { None }
         }
 
         TraceAssertion::RoundCountLe(max) => {

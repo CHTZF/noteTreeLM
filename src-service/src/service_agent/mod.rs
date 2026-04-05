@@ -1,4 +1,7 @@
-pub const MAX_ROUNDS: usize = 20;
+/// Absolute safety-net round cap. Normal termination happens via stall detection
+/// (repeated_calls warning) or when the LLM produces no tool call. This value
+/// should rarely be reached in practice.
+pub const MAX_ROUNDS: usize = 50;
 
 // ── 基礎型別 ─────────────────────────────────────────────────────────────────
 pub mod types;

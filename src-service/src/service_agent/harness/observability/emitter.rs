@@ -119,9 +119,10 @@ impl ObservabilityEmitter {
             (s.started_at, s.round_count, s.skill_activations.clone(), s.llm_latency_ms.clone())
         };
 
-        let tool_calls = working_memory
+        let tool_calls: Vec<_> = working_memory
             .with_records(|map| map.values().cloned().collect())
             .await;
+        let repeated_call_count = working_memory.repeated_calls().await.len();
 
         SessionTrace {
             conv_id: conv_id.to_string(),
@@ -132,6 +133,7 @@ impl ObservabilityEmitter {
             llm_latency_ms,
             tool_calls,
             memory_facts_injected,
+            repeated_call_count,
         }
     }
 }

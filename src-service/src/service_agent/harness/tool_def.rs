@@ -83,6 +83,7 @@ pub(crate) static ALL_TOOL_DEFS: &[ToolDef] = &[
     ToolDef { name: "search_skills",       schema_fn: schema_search_skills,       is_write: false, guard: None, handler: handle_search_skills,       rollback: None },
 
     // ── Agent / UI tools ─────────────────────────────────────────────────────
+    ToolDef { name: "get_session_state",   schema_fn: schema_get_session_state,   is_write: false, guard: None, handler: handle_get_session_state,   rollback: None },
     ToolDef { name: "plan_announce",       schema_fn: schema_plan_announce,       is_write: false, guard: None, handler: handle_plan_announce,       rollback: None },
     ToolDef { name: "open_note",           schema_fn: schema_open_note,           is_write: false, guard: None, handler: handle_open_note,           rollback: None },
     ToolDef { name: "create_agent_skill",  schema_fn: schema_create_agent_skill,  is_write: true,  guard: None, handler: handle_create_agent_skill,  rollback: None },
@@ -369,6 +370,12 @@ fn schema_search_skills() -> Value { json!({ "type": "function", "function": {
     "parameters": { "type": "object", "properties": {
         "query": { "type": "string", "description": "搜尋關鍵字或描述" }
     }, "required": ["query"] }
+}})}
+
+fn schema_get_session_state() -> Value { json!({ "type": "function", "function": {
+    "name": "get_session_state",
+    "description": "回傳本輪 session 已執行的工具清單（name、args 摘要、guard 結果、耗時）及重複呼叫警告。當你不確定自己是否已讀取某個路徑、或要避免重複操作時，先呼叫此工具。",
+    "parameters": { "type": "object", "properties": {} }
 }})}
 
 fn schema_plan_announce() -> Value { json!({ "type": "function", "function": {
@@ -821,6 +828,23 @@ fn handle_search_skills(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 }
 
 // ── Agent / UI tools ──────────────────────────────────────────────────────────
+
+/// get_session_state: snapshot WorkingMemory for agent self-inspection.
+fn handle_get_session_state(env: Arc<VaultEnv>, _args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let calls = env.working_memory.snapshot_summary().await;
+        let repeats = env.working_memory.repeated_calls().await;
+        let repeat_warnings: Vec<Value> = repeats.iter().map(|(name, arg)| json!({
+            "tool": name,
+            "arg":  arg,
+            "warning": format!("你已在本 session 多次呼叫 {}({})，請換策略或確認是否已得到所需資訊。", name, arg),
+        })).collect();
+        Ok(json!({
+            "tool_calls": calls,
+            "repeated_calls": repeat_warnings,
+        }))
+    })
+}
 
 /// plan_announce: emit SSE only — no filesystem/DB side effects.
 fn handle_plan_announce(env: Arc<VaultEnv>, args: Value) -> ToolFuture {

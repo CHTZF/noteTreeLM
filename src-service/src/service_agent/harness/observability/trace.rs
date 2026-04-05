@@ -25,6 +25,10 @@ pub(crate) struct SessionTrace {
     /// Number of memory facts injected into the context for this session.
     /// 0 means memory prefetch returned nothing or was skipped.
     pub memory_facts_injected: usize,
+    /// Number of distinct (tool_name, arg) pairs called ≥ 2 times in this session.
+    /// > 0 indicates the stall-detection warning was triggered.
+    #[serde(default)]
+    pub repeated_call_count: usize,
 }
 
 impl SessionTrace {

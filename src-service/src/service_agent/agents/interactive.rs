@@ -233,6 +233,22 @@ pub(crate) async fn run_interactive_agent(
                     Err(e) => { tracing::warn!("[interactive/tools] dispatcher error: {}", e); break; }
                 };
                 msgs.extend(Planner::results_to_messages(&tool_chunks, results));
+                // Stall detection: inject warning if any (tool, arg) pair has been
+                // called ≥ 2 times. Gives the agent a chance to change strategy
+                // before the hard MAX_ROUNDS safety net triggers.
+                let repeats = working_memory.repeated_calls().await;
+                if !repeats.is_empty() {
+                    let names: Vec<String> = repeats.iter()
+                        .map(|(t, a)| if a.is_empty() { t.clone() } else { format!("{}({})", t, a) })
+                        .collect();
+                    msgs.push(json!({
+                        "role": "user",
+                        "content": format!(
+                            "[系統提示] 你在本 session 已重複呼叫：{}。請換策略，或直接根據已取得的資訊回覆使用者。",
+                            names.join("、")
+                        )
+                    }));
+                }
                 if cancel.load(Ordering::Relaxed) { break; }
             } else {
                 break;
@@ -334,8 +350,13 @@ pub(crate) fn build_interactive_registry(env: Arc<VaultEnv>) -> ToolRegistry {
                     }).await;
                     if let Some(h) = hint {
                         // Return a sentinel object so executor can detect GuardOutcome::Blocked
-                        // and unwrap the hint string before forwarding to the LLM.
-                        return Ok(json!({ "__guard_blocked__": true, "__guard_hint__": h }));
+                        // and unwrap the structured hint before forwarding to the LLM.
+                        return Ok(json!({
+                            "__guard_blocked__": true,
+                            "__guard_hint__": h.message,
+                            "__guard_required_tool__": h.required_tool,
+                            "__guard_required_path__": h.required_path,
+                        }));
                     }
                 }
 

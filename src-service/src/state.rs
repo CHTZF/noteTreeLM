@@ -20,14 +20,38 @@ pub struct ServiceEvent {
     pub payload: serde_json::Value,
 }
 
+/// Structured block reason returned by `evaluate_guard`.
+/// Carries both the human-readable message and machine-readable fields so the
+/// LLM can programmatically decide its next action instead of parsing text.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GuardHint {
+    /// Human-readable explanation forwarded to the LLM as the tool result.
+    pub message: String,
+    /// The tool the agent should call next to satisfy the guard (e.g. "read_note").
+    pub required_tool: Option<String>,
+    /// The exact path the required_tool should be called with.
+    pub required_path: Option<String>,
+}
+
+impl GuardHint {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self { message: message.into(), required_tool: None, required_path: None }
+    }
+    pub fn with_tool(mut self, tool: impl Into<String>, path: impl Into<String>) -> Self {
+        self.required_tool = Some(tool.into());
+        self.required_path = Some(path.into());
+        self
+    }
+}
+
 /// Guard evaluation outcome for a single tool execution.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", content = "reason")]
 pub enum GuardOutcome {
     /// Guard passed (or tool has no guard spec).
     Passed,
-    /// Guard blocked execution; inner string is the hint returned to the LLM.
-    Blocked(String),
+    /// Guard blocked execution; inner GuardHint carries message + required action.
+    Blocked(GuardHint),
     /// Tool is explicitly exempt from guard evaluation.
     Exempt,
 }

@@ -74,6 +74,7 @@ impl EvalRunner {
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
         let tool_calls = pairs.into_iter().map(|(_, v)| v).collect();
 
+        let repeated_call_count = working_memory.repeated_calls().await.len();
         let trace = SessionTrace {
             conv_id:                String::new(), // eval traces are not tied to a real conversation
             started_at:             0,
@@ -83,6 +84,7 @@ impl EvalRunner {
             llm_latency_ms:         vec![],
             tool_calls,
             memory_facts_injected:  0, // not applicable in eval context
+            repeated_call_count,
         };
 
         EvalResult::evaluate(case.description.clone(), trace, &case.assertions)
@@ -170,7 +172,12 @@ fn build_eval_registry(
                 if let Some(ref spec) = guard {
                     let hint = wm.with_records(|store| evaluate_guard(spec, &args, store)).await;
                     if let Some(h) = hint {
-                        return Ok(json!({ "__guard_blocked__": true, "__guard_hint__": h }));
+                        return Ok(json!({
+                            "__guard_blocked__": true,
+                            "__guard_hint__": h.message,
+                            "__guard_required_tool__": h.required_tool,
+                            "__guard_required_path__": h.required_path,
+                        }));
                     }
                 }
                 // Dequeue the first result for this tool name.

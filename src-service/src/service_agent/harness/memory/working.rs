@@ -80,6 +80,54 @@ impl WorkingMemory {
         self.inner.lock().await.is_empty()
     }
 
+    /// Return (tool_name, args_summary) pairs for calls that appear ≥ 2 times
+    /// (same tool name + identical `path` or `query` arg).
+    /// Used by the round loop to inject a stall-detection warning.
+    pub(crate) async fn repeated_calls(&self) -> Vec<(String, String)> {
+        let map = self.inner.lock().await;
+        let mut counts: std::collections::HashMap<(String, String), usize> =
+            std::collections::HashMap::new();
+        for rec in map.values() {
+            let key_arg = rec.args["path"]
+                .as_str()
+                .or_else(|| rec.args["query"].as_str())
+                .unwrap_or("")
+                .to_string();
+            *counts.entry((rec.name.clone(), key_arg)).or_insert(0) += 1;
+        }
+        counts.into_iter()
+            .filter(|(_, n)| *n >= 2)
+            .map(|((name, arg), _)| (name, arg))
+            .collect()
+    }
+
+    /// Snapshot all records as a JSON-serialisable summary for `get_session_state`.
+    /// Returns a Vec of `{name, args, guard_outcome, duration_ms}` objects (no result body).
+    pub(crate) async fn snapshot_summary(&self) -> Vec<serde_json::Value> {
+        use serde_json::json;
+        let map = self.inner.lock().await;
+        let mut records: Vec<_> = map.values().collect();
+        // Sort by started_at for deterministic ordering.
+        records.sort_by_key(|r| r.started_at);
+        records.iter().map(|r| {
+            let outcome = match &r.guard_outcome {
+                crate::state::GuardOutcome::Passed  => json!("passed"),
+                crate::state::GuardOutcome::Exempt  => json!("exempt"),
+                crate::state::GuardOutcome::Blocked(h) => json!({
+                    "blocked": true,
+                    "required_tool": h.required_tool,
+                    "required_path": h.required_path,
+                }),
+            };
+            json!({
+                "name":         r.name,
+                "args":         r.args,
+                "guard":        outcome,
+                "duration_ms":  r.duration_ms,
+            })
+        }).collect()
+    }
+
     /// Expose the raw `Arc<Mutex<HashMap<...>>>` for callers that still hold the legacy
     /// `Arc<Mutex<HashMap>>` type (e.g. `AgentSession.tool_calls` in `state.rs`).
     ///
