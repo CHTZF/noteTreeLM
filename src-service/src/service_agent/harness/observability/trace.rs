@@ -22,6 +22,9 @@ pub(crate) struct SessionTrace {
     pub llm_latency_ms: Vec<u64>,
     /// All tool executions in this session, including guard-blocked calls.
     pub tool_calls: Vec<ToolCallRecord>,
+    /// Number of memory facts injected into the context for this session.
+    /// 0 means memory prefetch returned nothing or was skipped.
+    pub memory_facts_injected: usize,
 }
 
 impl SessionTrace {

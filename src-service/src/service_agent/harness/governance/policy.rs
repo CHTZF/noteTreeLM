@@ -24,17 +24,27 @@ pub(crate) fn is_interactive_write_tool(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Assert that every destructive write tool has a guard spec or appears in
-/// `GUARD_EXEMPT_WRITE_TOOLS`. Fires only in debug builds; call once during
-/// registry construction to catch omissions at startup.
+/// Check that every destructive write tool has a guard spec or appears in
+/// `GUARD_EXEMPT_WRITE_TOOLS`.
+///
+/// - All builds: logs a warning for each uncovered tool so production gaps are visible.
+/// - Debug builds: additionally panics to catch omissions during development.
+///
+/// Call once during registry construction (e.g. `build_interactive_registry`).
 pub(crate) fn assert_guard_coverage() {
     for def in ALL_TOOL_DEFS {
-        debug_assert!(
-            !def.is_write
-                || def.guard.is_some()
-                || GUARD_EXEMPT_WRITE_TOOLS.contains(&def.name),
-            "write tool '{}' has no guard spec and is not in GUARD_EXEMPT_WRITE_TOOLS",
-            def.name
-        );
+        let uncovered = def.is_write
+            && def.guard.is_none()
+            && !GUARD_EXEMPT_WRITE_TOOLS.contains(&def.name);
+        if uncovered {
+            tracing::warn!(
+                "[guard_coverage] write tool '{}' has no guard spec and is not in GUARD_EXEMPT_WRITE_TOOLS",
+                def.name
+            );
+            debug_assert!(false,
+                "write tool '{}' has no guard spec and is not in GUARD_EXEMPT_WRITE_TOOLS",
+                def.name
+            );
+        }
     }
 }

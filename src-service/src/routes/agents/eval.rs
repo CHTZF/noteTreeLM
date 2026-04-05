@@ -52,15 +52,44 @@ pub async fn run_trace_analysis(
     let state_clone = state.clone();
     tokio::spawn(async move {
         crate::service_agent::agents::interactive::run_agent(
-            state_clone,
+            state_clone.clone(),
             agent_def,
             input,
             vault_id,
-            account_id,
+            account_id.clone(),
             conversation_id,
             false, // silent background run — no SSE streaming
             None,
         ).await;
+
+        // After trace_analyst finishes proposing, auto-run enabled eval cases so
+        // last_run_result is up to date without requiring a manual "Run All" click.
+        let results = crate::service_agent::harness::eval::runner::load_enabled_cases(
+            &state_clone.db,
+            &account_id,
+        ).await;
+
+        let now = chrono::Utc::now().timestamp();
+        for (name, result) in &results {
+            let result_str = if result.passed() { "passed" } else { "failed" };
+            let _ = state_clone.db
+                .query(
+                    "UPDATE proposed_eval_cases SET last_run_result = $res, last_run_at = $now \
+                     WHERE account_id = $aid AND name = $name AND status = 'enabled'"
+                )
+                .bind(("res",  result_str.to_string()))
+                .bind(("now",  now))
+                .bind(("aid",  account_id.clone()))
+                .bind(("name", name.clone()))
+                .await;
+        }
+
+        let passed = results.iter().filter(|(_, r)| r.passed()).count();
+        let total  = results.len();
+        tracing::info!(
+            "[eval] auto-run after trace_analyst: {}/{} passed",
+            passed, total
+        );
     });
 
     Ok(Json(json!({ "session_id": session_id })))

@@ -75,13 +75,14 @@ impl EvalRunner {
         let tool_calls = pairs.into_iter().map(|(_, v)| v).collect();
 
         let trace = SessionTrace {
-            conv_id:           String::new(), // eval traces are not tied to a real conversation
-            started_at:        0,
-            ended_at:          0,
-            round_count:       1, // single simulated round
-            skill_activations: vec![],
-            llm_latency_ms:    vec![],
+            conv_id:                String::new(), // eval traces are not tied to a real conversation
+            started_at:             0,
+            ended_at:               0,
+            round_count:            1, // single simulated round
+            skill_activations:      vec![],
+            llm_latency_ms:         vec![],
             tool_calls,
+            memory_facts_injected:  0, // not applicable in eval context
         };
 
         EvalResult::evaluate(trace, &case.assertions)

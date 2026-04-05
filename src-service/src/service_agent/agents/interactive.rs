@@ -281,7 +281,7 @@ pub(crate) async fn run_interactive_agent(
     }
 
     // 11. Assemble + emit session trace for observability, then persist to DB.
-    let trace = emitter.finish(&working_memory, &conv_id).await;
+    let trace = emitter.finish(&working_memory, &conv_id, mem_facts.len()).await;
     tracing::debug!(
         "[session:trace] session={} rounds={} tools={} blocked={} tool_ms={}ms",
         session_id,
