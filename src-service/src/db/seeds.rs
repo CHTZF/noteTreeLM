@@ -386,9 +386,6 @@ pub async fn seed_builtins(db: &SurrealDb, account_id: &str) {
     // 幂等判斷：count 必須等於 SKILLS.len() 才跳過；少一個就重建
     #[derive(serde::Deserialize)]
     struct CountRow { count: i64 }
-    // Harness seed runs unconditionally (uses conditional INSERT internally — idempotent).
-    crate::service_agent::harness::seed_agents::seed_builtin_agents(db, account_id).await;
-    crate::service_agent::harness::eval::cases::seed_eval_cases(db, account_id).await;
 
     // Skill/agent early-exit: if builtin skill count already matches, skip full rebuild.
     if let Ok(mut r) = db.query(
@@ -398,6 +395,10 @@ pub async fn seed_builtins(db: &SurrealDb, account_id: &str) {
         let existing = rows.into_iter().next().map(|r| r.count).unwrap_or(0) as usize;
         if existing == SKILLS.len() {
             tracing::debug!("seed_builtins: account {} already seeded ({} skills), skipping", account_id, existing);
+            // Harness seeds are idempotent (conditional INSERT) — run on the fast path
+            // so new trace_analyst prompts / eval cases added in future versions are picked up.
+            crate::service_agent::harness::seed_agents::seed_builtin_agents(db, account_id).await;
+            crate::service_agent::harness::eval::cases::seed_eval_cases(db, account_id).await;
             return;
         }
         tracing::info!("seed_builtins: account {} has {}/{} builtin skills, rebuilding", account_id, existing, SKILLS.len());
@@ -471,6 +472,12 @@ pub async fn seed_builtins(db: &SurrealDb, account_id: &str) {
     }
 
     tracing::info!("Seeded {} builtin agents for account {}", AGENTS.len(), account_id);
+
+    // Seed harness built-ins after the full rebuild.
+    // Must run AFTER the DELETE above (which wipes all is_builtin=true agent_definitions)
+    // so that trace_analyst is re-created correctly.
+    crate::service_agent::harness::seed_agents::seed_builtin_agents(db, account_id).await;
+    crate::service_agent::harness::eval::cases::seed_eval_cases(db, account_id).await;
 
     // Embedding happens later when embed_skills_for_account is called with embedding_url.
     // (seed_builtins doesn't have access to the daemon's embedding_url)
