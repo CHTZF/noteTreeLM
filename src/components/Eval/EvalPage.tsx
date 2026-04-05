@@ -61,6 +61,20 @@ export default function EvalPage() {
 
   useEffect(() => { loadCases() }, [loadCases])
 
+  // Poll for new proposals while trace_analyst is running in the background.
+  // trace_analyst may take 30-60s; a single 3s timeout misses most of the results.
+  useEffect(() => {
+    if (analysisState !== 'done') return
+    // Poll every 8s for up to 2 minutes (15 attempts), then stop.
+    let attempts = 0
+    const id = setInterval(() => {
+      attempts++
+      loadCases()
+      if (attempts >= 15) clearInterval(id)
+    }, 8000)
+    return () => clearInterval(id)
+  }, [analysisState, loadCases])
+
   async function handleDelete(caseId: string) {
     try {
       await api.deleteEvalCase(caseId)
@@ -107,9 +121,7 @@ export default function EvalPage() {
     setAnalysisState('running')
     try {
       await api.runTraceAnalysis()
-      setAnalysisState('done')
-      // Reload cases after a short delay (analysis runs in background)
-      setTimeout(loadCases, 3000)
+      setAnalysisState('done') // triggers polling useEffect
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e)
       if (msg.includes('409') || msg.includes('already running')) {
@@ -192,6 +204,9 @@ export default function EvalPage() {
                       )}
                     </div>
                     <p className="text-xs text-gray-400 mt-0.5">{c.step_count} steps</p>
+                    {c.description && (
+                      <p className="text-xs text-gray-500 mt-1 italic">{c.description}</p>
+                    )}
                     {/* Failure details */}
                     {runResult && !runResult.passed && runResult.failures.length > 0 && (
                       <ul className="mt-1.5 space-y-0.5">

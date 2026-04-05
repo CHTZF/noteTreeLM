@@ -14,16 +14,31 @@ use serde_json::json;
 pub(crate) async fn seed_builtin_agents(db: &SurrealDb, account_id: &str) {
     let agents = builtin_agents(account_id);
     for agent in agents {
-        let name = agent["name"].as_str().unwrap_or("").to_string();
+        let name    = agent["name"].as_str().unwrap_or("").to_string();
+        let prompt  = agent["system_prompt"].as_str().unwrap_or("").to_string();
+        let version = agent["system_prompt_version"].as_u64().unwrap_or(1);
+
         if let Err(e) = db
             .query(
-                "IF (SELECT count() FROM agent_definitions WHERE account_id = $aid AND name = $name GROUP ALL)[0].count = 0 \
+                // Create if new; update system_prompt when version in code exceeds DB version.
+                // Other fields (tool_names, max_rounds, etc.) are left untouched so user
+                // edits made via the frontend are preserved.
+                "IF (SELECT count() FROM agent_definitions \
+                     WHERE account_id = $aid AND name = $name GROUP ALL)[0].count = 0 \
                  THEN (CREATE agent_definitions CONTENT $data) \
+                 ELSE IF (SELECT VALUE system_prompt_version FROM agent_definitions \
+                          WHERE account_id = $aid AND name = $name \
+                          LIMIT 1)[0] < $ver \
+                 THEN (UPDATE agent_definitions \
+                       SET system_prompt = $prompt, system_prompt_version = $ver \
+                       WHERE account_id = $aid AND name = $name) \
                  END"
             )
-            .bind(("aid",  account_id.to_string()))
-            .bind(("name", name.clone()))
-            .bind(("data", agent))
+            .bind(("aid",    account_id.to_string()))
+            .bind(("name",   name.clone()))
+            .bind(("data",   agent))
+            .bind(("prompt", prompt))
+            .bind(("ver",    version))
             .await
         {
             tracing::warn!("[seed_builtin_agents] upsert '{}' error: {}", name, e);
@@ -52,8 +67,9 @@ fn trace_analyst_def(account_id: &str) -> serde_json::Value {
             "read_session_with_conversation",
             "propose_eval_case"
         ],
-        "system_prompt": TRACE_ANALYST_PROMPT,
-        "max_rounds":    10,
+        "system_prompt":         TRACE_ANALYST_PROMPT,
+        "system_prompt_version": 2,
+        "max_rounds":            10,
     })
 }
 
@@ -70,12 +86,23 @@ const TRACE_ANALYST_PROMPT: &str = r#"
    - **Performance 異常**：簡單請求但 `round_count` 異常高 → `RoundCountLe` budget case
 4. 針對每個有價值的模式，呼叫 `propose_eval_case` 儲存提案
 
+## Trace 欄位說明
+
+每個 trace 包含以下欄位，請善用它們輔助判斷：
+- `blocked_calls`：被 guard 攔截的工具呼叫數
+- `round_count`：LLM 回合數（高數值可能代表效率問題）
+- `skill_activations`：本次對話觸發的技能名稱清單
+- `memory_facts_injected`：注入 context 的記憶片段數量
+  - 值為 0 代表記憶沒有命中，表示這是全新話題或記憶系統未命中
+  - 值 > 0 代表有記憶輔助，可評估是否影響了工具選擇
+
 ## 判斷標準
 
 **值得提案的情況：**
 - trace 顯示某工具被 guard blocked，且對話中使用者的意圖確實需要先讀取才能寫入
 - 一個完整的讀→寫序列在對話中被成功執行，可作為 happy path 範本
 - `blocked_calls > 0` 且對話顯示 LLM 在第二輪自行修正了路徑（說明 guard 有效）
+- `memory_facts_injected = 0` 且 `round_count` 異常高（記憶缺失導致效率下降）
 
 **不值得提案的情況：**
 - trace 完全正常，沒有 guard block，也沒有特殊模式
