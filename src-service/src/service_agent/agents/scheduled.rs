@@ -53,7 +53,10 @@ pub async fn execute_scheduled_task(
     };
 
     let initial_msg = agent_prompt.unwrap_or_else(|| description.clone());
-    let conversation_id = format!("scheduled_{}_{}", task_id, agent_name);
+    // Per-run conversation_id: scheduled tasks don't benefit from cross-run history.
+    // Cross-run continuity lives in the notes the agent writes, not dialogue history.
+    // A fixed id would accumulate unbounded EpisodicMemory rows across daily runs.
+    let conversation_id = format!("scheduled_{}_{}_{}", task_id, agent_name, chrono::Utc::now().timestamp());
 
     tracing::info!(
         "[scheduler] running agent '{}' for task {} vault_id='{}'",

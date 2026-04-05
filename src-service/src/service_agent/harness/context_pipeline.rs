@@ -66,6 +66,9 @@ pub(crate) struct ContextInput<'a> {
     pub activity_context: Option<&'a str>,
     /// Memory facts pre-fetched by the parallel pre-pass.
     pub memory_facts:     &'a [Value],
+    /// True for interactive chat agents (kind = "chat").
+    /// Controls whether the citation protocol instruction is appended to the system message.
+    pub is_chat:          bool,
 }
 
 // ── Output ────────────────────────────────────────────────────────────────────
@@ -141,12 +144,11 @@ impl ContextPipeline {
     // ── Stage 1 helper ────────────────────────────────────────────────────────
 
     fn build_system_content(&self, input: &ContextInput<'_>) -> String {
-        // Anti-hallucination suffix appended to every system prompt.
-        const ANTI_HALLUCINATION: &str =
-            "\n\n必須實際呼叫工具完成任務；禁止假裝或虛構結果。\
-             若搜尋無結果，直接說明找不到。\
-             回覆中引用筆記時，請包含完整的 vault 相對路徑。\
-             工具結果中含有 __cite_id__ 欄位；最終文字回覆的第一句必須以 \
+        // Citation protocol — only injected for interactive chat agents (kind = "chat").
+        // stream_llm_round actively parses [cite:id1,id2] / [cite:none] from LLM output;
+        // background/sub/scheduled agents never stream back to users so this is noise for them.
+        const CITATION_PROTOCOL: &str =
+            "工具結果中含有 __cite_id__ 欄位；最終文字回覆的第一句必須以 \
              [cite:id1,id2] 格式引用所依據的工具結果，若本輪未使用任何工具則輸出 [cite:none]。";
 
         let mut parts: Vec<String> = Vec::new();
@@ -161,8 +163,10 @@ impl ContextPipeline {
             }
         }
 
-        // 1c. Anti-hallucination (always appended right after base content)
-        parts.push(ANTI_HALLUCINATION.to_string());
+        // 1c. Citation protocol (chat agents only)
+        if input.is_chat {
+            parts.push(CITATION_PROTOCOL.to_string());
+        }
 
         // 1d. Memory facts (capped by memory_chars budget)
         if !input.memory_facts.is_empty() {

@@ -90,6 +90,10 @@ pub(crate) async fn run_interactive_agent(
             skill_injection:  &system_injection,
             activity_context: activity_context.as_deref(),
             memory_facts:     &mem_facts,
+            // Citation protocol is only meaningful for streaming chat agents:
+            // stream_llm_round parses [cite:...] from SSE output. Background agents
+            // don't stream to users so the instruction is irrelevant noise for them.
+            is_chat:          streaming,
         },
         &client,
         &llm_url,
@@ -470,7 +474,10 @@ pub async fn run_agent(
     let system_prompt = agent_def["system_prompt"].as_str().unwrap_or("").to_string();
     let enable_think = agent_def["enable_think"].as_bool().unwrap_or(false);
     let max_rounds = agent_def["max_rounds"].as_u64().unwrap_or(super::super::MAX_ROUNDS as u64) as usize;
-    let is_background = agent_def["kind"].as_str() == Some("background");
+    let is_background = matches!(
+        agent_def["kind"].as_str(),
+        Some("background") | Some("sub") | Some("scheduled")
+    );
     let mut tool_names: Vec<String> = agent_def["tool_names"]
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
