@@ -51,7 +51,7 @@ pub fn router() -> Router<ApiState> {
         .route("/vaults/:vid/eval/trace-analysis", post(eval::run_trace_analysis))
         .route("/vaults/:vid/eval/cases",           get(eval::list_eval_cases))
         .route("/vaults/:vid/eval/cases/:case_id/toggle", axum::routing::patch(eval::toggle_eval_case))
-        .route("/vaults/:vid/eval/cases/:case_id",        axum::routing::delete(eval::delete_eval_case))
+        .route("/vaults/:vid/eval/cases/:case_id",        axum::routing::get(eval::get_eval_case).delete(eval::delete_eval_case))
         .route("/vaults/:vid/eval/run",             post(eval::run_eval_suite))
 }
 

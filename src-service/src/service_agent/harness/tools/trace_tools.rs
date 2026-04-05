@@ -19,7 +19,7 @@ use crate::service_agent::types::ToolFuture;
 pub(crate) fn schema_list_session_traces() -> Value {
     json!({
         "name": "list_session_traces",
-        "description": "List recent session traces for this account. Returns a summary of each session: trace_id, conv_id, started_at, round_count, blocked_calls, skill_activations.",
+        "description": "List recent session traces for this account. Returns a summary of each session: trace_id, conv_id, started_at, round_count, blocked_calls, memory_facts_injected, skill_activations.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -102,7 +102,7 @@ pub(crate) fn handle_list_session_traces(env: Arc<VaultEnv>, args: Value) -> Too
         let mut resp = env.db
             .query(
                 "SELECT meta::id(id) AS trace_id, conv_id, started_at, ended_at, \
-                 round_count, skill_activations, tool_calls \
+                 round_count, skill_activations, memory_facts_injected, tool_calls \
                  FROM session_traces \
                  WHERE account_id = $aid \
                  ORDER BY started_at DESC \

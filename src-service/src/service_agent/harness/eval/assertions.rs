@@ -66,10 +66,12 @@ impl From<&GuardOutcome> for GuardOutcomeKind {
 /// Result of running an [`EvalCase`].
 #[derive(Serialize, Deserialize)]
 pub(crate) struct EvalResult {
+    /// Case description, surfaced in run output for easier debugging.
+    pub description: String,
     /// The assembled session trace.
-    pub trace:    SessionTrace,
+    pub trace:       SessionTrace,
     /// Assertion failures — empty means all passed.
-    pub failures: Vec<String>,
+    pub failures:    Vec<String>,
 }
 
 impl EvalResult {
@@ -79,11 +81,11 @@ impl EvalResult {
     }
 
     /// Evaluate all assertions against `trace`, collecting failure messages.
-    pub(crate) fn evaluate(trace: SessionTrace, assertions: &[TraceAssertion]) -> Self {
+    pub(crate) fn evaluate(description: String, trace: SessionTrace, assertions: &[TraceAssertion]) -> Self {
         let failures = assertions.iter()
             .filter_map(|a| check(&trace, a))
             .collect();
-        Self { trace, failures }
+        Self { description, trace, failures }
     }
 }
 

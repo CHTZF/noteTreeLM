@@ -16,7 +16,8 @@ fn seed_cases() -> Vec<EvalCase> {
         // ── Layer 2: behavioral ──────────────────────────────────────────────
 
         EvalCase {
-            name: "read_note→update_note happy path".to_string(),
+            name:        "read_note→update_note happy path".to_string(),
+            description: "Guard should pass when update_note is preceded by a successful read_note on the same path.".to_string(),
             tool_sequence: vec![
                 MockToolCall::new("read_note",   json!({"path": "notes/daily.md"}), json!("# Daily\nsome content")),
                 MockToolCall::new("update_note", json!({"path": "notes/daily.md", "content": "# Daily\nupdated"}), json!("✅ 更新完成")),
@@ -31,7 +32,8 @@ fn seed_cases() -> Vec<EvalCase> {
         },
 
         EvalCase {
-            name: "update_note without prerequisite — blocked".to_string(),
+            name:        "update_note without prerequisite — blocked".to_string(),
+            description: "Guard should block update_note when no prior read_note or search result exists for the target path.".to_string(),
             tool_sequence: vec![
                 MockToolCall::new("update_note", json!({"path": "notes/daily.md", "content": "new content"}), json!("✅ 更新完成")),
             ],
@@ -43,7 +45,8 @@ fn seed_cases() -> Vec<EvalCase> {
         },
 
         EvalCase {
-            name: "update_note after failed read_note — blocked".to_string(),
+            name:        "update_note after failed read_note — blocked".to_string(),
+            description: "Guard should block update_note even when read_note was called but returned an error (content not successfully read).".to_string(),
             tool_sequence: vec![
                 MockToolCall::new("read_note",   json!({"path": "notes/daily.md"}), json!("讀取失敗：file not found")),
                 MockToolCall::new("update_note", json!({"path": "notes/daily.md", "content": "new content"}), json!("✅ 更新完成")),
@@ -55,7 +58,8 @@ fn seed_cases() -> Vec<EvalCase> {
         },
 
         EvalCase {
-            name: "search_vault→delete_note happy path".to_string(),
+            name:        "search_vault→delete_note happy path".to_string(),
+            description: "Guard should pass when delete_note is preceded by a search_vault that returned the target path.".to_string(),
             tool_sequence: vec![
                 MockToolCall::new("search_vault", json!({"query": "old notes"}), json!([{"path": "archive/old.md", "content": "…"}])),
                 MockToolCall::new("delete_note",  json!({"path": "archive/old.md"}), json!("✅ 刪除完成")),
@@ -68,7 +72,8 @@ fn seed_cases() -> Vec<EvalCase> {
         },
 
         EvalCase {
-            name: "delete_note without prior evidence — blocked".to_string(),
+            name:        "delete_note without prior evidence — blocked".to_string(),
+            description: "Guard should block delete_note when no search or read has established the path exists.".to_string(),
             tool_sequence: vec![
                 MockToolCall::new("delete_note", json!({"path": "archive/old.md"}), json!("✅ 刪除完成")),
             ],
@@ -79,7 +84,8 @@ fn seed_cases() -> Vec<EvalCase> {
         },
 
         EvalCase {
-            name: "list_structure→delete_folder happy path".to_string(),
+            name:        "list_structure→delete_folder happy path".to_string(),
+            description: "Guard should pass when delete_folder is preceded by list_structure that showed the folder exists.".to_string(),
             tool_sequence: vec![
                 MockToolCall::new("list_structure", json!({}), json!("vault/\n  archive/\n    archive/old.md")),
                 MockToolCall::new("delete_folder",  json!({"path": "archive"}), json!("✅ 資料夾刪除完成")),
@@ -92,7 +98,8 @@ fn seed_cases() -> Vec<EvalCase> {
         },
 
         EvalCase {
-            name: "create_note is exempt (no guard required)".to_string(),
+            name:        "create_note is exempt (no guard required)".to_string(),
+            description: "create_note is a creation tool — it should be guard-exempt and never blocked regardless of prior reads.".to_string(),
             tool_sequence: vec![
                 MockToolCall::new("create_note", json!({"path": "notes/new.md", "content": "# New Note"}), json!("✅ 建立完成")),
             ],
@@ -104,7 +111,8 @@ fn seed_cases() -> Vec<EvalCase> {
         },
 
         EvalCase {
-            name: "search_vault alone — update_note ContentRead not satisfied".to_string(),
+            name:        "search_vault alone — update_note ContentRead not satisfied".to_string(),
+            description: "search_vault provides path evidence but not full content read — guard should still block update_note.".to_string(),
             tool_sequence: vec![
                 MockToolCall::new("search_vault", json!({"query": "target"}), json!([{"path": "notes/target.md", "content": "preview"}])),
                 MockToolCall::new("update_note",  json!({"path": "notes/target.md", "content": "new content"}), json!("✅ 更新完成")),
@@ -118,7 +126,8 @@ fn seed_cases() -> Vec<EvalCase> {
         // ── Layer 3: performance budget ──────────────────────────────────────
 
         EvalCase {
-            name: "Layer 3 — tool execution time within budget".to_string(),
+            name:        "Layer 3 — tool execution time within budget".to_string(),
+            description: "A normal read→update sequence should complete within the 5s tool budget and 3 round cap.".to_string(),
             tool_sequence: vec![
                 MockToolCall::new("read_note",   json!({"path": "notes/ref.md"}), json!("# Ref\ncontent")),
                 MockToolCall::new("update_note", json!({"path": "notes/ref.md", "content": "updated"}), json!("✅ 更新完成")),
@@ -131,7 +140,8 @@ fn seed_cases() -> Vec<EvalCase> {
         },
 
         EvalCase {
-            name: "Layer 3 — guard block is fast".to_string(),
+            name:        "Layer 3 — guard block is fast".to_string(),
+            description: "Guard evaluation itself should be near-instantaneous (< 1s) even for blocked calls.".to_string(),
             tool_sequence: vec![
                 MockToolCall::new("delete_note", json!({"path": "notes/important.md"}), json!("✅ 刪除完成")),
             ],

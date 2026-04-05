@@ -85,7 +85,7 @@ impl EvalRunner {
             memory_facts_injected:  0, // not applicable in eval context
         };
 
-        EvalResult::evaluate(trace, &case.assertions)
+        EvalResult::evaluate(case.description.clone(), trace, &case.assertions)
     }
 }
 

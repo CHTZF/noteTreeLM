@@ -341,6 +341,10 @@ export const api = {
     const vaultId = await getVaultId()
     return request<EvalSuiteResult>('POST', `/vaults/${encodeURIComponent(vaultId)}/eval/run`)
   },
+  getEvalCase: async (caseId: string) => {
+    const vaultId = await getVaultId()
+    return request<EvalCaseDetail>('GET', `/vaults/${encodeURIComponent(vaultId)}/eval/cases/${encodeURIComponent(caseId)}`)
+  },
   deleteEvalCase: async (caseId: string) => {
     const vaultId = await getVaultId()
     return request<{ case_id: string; deleted: boolean }>('DELETE', `/vaults/${encodeURIComponent(vaultId)}/eval/cases/${encodeURIComponent(caseId)}`)
@@ -358,8 +362,22 @@ export interface EvalCaseSummary {
   step_count: number
 }
 
+export interface EvalCaseDetail {
+  case_id: string
+  name: string
+  description: string
+  source: 'seed' | 'llm_proposed'
+  status: string
+  tool_sequence: Array<{ id?: string; name: string; args: Record<string, unknown>; mock_result: unknown }>
+  assertions: Array<Record<string, unknown>>
+  source_trace_ids: string[]
+  last_run_result: 'passed' | 'failed' | null
+  last_run_at: number | null
+}
+
 export interface EvalCaseResult {
   name: string
+  description: string
   passed: boolean
   failures: string[]
 }

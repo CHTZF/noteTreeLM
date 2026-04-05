@@ -84,34 +84,50 @@ pub async fn run_trace_analysis(
             None,
         ).await;
 
-        // After trace_analyst finishes proposing, auto-run enabled eval cases so
-        // last_run_result is up to date without requiring a manual "Run All" click.
-        let results = crate::service_agent::harness::eval::runner::load_enabled_cases(
-            &state_clone.db,
-            &account_id,
-        ).await;
+        // Auto-run enabled eval cases after trace_analyst finishes, so last_run_result
+        // stays fresh without requiring a manual "Run All" click.
+        // Skip entirely when there are no enabled cases to avoid a no-op round.
+        let enabled_count: i64 = state_clone.db
+            .query("SELECT count() AS count FROM proposed_eval_cases \
+                    WHERE account_id = $aid AND status = 'enabled' GROUP ALL")
+            .bind(("aid", account_id.clone()))
+            .await
+            .ok()
+            .and_then(|mut r| {
+                #[derive(serde::Deserialize)] struct C { count: i64 }
+                r.take::<Vec<C>>(0).ok()?.into_iter().next().map(|c| c.count)
+            })
+            .unwrap_or(0);
 
-        let now = chrono::Utc::now().timestamp();
-        for (name, result) in &results {
-            let result_str = if result.passed() { "passed" } else { "failed" };
-            let _ = state_clone.db
-                .query(
-                    "UPDATE proposed_eval_cases SET last_run_result = $res, last_run_at = $now \
-                     WHERE account_id = $aid AND name = $name AND status = 'enabled'"
-                )
-                .bind(("res",  result_str.to_string()))
-                .bind(("now",  now))
-                .bind(("aid",  account_id.clone()))
-                .bind(("name", name.clone()))
-                .await;
+        if enabled_count > 0 {
+            let results = crate::service_agent::harness::eval::runner::load_enabled_cases(
+                &state_clone.db,
+                &account_id,
+            ).await;
+
+            let now = chrono::Utc::now().timestamp();
+            for (name, result) in &results {
+                let result_str = if result.passed() { "passed" } else { "failed" };
+                let _ = state_clone.db
+                    .query(
+                        "UPDATE proposed_eval_cases SET last_run_result = $res, last_run_at = $now \
+                         WHERE account_id = $aid AND name = $name AND status = 'enabled'"
+                    )
+                    .bind(("res",  result_str.to_string()))
+                    .bind(("now",  now))
+                    .bind(("aid",  account_id.clone()))
+                    .bind(("name", name.clone()))
+                    .await;
+            }
+
+            let passed = results.iter().filter(|(_, r)| r.passed()).count();
+            tracing::info!(
+                "[eval] auto-run after trace_analyst: {}/{} passed",
+                passed, results.len()
+            );
+        } else {
+            tracing::debug!("[eval] auto-run skipped — no enabled cases for account");
         }
-
-        let passed = results.iter().filter(|(_, r)| r.passed()).count();
-        let total  = results.len();
-        tracing::info!(
-            "[eval] auto-run after trace_analyst: {}/{} passed",
-            passed, total
-        );
 
         // Release lock so the account can trigger another analysis.
         running_analyses().lock().unwrap().remove(&account_id);
@@ -143,6 +159,35 @@ pub async fn list_eval_cases(
 
     let cases: Vec<Value> = resp.take(0).unwrap_or_default();
     Ok(Json(json!({ "cases": cases })))
+}
+
+// ── GET /vaults/:vid/eval/cases/:case_id ─────────────────────────────────────
+
+/// Return the full eval case record including tool_sequence and assertions.
+pub async fn get_eval_case(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path((_vault_id, case_id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let account_id = account_id_from_headers(&state, &headers).await?;
+
+    let mut resp = state.db
+        .query(
+            "SELECT meta::id(id) AS case_id, name, description, source, status, \
+             tool_sequence, assertions, source_trace_ids, last_run_result, last_run_at \
+             FROM proposed_eval_cases \
+             WHERE meta::id(id) = $cid AND account_id = $aid \
+             LIMIT 1"
+        )
+        .bind(("cid", case_id.clone()))
+        .bind(("aid", account_id))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let rows: Vec<Value> = resp.take(0).unwrap_or_default();
+    rows.into_iter().next()
+        .map(|v| Json(v))
+        .ok_or((StatusCode::NOT_FOUND, format!("eval case '{}' not found", case_id)))
 }
 
 // ── PATCH /vaults/:vid/eval/cases/:case_id/toggle ────────────────────────────
@@ -215,9 +260,10 @@ pub async fn run_eval_suite(
     let now = chrono::Utc::now().timestamp();
     let output: Vec<Value> = results.iter().map(|(name, r)| {
         json!({
-            "name":     name,
-            "passed":   r.passed(),
-            "failures": r.failures,
+            "name":        name,
+            "description": r.description,
+            "passed":      r.passed(),
+            "failures":    r.failures,
         })
     }).collect();
 

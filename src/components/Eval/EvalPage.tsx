@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { api, type EvalCaseSummary, type EvalCaseResult, type EvalSuiteResult } from '../../lib/api'
+import { api, type EvalCaseSummary, type EvalCaseResult, type EvalSuiteResult, type EvalCaseDetail } from '../../lib/api'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -47,6 +47,8 @@ export default function EvalPage() {
   const [suiteResult, setSuiteResult] = useState<EvalSuiteResult | null>(null)
   const [analysisState, setAnalysisState] = useState<'idle' | 'running' | 'done'>('idle')
   const [resultMap, setResultMap]     = useState<Record<string, EvalCaseResult>>({})
+  const [expandedId, setExpandedId]   = useState<string | null>(null)
+  const [detailMap, setDetailMap]     = useState<Record<string, EvalCaseDetail>>({})
 
   const loadCases = useCallback(async () => {
     try {
@@ -74,6 +76,22 @@ export default function EvalPage() {
     }, 8000)
     return () => clearInterval(id)
   }, [analysisState, loadCases])
+
+  async function handleExpand(caseId: string) {
+    if (expandedId === caseId) {
+      setExpandedId(null)
+      return
+    }
+    setExpandedId(caseId)
+    if (!detailMap[caseId]) {
+      try {
+        const detail = await api.getEvalCase(caseId)
+        setDetailMap(prev => ({ ...prev, [caseId]: detail }))
+      } catch (e) {
+        console.error('getEvalCase failed', e)
+      }
+    }
+  }
 
   async function handleDelete(caseId: string) {
     try {
@@ -187,57 +205,94 @@ export default function EvalPage() {
         <div className="space-y-2">
           {cases.map(c => {
             const runResult = resultMap[c.name]
+            const isExpanded = expandedId === c.case_id
+            const detail = detailMap[c.case_id]
             return (
-              <div key={c.case_id} className="border border-gray-200 rounded-lg p-3">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="text-sm font-medium text-gray-800 truncate">{c.name}</span>
-                      {sourceBadge(c.source)}
-                      {statusBadge(c.status)}
-                      {lastRunBadge(c.last_run_result)}
-                      {runResult && !runResult.passed && (
-                        <span className="text-xs text-red-500">✗ 本次</span>
+              <div key={c.case_id} className="border border-gray-200 rounded-lg">
+                <div className="p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <button
+                          onClick={() => handleExpand(c.case_id)}
+                          className="text-sm font-medium text-gray-800 hover:text-blue-600 text-left"
+                        >
+                          {isExpanded ? '▾' : '▸'} {c.name}
+                        </button>
+                        {sourceBadge(c.source)}
+                        {statusBadge(c.status)}
+                        {lastRunBadge(c.last_run_result)}
+                        {runResult && !runResult.passed && (
+                          <span className="text-xs text-red-500">✗ 本次</span>
+                        )}
+                        {runResult && runResult.passed && (
+                          <span className="text-xs text-green-600">✓ 本次</span>
+                        )}
+                      </div>
+                      <p className="text-xs text-gray-400 mt-0.5">{c.step_count} steps</p>
+                      {c.description && (
+                        <p className="text-xs text-gray-500 mt-1 italic">{c.description}</p>
                       )}
-                      {runResult && runResult.passed && (
-                        <span className="text-xs text-green-600">✓ 本次</span>
+                      {/* Failure details */}
+                      {runResult && !runResult.passed && runResult.failures.length > 0 && (
+                        <ul className="mt-1.5 space-y-0.5">
+                          {runResult.failures.map((f, i) => (
+                            <li key={i} className="text-xs text-red-600 font-mono bg-red-50 px-2 py-0.5 rounded">{f}</li>
+                          ))}
+                        </ul>
                       )}
                     </div>
-                    <p className="text-xs text-gray-400 mt-0.5">{c.step_count} steps</p>
-                    {c.description && (
-                      <p className="text-xs text-gray-500 mt-1 italic">{c.description}</p>
-                    )}
-                    {/* Failure details */}
-                    {runResult && !runResult.passed && runResult.failures.length > 0 && (
-                      <ul className="mt-1.5 space-y-0.5">
-                        {runResult.failures.map((f, i) => (
-                          <li key={i} className="text-xs text-red-600 font-mono bg-red-50 px-2 py-0.5 rounded">{f}</li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                  <div className="flex gap-1 shrink-0">
-                    <button
-                      onClick={() => handleToggle(c.case_id, c.status)}
-                      className={`text-xs px-2 py-1 rounded border ${
-                        c.status === 'enabled'
-                          ? 'border-green-300 text-green-700 hover:bg-green-50'
-                          : 'border-gray-300 text-gray-500 hover:bg-gray-50'
-                      }`}
-                    >
-                      {c.status === 'enabled' ? '停用' : '啟用'}
-                    </button>
-                    {c.source !== 'seed' && (
+                    <div className="flex gap-1 shrink-0">
                       <button
-                        onClick={() => handleDelete(c.case_id)}
-                        className="text-xs px-2 py-1 rounded border border-red-200 text-red-400 hover:bg-red-50"
-                        title="刪除此提案"
+                        onClick={() => handleToggle(c.case_id, c.status)}
+                        className={`text-xs px-2 py-1 rounded border ${
+                          c.status === 'enabled'
+                            ? 'border-green-300 text-green-700 hover:bg-green-50'
+                            : 'border-gray-300 text-gray-500 hover:bg-gray-50'
+                        }`}
                       >
-                        ✕
+                        {c.status === 'enabled' ? '停用' : '啟用'}
                       </button>
-                    )}
+                      {c.source !== 'seed' && (
+                        <button
+                          onClick={() => handleDelete(c.case_id)}
+                          className="text-xs px-2 py-1 rounded border border-red-200 text-red-400 hover:bg-red-50"
+                          title="刪除此提案"
+                        >
+                          ✕
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
+                {/* Expandable detail: tool_sequence + assertions */}
+                {isExpanded && (
+                  <div className="border-t border-gray-100 bg-gray-50 rounded-b-lg px-3 py-2 space-y-2">
+                    {!detail ? (
+                      <p className="text-xs text-gray-400">載入中…</p>
+                    ) : (
+                      <>
+                        <div>
+                          <p className="text-xs font-medium text-gray-500 mb-1">tool_sequence</p>
+                          <pre className="text-xs bg-white border border-gray-200 rounded p-2 overflow-x-auto">
+                            {JSON.stringify(detail.tool_sequence, null, 2)}
+                          </pre>
+                        </div>
+                        <div>
+                          <p className="text-xs font-medium text-gray-500 mb-1">assertions</p>
+                          <pre className="text-xs bg-white border border-gray-200 rounded p-2 overflow-x-auto">
+                            {JSON.stringify(detail.assertions, null, 2)}
+                          </pre>
+                        </div>
+                        {detail.source_trace_ids.length > 0 && (
+                          <p className="text-xs text-gray-400">
+                            來源 traces: {detail.source_trace_ids.join(', ')}
+                          </p>
+                        )}
+                      </>
+                    )}
+                  </div>
+                )}
               </div>
             )
           })}

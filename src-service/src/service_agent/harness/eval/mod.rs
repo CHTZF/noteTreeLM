@@ -49,6 +49,8 @@ impl MockToolCall {
 #[derive(Serialize, Deserialize)]
 pub(crate) struct EvalCase {
     pub name:          String,
+    #[serde(default)]
+    pub description:   String,
     pub tool_sequence: Vec<MockToolCall>,
     pub assertions:    Vec<TraceAssertion>,
 }
