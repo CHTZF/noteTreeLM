@@ -386,6 +386,11 @@ pub async fn seed_builtins(db: &SurrealDb, account_id: &str) {
     // 幂等判斷：count 必須等於 SKILLS.len() 才跳過；少一個就重建
     #[derive(serde::Deserialize)]
     struct CountRow { count: i64 }
+    // Harness seed runs unconditionally (uses conditional INSERT internally — idempotent).
+    crate::service_agent::harness::seed_agents::seed_builtin_agents(db, account_id).await;
+    crate::service_agent::harness::eval::cases::seed_eval_cases(db, account_id).await;
+
+    // Skill/agent early-exit: if builtin skill count already matches, skip full rebuild.
     if let Ok(mut r) = db.query(
         "SELECT count() AS count FROM agent_skills WHERE account_id = $aid AND knowledge_item_id = '__builtin__' GROUP ALL"
     ).bind(("aid", account_id.to_string())).await {
@@ -484,11 +489,6 @@ pub async fn seed_builtins(db: &SurrealDb, account_id: &str) {
     for v in vaults {
         ensure_memory_schedule(db, &v.vault_id, account_id).await;
     }
-
-    // Seed harness built-in agents (trace_analyst, etc.) and eval cases.
-    // These use conditional INSERT so frontend edits are preserved across restarts.
-    crate::service_agent::harness::seed_agents::seed_builtin_agents(db, account_id).await;
-    crate::service_agent::harness::eval::cases::seed_eval_cases(db, account_id).await;
 }
 
 /// Idempotently ensures a periodic memory_agent scheduled task exists for (vault_id, account_id).

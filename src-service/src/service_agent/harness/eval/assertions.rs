@@ -167,3 +167,25 @@ fn check(trace: &SessionTrace, assertion: &TraceAssertion) -> Option<String> {
         }
     }
 }
+
+#[cfg(test)]
+mod serde_tests {
+    use super::*;
+    #[test]
+    fn trace_assertion_roundtrip() {
+        let cases = vec![
+            TraceAssertion::NoBlockedCalls,
+            TraceAssertion::BlockedCountEq(2),
+            TraceAssertion::TotalCallsEq(3),
+            TraceAssertion::GuardAt { index: 0, expected: GuardOutcomeKind::Blocked },
+            TraceAssertion::ToolAt { index: 1, name: "update_note".to_string() },
+            TraceAssertion::RoundCountLe(5),
+        ];
+        for a in &cases {
+            let s = serde_json::to_string(a).expect("serialize");
+            let back: TraceAssertion = serde_json::from_str(&s).expect(&format!("deserialize: {}", s));
+            let s2 = serde_json::to_string(&back).unwrap();
+            assert_eq!(s, s2, "roundtrip failed");
+        }
+    }
+}

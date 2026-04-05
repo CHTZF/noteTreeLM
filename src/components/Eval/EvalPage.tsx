@@ -124,18 +124,18 @@ export default function EvalPage() {
         </div>
         <div className="flex gap-2">
           <button
-            onClick={handleTraceAnalysis}
+            onClick={analysisState === 'done' ? () => setAnalysisState('idle') : handleTraceAnalysis}
             disabled={analysisState === 'running'}
             className="px-3 py-1.5 text-sm border border-purple-300 text-purple-700 rounded hover:bg-purple-50 disabled:opacity-50"
           >
-            {analysisState === 'running' ? '分析中…' : analysisState === 'done' ? '✓ 已提案' : '分析 Traces'}
+            {analysisState === 'running' ? '分析中…' : analysisState === 'done' ? '✓ 已提案（再次分析）' : '分析 Traces'}
           </button>
           <button
             onClick={handleRunAll}
             disabled={runState === 'running' || enabledCount === 0}
             className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
           >
-            {runState === 'running' ? '執行中…' : 'Run All'}
+            {runState === 'running' ? '執行中…' : runState === 'done' ? '再次執行' : 'Run All'}
           </button>
         </div>
       </div>
