@@ -435,15 +435,6 @@ pub async fn seed_builtins(db: &SurrealDb, account_id: &str) {
         .map(|r| (r.skill_id, r.seed_skill_version.unwrap_or(0)))
         .collect();
 
-    // ── Fast path: all skills present and up-to-date ─────────────────────────
-    let all_ok = SKILLS.iter().all(|s| existing.get(s.id).copied() == Some(s.seed_version));
-    if all_ok {
-        tracing::debug!("seed_builtins: account {} skills all up-to-date, skipping rebuild", account_id);
-        crate::service_agent::harness::seed_agents::seed_builtin_agents(db, account_id).await;
-        crate::service_agent::harness::eval::cases::seed_eval_cases(db, account_id).await;
-        return;
-    }
-
     // ── Targeted skill update ────────────────────────────────────────────────
     let now = Utc::now().timestamp();
     let mut inserted = 0usize;
@@ -491,49 +482,47 @@ pub async fn seed_builtins(db: &SurrealDb, account_id: &str) {
         );
     }
 
-    // ── Agent Definitions ────────────────────────────────────────────────────
-    let _ = db.query(
-        "DELETE agent_definitions WHERE account_id = $aid AND is_builtin = true"
-    )
-    .bind(("aid", account_id.to_string()))
-    .await;
-
+    // ── Agent Definitions: conditional INSERT (preserve user edits) ─────────
+    // Same pattern as seed_builtin_agents: only insert if the agent doesn't exist yet.
+    // Users may customise system_prompt / tool_names via the frontend; we never overwrite.
     for a in AGENTS {
         let tool_names_json: serde_json::Value = serde_json::Value::Array(
             a.tool_names.iter().map(|t| serde_json::Value::String(t.to_string())).collect(),
         );
-        let result = db.query(
-            "INSERT INTO agent_definitions \
-             (def_id, account_id, name, description, kind, skill_ids, tool_names, \
-              use_skill_pass, enable_think, system_prompt, max_rounds, is_active, is_builtin, trigger, \
-              status, use_count, created_at) \
-             VALUES ($did, $aid, $name, $desc, $kind, [], $tools, \
-                     $use_skill_pass, $enable_think, $prompt, $rounds, true, true, $trigger, \
-                     'active', 0, $now)"
+        let payload = serde_json::json!({
+            "def_id":         a.id,
+            "account_id":     account_id,
+            "name":           a.name,
+            "description":    a.description,
+            "kind":           a.kind,
+            "skill_ids":      [],
+            "tool_names":     tool_names_json,
+            "use_skill_pass": a.use_skill_pass,
+            "enable_think":   a.enable_think,
+            "system_prompt":  a.system_prompt,
+            "max_rounds":     a.max_rounds,
+            "is_active":      true,
+            "is_builtin":     true,
+            "trigger":        a.trigger,
+            "status":         "active",
+            "use_count":      0,
+            "created_at":     now,
+        });
+        if let Err(e) = db.query(
+            "IF (SELECT count() FROM agent_definitions \
+                 WHERE account_id = $aid AND def_id = $did GROUP ALL)[0].count = 0 \
+             THEN (CREATE agent_definitions CONTENT $data) END"
         )
-        .bind(("did",           a.id.to_string()))
-        .bind(("aid",           account_id.to_string()))
-        .bind(("name",          a.name.to_string()))
-        .bind(("desc",          a.description.to_string()))
-        .bind(("kind",          a.kind.to_string()))
-        .bind(("tools",         tool_names_json))
-        .bind(("use_skill_pass",a.use_skill_pass))
-        .bind(("enable_think",  a.enable_think))
-        .bind(("prompt",        a.system_prompt.to_string()))
-        .bind(("rounds",        a.max_rounds))
-        .bind(("trigger",       a.trigger.to_string()))
-        .bind(("now",           now))
-        .await;
-        if let Err(e) = result {
-            tracing::error!("[seeds] INSERT agent_definitions '{}' failed: {}", a.name, e);
+        .bind(("aid",  account_id.to_string()))
+        .bind(("did",  a.id.to_string()))
+        .bind(("data", payload))
+        .await
+        {
+            tracing::error!("[seeds] conditional INSERT agent_definitions '{}' failed: {}", a.name, e);
         }
     }
 
-    tracing::info!("Seeded {} builtin agents for account {}", AGENTS.len(), account_id);
-
-    // Seed harness built-ins after the full rebuild.
-    // Must run AFTER the DELETE above (which wipes all is_builtin=true agent_definitions)
-    // so that trace_analyst is re-created correctly.
+    // ── Harness built-ins: conditional INSERT ────────────────────────────────
     crate::service_agent::harness::seed_agents::seed_builtin_agents(db, account_id).await;
     crate::service_agent::harness::eval::cases::seed_eval_cases(db, account_id).await;
 
