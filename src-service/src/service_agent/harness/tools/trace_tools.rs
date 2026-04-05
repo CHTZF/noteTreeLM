@@ -195,6 +195,26 @@ pub(crate) fn handle_propose_eval_case(env: Arc<VaultEnv>, args: Value) -> ToolF
             return Ok(json!({"error": "name is required"}));
         }
 
+        // DB-level dedup: reject if a case with the same name already exists for this account.
+        // Prevents trace_analyst from creating duplicate proposals on repeated runs.
+        #[derive(serde::Deserialize)]
+        struct CountRow { count: i64 }
+        let exists = env.db
+            .query("SELECT count() AS count FROM proposed_eval_cases \
+                    WHERE account_id = $aid AND name = $name GROUP ALL")
+            .bind(("aid",  env.account_id.clone()))
+            .bind(("name", name.clone()))
+            .await
+            .ok()
+            .and_then(|mut r| r.take::<Vec<CountRow>>(0).ok())
+            .and_then(|rows| rows.into_iter().next().map(|r| r.count > 0))
+            .unwrap_or(false);
+
+        if exists {
+            return Ok(json!({ "ok": false, "reason": "duplicate", "name": name,
+                              "message": "A case with this name already exists — skipped to avoid duplicates." }));
+        }
+
         let payload = json!({
             "account_id":       env.account_id,
             "name":             name,

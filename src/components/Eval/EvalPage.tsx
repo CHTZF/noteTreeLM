@@ -61,6 +61,15 @@ export default function EvalPage() {
 
   useEffect(() => { loadCases() }, [loadCases])
 
+  async function handleDelete(caseId: string) {
+    try {
+      await api.deleteEvalCase(caseId)
+      setCases(prev => prev.filter(c => c.case_id !== caseId))
+    } catch (e) {
+      console.error('deleteEvalCase failed', e)
+    }
+  }
+
   async function handleToggle(caseId: string, currentStatus: EvalCaseSummary['status']) {
     const newEnabled = currentStatus !== 'enabled'
     try {
@@ -101,9 +110,15 @@ export default function EvalPage() {
       setAnalysisState('done')
       // Reload cases after a short delay (analysis runs in background)
       setTimeout(loadCases, 3000)
-    } catch (e) {
-      console.error('runTraceAnalysis failed', e)
-      setAnalysisState('idle')
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e)
+      if (msg.includes('409') || msg.includes('already running')) {
+        setAnalysisState('idle')
+        // Don't log as error — this is expected when button is clicked twice
+      } else {
+        console.error('runTraceAnalysis failed', e)
+        setAnalysisState('idle')
+      }
     }
   }
 
@@ -186,16 +201,27 @@ export default function EvalPage() {
                       </ul>
                     )}
                   </div>
-                  <button
-                    onClick={() => handleToggle(c.case_id, c.status)}
-                    className={`shrink-0 text-xs px-2 py-1 rounded border ${
-                      c.status === 'enabled'
-                        ? 'border-green-300 text-green-700 hover:bg-green-50'
-                        : 'border-gray-300 text-gray-500 hover:bg-gray-50'
-                    }`}
-                  >
-                    {c.status === 'enabled' ? '停用' : '啟用'}
-                  </button>
+                  <div className="flex gap-1 shrink-0">
+                    <button
+                      onClick={() => handleToggle(c.case_id, c.status)}
+                      className={`text-xs px-2 py-1 rounded border ${
+                        c.status === 'enabled'
+                          ? 'border-green-300 text-green-700 hover:bg-green-50'
+                          : 'border-gray-300 text-gray-500 hover:bg-gray-50'
+                      }`}
+                    >
+                      {c.status === 'enabled' ? '停用' : '啟用'}
+                    </button>
+                    {c.source !== 'seed' && (
+                      <button
+                        onClick={() => handleDelete(c.case_id)}
+                        className="text-xs px-2 py-1 rounded border border-red-200 text-red-400 hover:bg-red-50"
+                        title="刪除此提案"
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
             )

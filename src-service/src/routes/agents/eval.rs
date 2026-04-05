@@ -14,14 +14,26 @@ use axum::{
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 
 use crate::api_state::ApiState;
 use super::account_id_from_headers;
+
+// ── Per-account trace_analyst run lock ───────────────────────────────────────
+
+/// In-memory set of account_ids that currently have a trace_analyst running.
+/// Prevents duplicate background runs from concurrent button clicks.
+fn running_analyses() -> &'static Mutex<HashSet<String>> {
+    static CELL: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(HashSet::new()))
+}
 
 // ── POST /vaults/:vid/eval/trace-analysis ─────────────────────────────────────
 
 /// Trigger a trace_analyst agent run to analyse recent sessions and propose eval cases.
 /// Returns immediately with session_id; analysis runs in background.
+/// Returns 409 if an analysis is already running for this account.
 pub async fn run_trace_analysis(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -29,6 +41,16 @@ pub async fn run_trace_analysis(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let account_id = account_id_from_headers(&state, &headers).await?;
+
+    // Reject if an analysis is already in progress for this account.
+    {
+        let mut running = running_analyses().lock().unwrap();
+        if running.contains(&account_id) {
+            return Err((StatusCode::CONFLICT, "trace_analyst already running for this account".to_string()));
+        }
+        running.insert(account_id.clone());
+    }
+
     let session_id = Uuid::new_v4().to_string();
 
     let agent_def = {
@@ -90,6 +112,9 @@ pub async fn run_trace_analysis(
             "[eval] auto-run after trace_analyst: {}/{} passed",
             passed, total
         );
+
+        // Release lock so the account can trigger another analysis.
+        running_analyses().lock().unwrap().remove(&account_id);
     });
 
     Ok(Json(json!({ "session_id": session_id })))
@@ -146,6 +171,29 @@ pub async fn toggle_eval_case(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({ "case_id": case_id, "status": new_status })))
+}
+
+// ── DELETE /vaults/:vid/eval/cases/:case_id ──────────────────────────────────
+
+/// Delete an eval case permanently (e.g. bad proposals from trace_analyst).
+pub async fn delete_eval_case(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path((_vault_id, case_id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let account_id = account_id_from_headers(&state, &headers).await?;
+
+    state.db
+        .query(
+            "DELETE proposed_eval_cases \
+             WHERE meta::id(id) = $cid AND account_id = $aid"
+        )
+        .bind(("cid", case_id.clone()))
+        .bind(("aid", account_id))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({ "case_id": case_id, "deleted": true })))
 }
 
 // ── POST /vaults/:vid/eval/run ────────────────────────────────────────────────

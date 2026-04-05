@@ -341,6 +341,10 @@ export const api = {
     const vaultId = await getVaultId()
     return request<EvalSuiteResult>('POST', `/vaults/${encodeURIComponent(vaultId)}/eval/run`)
   },
+  deleteEvalCase: async (caseId: string) => {
+    const vaultId = await getVaultId()
+    return request<{ case_id: string; deleted: boolean }>('DELETE', `/vaults/${encodeURIComponent(vaultId)}/eval/cases/${encodeURIComponent(caseId)}`)
+  },
 }
 
 export interface EvalCaseSummary {
