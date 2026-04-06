@@ -233,7 +233,7 @@ pub(crate) async fn seed_eval_cases(db: &SurrealDb, account_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service_agent::harness::eval::EvalRunner;
+    use crate::service::harness::eval::EvalRunner;
 
     #[tokio::test]
     async fn all_seed_cases_pass() {

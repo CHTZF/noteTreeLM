@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use crate::auth::store::AuthStore;
 use crate::db::SurrealDb;
-use crate::service_agent::types::EmitEventFn;
-use crate::service_agent::HarnessRequestRuntime;
+use crate::service::types::EmitEventFn;
+use crate::service::HarnessRequestRuntime;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerInfo {
@@ -91,10 +91,10 @@ pub struct AgentSession {
     pub conv_id: Arc<String>,
     /// Shared with `AgentEnv::cancel` — set true to abort the agent loop.
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
-    pub transaction: Option<Arc<crate::service_agent::harness::engine::transaction::Transaction>>,
+    pub transaction: Option<Arc<crate::service::harness::engine::transaction::Transaction>>,
     /// Channel for the `ask_user` tool / Step-0b resume flow.
     /// Shared via `Arc` so Step-0b only needs `sessions.get()`, not `get_mut()`.
-    pub answer_channel: Arc<crate::service_agent::harness::engine::transaction::AnswerChannel>,
+    pub answer_channel: Arc<crate::service::harness::engine::transaction::AnswerChannel>,
 }
 
 #[derive(Clone)]
@@ -195,9 +195,9 @@ impl ApiState {
             conv_id:        Arc::new(conv_id),
             cancel:         Arc::new(std::sync::atomic::AtomicBool::new(false)),
             answer_channel: Arc::new(
-                crate::service_agent::harness::engine::transaction::AnswerChannel::new()
+                crate::service::harness::engine::transaction::AnswerChannel::new()
             ),
-            working_memory: crate::service_agent::harness::memory::working::WorkingMemory::new(),
+            working_memory: crate::service::harness::memory::working::WorkingMemory::new(),
             client:         reqwest::Client::builder()
                                 .timeout(std::time::Duration::from_secs(300))
                                 .build()

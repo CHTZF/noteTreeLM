@@ -11,8 +11,8 @@
 use std::sync::Arc;
 use serde_json::{json, Value};
 
-use crate::service_agent::harness::runtime::HarnessRequestRuntime;
-use crate::service_agent::types::ToolFuture;
+use crate::service::harness::runtime::HarnessRequestRuntime;
+use crate::service::types::ToolFuture;
 
 // ── Schemas ───────────────────────────────────────────────────────────────────
 

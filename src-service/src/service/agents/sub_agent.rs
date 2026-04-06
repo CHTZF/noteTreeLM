@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicBool;
 
 use serde_json::json;
 
-use crate::service_agent::HarnessRequestRuntime;
+use crate::service::HarnessRequestRuntime;
 
 /// Execute a sub-agent that shares the parent's infrastructure context.
 ///

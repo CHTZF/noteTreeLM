@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use super::super::tool_def::ALL_TOOL_DEFS;
-use crate::service_agent::types::NeedConfirmFn;
+use crate::service::types::NeedConfirmFn;
 
 /// Write tools that are exempt from the path-existence guard requirement.
 ///

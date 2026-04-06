@@ -2,7 +2,7 @@ mod auth;
 pub(crate) mod crypto;
 mod daemon;
 mod db;
-pub mod service_agent;
+pub mod service;
 mod network;
 mod processing;
 mod routes;

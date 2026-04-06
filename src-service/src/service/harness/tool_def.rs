@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 
 use super::runtime::HarnessRequestRuntime;
 use super::governance::guard::{GuardLevel, ToolGuardSpec, norm_path};
-use crate::service_agent::types::ToolFuture;
+use crate::service::types::ToolFuture;
 use super::tools::{memory_tools, vault_tools, trace_tools};
 
 // ── ToolDef ───────────────────────────────────────────────────────────────────
@@ -1264,13 +1264,13 @@ fn handle_call_agent(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture
         if agent_name.is_empty() {
             return Err("call_agent: missing agent name".into());
         }
-        let def = match crate::service_agent::helpers::load_agent_def(
+        let def = match crate::service::helpers::load_agent_def(
             &env.db, &agent_name, &env.account_id,
         ).await {
             Some(d) => d,
             None => return Err(format!("call_agent: agent '{}' not found", agent_name)),
         };
-        let result = crate::service_agent::agents::sub_agent::run_sub_agent(
+        let result = crate::service::agents::sub_agent::run_sub_agent(
             &env,
             &env.session_id, &agent_name,
             def, &input,

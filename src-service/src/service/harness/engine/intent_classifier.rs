@@ -1,4 +1,4 @@
-use crate::service_agent::types::EmbedFn;
+use crate::service::types::EmbedFn;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Intent {

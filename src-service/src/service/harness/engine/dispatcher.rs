@@ -6,8 +6,8 @@ use super::executor::Executor;
 use super::graph::ToolGraph;
 use super::tool_registry::ToolRegistry;
 use super::transaction::Transaction;
-use crate::service_agent::types::{EmitEventFn, NeedConfirmFn};
-use crate::service_agent::harness::runtime::HarnessRequestRuntime;
+use crate::service::types::{EmitEventFn, NeedConfirmFn};
+use crate::service::harness::runtime::HarnessRequestRuntime;
 
 #[derive(Clone)]
 pub struct Dispatcher {

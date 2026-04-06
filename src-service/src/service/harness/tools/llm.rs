@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-use crate::service_agent::harness::observability::emitter::ObservabilityEmitter;
-use crate::service_agent::harness::memory::working::WorkingMemory;
+use crate::service::harness::observability::emitter::ObservabilityEmitter;
+use crate::service::harness::memory::working::WorkingMemory;
 
 /// Returns the byte offset up to which `s` can safely be emitted without risking
 /// a partial prefix of `tag` at the end.

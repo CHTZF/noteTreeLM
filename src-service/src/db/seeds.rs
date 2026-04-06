@@ -491,8 +491,8 @@ pub async fn seed_builtins(db: &SurrealDb, account_id: &str) {
     }
 
     // ── Harness built-ins: conditional INSERT ────────────────────────────────
-    crate::service_agent::harness::seed_agents::seed_builtin_agents(db, account_id).await;
-    crate::service_agent::harness::eval::cases::seed_eval_cases(db, account_id).await;
+    crate::service::harness::seed_agents::seed_builtin_agents(db, account_id).await;
+    crate::service::harness::eval::cases::seed_eval_cases(db, account_id).await;
 
     // Embedding happens later when embed_skills_for_account is called with embedding_url.
     // (seed_builtins doesn't have access to the daemon's embedding_url)

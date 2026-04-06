@@ -80,7 +80,7 @@ pub(crate) async fn run(
             let agent_name = task.agent_def_name.clone();
             let agent_prompt = task.agent_prompt.clone();
             tokio::spawn(async move {
-                crate::service_agent::execute_scheduled_task(
+                crate::service::execute_scheduled_task(
                     state_clone, tid, vid, aid, agent_name, agent_prompt, desc,
                 ).await;
             });

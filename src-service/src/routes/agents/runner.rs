@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::state::ApiState;
-use crate::service_agent::harness::engine::transaction::Transaction;
+use crate::service::harness::engine::transaction::Transaction;
 use super::account_id_from_headers;
 
 /// POST /vaults/:vid/agent/run
@@ -35,7 +35,7 @@ pub async fn run(
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     let agent_name = body["agent"].as_str().unwrap_or("chat");
-    let agent_def = crate::service_agent::helpers::load_agent_def(&state.db, agent_name, &account_id)
+    let agent_def = crate::service::helpers::load_agent_def(&state.db, agent_name, &account_id)
         .await
         .unwrap_or_else(|| json!({}));
 
@@ -70,7 +70,7 @@ pub async fn run(
             return Ok(Json(json!({ "session_id": session_id, "conversation_id": conversation_id })));
         }
     };
-    crate::service_agent::run_agent(
+    crate::service::run_agent(
         runtime,
         input,
         activity_context,
@@ -148,7 +148,7 @@ pub async fn live_chat(
     let conversation_id = body["conversation_id"].as_str().unwrap_or("").to_string();
 
     // Load live_chat agent_def; fall back to empty def (skill pre-pass will fill tool_names).
-    let agent_def = crate::service_agent::helpers::load_agent_def(&state.db, "live_chat", &account_id)
+    let agent_def = crate::service::helpers::load_agent_def(&state.db, "live_chat", &account_id)
         .await
         .unwrap_or_else(|| json!({
             "system_prompt": "",
@@ -167,7 +167,7 @@ pub async fn live_chat(
         Some(r) => r,
         None => return Ok(Json(json!({ "error": "LLM not configured" }))),
     };
-    let agent_response = crate::service_agent::run_agent(
+    let agent_response = crate::service::run_agent(
         runtime,
         input.clone(),
         activity_context,
@@ -195,7 +195,7 @@ pub async fn live_chat(
         .map(|nc| format!("\n[當前開啟的筆記]\n{}", nc))
         .unwrap_or_default();
 
-    let live_respond_schema = crate::service_agent::harness::tool_def::build_tools_schema(
+    let live_respond_schema = crate::service::harness::tool_def::build_tools_schema(
         &["live_respond".to_string()],
     );
     let client = reqwest::Client::new();
@@ -216,7 +216,7 @@ pub async fn live_chat(
         "max_tokens": 512,
     });
 
-    let speech = match crate::service_agent::tools::llm::call_llm_once(
+    let speech = match crate::service::tools::llm::call_llm_once(
         &client, &llm_url, &respond_msgs, Some(respond_body["tools"].clone()), &cancel,
     ).await {
         Ok((_, tool_chunks)) => {

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{json, Value};
 use crate::db::SurrealDb;
 use chrono::Datelike;
-use crate::service_agent::harness::governance::guard::validate_rel_path;
+use crate::service::harness::governance::guard::validate_rel_path;
 
 // ── Structured error helper ───────────────────────────────────────────────────
 

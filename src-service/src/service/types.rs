@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::service_agent::harness::runtime::HarnessRequestRuntime;
-use crate::service_agent::harness::governance::guard::ToolGuardSpec;
+use crate::service::harness::runtime::HarnessRequestRuntime;
+use crate::service::harness::governance::guard::ToolGuardSpec;
 
 pub type ToolFuture =
     Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>;

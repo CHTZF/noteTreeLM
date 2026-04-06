@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use serde_json::Value;
 
-use crate::service_agent::types::EmitEventFn;
+use crate::service::types::EmitEventFn;
 use super::trace::SessionTrace;
 use super::super::memory::working::WorkingMemory;
 

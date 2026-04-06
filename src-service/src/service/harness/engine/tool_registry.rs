@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::service_agent::types::Tool;
+use crate::service::types::Tool;
 
 pub struct ToolRegistry {
 

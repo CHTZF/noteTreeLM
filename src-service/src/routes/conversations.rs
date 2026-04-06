@@ -375,7 +375,7 @@ async fn maybe_trigger_memory_agent(state: ApiState, conv_id: String, messages_j
         .unwrap_or(0);
 
     let task_id = uuid::Uuid::new_v4().to_string();
-    tokio::spawn(crate::service_agent::execute_scheduled_task(
+    tokio::spawn(crate::service::execute_scheduled_task(
         state,
         task_id,
         vault_id,

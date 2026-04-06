@@ -7,9 +7,9 @@ use serde_json::{json, Value};
 
 use crate::db::SurrealDb;
 use crate::state::AgentSession;
-use crate::service_agent::types::{EmitEventFn, EmbedFn};
-use crate::service_agent::harness::engine::transaction::{TransactionState, AnswerChannel};
-use crate::service_agent::harness::engine::intent_classifier::{Intent, IntentClassifier};
+use crate::service::types::{EmitEventFn, EmbedFn};
+use crate::service::harness::engine::transaction::{TransactionState, AnswerChannel};
+use crate::service::harness::engine::intent_classifier::{Intent, IntentClassifier};
 use super::memory::working::WorkingMemory;
 use super::engine::dispatcher::Dispatcher;
 use super::context_pipeline::{ContextBudget, ContextInput, ContextPipeline};
@@ -306,7 +306,7 @@ impl HarnessRequestRuntime {
         let (skill_result, prefetched_memory) = tokio::join!(
             async {
                 if do_skill_pass {
-                    Some(crate::service_agent::helpers::run_skill_pass(
+                    Some(crate::service::helpers::run_skill_pass(
                         &self.client, &self.embedding_url, &self.db,
                         &self.vault_id, &self.account_id, input,
                     ).await)
@@ -316,7 +316,7 @@ impl HarnessRequestRuntime {
             },
             async {
                 if do_memory_prefetch {
-                    let facts = crate::service_agent::helpers::vault_query_memory_with_limit(
+                    let facts = crate::service::helpers::vault_query_memory_with_limit(
                         &self.client, &self.embedding_url, &self.db,
                         &self.vault_id, &self.account_id, &keywords, 6,
                     ).await;
@@ -400,7 +400,7 @@ impl HarnessRequestRuntime {
         use super::engine::tool_registry::ToolRegistry;
         use super::governance::policy::assert_guard_coverage;
         use super::tool_def::ALL_TOOL_DEFS;
-        use crate::service_agent::types::{HandlerFn, Tool};
+        use crate::service::types::{HandlerFn, Tool};
 
         assert_guard_coverage();
         let mut registry = ToolRegistry::new();
@@ -425,7 +425,7 @@ impl HarnessRequestRuntime {
     ) {
         if self.streaming {
             self.emit("llm:done", json!(full_response));
-            if !full_response.is_empty() && crate::service_agent::helpers::detect_response_framework(full_response) {
+            if !full_response.is_empty() && crate::service::helpers::detect_response_framework(full_response) {
                 self.emit("agent:skill_suggestion", json!({
                     "query": input,
                     "response_preview": full_response.chars().take(200).collect::<String>(),

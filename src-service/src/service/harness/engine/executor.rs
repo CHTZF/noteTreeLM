@@ -7,12 +7,12 @@ use serde_json::{json, Value};
 use super::graph::ToolGraph;
 use super::tool_registry::ToolRegistry;
 use super::transaction::{Transaction, TransactionState};
-use crate::service_agent::types::{EmitEventFn, NeedConfirmFn, ToolCall};
-use crate::service_agent::harness::runtime::HarnessRequestRuntime;
-use crate::service_agent::harness::governance::guard::evaluate_guard;
-use crate::service_agent::harness::governance::policy::GUARD_EXEMPT_WRITE_TOOLS;
-use crate::service_agent::harness::memory::working::WorkingMemory;
-use crate::service_agent::harness::tools::vault_tools;
+use crate::service::types::{EmitEventFn, NeedConfirmFn, ToolCall};
+use crate::service::harness::runtime::HarnessRequestRuntime;
+use crate::service::harness::governance::guard::evaluate_guard;
+use crate::service::harness::governance::policy::GUARD_EXEMPT_WRITE_TOOLS;
+use crate::service::harness::memory::working::WorkingMemory;
+use crate::service::harness::tools::vault_tools;
 use crate::state::GuardOutcome;
 
 pub struct Executor {

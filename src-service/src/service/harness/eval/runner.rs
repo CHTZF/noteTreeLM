@@ -4,15 +4,15 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::db::SurrealDb;
-use crate::service_agent::harness::engine::executor::Executor;
-use crate::service_agent::harness::engine::planner::Planner;
-use crate::service_agent::harness::engine::tool_registry::ToolRegistry;
-use crate::service_agent::harness::engine::transaction::Transaction;
-use crate::service_agent::harness::memory::working::WorkingMemory;
-use crate::service_agent::harness::observability::trace::SessionTrace;
-use crate::service_agent::harness::tool_def::find_tool_def;
-use crate::service_agent::harness::runtime::HarnessRequestRuntime;
-use crate::service_agent::types::{EmitEventFn, HandlerFn, NeedConfirmFn, Tool};
+use crate::service::harness::engine::executor::Executor;
+use crate::service::harness::engine::planner::Planner;
+use crate::service::harness::engine::tool_registry::ToolRegistry;
+use crate::service::harness::engine::transaction::Transaction;
+use crate::service::harness::memory::working::WorkingMemory;
+use crate::service::harness::observability::trace::SessionTrace;
+use crate::service::harness::tool_def::find_tool_def;
+use crate::service::harness::runtime::HarnessRequestRuntime;
+use crate::service::types::{EmitEventFn, HandlerFn, NeedConfirmFn, Tool};
 
 use super::{EvalCase, EvalResult, MockToolCall};
 

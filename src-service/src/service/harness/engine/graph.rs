@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::Value;
-use crate::service_agent::types::ToolCall;
+use crate::service::types::ToolCall;
 
 /// Derives this node's args from the previous (effective) node's result and args.
 /// Signature: (prev_result, prev_args) → args_for_this_node

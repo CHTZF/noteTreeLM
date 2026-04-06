@@ -54,7 +54,7 @@ pub async fn run_trace_analysis(
     let session_id = Uuid::new_v4().to_string();
 
     let agent_def = {
-        let mut def = crate::service_agent::helpers::load_agent_def(
+        let mut def = crate::service::helpers::load_agent_def(
             &state.db, "trace_analyst", &account_id,
         )
         .await
@@ -84,7 +84,7 @@ pub async fn run_trace_analysis(
 
     tokio::spawn(async move {
         let db = runtime.db.clone();
-        crate::service_agent::agents::interactive::run_agent(
+        crate::service::agents::interactive::run_agent(
             runtime,
             input,
             None,
@@ -105,7 +105,7 @@ pub async fn run_trace_analysis(
             .unwrap_or(0);
 
         if enabled_count > 0 {
-            let results = crate::service_agent::harness::eval::runner::load_enabled_cases(
+            let results = crate::service::harness::eval::runner::load_enabled_cases(
                 &db,
                 &account_id,
             ).await;
@@ -257,7 +257,7 @@ pub async fn run_eval_suite(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let account_id = account_id_from_headers(&state, &headers).await?;
 
-    let results = crate::service_agent::harness::eval::runner::load_enabled_cases(
+    let results = crate::service::harness::eval::runner::load_enabled_cases(
         &state.db,
         &account_id,
     ).await;
