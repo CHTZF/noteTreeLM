@@ -23,7 +23,7 @@ pub use harness::tools::vault_tools;
 pub(crate) mod helpers {
     pub(crate) use super::harness::agent_def::load_agent_def;
     pub(crate) use super::harness::memory::semantic::vault_query_memory_with_limit;
-    pub(crate) use super::harness::tools::vault_tools::detect_response_framework;
+    pub(crate) use super::harness::tools::llm::detect_response_framework;
     pub(crate) use super::harness::tools::skill_tools::run_skill_pass;
     #[allow(unused_imports)]
     pub(crate) use super::harness::tools::skill_tools::SkillPassResult;

@@ -216,7 +216,7 @@ pub async fn live_chat(
         "max_tokens": 512,
     });
 
-    let speech = match crate::service_agent::tools::vault_tools::call_llm_once(
+    let speech = match crate::service_agent::tools::llm::call_llm_once(
         &client, &llm_url, &respond_msgs, Some(respond_body["tools"].clone()), &cancel,
     ).await {
         Ok((_, tool_chunks)) => {

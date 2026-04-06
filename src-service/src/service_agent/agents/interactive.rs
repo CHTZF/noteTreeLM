@@ -136,7 +136,7 @@ async fn run_one_llm_round(
     tool_choice: Value,
     emitter:     &super::super::harness::observability::emitter::ObservabilityEmitter,
 ) -> Result<(String, Vec<(String, String, String)>), String> {
-    use super::super::harness::tools::vault_tools;
+    use super::super::harness::tools::llm;
     let has_tools = tools.is_some();
     if runtime.streaming {
         let body = match tools {
@@ -145,11 +145,11 @@ async fn run_one_llm_round(
             None     => json!({ "messages": msgs, "stream": true, "temperature": 0.7, "max_tokens": 2048 }),
         };
         let wm = if has_tools { Some(&runtime.working_memory) } else { None };
-        vault_tools::stream_llm_round(
+        llm::stream_llm_round(
             &runtime.client, &runtime.llm_url, body, emitter, &runtime.cancel, wm,
         ).await.map(|(t, _, chunks)| (t, chunks))
     } else {
-        vault_tools::call_llm_once(
+        llm::call_llm_once(
             &runtime.client, &runtime.llm_url, msgs, tools, &runtime.cancel,
         ).await
     }
