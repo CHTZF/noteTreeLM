@@ -3,7 +3,7 @@ mod cloudflared;
 
 use std::path::PathBuf;
 use tokio::signal;
-use crate::api_state::ApiState;
+use crate::state::ApiState;
 use crate::auth::store::AuthStore;
 use crate::state::DaemonState;
 

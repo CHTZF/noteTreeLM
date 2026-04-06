@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::api_state::ApiState;
+use crate::state::ApiState;
 use crate::routes::vault::get_vault_path;
 
 pub fn router() -> Router<ApiState> {

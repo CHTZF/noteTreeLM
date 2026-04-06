@@ -12,7 +12,7 @@ use std::{net::SocketAddr, time::Duration};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::Span;
-use crate::api_state::ApiState;
+use crate::state::ApiState;
 use crate::auth::{handlers, middleware::auth_middleware, store::AuthStore};
 use crate::db::SurrealDb;
 use crate::state::{DaemonState, ServerInfo};

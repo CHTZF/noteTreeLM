@@ -1,4 +1,3 @@
-mod api_state;
 mod auth;
 pub(crate) mod crypto;
 mod daemon;

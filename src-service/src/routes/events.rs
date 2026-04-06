@@ -6,7 +6,7 @@ use futures_util::stream::StreamExt;
 use std::convert::Infallible;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::api_state::ApiState;
+use crate::state::ApiState;
 
 pub fn router() -> axum::Router<ApiState> {
     axum::Router::new().route("/events", axum::routing::get(sse_handler))
