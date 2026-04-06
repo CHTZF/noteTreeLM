@@ -232,7 +232,7 @@ impl HarnessRequestRuntime {
         if let Some(pending) = pending_tx {
             if pending.state().await == TransactionState::Preparing {
                 let embed_fn: EmbedFn = {
-                    let client = reqwest::Client::new();
+                    let client = self.client.clone();
                     let llm_url = self.llm_url.clone();
                     Arc::new(move |text: String| {
                         let client = client.clone();

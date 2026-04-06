@@ -476,23 +476,6 @@ pub(crate) async fn vault_create_note(
     Ok(json!({ "ok": true, "path": rel_path }))
 }
 
-#[allow(dead_code)]
-pub(crate) async fn vault_update_note(
-    rel_path: &str,
-    content: &str,
-    vault_path: &str,
-    client: &reqwest::Client,
-    db: &SurrealDb,
-    vault_id: &str,
-) -> Result<Value, String> {
-    if vault_path.is_empty() { return Err("Vault 未設定".to_string()); }
-    validate_rel_path(rel_path)?;
-    let full = std::path::Path::new(vault_path).join(rel_path);
-    if !full.exists() { return Err(format!("筆記不存在：{}", rel_path)); }
-    let original = tokio::fs::read_to_string(&full).await.unwrap_or_default();
-    vault_update_note_inner(rel_path, content, &original, &full, client, db, vault_id).await
-}
-
 /// Variant that checks for write conflicts before committing.
 /// `mtime_at_read` — the file's mtime (secs) when the caller last read it.
 /// If the file's current mtime is newer, returns a conflict result without writing.
@@ -507,7 +490,7 @@ pub(crate) async fn vault_update_note_with_conflict_check(
     vault_id: &str,
 ) -> Result<Value, String> {
     if vault_path.is_empty() { return Ok(tool_err("VAULT_NOT_SET", "Vault 未設定", None)); }
-    validate_rel_path(rel_path).map_err(|e| e)?;
+    validate_rel_path(rel_path)?;
     let full = std::path::Path::new(vault_path).join(rel_path);
     if !full.exists() { return Ok(tool_err("NOT_FOUND", format!("筆記不存在：{}", rel_path), Some(rel_path))); }
 
@@ -535,24 +518,6 @@ pub(crate) async fn vault_update_note_with_conflict_check(
     vault_update_note_inner(rel_path, content, original, &full, client, db, vault_id).await
 }
 
-/// Variant that accepts a pre-read original to avoid double-reading.
-/// Kept for callers that do not need conflict detection (e.g. batch rollback paths).
-#[allow(dead_code)]
-pub(crate) async fn vault_update_note_with_original(
-    rel_path: &str,
-    content: &str,
-    original: &str,
-    vault_path: &str,
-    client: &reqwest::Client,
-    db: &SurrealDb,
-    vault_id: &str,
-) -> Result<Value, String> {
-    if vault_path.is_empty() { return Ok(tool_err("VAULT_NOT_SET", "Vault 未設定", None)); }
-    validate_rel_path(rel_path).map_err(|e| e)?;
-    let full = std::path::Path::new(vault_path).join(rel_path);
-    if !full.exists() { return Ok(tool_err("NOT_FOUND", format!("筆記不存在：{}", rel_path), Some(rel_path))); }
-    vault_update_note_inner(rel_path, content, original, &full, client, db, vault_id).await
-}
 
 async fn vault_update_note_inner(
     rel_path: &str,

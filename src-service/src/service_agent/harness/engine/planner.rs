@@ -11,7 +11,10 @@ impl Planner {
     pub fn plan_from_chunks(tool_chunks: &[(String, String, String)]) -> ToolGraph {
         let calls: Vec<(String, String, Value)> = tool_chunks.iter()
             .map(|(id, name, args_str)| {
-                let args = serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
+                let args = serde_json::from_str(args_str).unwrap_or_else(|e| {
+                    tracing::warn!("[planner] failed to parse args for '{}': {}", name, e);
+                    serde_json::json!({})
+                });
                 (id.clone(), name.clone(), args)
             })
             .collect();
