@@ -71,7 +71,7 @@ pub async fn execute_scheduled_task(
         agent_name, task_id, runtime.vault_id
     );
 
-    let result = super::interactive::run_agent(
+    let result = super::agent::run_agent(
         runtime.clone(),
         initial_msg,
         None,

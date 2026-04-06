@@ -84,7 +84,7 @@ pub async fn run_trace_analysis(
 
     tokio::spawn(async move {
         let db = runtime.db.clone();
-        crate::service::agents::interactive::run_agent(
+        crate::service::agents::agent::run_agent(
             runtime,
             input,
             None,

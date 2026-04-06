@@ -28,7 +28,7 @@ pub(crate) async fn run_sub_agent(
     let conversation_id = format!("sub_{}_{}_{}", parent_session_id, agent_name, runtime.vault_id);
     let sub_runtime = runtime.fork_for_sub_agent(conversation_id, agent_def);
 
-    let result = super::interactive::run_agent(
+    let result = super::agent::run_agent(
         sub_runtime,
         input.to_string(),
         None,
