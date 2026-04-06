@@ -1,11 +1,12 @@
 mod scheduler;
 mod cloudflared;
+pub(crate) mod state;
 
 use std::path::PathBuf;
 use tokio::signal;
-use crate::state::ApiState;
+use crate::app_state::ApiState;
 use crate::auth::store::AuthStore;
-use crate::state::DaemonState;
+use crate::daemon::state::DaemonState;
 
 pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("noteTreeLM Service starting...");

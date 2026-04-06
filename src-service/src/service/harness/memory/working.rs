@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use serde_json::Value;
-use crate::state::ToolCallRecord;
+use crate::service::harness::governance::guard::{GuardOutcome, ToolCallRecord};
 
 /// Per-session, in-memory store of tool execution evidence.
 ///
@@ -45,7 +45,7 @@ impl WorkingMemory {
         result:        Value,
         started_at:    i64,
         duration_ms:   u64,
-        guard_outcome: crate::state::GuardOutcome,
+        guard_outcome: GuardOutcome,
     ) {
         self.inner.lock().await.insert(
             id.into(),
@@ -111,9 +111,9 @@ impl WorkingMemory {
         records.sort_by_key(|r| r.started_at);
         records.iter().map(|r| {
             let outcome = match &r.guard_outcome {
-                crate::state::GuardOutcome::Passed  => json!("passed"),
-                crate::state::GuardOutcome::Exempt  => json!("exempt"),
-                crate::state::GuardOutcome::Blocked(h) => json!({
+                GuardOutcome::Passed  => json!("passed"),
+                GuardOutcome::Exempt  => json!("exempt"),
+                GuardOutcome::Blocked(h) => json!({
                     "blocked": true,
                     "required_tool": h.required_tool,
                     "required_path": h.required_path,

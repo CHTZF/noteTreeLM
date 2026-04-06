@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use crate::state::{GuardOutcome, ToolCallRecord};
+use crate::service::harness::governance::guard::{GuardOutcome, ToolCallRecord};
 
 /// Immutable snapshot of a single agent session's execution.
 ///

@@ -1,8 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use serde_json::{json, Value};
-use crate::state::AgentSession;
-use super::super::harness::runtime::{HarnessRequestRuntime, AgentContextResult};
+use super::super::harness::runtime::{HarnessRequestRuntime, AgentContextResult, AgentSession};
 
 use super::super::harness::engine::planner::Planner;
 use super::super::harness::engine::transaction::Transaction;

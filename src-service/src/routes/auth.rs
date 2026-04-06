@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::state::ApiState;
+use crate::app_state::ApiState;
 
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {

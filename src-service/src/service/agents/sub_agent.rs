@@ -7,8 +7,9 @@ use crate::service::HarnessRequestRuntime;
 
 /// Execute a sub-agent that shares the parent's infrastructure context.
 ///
-/// - Forks a new `HarnessRequestRuntime` with a fresh session/cancel/working-memory
+/// - Forks a new `HarnessRequestRuntime` with a fresh session/working-memory
 ///   but the same db, llm_url, vault_id, account_id, and caches as the parent.
+/// - Shares the parent's cancel flag so cancelling the parent also stops the sub-agent.
 /// - Uses non-streaming LLM calls so tokens don't mix with parent's llm:token stream.
 /// - Emits sub_agent:start / sub_agent:done / sub_agent:error.
 pub(crate) async fn run_sub_agent(
@@ -17,7 +18,7 @@ pub(crate) async fn run_sub_agent(
     agent_name: &str,
     agent_def: serde_json::Value,
     input: &str,
-    _parent_cancel: Arc<AtomicBool>,
+    parent_cancel: Arc<AtomicBool>,
 ) -> String {
     runtime.emit("sub_agent:start", json!({
         "parent_session_id": parent_session_id,
@@ -26,7 +27,8 @@ pub(crate) async fn run_sub_agent(
     }));
 
     let conversation_id = format!("sub_{}_{}_{}", parent_session_id, agent_name, runtime.vault_id);
-    let sub_runtime = runtime.fork_for_sub_agent(conversation_id, agent_def);
+    let mut sub_runtime = runtime.fork_for_sub_agent(conversation_id, agent_def);
+    sub_runtime.cancel = Arc::clone(&parent_cancel);
 
     let result = super::agent::run_agent(
         sub_runtime,

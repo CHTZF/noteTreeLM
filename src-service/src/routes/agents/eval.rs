@@ -17,7 +17,7 @@ use uuid::Uuid;
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
-use crate::state::ApiState;
+use crate::app_state::ApiState;
 use super::account_id_from_headers;
 
 // ── Per-account trace_analyst run lock ───────────────────────────────────────

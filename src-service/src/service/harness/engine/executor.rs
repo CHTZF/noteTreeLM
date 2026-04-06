@@ -13,7 +13,7 @@ use crate::service::harness::governance::guard::evaluate_guard;
 use crate::service::harness::governance::policy::GUARD_EXEMPT_WRITE_TOOLS;
 use crate::service::harness::memory::working::WorkingMemory;
 use crate::service::harness::tools::vault_tools;
-use crate::state::GuardOutcome;
+use crate::service::harness::governance::guard::GuardOutcome;
 
 pub struct Executor {
     registry:        Arc<ToolRegistry>,
@@ -333,7 +333,7 @@ fn extract_guard_outcome(v: Value, tool_name: &str) -> (GuardOutcome, Value) {
         let message       = v["__guard_hint__"].as_str().unwrap_or("guard blocked").to_string();
         let required_tool = v["__guard_required_tool__"].as_str().map(String::from);
         let required_path = v["__guard_required_path__"].as_str().map(String::from);
-        let hint = crate::state::GuardHint { message: message.clone(), required_tool, required_path };
+        let hint = crate::service::harness::governance::guard::GuardHint { message: message.clone(), required_tool, required_path };
         // Forward only the human-readable message to the LLM; the structured fields
         // are stored in WorkingMemory for get_session_state and trace_analyst.
         (GuardOutcome::Blocked(hint), Value::String(message))

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use crate::state::GuardOutcome;
+use crate::service::harness::governance::guard::GuardOutcome;
 use crate::service::harness::observability::trace::SessionTrace;
 
 /// Assertion kinds for evaluating a [`SessionTrace`].

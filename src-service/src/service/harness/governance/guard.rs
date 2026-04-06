@@ -1,5 +1,46 @@
 use serde_json::Value;
-use crate::state::GuardHint;
+
+// ── Shared guard / evidence types ────────────────────────────────────────────
+
+/// Human-readable block hint returned by `evaluate_guard`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GuardHint {
+    pub message: String,
+    pub required_tool: Option<String>,
+    pub required_path: Option<String>,
+}
+
+impl GuardHint {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self { message: message.into(), required_tool: None, required_path: None }
+    }
+    pub(crate) fn with_tool(mut self, tool: impl Into<String>, path: impl Into<String>) -> Self {
+        self.required_tool = Some(tool.into());
+        self.required_path = Some(path.into());
+        self
+    }
+}
+
+/// Guard evaluation outcome for a single tool execution.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "reason")]
+pub(crate) enum GuardOutcome {
+    Passed,
+    Blocked(GuardHint),
+    Exempt,
+}
+
+/// A single tool execution record within a session.
+/// Stored in `WorkingMemory` keyed by `tool_call_id`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ToolCallRecord {
+    pub name: String,
+    pub args: serde_json::Value,
+    pub result: serde_json::Value,
+    pub started_at: i64,
+    pub duration_ms: u64,
+    pub guard_outcome: GuardOutcome,
+}
 
 // ── Guard types ───────────────────────────────────────────────────────────────
 
@@ -55,7 +96,7 @@ pub(crate) fn validate_rel_path(rel_path: &str) -> Result<(), String> {
 
 // ── Store types and query helpers ─────────────────────────────────────────────
 
-pub(crate) type StoreMap = std::collections::HashMap<String, crate::state::ToolCallRecord>;
+pub(crate) type StoreMap = std::collections::HashMap<String, ToolCallRecord>;
 
 /// Returns true if a read_note result value indicates a failure (file not found, empty vault, etc.).
 /// `vault_read_note` now always returns a `Value::Object`; errors carry a non-null `"error_code"`.
@@ -177,7 +218,6 @@ pub(crate) fn evaluate_guard(spec: &ToolGuardSpec, args: &Value, store: &StoreMa
 mod tests {
     use super::*;
     use serde_json::json;
-    use crate::state::{GuardOutcome, ToolCallRecord};
 
     // ── Test helpers ─────────────────────────────────────────────────────────
 

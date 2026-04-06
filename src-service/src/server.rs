@@ -12,10 +12,10 @@ use std::{net::SocketAddr, time::Duration};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::Span;
-use crate::state::ApiState;
+use crate::app_state::ApiState;
 use crate::auth::{handlers, middleware::auth_middleware, store::AuthStore};
 use crate::db::SurrealDb;
-use crate::state::{DaemonState, ServerInfo};
+use crate::daemon::state::{DaemonState, ServerInfo};
 
 /// Build the shared API router with all routes.
 /// Used by both HTTP :7787 and HTTPS :7788.

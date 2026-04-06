@@ -590,7 +590,7 @@ pub(crate) async fn vault_read_then_write(
         json!({ "error_code": null, "content": original, "path": rel_path }),
         chrono::Utc::now().timestamp(),
         0,
-        crate::state::GuardOutcome::Exempt,
+        crate::service::harness::governance::guard::GuardOutcome::Exempt,
     ).await;
 
     let original_chars = original.len();

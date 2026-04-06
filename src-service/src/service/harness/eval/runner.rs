@@ -68,7 +68,7 @@ impl EvalRunner {
 
         // Collect tool call records sorted by their WorkingMemory key (eval_00, eval_01…)
         // for deterministic ToolAt / GuardAt index assertions.
-        let mut pairs: Vec<(String, crate::state::ToolCallRecord)> = working_memory
+        let mut pairs: Vec<(String, crate::service::harness::governance::guard::ToolCallRecord)> = working_memory
             .with_records(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .await;
         pairs.sort_by(|a, b| a.0.cmp(&b.0));

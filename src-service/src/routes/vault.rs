@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::path::Path as FsPath;
 use uuid::Uuid;
 
-use crate::state::ApiState;
+use crate::app_state::ApiState;
 use crate::processing::chunker;
 use crate::processing::embedder;
 

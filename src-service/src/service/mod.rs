@@ -15,7 +15,7 @@ pub mod agents;
 
 // Public entry points used by routes
 pub use agents::agent::run_agent;
-pub use agents::scheduled::execute_scheduled_task;
+pub use agents::scheduled_agents::execute_scheduled_task;
 /// Re-export harness::tools at the legacy path so routes outside this crate
 /// (e.g. routes/agents/runner.rs) continue to compile without path changes.
 pub use harness::tools as tools;
