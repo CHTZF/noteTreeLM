@@ -959,7 +959,7 @@ fn handle_search_skills(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFut
 
         // Semantic search when we have a non-empty query and an embedding server.
         let q_vec = if !query.is_empty() {
-            crate::processing::embedder::embed_text(&env.client, &env.embedding_url, &query).await
+            crate::embedding::embedder::embed_text(&env.client, &env.embedding_url, &query).await
         } else {
             None
         };
@@ -970,7 +970,7 @@ fn handle_search_skills(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFut
                     .iter().filter_map(|v| v.as_f64().map(|f| f as f32))
                     .collect();
                 if emb.is_empty() { return None; }
-                let score = crate::processing::embedder::cosine_sim(qv, &emb);
+                let score = crate::embedding::embedder::cosine_sim(qv, &emb);
                 if score >= 0.60 { Some((score, r)) } else { None }
             }).collect();
             scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));

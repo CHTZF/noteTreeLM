@@ -11,8 +11,8 @@ use std::path::Path as FsPath;
 use uuid::Uuid;
 
 use crate::app_state::ApiState;
-use crate::processing::chunker;
-use crate::processing::embedder;
+use crate::embedding::chunker;
+use crate::embedding::embedder;
 
 pub fn router() -> Router<ApiState> {
     Router::new()

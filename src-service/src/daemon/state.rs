@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
-use crate::service::harness::runtime::AgentSession;
+use crate::service::types::{AgentSession, ServiceEvent};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerInfo {
@@ -13,13 +13,6 @@ pub struct ServerInfo {
     pub status: String,   // "running" | "stopped" | "error"
     pub model: Option<String>,
     pub updated_at: i64,
-}
-
-/// Lightweight event broadcast for SSE clients.
-#[derive(Debug, Clone, Serialize)]
-pub struct ServiceEvent {
-    pub event: String,
-    pub payload: serde_json::Value,
 }
 
 #[derive(Clone)]

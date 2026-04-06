@@ -71,7 +71,7 @@ pub async fn run_trace_analysis(
         .map(String::from)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    let runtime = match state.agent_runtime(
+    let runtime = match crate::service::build_agent_runtime(&state, 
         &vault_id, &account_id,
         Some(session_id.clone()),
         conversation_id,

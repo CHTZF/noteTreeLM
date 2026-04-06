@@ -49,7 +49,7 @@ async fn search_notes(
     if emb_url.is_some() {
         let http_client = reqwest::Client::new();
         if let Some(embedding) =
-            crate::processing::embedder::embed_text(&http_client, &emb_url, &query_str).await
+            crate::embedding::embedder::embed_text(&http_client, &emb_url, &query_str).await
         {
             #[derive(serde::Deserialize)]
             struct VecRow {

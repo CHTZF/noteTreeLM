@@ -123,7 +123,7 @@ pub(crate) async fn save_memory_facts(
 
         // Compute embedding first (needed for both semantic dedup and storage)
         let embedding_vec: Option<Vec<f32>> =
-            crate::processing::embedder::embed_text(client, embedding_url, &content).await;
+            crate::embedding::embedder::embed_text(client, embedding_url, &content).await;
 
         // Dedup: semantic similarity (cosine > 0.92) when embeddings available;
         // otherwise fall back to prefix match on first 40 chars.
@@ -142,7 +142,7 @@ pub(crate) async fn save_memory_facts(
                 .unwrap_or_default();
             existing.into_iter().find(|row| {
                 row.embedding.as_ref().map(|emb| {
-                    crate::processing::embedder::cosine_sim(new_emb, emb) > 0.92
+                    crate::embedding::embedder::cosine_sim(new_emb, emb) > 0.92
                 }).unwrap_or(false)
             }).map(|row| row.fact_id)
         } else {
@@ -294,7 +294,7 @@ pub(crate) async fn condense_memory_facts(
         let expires_at = now + 365 * 86400;
         let new_fid = uuid::Uuid::new_v4().to_string();
         let embedding_vec: Option<Vec<f32>> =
-            crate::processing::embedder::embed_text(client, embedding_url, &summary).await;
+            crate::embedding::embedder::embed_text(client, embedding_url, &summary).await;
         let insert_ok = db
             .query("INSERT INTO memory_facts (fact_id, vault_id, account_id, content, category, expires_at, created_at, embedding) VALUES ($fid, $vid, $aid, $content, $cat, $exp, $now, $emb)")
             .bind(("fid", new_fid))

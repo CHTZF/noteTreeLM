@@ -1,12 +1,9 @@
 mod auth;
-pub(crate) mod crypto;
 mod daemon;
 mod db;
 pub mod service;
-mod network;
-mod processing;
+mod embedding;
 mod routes;
-mod server;
 mod app_state;
 
 fn get_data_dir() -> std::path::PathBuf {

@@ -1,6 +1,6 @@
 use serde_json::Value;
 use crate::db::SurrealDb;
-use crate::processing::embedder::cosine_sim;
+use crate::embedding::embedder::cosine_sim;
 use crate::service::harness::memory::semantic::vault_query_memory_with_limit;
 
 pub(crate) struct SkillPassResult {
@@ -78,7 +78,7 @@ async fn semantic_skill_search(
     input: &str,
     threshold: f32,
 ) -> Option<Vec<SkillRow>> {
-    let input_vec = crate::processing::embedder::embed_text(client, embedding_url, input).await?;
+    let input_vec = crate::embedding::embedder::embed_text(client, embedding_url, input).await?;
     if input_vec.is_empty() { return None; }
 
     let mut resp = db

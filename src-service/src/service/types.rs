@@ -7,6 +7,24 @@ use serde_json::Value;
 
 use crate::service::harness::runtime::HarnessRequestRuntime;
 use crate::service::harness::governance::guard::ToolGuardSpec;
+use crate::service::harness::engine::transaction::{Transaction, AnswerChannel};
+
+/// Lightweight event for SSE broadcast (shared between daemon broadcast and service emit).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ServiceEvent {
+    pub event: String,
+    pub payload: serde_json::Value,
+}
+
+/// Per-session state for interactive agent runs.
+/// Stored in `DaemonState.agent_sessions` keyed by `conv_id`.
+pub struct AgentSession {
+    pub session_id:     Arc<String>,
+    pub conv_id:        Arc<String>,
+    pub cancel:         Arc<AtomicBool>,
+    pub transaction:    Option<Arc<Transaction>>,
+    pub answer_channel: Arc<AnswerChannel>,
+}
 
 pub type ToolFuture =
     Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>;

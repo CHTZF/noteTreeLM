@@ -149,7 +149,7 @@ pub(crate) async fn vault_query_memory_with_limit(
     // Try semantic search first when we have keywords and an embedding server.
     if !keywords.is_empty() {
         let query_text = keywords.join(" ");
-        if let Some(query_vec) = crate::processing::embedder::embed_text(client, embedding_url, &query_text).await {
+        if let Some(query_vec) = crate::embedding::embedder::embed_text(client, embedding_url, &query_text).await {
             if !query_vec.is_empty() {
                 let rows: Vec<Row> = db
                     .query("SELECT fact_id, content, category, embedding FROM memory_facts WHERE vault_id = $vid AND account_id = $aid AND expires_at > $now AND embedding IS NOT NONE")
@@ -165,7 +165,7 @@ pub(crate) async fn vault_query_memory_with_limit(
                     let mut scored: Vec<(f32, Row)> = rows.into_iter().filter_map(|row| {
                         let emb = row.embedding.as_ref()?;
                         if emb.is_empty() { return None; }
-                        let score = crate::processing::embedder::cosine_sim(&query_vec, emb);
+                        let score = crate::embedding::embedder::cosine_sim(&query_vec, emb);
                         Some((score, row))
                     }).collect();
                     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));

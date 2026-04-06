@@ -136,7 +136,7 @@ pub(crate) async fn vault_search(
     if query.is_empty() { return Ok(json!([])); }
 
     // ── Cosine similarity search on chunks ────────────────────────────────
-    if let Some(vec) = crate::processing::embedder::embed_text(client, embedding_url, query).await {
+    if let Some(vec) = crate::embedding::embedder::embed_text(client, embedding_url, query).await {
         #[derive(serde::Deserialize)]
         struct ChunkRow { file_path: String, score: f32 }
         let mut resp = db
@@ -214,7 +214,7 @@ pub(crate) async fn vault_query_memory_with_ids(
     // Try semantic search first when we have keywords and an embedding server
     if !keywords.is_empty() {
         let query_text = keywords.join(" ");
-        if let Some(query_vec) = crate::processing::embedder::embed_text(client, embedding_url, &query_text).await {
+        if let Some(query_vec) = crate::embedding::embedder::embed_text(client, embedding_url, &query_text).await {
             if !query_vec.is_empty() {
                 let rows: Vec<Row> = db
                     .query("SELECT fact_id, content, category, embedding FROM memory_facts WHERE vault_id = $vid AND account_id = $aid AND expires_at > $now AND embedding IS NOT NONE")
@@ -230,7 +230,7 @@ pub(crate) async fn vault_query_memory_with_ids(
                     let mut scored: Vec<(f32, Row)> = rows.into_iter().filter_map(|row| {
                         let emb = row.embedding.as_ref()?;
                         if emb.is_empty() { return None; }
-                        let score = crate::processing::embedder::cosine_sim(&query_vec, emb);
+                        let score = crate::embedding::embedder::cosine_sim(&query_vec, emb);
                         Some((score, row))
                     }).collect();
                     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -960,7 +960,7 @@ pub(crate) async fn vault_web_search(
         return Ok(json!("請至設定頁面設定 Brave Search API Key"));
     }
 
-    let api_key = crate::crypto::decrypt_api_key_db(db, &enc).await;
+    let api_key = crate::service::harness::crypto::decrypt_api_key_db(db, &enc).await;
     if api_key.is_empty() {
         return Ok(json!("Brave Search API Key 解密失敗，請重新設定"));
     }

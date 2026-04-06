@@ -57,7 +57,7 @@ pub async fn run(
         }
     }
 
-    let runtime = match state.agent_runtime(
+    let runtime = match crate::service::build_agent_runtime(&state, 
         &vault_id, &account_id,
         Some(session_id.clone()),
         conversation_id.clone(),
@@ -157,7 +157,7 @@ pub async fn live_chat(
 
     // Phase 1: run_agent (streaming:false) — tool execution (think + skill tools).
     // live_respond is intentionally excluded; it's called separately below.
-    let runtime = match state.agent_runtime(
+    let runtime = match crate::service::build_agent_runtime(&state, 
         &vault_id, &account_id,
         Some(session_id.clone()),
         conversation_id.clone(),

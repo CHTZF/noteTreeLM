@@ -11,3 +11,4 @@ pub(crate) mod context_pipeline;
 /// Tool handler implementations — dispatched by tool_def.rs.
 pub mod tools;
 pub(crate) mod eval;
+pub(crate) mod crypto;

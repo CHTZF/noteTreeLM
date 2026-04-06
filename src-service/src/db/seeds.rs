@@ -594,7 +594,7 @@ pub async fn embed_skills_for_account(
             row.trigger,
             row.behavior.chars().take(200).collect::<String>(),
         );
-        if let Some(vec) = crate::processing::embedder::embed_text(&client, embedding_url, &text).await {
+        if let Some(vec) = crate::embedding::embedder::embed_text(&client, embedding_url, &text).await {
             let _ = db
                 .query("UPDATE agent_skills SET embedding = $emb WHERE skill_id = $sid")
                 .bind(("emb", vec))

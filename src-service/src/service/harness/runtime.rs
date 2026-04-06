@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 use serde_json::{json, Value};
 
 use crate::db::SurrealDb;
-use crate::service::types::{EmitEventFn, EmbedFn};
+use crate::service::types::{EmitEventFn, EmbedFn, AgentSession};
 use crate::service::harness::engine::transaction::{Transaction, TransactionState, AnswerChannel};
 use crate::service::harness::engine::intent_classifier::{Intent, IntentClassifier};
 use super::memory::working::WorkingMemory;
@@ -15,15 +15,6 @@ use super::context_pipeline::{ContextBudget, ContextInput, ContextPipeline};
 use super::memory::episodic::EpisodicMemory;
 use super::observability::emitter::ObservabilityEmitter;
 use super::governance::policy::build_need_confirm_fn;
-
-/// Per-session state for interactive agent runs.
-pub struct AgentSession {
-    pub session_id:     Arc<String>,
-    pub conv_id:        Arc<String>,
-    pub cancel:         Arc<std::sync::atomic::AtomicBool>,
-    pub transaction:    Option<Arc<Transaction>>,
-    pub answer_channel: Arc<AnswerChannel>,
-}
 
 /// Resolved runtime context for a single agent request.
 ///
@@ -246,7 +237,7 @@ impl HarnessRequestRuntime {
                         let client = client.clone();
                         let llm_url = llm_url.clone();
                         Box::pin(async move {
-                            crate::processing::embedder::embed_text_llm(&client, &llm_url, &text).await
+                            crate::embedding::embedder::embed_text_llm(&client, &llm_url, &text).await
                         })
                     })
                 };

@@ -1,6 +1,8 @@
 mod scheduler;
 mod cloudflared;
 pub(crate) mod state;
+pub(crate) mod server;
+pub(crate) mod network;
 
 use std::path::PathBuf;
 use tokio::signal;
@@ -14,11 +16,11 @@ pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let db = crate::db::init_db(&data_dir).await?;
     tracing::info!("Database initialized");
 
-    let hostnames = crate::network::tls::collect_san_hostnames();
-    let tls = crate::network::tls::generate_tls_cert(hostnames)?;
+    let hostnames = network::tls::collect_san_hostnames();
+    let tls = network::tls::generate_tls_cert(hostnames)?;
     tracing::info!("TLS SPKI pin: {}", tls.spki_pin);
 
-    let _mdns = crate::network::mdns::start_mdns_broadcast(&tls.spki_pin)?;
+    let _mdns = network::mdns::start_mdns_broadcast(&tls.spki_pin)?;
 
     let auth_store = AuthStore::new();
     let daemon_state = DaemonState::new_with_data_dir(&data_dir);
@@ -41,7 +43,7 @@ pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         let api_state = ApiState::new(auth_store.clone(), db.clone(), daemon_state.clone());
         let rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
-            if let Err(e) = crate::server::run_http_server(7787, api_state, rx).await {
+            if let Err(e) = server::run_http_server(7787, api_state, rx).await {
                 tracing::error!("HTTP server error: {}", e);
             }
         })
@@ -56,7 +58,7 @@ pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         let daemon_state_clone = daemon_state.clone();
         let handle = https_handle.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::server::run_https_server(
+            if let Err(e) = server::run_https_server(
                 cert_pem, key_pem, 7788, store_clone, db_clone, daemon_state_clone, handle,
             ).await {
                 tracing::error!("HTTPS server error: {}", e);

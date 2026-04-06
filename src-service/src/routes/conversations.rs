@@ -374,16 +374,30 @@ async fn maybe_trigger_memory_agent(state: ApiState, conv_id: String, messages_j
         .and_then(|r| r.memory_processed_msg_count)
         .unwrap_or(0);
 
-    let task_id = uuid::Uuid::new_v4().to_string();
-    tokio::spawn(crate::service::execute_scheduled_task(
-        state,
-        task_id,
-        vault_id,
-        account_id,
-        Some("memory_agent".to_string()),
-        Some(format!("conv_id:{} skip_count:{}", conv_id, skip_count)),
-        "auto memory".to_string(),
-    ));
+    let task_id     = uuid::Uuid::new_v4().to_string();
+    let initial_msg = format!("conv_id:{} skip_count:{}", conv_id, skip_count);
+    let description = "auto memory".to_string();
+    tokio::spawn(async move {
+        let agent_def = match crate::service::helpers::load_agent_def(
+            &state.db, "memory_agent", &account_id,
+        ).await {
+            Some(a) => a,
+            None => {
+                tracing::warn!("[memory] memory_agent def not found for account '{}'", account_id);
+                return;
+            }
+        };
+        let conv_id = format!("scheduled_{}_memory_agent_{}", task_id, chrono::Utc::now().timestamp());
+        let runtime = match crate::service::build_agent_runtime(
+            &state, &vault_id, &account_id,
+            None, conv_id, agent_def,
+            false,
+        ).await {
+            Some(r) => r,
+            None => return,
+        };
+        crate::service::execute_scheduled_task(runtime, task_id, description, initial_msg).await;
+    });
 }
 
 /// LLM-based judgment for ambiguous cases not caught by keyword heuristic.
