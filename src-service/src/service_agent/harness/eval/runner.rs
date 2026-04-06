@@ -30,7 +30,7 @@ pub(crate) struct EvalRunner;
 impl EvalRunner {
     pub(crate) async fn run(case: &EvalCase) -> EvalResult {
         let working_memory = WorkingMemory::new();
-        let registry = build_eval_registry(&case.tool_sequence, working_memory.clone());
+        let registry = build_eval_registry(&case.tool_sequence);
 
         // Assign deterministic eval ids so WorkingMemory keys are sortable.
         let calls: Vec<(String, String, Value)> = case.tool_sequence.iter()
@@ -137,10 +137,7 @@ pub(crate) async fn load_enabled_cases(
 ///
 /// Multiple calls to the same tool name dequeue results in sequence — the first call
 /// gets the first matching `mock_result`, the second call gets the second, etc.
-fn build_eval_registry(
-    tool_sequence: &[MockToolCall],
-    working_memory: WorkingMemory,
-) -> ToolRegistry {
+fn build_eval_registry(tool_sequence: &[MockToolCall]) -> ToolRegistry {
     // Shared result queue: (tool_name, mock_result) in call order.
     let queue: Arc<tokio::sync::Mutex<VecDeque<(String, Value)>>> = Arc::new(
         tokio::sync::Mutex::new(
@@ -159,7 +156,6 @@ fn build_eval_registry(
         }
 
         let name  = mock_call.name.clone();
-        let wm    = working_memory.clone();
         let queue = Arc::clone(&queue);
         let guard = find_tool_def(&name).and_then(|d| d.guard);
 

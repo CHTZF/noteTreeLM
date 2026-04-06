@@ -6,7 +6,6 @@ pub enum Intent {
     Cancel,
     Confirm,
     ToolUse,
-    Chat,
 }
 
 pub struct IntentClassifier;
@@ -95,32 +94,4 @@ impl IntentClassifier {
         else { Intent::Interrupt }
     }
 
-    pub async fn classify_with_embedding(&self, input: &str, embed_fn: &EmbedFn) -> Intent {
-        const THRESHOLD: f32 = 0.75;
-        async fn batch(ef: &EmbedFn, phrases: &[&str]) -> Vec<Vec<f32>> {
-            futures_util::future::join_all(phrases.iter().map(|p| (ef)(p.to_string())))
-                .await.into_iter().filter(|v| !v.is_empty()).collect()
-        }
-        let (cv, ccl, ci) = tokio::join!(
-            batch(embed_fn, IntentClassifier::confirm_phrases()),
-            batch(embed_fn, IntentClassifier::cancel_phrases()),
-            batch(embed_fn, IntentClassifier::interrupt_phrases()),
-        );
-        let confirm_c   = compute_centroid(&cv);
-        let cancel_c    = compute_centroid(&ccl);
-        let interrupt_c = compute_centroid(&ci);
-        if confirm_c.is_empty() || cancel_c.is_empty() || interrupt_c.is_empty() {
-            return self.classify(input).await;
-        }
-        let input_vec = embed_fn(input.to_string()).await;
-        if input_vec.is_empty() { return self.classify(input).await; }
-        let sim_confirm   = cosine_sim(&input_vec, &confirm_c);
-        let sim_cancel    = cosine_sim(&input_vec, &cancel_c);
-        let sim_interrupt = cosine_sim(&input_vec, &interrupt_c);
-        let max_sim = sim_confirm.max(sim_cancel).max(sim_interrupt);
-        if max_sim < THRESHOLD { return self.classify(input).await; }
-        if sim_confirm >= sim_cancel && sim_confirm >= sim_interrupt { Intent::Confirm }
-        else if sim_cancel >= sim_interrupt { Intent::Cancel }
-        else { Intent::Interrupt }
-    }
 }

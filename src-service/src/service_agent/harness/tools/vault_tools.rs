@@ -1279,7 +1279,7 @@ pub(crate) async fn stream_llm_round(
     client: &reqwest::Client,
     llm_url: &str,
     body: Value,
-    emit_fn: &crate::service_agent::types::EmitEventFn,
+    emitter: &crate::service_agent::harness::observability::emitter::ObservabilityEmitter,
     cancel: &Arc<AtomicBool>,
     working_memory: Option<&crate::service_agent::harness::memory::working::WorkingMemory>,
 ) -> Result<(String, String, Vec<(String, String, String)>), String> {
@@ -1353,7 +1353,7 @@ pub(crate) async fn stream_llm_round(
                                                             "[citation] invalid cite ids: [cite:{}]",
                                                             cite_inner
                                                         );
-                                                        (emit_fn)("agent:citation_missing".to_string(), json!({}));
+                                                        emitter.emit("agent:citation_missing".to_string(), json!({}));
                                                     }
                                                     // Strip [cite:...] from what we forward
                                                     let rest = cite_buf[cite_end + 1..].to_string();
@@ -1371,7 +1371,7 @@ pub(crate) async fn stream_llm_round(
                                                 // Timeout: no [cite:...] found — treat as [cite:none]
                                                 if !cite_retry_done && working_memory.is_some() {
                                                     // Emit warning event; forward buffered content
-                                                    (emit_fn)("agent:citation_missing".to_string(), json!({}));
+                                                    emitter.emit("agent:citation_missing".to_string(), json!({}));
                                                     cite_retry_done = true;
                                                 }
                                                 let flushed = cite_buf.clone();
@@ -1388,7 +1388,7 @@ pub(crate) async fn stream_llm_round(
                                         if pending_emit.contains("<tool_call>") {
                                             let pos = pending_emit.find("<tool_call>").unwrap_or(0);
                                             if pos > 0 {
-                                                (emit_fn)("llm:token".to_string(), json!(&pending_emit[..pos]));
+                                                emitter.emit("llm:token".to_string(), json!(&pending_emit[..pos]));
                                             }
                                             pending_emit.clear();
                                             suppress_emit = true;
@@ -1397,7 +1397,7 @@ pub(crate) async fn stream_llm_round(
                                             if safe_end > 0 {
                                                 let chunk = pending_emit[..safe_end].to_string();
                                                 pending_emit = pending_emit[safe_end..].to_string();
-                                                (emit_fn)("llm:token".to_string(), json!(chunk));
+                                                emitter.emit("llm:token".to_string(), json!(chunk));
                                             }
                                         }
                                     }
@@ -1429,7 +1429,7 @@ pub(crate) async fn stream_llm_round(
     }
     // Flush remaining pending (if stream ended without <tool_call>)
     if !suppress_emit && !pending_emit.is_empty() {
-        (emit_fn)("llm:token".to_string(), json!(pending_emit));
+        emitter.emit("llm:token".to_string(), json!(pending_emit));
     }
 
     // Parse text-format tool calls from full_text (e.g. Qwen/Mistral <tool_call> style)

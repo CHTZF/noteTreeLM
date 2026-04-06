@@ -34,10 +34,10 @@ pub struct ToolCall {
     pub args: Value,
 }
 
-pub struct Tool {
-    pub execute:  HandlerFn,
-    pub rollback: Option<HandlerFn>,
-    pub guard:    Option<ToolGuardSpec>,
+pub(crate) struct Tool {
+    pub(crate) execute:  HandlerFn,
+    pub(crate) rollback: Option<HandlerFn>,
+    pub(crate) guard:    Option<ToolGuardSpec>,
 }
 
 // ── Agent 回呼型別 ─────────────────────────────────────────────────────────

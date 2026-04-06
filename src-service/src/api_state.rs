@@ -41,7 +41,7 @@ impl ApiState {
         let kind       = agent_def["kind"].as_str().unwrap_or("").to_string();
         let session_id = Arc::new(session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
         let emitter    = HarnessRequestRuntime::build_emitter(&emit_fn, &session_id);
-        let dispatcher = HarnessRequestRuntime::build_dispatcher(emitter.as_emit_fn(), &kind);
+        let dispatcher = Some(HarnessRequestRuntime::build_dispatcher(emitter.as_emit_fn(), &kind));
 
         Some(HarnessRequestRuntime {
             db:               self.db.clone(),

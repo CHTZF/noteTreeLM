@@ -42,7 +42,4 @@ impl ToolGraph {
         self.nodes.insert(id.clone(), ToolNode::new(call, deps));
     }
 
-    pub fn add_node_full(&mut self, id: String, node: ToolNode) {
-        self.nodes.insert(id, node);
-    }
 }
