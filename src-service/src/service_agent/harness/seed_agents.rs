@@ -12,7 +12,8 @@ use serde_json::json;
 /// Safe to call on every startup — uses a conditional INSERT that is a no-op
 /// if the agent already exists.
 pub(crate) async fn seed_builtin_agents(db: &SurrealDb, account_id: &str) {
-    let agents = builtin_agents(account_id);
+    let now = chrono::Utc::now().timestamp();
+    let agents = builtin_agents(account_id, now);
     for agent in agents {
         let name    = agent["name"].as_str().unwrap_or("").to_string();
         let prompt  = agent["system_prompt"].as_str().unwrap_or("").to_string();
@@ -46,15 +47,17 @@ pub(crate) async fn seed_builtin_agents(db: &SurrealDb, account_id: &str) {
     }
 }
 
-fn builtin_agents(account_id: &str) -> Vec<serde_json::Value> {
+fn builtin_agents(account_id: &str, now: i64) -> Vec<serde_json::Value> {
     vec![
-        trace_analyst_def(account_id),
+        trace_analyst_def(account_id, now),
+        memory_agent_def(account_id, now),
     ]
 }
 
-fn trace_analyst_def(account_id: &str) -> serde_json::Value {
+fn trace_analyst_def(account_id: &str, now: i64) -> serde_json::Value {
     json!({
         "account_id":    account_id,
+        "def_id":        "builtin_trace_analyst",
         "name":          "trace_analyst",
         "description":   "Analyses recent session traces and conversations to propose eval cases that capture guard invariants and behavioural patterns.",
         "kind":          "background",
@@ -67,11 +70,67 @@ fn trace_analyst_def(account_id: &str) -> serde_json::Value {
             "read_session_with_conversation",
             "propose_eval_case"
         ],
+        "skill_ids":             [],
+        "trigger":               "",
+        "status":                "active",
+        "use_count":             0,
+        "created_at":            now,
         "system_prompt":         TRACE_ANALYST_PROMPT,
         "system_prompt_version": 2,
         "max_rounds":            10,
     })
 }
+
+fn memory_agent_def(account_id: &str, now: i64) -> serde_json::Value {
+    json!({
+        "account_id":    account_id,
+        "def_id":        "builtin_memory_agent",
+        "name":          "memory_agent",
+        "description":   "定期掃描未分析的對話，萃取長期記憶事實並整理到記憶庫",
+        "kind":          "scheduled",
+        "is_active":     true,
+        "is_builtin":    true,
+        "enable_think":  false,
+        "use_skill_pass": false,
+        "tool_names": [
+            "get_unprocessed_conversations",
+            "get_conversation_content",
+            "save_memory_facts",
+            "mark_conversation_processed",
+            "condense_memory_facts"
+        ],
+        "skill_ids":             [],
+        "trigger":               "memory_agent",
+        "status":                "active",
+        "use_count":             0,
+        "created_at":            now,
+        "system_prompt":         MEMORY_AGENT_PROMPT,
+        "system_prompt_version": 1,
+        "max_rounds":            20,
+    })
+}
+
+const MEMORY_AGENT_PROMPT: &str = "你是記憶管理助理。\n\
+    ## 模式判斷\n\
+    若使用者訊息中包含「conv_id:」，進入 **單一對話模式**：\n\
+      1. 從訊息中解析 conv_id 與 skip_count（若有 skip_count: 欄位，解析為數字，預設 0）\n\
+      2. 呼叫 get_conversation_content（帶入 conversation_id 與 skip_count），跳過 get_unprocessed_conversations\n\
+      3. 判斷是否有長期記憶價值\n\
+      4. 有價值 → 呼叫 save_memory_facts；記錄回傳的 facts_saved 數字\n\
+      5. 呼叫 mark_conversation_processed\n\
+      6. 僅當 facts_saved > 0 時，呼叫 condense_memory_facts（不傳 category）\n\
+    \n\
+    若使用者訊息中不含「conv_id:」，進入 **全量掃描模式**：\n\
+      1. 呼叫 get_unprocessed_conversations 取得待分析對話列表\n\
+      2. 對每個對話，以 processed_msg_count 作為 skip_count 呼叫 get_conversation_content（只讀尚未處理的新訊息）\n\
+      3. 判斷是否有長期記憶價值（使用者偏好/背景/規則/重要決策）\n\
+         - 一般查詢、搜尋、閒聊 → 無記憶價值\n\
+         - 使用者分享個人資訊、設定偏好、做重要決定 → 有記憶價值\n\
+      4. 有價值 → 呼叫 save_memory_facts；累計 facts_saved 總數\n\
+      5. 每個對話無論成功失敗 → 呼叫 mark_conversation_processed\n\
+      6. 所有對話處理完畢後，僅當累計 facts_saved > 0 時，呼叫 condense_memory_facts（不傳 category）\n\
+    \n\
+    完成後輸出摘要（處理幾個對話、儲存幾條記憶）。";
 
 const TRACE_ANALYST_PROMPT: &str = r#"
 你是一個 Eval Case 提案專家，任務是分析最近的 session traces 和對話記錄，找出值得新增為 eval case 的行為模式。

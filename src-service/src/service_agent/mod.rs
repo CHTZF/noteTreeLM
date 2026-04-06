@@ -8,9 +8,7 @@ pub mod types;
 
 // ── Harness（環境綁定 + 工具定義）────────────────────────────────────────────
 pub(crate) mod harness;
-
-// ── 執行引擎（含 context, intent_classifier） ────────────────────────────────
-pub mod engine;
+pub use harness::HarnessRequestRuntime;
 
 // ── Agent 邏輯 ───────────────────────────────────────────────────────────────
 pub mod agents;
@@ -29,5 +27,4 @@ pub(crate) mod helpers {
     pub(crate) use super::harness::tools::skill_tools::run_skill_pass;
     #[allow(unused_imports)]
     pub(crate) use super::harness::tools::skill_tools::SkillPassResult;
-    pub(crate) use crate::processing::embedder::embed_text_llm;
 }

@@ -4,15 +4,15 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::db::SurrealDb;
-use crate::service_agent::engine::executor::Executor;
-use crate::service_agent::engine::planner::Planner;
-use crate::service_agent::engine::tool_registry::ToolRegistry;
-use crate::service_agent::engine::transaction::Transaction;
-use crate::service_agent::harness::governance::guard::evaluate_guard;
+use crate::service_agent::harness::engine::executor::Executor;
+use crate::service_agent::harness::engine::planner::Planner;
+use crate::service_agent::harness::engine::tool_registry::ToolRegistry;
+use crate::service_agent::harness::engine::transaction::Transaction;
 use crate::service_agent::harness::memory::working::WorkingMemory;
 use crate::service_agent::harness::observability::trace::SessionTrace;
 use crate::service_agent::harness::tool_def::find_tool_def;
-use crate::service_agent::types::{EmitEventFn, NeedConfirmFn, Tool};
+use crate::service_agent::harness::runtime::HarnessRequestRuntime;
+use crate::service_agent::types::{EmitEventFn, HandlerFn, NeedConfirmFn, Tool};
 
 use super::{EvalCase, EvalResult, MockToolCall};
 
@@ -55,7 +55,7 @@ impl EvalRunner {
         let need_confirm_fn: NeedConfirmFn = Arc::new(|_| false);
         let tx = Arc::new(Transaction::new());
 
-        let executor = Executor::new(
+        let executor = Executor::new_eval(
             Arc::new(registry),
             emit_fn,
             need_confirm_fn,
@@ -163,24 +163,12 @@ fn build_eval_registry(
         let queue = Arc::clone(&queue);
         let guard = find_tool_def(&name).and_then(|d| d.guard);
 
-        let execute: crate::service_agent::types::ToolFn = Arc::new(move |args: Value| {
-            let wm    = wm.clone();
+        // Guard is now evaluated by Executor; mock handler just returns the queued result.
+        let execute: HandlerFn = Arc::new(move |_env: Arc<HarnessRequestRuntime>, args: Value| {
             let queue = Arc::clone(&queue);
             let name  = name.clone();
             Box::pin(async move {
-                // Apply real guard logic (identical to build_interactive_registry).
-                if let Some(ref spec) = guard {
-                    let hint = wm.with_records(|store| evaluate_guard(spec, &args, store)).await;
-                    if let Some(h) = hint {
-                        return Ok(json!({
-                            "__guard_blocked__": true,
-                            "__guard_hint__": h.message,
-                            "__guard_required_tool__": h.required_tool,
-                            "__guard_required_path__": h.required_path,
-                        }));
-                    }
-                }
-                // Dequeue the first result for this tool name.
+                let _ = args; // unused in mock
                 let mut q = queue.lock().await;
                 let result = q.iter().position(|(n, _)| n == &name)
                     .map(|i| { let (_, r) = q.remove(i).unwrap(); r })
@@ -189,7 +177,7 @@ fn build_eval_registry(
             })
         });
 
-        registry.register(mock_call.name.clone(), Tool { execute, rollback: None });
+        registry.register(mock_call.name.clone(), Tool { execute, rollback: None, guard });
     }
 
     registry

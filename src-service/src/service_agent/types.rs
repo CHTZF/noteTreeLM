@@ -5,11 +5,17 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::service_agent::harness::runtime::HarnessRequestRuntime;
+use crate::service_agent::harness::governance::guard::ToolGuardSpec;
+
 pub type ToolFuture =
     Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>;
 
-pub type ToolFn =
-    Arc<dyn Fn(Value) -> ToolFuture + Send + Sync>;
+/// Tool handler: receives the shared runtime + args, returns a boxed future.
+/// Using `Arc<dyn Fn>` (not a bare fn pointer) allows both static handlers
+/// and closures (e.g. eval mock tools).
+pub type HandlerFn =
+    Arc<dyn Fn(Arc<HarnessRequestRuntime>, Value) -> ToolFuture + Send + Sync>;
 
 /// 前端 debug 區塊用的 transaction 狀態事件
 #[derive(Debug, Clone, serde::Serialize)]
@@ -29,8 +35,9 @@ pub struct ToolCall {
 }
 
 pub struct Tool {
-    pub execute: ToolFn,
-    pub rollback: Option<ToolFn>,
+    pub execute:  HandlerFn,
+    pub rollback: Option<HandlerFn>,
+    pub guard:    Option<ToolGuardSpec>,
 }
 
 // ── Agent 回呼型別 ─────────────────────────────────────────────────────────

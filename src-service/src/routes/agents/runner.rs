@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::api_state::ApiState;
-use crate::service_agent::engine::transaction::Transaction;
+use crate::service_agent::harness::engine::transaction::Transaction;
 use super::account_id_from_headers;
 
 /// POST /vaults/:vid/agent/run
@@ -57,12 +57,23 @@ pub async fn run(
         }
     }
 
-    crate::service_agent::run_agent(
-        state, agent_def, input,
-        vault_id, account_id, conversation_id.clone(),
-        true,  // streaming
-        activity_context,
+    let runtime = match state.agent_runtime(
+        &vault_id, &account_id,
         Some(session_id.clone()),
+        conversation_id.clone(),
+        agent_def,
+        true, // streaming
+    ).await {
+        Some(r) => r,
+        None => {
+            state.daemon.emit("llm:done", serde_json::json!(""));
+            return Ok(Json(json!({ "session_id": session_id, "conversation_id": conversation_id })));
+        }
+    };
+    crate::service_agent::run_agent(
+        runtime,
+        input,
+        activity_context,
     ).await;
 
     Ok(Json(json!({ "session_id": session_id, "conversation_id": conversation_id })))
@@ -146,13 +157,20 @@ pub async fn live_chat(
 
     // Phase 1: run_agent (streaming:false) — tool execution (think + skill tools).
     // live_respond is intentionally excluded; it's called separately below.
-    let agent_response = crate::service_agent::run_agent(
-        state.clone(), agent_def,
-        input.clone(), vault_id.clone(), account_id.clone(),
-        conversation_id.clone(),
-        false,          // non-streaming: no llm:done / skill_suggestion events
-        activity_context,
+    let runtime = match state.agent_runtime(
+        &vault_id, &account_id,
         Some(session_id.clone()),
+        conversation_id.clone(),
+        agent_def,
+        false, // non-streaming: no llm:done / skill_suggestion events
+    ).await {
+        Some(r) => r,
+        None => return Ok(Json(json!({ "error": "LLM not configured" }))),
+    };
+    let agent_response = crate::service_agent::run_agent(
+        runtime,
+        input.clone(),
+        activity_context,
     ).await;
 
     // Phase 2: one final live_respond call to format speech.

@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use serde_json::{json, Value};
 
-use crate::service_agent::harness::env::VaultEnv;
+use crate::service_agent::harness::runtime::HarnessRequestRuntime;
 use crate::service_agent::types::ToolFuture;
 
 // ── Schemas ───────────────────────────────────────────────────────────────────
@@ -96,7 +96,7 @@ pub(crate) fn schema_propose_eval_case() -> Value {
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-pub(crate) fn handle_list_session_traces(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+pub(crate) fn handle_list_session_traces(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let limit = args["limit"].as_u64().unwrap_or(20).min(50) as usize;
         let mut resp = env.db
@@ -135,7 +135,7 @@ pub(crate) fn handle_list_session_traces(env: Arc<VaultEnv>, args: Value) -> Too
     })
 }
 
-pub(crate) fn handle_read_session_with_conversation(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+pub(crate) fn handle_read_session_with_conversation(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let trace_id = args["trace_id"].as_str().unwrap_or("").trim().to_string();
         if trace_id.is_empty() {
@@ -188,7 +188,7 @@ pub(crate) fn handle_read_session_with_conversation(env: Arc<VaultEnv>, args: Va
     })
 }
 
-pub(crate) fn handle_propose_eval_case(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+pub(crate) fn handle_propose_eval_case(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let name = args["name"].as_str().unwrap_or("").trim().to_string();
         if name.is_empty() {

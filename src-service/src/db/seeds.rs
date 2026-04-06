@@ -322,38 +322,6 @@ const AGENTS: &[BuiltinAgent] = &[
         trigger: "建立筆記卡片、知識卡片、建議卡片、整理成卡片、幫我做成卡片、suggest note card、create note card、concept 卡片、procedure 卡片、reference 卡片",
     },
     BuiltinAgent {
-        id: "builtin_memory_agent",
-        name: "memory_agent",
-        description: "定期掃描未分析的對話，萃取長期記憶事實並整理到記憶庫",
-        kind: "scheduled",
-        tool_names: &["get_unprocessed_conversations", "get_conversation_content", "save_memory_facts", "mark_conversation_processed", "condense_memory_facts"],
-        use_skill_pass: false,
-        enable_think: false,
-        system_prompt: "你是記憶管理助理。\n\
-            ## 模式判斷\n\
-            若使用者訊息中包含「conv_id:」，進入 **單一對話模式**：\n\
-              1. 從訊息中解析 conv_id 與 skip_count（若有 skip_count: 欄位，解析為數字，預設 0）\n\
-              2. 呼叫 get_conversation_content（帶入 conversation_id 與 skip_count），跳過 get_unprocessed_conversations\n\
-              3. 判斷是否有長期記憶價值\n\
-              4. 有價值 → 呼叫 save_memory_facts；記錄回傳的 facts_saved 數字\n\
-              5. 呼叫 mark_conversation_processed\n\
-              6. 僅當 facts_saved > 0 時，呼叫 condense_memory_facts（不傳 category）\n\
-            \n\
-            若使用者訊息中不含「conv_id:」，進入 **全量掃描模式**：\n\
-              1. 呼叫 get_unprocessed_conversations 取得待分析對話列表\n\
-              2. 對每個對話，以 processed_msg_count 作為 skip_count 呼叫 get_conversation_content（只讀尚未處理的新訊息）\n\
-              3. 判斷是否有長期記憶價值（使用者偏好/背景/規則/重要決策）\n\
-                 - 一般查詢、搜尋、閒聊 → 無記憶價值\n\
-                 - 使用者分享個人資訊、設定偏好、做重要決定 → 有記憶價值\n\
-              4. 有價值 → 呼叫 save_memory_facts；累計 facts_saved 總數\n\
-              5. 每個對話無論成功失敗 → 呼叫 mark_conversation_processed\n\
-              6. 所有對話處理完畢後，僅當累計 facts_saved > 0 時，呼叫 condense_memory_facts（不傳 category）\n\
-            \n\
-            完成後輸出摘要（處理幾個對話、儲存幾條記憶）。",
-        max_rounds: 20,
-        trigger: "memory_agent",
-    },
-    BuiltinAgent {
         id: "builtin_note_summarizer",
         name: "筆記整理助理",
         description: "閱讀多篇筆記並產出摘要、彙整或結構化整理",

@@ -86,10 +86,10 @@ pub struct AgentSession {
     pub conv_id: Arc<String>,
     /// Shared with `AgentEnv::cancel` — set true to abort the agent loop.
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
-    pub transaction: Option<Arc<crate::service_agent::engine::transaction::Transaction>>,
+    pub transaction: Option<Arc<crate::service_agent::harness::engine::transaction::Transaction>>,
     /// Channel for the `ask_user` tool / Step-0b resume flow.
     /// Shared via `Arc` so Step-0b only needs `sessions.get()`, not `get_mut()`.
-    pub answer_channel: Arc<crate::service_agent::engine::transaction::AnswerChannel>,
+    pub answer_channel: Arc<crate::service_agent::harness::engine::transaction::AnswerChannel>,
 }
 
 #[derive(Clone)]

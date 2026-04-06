@@ -3,52 +3,45 @@ use std::sync::atomic::AtomicBool;
 
 use serde_json::json;
 
-use crate::api_state::ApiState;
+use crate::service_agent::HarnessRequestRuntime;
 
-/// Execute a sub-agent that shares the parent conversation context.
+/// Execute a sub-agent that shares the parent's infrastructure context.
 ///
-/// - Uses non-streaming LLM calls (streaming: false) so tokens don't mix with parent's llm:token stream.
+/// - Forks a new `HarnessRequestRuntime` with a fresh session/cancel/working-memory
+///   but the same db, llm_url, vault_id, account_id, and caches as the parent.
+/// - Uses non-streaming LLM calls so tokens don't mix with parent's llm:token stream.
 /// - Emits sub_agent:start / sub_agent:done / sub_agent:error.
-/// - conversation_id is derived from parent so the sub-agent's messages are grouped together.
 pub(crate) async fn run_sub_agent(
-    state: &ApiState,
-    vault_id: &str,
-    account_id: &str,
+    runtime: &HarnessRequestRuntime,
     parent_session_id: &str,
     agent_name: &str,
     agent_def: serde_json::Value,
     input: &str,
     _parent_cancel: Arc<AtomicBool>,
 ) -> String {
-    state.daemon.emit("sub_agent:start", json!({
+    runtime.emit("sub_agent:start", json!({
         "parent_session_id": parent_session_id,
         "agent_name": agent_name,
         "input": input,
     }));
 
-    // Derive a stable conversation_id so the sub-agent's history is persisted separately
-    let conversation_id = format!("sub_{}_{}_{}", parent_session_id, agent_name, vault_id);
+    let conversation_id = format!("sub_{}_{}_{}", parent_session_id, agent_name, runtime.vault_id);
+    let sub_runtime = runtime.fork_for_sub_agent(conversation_id, agent_def);
 
     let result = super::interactive::run_agent(
-        state.clone(),
-        agent_def,
+        sub_runtime,
         input.to_string(),
-        vault_id.to_string(),
-        account_id.to_string(),
-        conversation_id,
-        false, // silent — parent is already streaming
-        None,
         None,
     ).await;
 
     if result.is_empty() {
-        state.daemon.emit("sub_agent:error", json!({
+        runtime.emit("sub_agent:error", json!({
             "parent_session_id": parent_session_id,
             "agent_name": agent_name,
             "reason": "no response from LLM",
         }));
     } else {
-        state.daemon.emit("sub_agent:done", json!({
+        runtime.emit("sub_agent:done", json!({
             "parent_session_id": parent_session_id,
             "agent_name": agent_name,
         }));

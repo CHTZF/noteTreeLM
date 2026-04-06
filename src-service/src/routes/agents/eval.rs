@@ -71,24 +71,28 @@ pub async fn run_trace_analysis(
         .map(String::from)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    let state_clone = state.clone();
+    let runtime = match state.agent_runtime(
+        &vault_id, &account_id,
+        Some(session_id.clone()),
+        conversation_id,
+        agent_def,
+        false, // silent background run — no SSE streaming
+    ).await {
+        Some(r) => r,
+        None => return Ok(Json(json!({ "error": "LLM not configured" }))),
+    };
+
     tokio::spawn(async move {
+        let db = runtime.db.clone();
         crate::service_agent::agents::interactive::run_agent(
-            state_clone.clone(),
-            agent_def,
+            runtime,
             input,
-            vault_id,
-            account_id.clone(),
-            conversation_id,
-            false, // silent background run — no SSE streaming
-            None,
             None,
         ).await;
 
         // Auto-run enabled eval cases after trace_analyst finishes, so last_run_result
         // stays fresh without requiring a manual "Run All" click.
-        // Skip entirely when there are no enabled cases to avoid a no-op round.
-        let enabled_count: i64 = state_clone.db
+        let enabled_count: i64 = db
             .query("SELECT count() AS count FROM proposed_eval_cases \
                     WHERE account_id = $aid AND status = 'enabled' GROUP ALL")
             .bind(("aid", account_id.clone()))
@@ -102,14 +106,14 @@ pub async fn run_trace_analysis(
 
         if enabled_count > 0 {
             let results = crate::service_agent::harness::eval::runner::load_enabled_cases(
-                &state_clone.db,
+                &db,
                 &account_id,
             ).await;
 
             let now = chrono::Utc::now().timestamp();
             for (name, result) in &results {
                 let result_str = if result.passed() { "passed" } else { "failed" };
-                let _ = state_clone.db
+                let _ = db
                     .query(
                         "UPDATE proposed_eval_cases SET last_run_result = $res, last_run_at = $now \
                          WHERE account_id = $aid AND name = $name AND status = 'enabled'"

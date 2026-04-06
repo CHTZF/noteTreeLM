@@ -37,6 +37,10 @@ pub(crate) struct ObservabilityEmitter {
 }
 
 impl ObservabilityEmitter {
+    /// Returns the underlying raw emit function (without session_id stamp).
+    /// Used by `fork_for_sub_agent` to build a new emitter with a fresh session_id.
+    pub(crate) fn raw_emit_fn(&self) -> &EmitEventFn { &self.inner }
+
     pub(crate) fn new(inner: EmitEventFn) -> Self {
         Self {
             inner,

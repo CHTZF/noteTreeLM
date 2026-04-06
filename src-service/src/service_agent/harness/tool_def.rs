@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use super::env::VaultEnv;
+use super::runtime::HarnessRequestRuntime;
 use super::governance::guard::{GuardLevel, ToolGuardSpec, norm_path};
 use crate::service_agent::types::ToolFuture;
 use super::tools::{memory_tools, vault_tools, trace_tools};
@@ -11,7 +11,7 @@ use super::tools::{memory_tools, vault_tools, trace_tools};
 
 /// Synchronous handler function pointer: takes the shared env + args, returns a boxed future.
 /// Using fn pointer (not Box<dyn Fn>) keeps ToolDef Copy and zero-allocation.
-pub(crate) type HandlerFn = fn(Arc<VaultEnv>, Value) -> ToolFuture;
+pub(crate) type HandlerFn = fn(Arc<HarnessRequestRuntime>, Value) -> ToolFuture;
 
 /// A single tool's complete definition: schema + guard + write-flag + handler + rollback,
 /// all co-located. Adding a new tool means adding ONE entry here — no other files need touching.
@@ -571,24 +571,24 @@ fn schema_condense_memory_facts() -> Value { json!({ "type": "function", "functi
 
 // ── Handler functions (one per tool, self-contained) ─────────────────────────
 //
-// Each handler receives Arc<VaultEnv> + args and calls the appropriate vault
+// Each handler receives Arc<HarnessRequestRuntime> + args and calls the appropriate vault
 // function directly. No intermediary dispatcher — adding a new tool means
 // adding ONE ToolDef entry here and nothing else.
 
 // ── No-op tools ──────────────────────────────────────────────────────────────
 
-fn handle_think(_env: Arc<VaultEnv>, _args: Value) -> ToolFuture {
+fn handle_think(_env: Arc<HarnessRequestRuntime>, _args: Value) -> ToolFuture {
     Box::pin(async { Ok(json!("✅")) })
 }
 
-fn handle_live_respond(_env: Arc<VaultEnv>, _args: Value) -> ToolFuture {
+fn handle_live_respond(_env: Arc<HarnessRequestRuntime>, _args: Value) -> ToolFuture {
     // Args (speech/action/content) are consumed by the SSE layer in runner.rs.
     Box::pin(async { Ok(json!("✅")) })
 }
 
 // ── Read tools ────────────────────────────────────────────────────────────────
 
-fn handle_list_structure(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_list_structure(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path = args["path"].as_str().unwrap_or("");
         Ok(Value::String(
@@ -597,7 +597,7 @@ fn handle_list_structure(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_read_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_read_note(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let raw = args["path"].as_str().unwrap_or("");
         let path = norm_path(raw);
@@ -605,7 +605,7 @@ fn handle_read_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_search_in_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_search_in_note(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let raw   = args["path"].as_str().unwrap_or("");
         let query = args["query"].as_str().unwrap_or("");
@@ -614,7 +614,7 @@ fn handle_search_in_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_get_vault_changes(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_get_vault_changes(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let since_ts = args["since_ts"].as_i64()
             .unwrap_or_else(|| chrono::Utc::now().timestamp() - 86_400);
@@ -645,7 +645,7 @@ fn handle_get_vault_changes(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_search_vault(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_search_vault(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let query = args["query"].as_str().unwrap_or("");
         vault_tools::vault_search(
@@ -654,24 +654,24 @@ fn handle_search_vault(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_web_search(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_web_search(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let query = args["query"].as_str().unwrap_or("").to_string();
         if query.is_empty() {
             return Ok(json!("查詢不能為空"));
         }
         let session_id = env.session_id.clone();
-        let state_ref = env.state.clone();
+        let emit_fn = env.emitter.as_emit_fn();
         vault_tools::vault_web_search(
             &env.client, &env.db,
-            |event, payload| state_ref.daemon.emit(event, payload),
+            move |event: &str, payload| (emit_fn)(event.to_string(), payload),
             &session_id,
             &query,
         ).await
     })
 }
 
-fn handle_query_memory(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_query_memory(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let keywords: Vec<String> = args["keywords"].as_array()
             .map(|a| a.iter().filter_map(|v| v.as_str()).map(String::from).collect())
@@ -686,7 +686,7 @@ fn handle_query_memory(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 
 // ── Write tools ───────────────────────────────────────────────────────────────
 
-fn handle_read_then_write(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_read_then_write(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path    = norm_path(args["path"].as_str().unwrap_or(""));
         let content = args["content"].as_str().unwrap_or("").to_string();
@@ -707,7 +707,7 @@ fn handle_read_then_write(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_create_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_create_note(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path    = norm_path(args["path"].as_str().unwrap_or(""));
         let content = args["content"].as_str().unwrap_or("");
@@ -717,7 +717,7 @@ fn handle_create_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_update_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_update_note(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path    = norm_path(args["path"].as_str().unwrap_or(""));
         let content = args["content"].as_str().unwrap_or("").to_string();
@@ -740,7 +740,7 @@ fn handle_update_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_append_to_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_append_to_note(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path    = norm_path(args["path"].as_str().unwrap_or(""));
         let content = args["content"].as_str().unwrap_or("").to_string();
@@ -754,7 +754,7 @@ fn handle_append_to_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_create_folder(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_create_folder(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path = args["path"].as_str().unwrap_or("");
         vault_tools::vault_create_folder(
@@ -763,7 +763,7 @@ fn handle_create_folder(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_delete_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_delete_note(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path = norm_path(args["path"].as_str().unwrap_or(""));
         // Snapshot original content before deleting so rollback can restore it.
@@ -776,7 +776,7 @@ fn handle_delete_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_delete_folder(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_delete_folder(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path = args["path"].as_str().unwrap_or("");
         vault_tools::vault_delete_folder(
@@ -785,7 +785,7 @@ fn handle_delete_folder(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_move_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_move_note(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let from = norm_path(args["from"].as_str().unwrap_or(""));
         let to   = norm_path(args["to"].as_str().unwrap_or(""));
@@ -795,7 +795,7 @@ fn handle_move_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_update_note_frontmatter(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_update_note_frontmatter(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path   = norm_path(args["path"].as_str().unwrap_or(""));
         let fields = args["fields"].clone();
@@ -809,7 +809,7 @@ fn handle_update_note_frontmatter(env: Arc<VaultEnv>, args: Value) -> ToolFuture
     })
 }
 
-fn handle_create_agent_skill(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_create_agent_skill(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let title          = args["title"].as_str().unwrap_or("").to_string();
         let trigger        = args["trigger"].as_str().unwrap_or("").to_string();
@@ -841,47 +841,47 @@ fn handle_create_agent_skill(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_get_current_datetime(_env: Arc<VaultEnv>, _args: Value) -> ToolFuture {
+fn handle_get_current_datetime(_env: Arc<HarnessRequestRuntime>, _args: Value) -> ToolFuture {
     Box::pin(async {
         let now = chrono::Local::now();
         Ok(Value::String(now.format("%Y-%m-%d %H:%M:%S %z").to_string()))
     })
 }
 
-fn handle_list_recent_notes(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_list_recent_notes(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let limit = args["limit"].as_u64().unwrap_or(10);
         vault_tools::vault_list_recent_notes(&env.db, &env.vault_id, limit).await
     })
 }
 
-fn handle_search_by_tag(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_search_by_tag(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let tag = args["tag"].as_str().unwrap_or("");
         vault_tools::vault_search_by_tag(&env.db, &env.vault_id, tag).await
     })
 }
 
-fn handle_get_vault_stats(env: Arc<VaultEnv>, _args: Value) -> ToolFuture {
+fn handle_get_vault_stats(env: Arc<HarnessRequestRuntime>, _args: Value) -> ToolFuture {
     Box::pin(async move {
         vault_tools::vault_get_stats(&env.db, &env.vault_id, &env.vault_path).await
     })
 }
 
-fn handle_get_note_backlinks(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_get_note_backlinks(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path = norm_path(args["path"].as_str().unwrap_or(""));
         vault_tools::vault_get_note_backlinks(&env.db, &env.vault_id, &path).await
     })
 }
 
-fn handle_find_orphan_notes(env: Arc<VaultEnv>, _args: Value) -> ToolFuture {
+fn handle_find_orphan_notes(env: Arc<HarnessRequestRuntime>, _args: Value) -> ToolFuture {
     Box::pin(async move {
         vault_tools::vault_find_orphan_notes(&env.db, &env.vault_id).await
     })
 }
 
-fn handle_link_notes(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_link_notes(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let source = norm_path(args["source"].as_str().unwrap_or(""));
         let target = norm_path(args["target"].as_str().unwrap_or(""));
@@ -895,7 +895,7 @@ fn handle_link_notes(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_compress_to_knowledge(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_compress_to_knowledge(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let title   = args["title"].as_str().unwrap_or("").to_string();
         let content = args["content"].as_str().unwrap_or("").to_string();
@@ -908,7 +908,7 @@ fn handle_compress_to_knowledge(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_generate_moc(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_generate_moc(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let folder = args["path"].as_str().unwrap_or("").to_string();
         let title  = args["title"].as_str().map(String::from);
@@ -923,7 +923,7 @@ fn handle_generate_moc(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_schedule_task(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_schedule_task(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let title       = args["title"].as_str().unwrap_or("").to_string();
         let description = args["description"].as_str().unwrap_or("").to_string();
@@ -937,7 +937,7 @@ fn handle_schedule_task(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 
 // ── Skill search ─────────────────────────────────────────────────────────────
 
-fn handle_search_skills(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_search_skills(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let query = args["query"].as_str().unwrap_or("").to_string();
 
@@ -1000,7 +1000,7 @@ fn handle_search_skills(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 // ── Agent / UI tools ──────────────────────────────────────────────────────────
 
 /// get_session_state: snapshot WorkingMemory for agent self-inspection.
-fn handle_get_session_state(env: Arc<VaultEnv>, _args: Value) -> ToolFuture {
+fn handle_get_session_state(env: Arc<HarnessRequestRuntime>, _args: Value) -> ToolFuture {
     Box::pin(async move {
         let calls = env.working_memory.snapshot_summary().await;
         let repeats = env.working_memory.repeated_calls().await;
@@ -1016,7 +1016,7 @@ fn handle_get_session_state(env: Arc<VaultEnv>, _args: Value) -> ToolFuture {
     })
 }
 
-fn handle_checkpoint(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_checkpoint(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let summary   = args["summary"].as_str().unwrap_or("").to_string();
         let remaining = args["remaining"].as_str().unwrap_or("").to_string();
@@ -1044,7 +1044,7 @@ fn handle_checkpoint(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_clear_checkpoint(env: Arc<VaultEnv>, _args: Value) -> ToolFuture {
+fn handle_clear_checkpoint(env: Arc<HarnessRequestRuntime>, _args: Value) -> ToolFuture {
     Box::pin(async move {
         let _ = env.db
             .query("DELETE task_checkpoints WHERE conv_id = $cid")
@@ -1054,12 +1054,12 @@ fn handle_clear_checkpoint(env: Arc<VaultEnv>, _args: Value) -> ToolFuture {
     })
 }
 
-fn handle_progress(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_progress(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let current = args["current"].as_u64().unwrap_or(0);
         let total   = args["total"].as_u64().unwrap_or(0);
         let message = args["message"].as_str().unwrap_or("").to_string();
-        env.state.daemon.emit("agent:progress", json!({
+        env.emit("agent:progress", json!({
             "session_id": env.session_id,
             "current":    current,
             "total":      total,
@@ -1069,7 +1069,7 @@ fn handle_progress(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_batch_apply(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_batch_apply(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         use super::governance::guard::evaluate_guard;
 
@@ -1131,7 +1131,7 @@ fn handle_batch_apply(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_save_agent_knowledge(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_save_agent_knowledge(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let key     = args["key"].as_str().unwrap_or("").to_string();
         let content = args["content"].as_str().unwrap_or("").to_string();
@@ -1159,7 +1159,7 @@ fn handle_save_agent_knowledge(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_get_agent_knowledge(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_get_agent_knowledge(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let key_filter = args["key"].as_str().map(String::from);
 
@@ -1198,7 +1198,7 @@ fn handle_get_agent_knowledge(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 /// message and exits loading state (allowing the user to type).  The tool then
 /// blocks on a oneshot channel; `run_agent` detects `waiting_for_answer` on the
 /// next user message and forwards it to this channel to resume execution.
-fn handle_ask_user(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_ask_user(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         use std::sync::atomic::Ordering;
 
@@ -1212,7 +1212,7 @@ fn handle_ask_user(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 
         // Emit the question as a regular assistant message so the frontend
         // exits loading state and lets the user type their reply.
-        env.state.daemon.emit("llm:done", serde_json::json!(question));
+        env.emit("llm:done", serde_json::json!(question));
 
         // Wait for the answer or cancellation.
         let cancel = Arc::clone(&env.cancel);
@@ -1233,19 +1233,16 @@ fn handle_ask_user(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 }
 
 /// plan_announce: emit SSE only — no filesystem/DB side effects.
-fn handle_plan_announce(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_plan_announce(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let plan = args["plan"].as_str().unwrap_or("").to_string();
-        env.state.daemon.emit("agent:plan_announce", json!({
-            "session_id": env.session_id,
-            "plan": plan,
-        }));
+        env.emit("agent:plan_announce", json!({ "plan": plan }));
         Ok(json!("✅ 已記錄計畫，請立即執行"))
     })
 }
 
 /// open_note: emit agent:open_note SSE and return opened paths.
-fn handle_open_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_open_note(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let paths: Vec<Value> = args["paths"].as_array()
             .cloned()
@@ -1254,13 +1251,13 @@ fn handle_open_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
                     .map(|p| vec![json!(p)])
                     .unwrap_or_default()
             });
-        env.state.daemon.emit("agent:open_note", json!(paths));
+        env.emit("agent:open_note", json!(paths));
         Ok(json!({ "opened": paths }))
     })
 }
 
 /// call_agent: load agent def from DB, spawn a sub-agent, return its response.
-fn handle_call_agent(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_call_agent(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let agent_name = args["name"].as_str().unwrap_or("").to_string();
         let input      = args["input"].as_str().unwrap_or("").to_string();
@@ -1274,8 +1271,7 @@ fn handle_call_agent(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
             None => return Err(format!("call_agent: agent '{}' not found", agent_name)),
         };
         let result = crate::service_agent::agents::sub_agent::run_sub_agent(
-            &env.state,
-            &env.vault_id, &env.account_id,
+            &env,
             &env.session_id, &agent_name,
             def, &input,
             Arc::clone(&env.cancel),
@@ -1286,7 +1282,7 @@ fn handle_call_agent(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 
 // ── Memory agent tools ────────────────────────────────────────────────────────
 
-fn handle_get_unprocessed_conversations(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_get_unprocessed_conversations(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let limit = args["limit"].as_i64().unwrap_or(20);
         memory_tools::get_unprocessed_conversations(
@@ -1295,7 +1291,7 @@ fn handle_get_unprocessed_conversations(env: Arc<VaultEnv>, args: Value) -> Tool
     })
 }
 
-fn handle_get_conversation_content(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_get_conversation_content(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let conv_id    = args["conversation_id"].as_str().unwrap_or("").to_string();
         let skip       = args["skip_count"].as_i64().unwrap_or(0);
@@ -1306,7 +1302,7 @@ fn handle_get_conversation_content(env: Arc<VaultEnv>, args: Value) -> ToolFutur
     })
 }
 
-fn handle_save_memory_facts(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_save_memory_facts(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let conv_id = args["conversation_id"].as_str().unwrap_or("").to_string();
         let facts   = args["facts"].as_array().cloned().unwrap_or_default();
@@ -1317,7 +1313,7 @@ fn handle_save_memory_facts(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     })
 }
 
-fn handle_mark_conversation_processed(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_mark_conversation_processed(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let conv_id = args["conversation_id"].as_str().unwrap_or("").to_string();
         memory_tools::mark_conversation_processed(
@@ -1326,7 +1322,7 @@ fn handle_mark_conversation_processed(env: Arc<VaultEnv>, args: Value) -> ToolFu
     })
 }
 
-fn handle_condense_memory_facts(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn handle_condense_memory_facts(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let category = args["category"].as_str().map(String::from);
         memory_tools::condense_memory_facts(
@@ -1345,7 +1341,7 @@ fn handle_condense_memory_facts(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 // For create_note / create_folder: args alone are sufficient (just delete/rmdir).
 
 /// Rollback create_note: delete the newly created file.
-fn rollback_create_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn rollback_create_note(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path = norm_path(args["path"].as_str().unwrap_or(""));
         if path == ".md" { return Ok(json!(null)); }
@@ -1356,7 +1352,7 @@ fn rollback_create_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 }
 
 /// Rollback create_folder: remove the directory.
-fn rollback_create_folder(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn rollback_create_folder(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path = args["path"].as_str().unwrap_or("");
         if path.is_empty() { return Ok(json!(null)); }
@@ -1369,7 +1365,7 @@ fn rollback_create_folder(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 /// Rollback update_note / append_to_note: restore original content.
 /// The forward handler snapshotted the pre-write content in env.write_snapshots.
 /// If no snapshot exists (e.g. file was new) the rollback is a no-op.
-fn rollback_overwrite_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn rollback_overwrite_note(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path     = norm_path(args["path"].as_str().unwrap_or(""));
         let original = match env.write_snapshots.lock().await.get(&path).cloned() {
@@ -1385,7 +1381,7 @@ fn rollback_overwrite_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 
 /// Rollback delete_note: restore the deleted file.
 /// The forward handler snapshotted the pre-delete content in env.write_snapshots.
-fn rollback_restore_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn rollback_restore_note(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path     = norm_path(args["path"].as_str().unwrap_or(""));
         let original = match env.write_snapshots.lock().await.get(&path).cloned() {
@@ -1404,7 +1400,7 @@ fn rollback_restore_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 
 /// Rollback move_note: move back (to → from).
 /// args contains "from" (original source) and "to" (original dest, now current location).
-fn rollback_move_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn rollback_move_note(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let from = norm_path(args["from"].as_str().unwrap_or(""));
         let to   = norm_path(args["to"].as_str().unwrap_or(""));
@@ -1418,7 +1414,7 @@ fn rollback_move_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 }
 
 /// Rollback link_notes: restore source note's original content from snapshot.
-fn rollback_link_notes(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn rollback_link_notes(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let source = norm_path(args["source"].as_str().unwrap_or(""));
         let original = match env.write_snapshots.lock().await.get(&source).cloned() {
@@ -1433,7 +1429,7 @@ fn rollback_link_notes(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 }
 
 /// Rollback compress_to_knowledge: delete the created knowledge note.
-fn rollback_compress_to_knowledge(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn rollback_compress_to_knowledge(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let title = args["title"].as_str().unwrap_or("");
         if title.is_empty() { return Ok(json!(null)); }
@@ -1445,7 +1441,7 @@ fn rollback_compress_to_knowledge(env: Arc<VaultEnv>, args: Value) -> ToolFuture
 }
 
 /// Rollback generate_moc: restore previous _moc.md if it existed, or delete if newly created.
-fn rollback_generate_moc(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn rollback_generate_moc(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let folder = args["path"].as_str().unwrap_or("").to_string();
         if folder.is_empty() { return Ok(json!(null)); }
@@ -1464,7 +1460,7 @@ fn rollback_generate_moc(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 }
 
 /// Rollback schedule_task: delete the created task note.
-fn rollback_schedule_task(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+fn rollback_schedule_task(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let title = args["title"].as_str().unwrap_or("");
         if title.is_empty() { return Ok(json!(null)); }

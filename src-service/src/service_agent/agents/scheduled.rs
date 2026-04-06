@@ -39,11 +39,7 @@ pub async fn execute_scheduled_task(
         account_id
     };
 
-    if state.daemon.llm_url.read().await.is_none() {
-        tracing::warn!("[scheduler] llm_url not available, skipping task {}", task_id);
-        return;
-    }
-
+    // Load agent_def before constructing the runtime (state.db is available directly).
     let agent_def = match super::super::helpers::load_agent_def(&state.db, &agent_name, &account_id).await {
         Some(a) => a,
         None => {
@@ -54,28 +50,34 @@ pub async fn execute_scheduled_task(
 
     let initial_msg = agent_prompt.unwrap_or_else(|| description.clone());
     // Per-run conversation_id: scheduled tasks don't benefit from cross-run history.
-    // Cross-run continuity lives in the notes the agent writes, not dialogue history.
-    // A fixed id would accumulate unbounded EpisodicMemory rows across daily runs.
     let conversation_id = format!("scheduled_{}_{}_{}", task_id, agent_name, chrono::Utc::now().timestamp());
+
+    let runtime = match state.agent_runtime(
+        &vault_id, &account_id,
+        None, // session_id — generated internally
+        conversation_id,
+        agent_def,
+        false, // background — no llm:token SSE
+    ).await {
+        Some(r) => r,
+        None => {
+            tracing::warn!("[scheduler] llm_url not available, skipping task {}", task_id);
+            return;
+        }
+    };
 
     tracing::info!(
         "[scheduler] running agent '{}' for task {} vault_id='{}'",
-        agent_name, task_id, vault_id
+        agent_name, task_id, runtime.vault_id
     );
 
     let result = super::interactive::run_agent(
-        state.clone(),
-        agent_def,
+        runtime.clone(),
         initial_msg,
-        vault_id.clone(),
-        account_id,
-        conversation_id,
-        false, // background — no llm:token SSE
-        None,
         None,
     ).await;
 
-    state.daemon.emit("schedule:completed", json!({
+    runtime.emit("schedule:completed", json!({
         "task_id": task_id,
         "agent": agent_name,
         "vault_id": vault_id,
