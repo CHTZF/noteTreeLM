@@ -1,3 +1,6 @@
+mod scheduler;
+mod cloudflared;
+
 use std::path::PathBuf;
 use tokio::signal;
 use crate::api_state::ApiState;
@@ -28,7 +31,7 @@ pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         let sched_api_state = ApiState::new(auth_store.clone(), db.clone(), daemon_state.clone());
         let sched_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
-            crate::scheduler::run(sched_api_state, sched_rx).await;
+            scheduler::run(sched_api_state, sched_rx).await;
         })
     };
 
@@ -64,7 +67,7 @@ pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     {
         let tunnel_url_ref = daemon_state.tunnel_url.clone();
         tokio::spawn(async move {
-            crate::cloudflared::spawn(tunnel_url_ref).await;
+            cloudflared::spawn(tunnel_url_ref).await;
         });
     }
 

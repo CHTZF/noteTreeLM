@@ -1,14 +1,12 @@
 mod api_state;
 mod auth;
 pub(crate) mod crypto;
-mod cloudflared;
 mod daemon;
 mod db;
 pub mod service_agent;
 mod network;
 mod processing;
 mod routes;
-mod scheduler;
 mod server;
 mod state;
 
