@@ -191,9 +191,7 @@ impl Executor {
 
                 let started_at = chrono::Utc::now().timestamp();
                 let t0 = Instant::now();
-                // Pass a dummy Arc for eval mode (mock tools ignore env).
-                let env_for_call = self.env.clone()
-                    .unwrap_or_else(|| Arc::new(HarnessRequestRuntime::eval_stub()));
+                let env_for_call = self.eval_env();
                 let result = (tool.execute)(env_for_call, actual_args.clone()).await;
                 let duration_ms = t0.elapsed().as_millis() as u64;
 
@@ -255,9 +253,17 @@ impl Executor {
         Ok(results)
     }
 
+    /// Returns the live env in interactive mode, or a working-memory-sharing stub in eval mode.
+    fn eval_env(&self) -> Arc<HarnessRequestRuntime> {
+        self.env.clone().unwrap_or_else(|| {
+            let mut stub = HarnessRequestRuntime::eval_stub();
+            stub.working_memory = self.working_memory.clone();
+            Arc::new(stub)
+        })
+    }
+
     async fn rollback(&self, executed: Vec<ToolCall>) {
-        let env = self.env.clone()
-            .unwrap_or_else(|| Arc::new(HarnessRequestRuntime::eval_stub()));
+        let env = self.eval_env();
         for call in executed.into_iter().rev() {
             if let Some(tool) = self.registry.get(&call.name) {
                 if let Some(rb) = &tool.rollback {
@@ -272,39 +278,25 @@ impl Executor {
 /// Kahn's algorithm topological sort for ToolGraph.
 /// Returns node ids in execution order (deps before dependents).
 fn topo_sort(graph: &ToolGraph) -> Vec<String> {
-    let mut in_degree: std::collections::HashMap<&str, usize> = graph.nodes
-        .keys()
-        .map(|id| (id.as_str(), 0))
-        .collect();
-    for node in graph.nodes.values() {
-        for dep in &node.deps {
-            *in_degree.entry(dep.as_str()).or_insert(0) += 0; // ensure dep key exists
-            if let Some(cnt) = in_degree.get_mut(dep.as_str()) {
-                let _ = cnt; // dep already counted; we need in-degree of node, not dep
-            }
-        }
-    }
-    // Re-compute: in_degree[id] = number of OTHER nodes that list id as dep (i.e. id's out-degree)
-    // Actually we want: in_degree[id] = number of deps id has (= node.deps.len())
     let mut in_deg: std::collections::HashMap<String, usize> = graph.nodes
         .iter()
         .map(|(id, node)| (id.clone(), node.deps.len()))
         .collect();
-    let mut queue: std::collections::VecDeque<String> = in_deg.iter()
+    let mut q_vec: Vec<String> = in_deg.iter()
         .filter(|(_, &d)| d == 0)
         .map(|(id, _)| id.clone())
         .collect();
-    // Stable order within same in-degree level: sort queue by id for determinism
-    let mut q_vec: Vec<String> = queue.drain(..).collect();
+    // Stable order within same in-degree level: sort for determinism
     q_vec.sort();
-    queue.extend(q_vec);
+    let mut queue: std::collections::VecDeque<String> = q_vec.into();
 
-    let mut order = Vec::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut in_order: HashSet<String> = HashSet::new();
     while let Some(id) = queue.pop_front() {
         order.push(id.clone());
-        // find nodes whose dep list contains this id
+        in_order.insert(id.clone());
         let mut newly_ready: Vec<String> = graph.nodes.iter()
-            .filter(|(nid, node)| !order.contains(nid) && node.deps.contains(&id))
+            .filter(|(nid, node)| !in_order.contains(*nid) && node.deps.contains(&id))
             .filter_map(|(nid, _)| {
                 let d = in_deg.get_mut(nid)?;
                 *d -= 1;
@@ -316,7 +308,7 @@ fn topo_sort(graph: &ToolGraph) -> Vec<String> {
     }
     // Fallback: if graph had cycles (shouldn't happen), append remaining
     for id in graph.nodes.keys() {
-        if !order.contains(id) { order.push(id.clone()); }
+        if !in_order.contains(id) { order.push(id.clone()); }
     }
     order
 }

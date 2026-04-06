@@ -44,7 +44,7 @@ pub async fn run_agent(
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
     tool_names.retain(|t| t != "think");
-    tool_names = inject_required_tools(tool_names, &runtime.kind);
+    tool_names = inject_required_tools(tool_names, runtime.needs_frontend());
 
     // ── Step 3: Session registration ─────────────────────────────────────────
     let tx = Arc::new(Transaction::new());
@@ -97,10 +97,8 @@ const VAULT_TOOL_MARKERS: &[&str] = &[
     "read_then_write", "update_note_frontmatter",
 ];
 
-fn inject_required_tools(mut tool_names: Vec<String>, kind: &str) -> Vec<String> {
+fn inject_required_tools(mut tool_names: Vec<String>, needs_frontend: bool) -> Vec<String> {
     if tool_names.is_empty() { return tool_names; }
-
-    let needs_frontend = !matches!(kind, "background" | "sub" | "scheduled");
 
     for name in [
         "get_session_state",
@@ -127,6 +125,34 @@ fn inject_required_tools(mut tool_names: Vec<String>, kind: &str) -> Vec<String>
     }
 
     tool_names
+}
+
+/// Single LLM invocation — handles both streaming and non-streaming, with or without tools.
+/// Returns `(full_text, tool_chunks)` where each chunk is `(id, name, args_json_string)`.
+async fn run_one_llm_round(
+    runtime:     &HarnessRequestRuntime,
+    msgs:        &[Value],
+    tools:       Option<Value>,
+    tool_choice: Value,
+    emitter:     &super::super::harness::observability::emitter::ObservabilityEmitter,
+) -> Result<(String, Vec<(String, String, String)>), String> {
+    use super::super::harness::tools::vault_tools;
+    let has_tools = tools.is_some();
+    if runtime.streaming {
+        let body = match tools {
+            Some(tv) => json!({ "messages": msgs, "tools": tv, "tool_choice": tool_choice,
+                               "stream": true, "temperature": 0.7, "max_tokens": 2048 }),
+            None     => json!({ "messages": msgs, "stream": true, "temperature": 0.7, "max_tokens": 2048 }),
+        };
+        let wm = if has_tools { Some(&runtime.working_memory) } else { None };
+        vault_tools::stream_llm_round(
+            &runtime.client, &runtime.llm_url, body, emitter, &runtime.cancel, wm,
+        ).await.map(|(t, _, chunks)| (t, chunks))
+    } else {
+        vault_tools::call_llm_once(
+            &runtime.client, &runtime.llm_url, msgs, tools, &runtime.cancel,
+        ).await
+    }
 }
 
 async fn run_tool_loop(
@@ -164,26 +190,11 @@ async fn run_tool_loop(
             };
 
             let llm_t0 = std::time::Instant::now();
-            let (text, tool_chunks) = if runtime.streaming {
-                let body = match &round_tools {
-                    Some(tv) => json!({ "messages": msgs, "tools": tv, "tool_choice": round_choice,
-                                       "stream": true, "temperature": 0.7, "max_tokens": 2048 }),
-                    None     => json!({ "messages": msgs, "stream": true, "temperature": 0.7, "max_tokens": 2048 }),
-                };
-                match super::super::harness::tools::vault_tools::stream_llm_round(
-                    &runtime.client, &runtime.llm_url, body, &emitter.as_emit_fn(),
-                    &runtime.cancel, Some(&runtime.working_memory),
-                ).await {
-                    Ok((t, _, chunks)) => (t, chunks),
-                    Err(e) => { tracing::warn!("[agent/tools] stream error: {}", e); break; }
-                }
-            } else {
-                match super::super::harness::tools::vault_tools::call_llm_once(
-                    &runtime.client, &runtime.llm_url, msgs, round_tools, &runtime.cancel,
-                ).await {
-                    Ok(r) => r,
-                    Err(e) => { tracing::warn!("[agent/tools] llm error: {}", e); break; }
-                }
+            let (text, tool_chunks) = match run_one_llm_round(
+                runtime, msgs, round_tools, round_choice, emitter,
+            ).await {
+                Ok(r) => r,
+                Err(e) => { tracing::warn!("[agent/tools] llm error: {}", e); break; }
             };
             emitter.record_llm_latency(llm_t0.elapsed().as_millis() as u64);
 
@@ -224,12 +235,12 @@ async fn run_tool_loop(
                 if msgs_chars >= CONTEXT_CRITICAL_CHARS {
                     msgs.push(json!({
                         "role": "system",
-                        "content": "[系統提示] ⚠️ context 已接近上限（約 40,000 字元）。請立即根據已取得的資訊作出最終回覆，不要再呼叫 read_note 或其他大型工具。"
+                        "content": format!("[系統提示] ⚠️ context 已接近上限（約 {} 字元）。請立即根據已取得的資訊作出最終回覆，不要再呼叫 read_note 或其他大型工具。", CONTEXT_CRITICAL_CHARS),
                     }));
                 } else if msgs_chars >= CONTEXT_WARN_CHARS {
                     msgs.push(json!({
                         "role": "system",
-                        "content": "[系統提示] context 已使用約 70%（28,000+ 字元）。建議改用 search_in_note 取代 read_note 以精準定位段落，避免繼續擴大 context。"
+                        "content": format!("[系統提示] context 已使用約 70%（{}+ 字元）。建議改用 search_in_note 取代 read_note 以精準定位段落，避免繼續擴大 context。", CONTEXT_WARN_CHARS),
                     }));
                 }
 
@@ -241,22 +252,9 @@ async fn run_tool_loop(
     } else {
         emitter.increment_round();
         let llm_t0 = std::time::Instant::now();
-        if runtime.streaming {
-            match super::super::harness::tools::vault_tools::stream_llm_round(
-                &runtime.client, &runtime.llm_url,
-                json!({ "messages": msgs, "stream": true, "temperature": 0.7, "max_tokens": 2048 }),
-                &emitter.as_emit_fn(), &runtime.cancel, None,
-            ).await {
-                Ok((text, _, _)) => { full_response = text; }
-                Err(e) => { tracing::warn!("[agent/pure] stream error: {}", e); }
-            }
-        } else {
-            match super::super::harness::tools::vault_tools::call_llm_once(
-                &runtime.client, &runtime.llm_url, msgs, None, &runtime.cancel,
-            ).await {
-                Ok((text, _)) => { full_response = text; }
-                Err(e) => { tracing::warn!("[agent/pure] llm error: {}", e); }
-            }
+        match run_one_llm_round(runtime, msgs, None, json!("auto"), emitter).await {
+            Ok((text, _)) => { full_response = text; }
+            Err(e) => { tracing::warn!("[agent/pure] llm error: {}", e); }
         }
         emitter.record_llm_latency(llm_t0.elapsed().as_millis() as u64);
     }

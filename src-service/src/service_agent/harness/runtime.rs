@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use crate::db::SurrealDb;
 use crate::state::AgentSession;
-use crate::service_agent::types::{EmitEventFn, EmbedFn, NeedConfirmFn};
+use crate::service_agent::types::{EmitEventFn, EmbedFn};
 use crate::service_agent::harness::engine::transaction::{TransactionState, AnswerChannel};
 use crate::service_agent::harness::engine::intent_classifier::{Intent, IntentClassifier};
 use super::memory::working::WorkingMemory;
@@ -71,8 +71,8 @@ pub struct HarnessRequestRuntime {
     // ── Eagerly-built execution helpers ──────────────────────────────────────
     /// Session-stamped SSE emitter (built at construction time).
     pub(crate) emitter:    ObservabilityEmitter,
-    /// Tool dispatcher wired to ALL_TOOL_DEFS (built at construction time).
-    pub(crate) dispatcher: Dispatcher,
+    /// Tool dispatcher wired to ALL_TOOL_DEFS. `None` in eval stubs.
+    pub(crate) dispatcher: Option<Dispatcher>,
 }
 
 /// Output of the skill pre-pass + context pipeline step.
@@ -89,12 +89,9 @@ impl HarnessRequestRuntime {
     /// Create a minimal stub runtime for eval test runs.
     /// All fields are empty/no-op — mock tool handlers ignore the env entirely.
     pub(crate) fn eval_stub() -> Self {
-        use std::sync::atomic::AtomicBool;
-        use crate::service_agent::harness::engine::transaction::AnswerChannel;
         let noop_emit: EmitEventFn = Arc::new(|_, _| {});
         let session_id             = Arc::new(String::new());
-        let emitter    = Self::build_emitter(&noop_emit, &session_id);
-        let dispatcher = Self::build_dispatcher(emitter.as_emit_fn(), "");
+        let emitter = Self::build_emitter(&noop_emit, &session_id);
         HarnessRequestRuntime {
             db:               surrealdb::Surreal::init(),
             llm_url:          String::new(),
@@ -117,7 +114,7 @@ impl HarnessRequestRuntime {
             write_snapshots:  Arc::new(Mutex::new(Default::default())),
             write_mtimes:     Arc::new(Mutex::new(Default::default())),
             emitter,
-            dispatcher,
+            dispatcher: None,
         }
     }
 
@@ -127,12 +124,15 @@ impl HarnessRequestRuntime {
         tx:    Arc<super::engine::transaction::Transaction>,
         graph: super::engine::graph::ToolGraph,
     ) -> Result<Vec<Value>, String> {
-        self.dispatcher.run(Arc::new(self.clone()), tx, graph).await
+        self.dispatcher
+            .as_ref()
+            .ok_or_else(|| "dispatch called on eval stub".to_string())?
+            .run(Arc::new(self.clone()), tx, graph).await
     }
 
     /// Emit an SSE event via the session-stamped emitter.
     pub(crate) fn emit(&self, event: &str, payload: Value) {
-        self.emitter.as_emit_fn()(event.to_string(), payload);
+        self.emitter.emit(event.to_string(), payload);
     }
 
     /// True for headless agent kinds that have no live frontend listener.
@@ -151,7 +151,7 @@ impl HarnessRequestRuntime {
         let session_id = Arc::new(uuid::Uuid::new_v4().to_string());
         let kind       = "sub".to_string();
         let emitter    = Self::build_emitter(self.emitter.raw_emit_fn(), &session_id);
-        let dispatcher = Self::build_dispatcher(emitter.as_emit_fn(), &kind);
+        let dispatcher = Some(Self::build_dispatcher(emitter.as_emit_fn(), &kind));
         HarnessRequestRuntime {
             db:               self.db.clone(),
             llm_url:          self.llm_url.clone(),
@@ -170,7 +170,10 @@ impl HarnessRequestRuntime {
             client:         reqwest::Client::builder()
                                 .timeout(Duration::from_secs(300))
                                 .build()
-                                .unwrap_or_default(),
+                                .unwrap_or_else(|e| {
+                                    tracing::warn!("[fork_for_sub_agent] reqwest client build failed: {}", e);
+                                    reqwest::Client::new()
+                                }),
             kind,
             streaming: false,
             agent_def,
