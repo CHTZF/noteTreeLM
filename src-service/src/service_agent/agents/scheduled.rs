@@ -72,6 +72,7 @@ pub async fn execute_scheduled_task(
         conversation_id,
         false, // background — no llm:token SSE
         None,
+        None,
     ).await;
 
     state.daemon.emit("schedule:completed", json!({

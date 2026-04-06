@@ -38,6 +38,7 @@ pub(crate) async fn run_sub_agent(
         conversation_id,
         false, // silent — parent is already streaming
         None,
+        None,
     ).await;
 
     if result.is_empty() {

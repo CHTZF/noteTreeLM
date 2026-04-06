@@ -58,12 +58,9 @@ pub(crate) fn validate_rel_path(rel_path: &str) -> Result<(), String> {
 pub(crate) type StoreMap = std::collections::HashMap<String, crate::state::ToolCallRecord>;
 
 /// Returns true if a read_note result value indicates a failure (file not found, empty vault, etc.).
-/// vault_tools::vault_read_note always returns Ok(String), so errors are encoded as specific prefixes.
+/// `vault_read_note` now always returns a `Value::Object`; errors carry a non-null `"error_code"`.
 pub(crate) fn is_read_note_error(result: &Value) -> bool {
-    match result.as_str() {
-        Some(s) => s.starts_with("讀取失敗：") || s == "Vault 未設定" || s == "路徑為空" || s.is_empty(),
-        None => true,
-    }
+    result.get("error_code").map(|v| !v.is_null()).unwrap_or(true)
 }
 
 /// Check whether `target` (already normalized) appears in any prior tool's evidence.
@@ -283,19 +280,19 @@ mod tests {
         let store = make_store(vec![rec(
             "read_note",
             json!({"path": "notes/foo.md"}),
-            json!("# Foo\nsome content"),
+            json!({"error_code": null, "content": "# Foo\nsome content", "path": "notes/foo.md"}),
         )]);
         let result = evaluate_guard(&GUARD_PATH, &json!({"path": "notes/foo.md"}), &store);
         assert!(result.is_none(), "should pass but got: {:?}", result);
     }
 
-    /// read_note returning an error string → does NOT count as PathSeen.
+    /// read_note returning an error object → does NOT count as PathSeen.
     #[test]
     fn read_note_error_does_not_count_as_path_seen() {
         let store = make_store(vec![rec(
             "read_note",
             json!({"path": "notes/foo.md"}),
-            json!("讀取失敗：file not found"),
+            json!({"error_code": "NOT_FOUND", "message": "找不到筆記", "path": "notes/foo.md"}),
         )]);
         let result = evaluate_guard(&GUARD_PATH, &json!({"path": "notes/foo.md"}), &store);
         assert!(result.is_some(), "error read_note should not satisfy path guard");
@@ -322,7 +319,7 @@ mod tests {
         let store = make_store(vec![rec(
             "read_note",
             json!({"path": "notes/foo.md"}),
-            json!("# Foo\ncontent here"),
+            json!({"error_code": null, "content": "# Foo\ncontent here", "path": "notes/foo.md"}),
         )]);
         let result = evaluate_guard(&GUARD_CONTENT, &json!({"path": "notes/foo.md"}), &store);
         assert!(result.is_none(), "should pass but got: {:?}", result);
@@ -358,7 +355,7 @@ mod tests {
         let store = make_store(vec![rec(
             "read_note",
             json!({"path": "Notes/Foo.MD"}),  // uppercase
-            json!("content"),
+            json!({"error_code": null, "content": "content", "path": "notes/foo.md"}),
         )]);
         // Query with lowercase + no extension → after norm_path both become "notes/foo.md"
         let result = evaluate_guard(&GUARD_PATH, &json!({"path": "notes/foo"}), &store);

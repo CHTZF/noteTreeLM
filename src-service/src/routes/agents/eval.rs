@@ -82,6 +82,7 @@ pub async fn run_trace_analysis(
             conversation_id,
             false, // silent background run — no SSE streaming
             None,
+            None,
         ).await;
 
         // Auto-run enabled eval cases after trace_analyst finishes, so last_run_result

@@ -7,6 +7,21 @@ use crate::db::SurrealDb;
 use chrono::Datelike;
 use crate::service_agent::harness::governance::guard::validate_rel_path;
 
+// ── Structured error helper ───────────────────────────────────────────────────
+
+/// Build a machine-readable tool error value.
+/// `code`    — short all-caps identifier, e.g. "NOT_FOUND", "VAULT_NOT_SET".
+/// `message` — human-readable explanation forwarded to the LLM.
+/// `path`    — optional vault-relative path involved in the error.
+#[inline]
+fn tool_err(code: &str, message: impl Into<String>, path: Option<&str>) -> Value {
+    let mut v = json!({ "error_code": code, "message": message.into() });
+    if let Some(p) = path {
+        v["path"] = json!(p);
+    }
+    v
+}
+
 // ── Read-only vault tools ─────────────────────────────────────────────────────
 
 pub(crate) fn vault_list_structure(rel_path: &str, vault_path: &str) -> String {
@@ -40,13 +55,76 @@ pub(crate) fn vault_list_structure(rel_path: &str, vault_path: &str) -> String {
     list_dir(&target, base, 0)
 }
 
-pub(crate) fn vault_read_note(rel_path: &str, vault_path: &str) -> String {
-    if vault_path.is_empty() { return "Vault 未設定".to_string(); }
-    if rel_path.is_empty() { return "路徑為空".to_string(); }
+pub(crate) fn vault_read_note(rel_path: &str, vault_path: &str) -> Value {
+    if vault_path.is_empty() {
+        return tool_err("VAULT_NOT_SET", "Vault 未設定，請先設定 Vault 路徑", None);
+    }
+    if rel_path.is_empty() {
+        return tool_err("PATH_EMPTY", "路徑不能為空", None);
+    }
     let full = std::path::Path::new(vault_path).join(rel_path);
+    if !full.exists() {
+        return tool_err("NOT_FOUND", format!("找不到筆記：{}", rel_path), Some(rel_path));
+    }
     match std::fs::read_to_string(&full) {
-        Ok(c) => c,
-        Err(_) => format!("讀取失敗：{}", rel_path),
+        Ok(c)  => json!({ "error_code": null, "content": c, "path": rel_path }),
+        Err(e) => tool_err("READ_FAILED", format!("讀取失敗：{}", e), Some(rel_path)),
+    }
+}
+
+/// Search within a single note, returning matching paragraphs with their starting line numbers.
+/// A "paragraph" is a block of consecutive non-empty lines separated by blank lines or markdown headers.
+pub(crate) fn vault_search_in_note(rel_path: &str, query: &str, vault_path: &str) -> serde_json::Value {
+    if vault_path.is_empty() { return json!("Vault 未設定"); }
+    if rel_path.is_empty()   { return json!("路徑為空"); }
+    if query.is_empty()      { return json!("查詢不能為空"); }
+
+    let full = std::path::Path::new(vault_path).join(rel_path);
+    let content = match std::fs::read_to_string(&full) {
+        Ok(c)  => c,
+        Err(_) => return json!(format!("讀取失敗：{}", rel_path)),
+    };
+
+    let q_lower = query.to_lowercase();
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    let mut line_num: usize = 1;
+    let mut para_start: usize = 1;
+    let mut para_lines: Vec<&str> = Vec::new();
+
+    let flush = |para_start: usize, lines: &Vec<&str>, results: &mut Vec<serde_json::Value>, q: &str| {
+        if lines.is_empty() { return; }
+        let text = lines.join("\n");
+        if text.to_lowercase().contains(q) {
+            results.push(json!({ "line": para_start, "text": text }));
+        }
+    };
+
+    for line in content.lines() {
+        // Start a new paragraph on blank lines or markdown headers (# / ##).
+        let is_break = line.trim().is_empty() || line.starts_with('#');
+        if is_break {
+            flush(para_start, &para_lines, &mut results, &q_lower);
+            para_lines.clear();
+            // A header line itself is the first line of the next paragraph.
+            if line.starts_with('#') {
+                para_start = line_num;
+                para_lines.push(line);
+            } else {
+                para_start = line_num + 1;
+            }
+        } else {
+            if para_lines.is_empty() { para_start = line_num; }
+            para_lines.push(line);
+        }
+        line_num += 1;
+    }
+    flush(para_start, &para_lines, &mut results, &q_lower);
+
+    let total = results.len();
+    if total == 0 {
+        json!({ "matches": [], "message": format!("在 {} 中找不到「{}」", rel_path, query) })
+    } else {
+        json!({ "matches": results, "total": total })
     }
 }
 
@@ -387,7 +465,7 @@ pub(crate) async fn vault_create_note(
     db: &SurrealDb,
     vault_id: &str,
 ) -> Result<Value, String> {
-    if vault_path.is_empty() { return Err("Vault 未設定".to_string()); }
+    if vault_path.is_empty() { return Ok(tool_err("VAULT_NOT_SET", "Vault 未設定", None)); }
     validate_rel_path(rel_path)?;
     let full = std::path::Path::new(vault_path).join(rel_path);
     if let Some(parent) = full.parent() {
@@ -399,6 +477,7 @@ pub(crate) async fn vault_create_note(
     Ok(json!({ "ok": true, "path": rel_path }))
 }
 
+#[allow(dead_code)]
 pub(crate) async fn vault_update_note(
     rel_path: &str,
     content: &str,
@@ -411,9 +490,155 @@ pub(crate) async fn vault_update_note(
     validate_rel_path(rel_path)?;
     let full = std::path::Path::new(vault_path).join(rel_path);
     if !full.exists() { return Err(format!("筆記不存在：{}", rel_path)); }
-    tokio::fs::write(&full, content).await.map_err(|e| e.to_string())?;
+    let original = tokio::fs::read_to_string(&full).await.unwrap_or_default();
+    vault_update_note_inner(rel_path, content, &original, &full, client, db, vault_id).await
+}
+
+/// Variant that checks for write conflicts before committing.
+/// `mtime_at_read` — the file's mtime (secs) when the caller last read it.
+/// If the file's current mtime is newer, returns a conflict result without writing.
+pub(crate) async fn vault_update_note_with_conflict_check(
+    rel_path: &str,
+    content: &str,
+    original: &str,
+    mtime_at_read: u64,
+    vault_path: &str,
+    client: &reqwest::Client,
+    db: &SurrealDb,
+    vault_id: &str,
+) -> Result<Value, String> {
+    if vault_path.is_empty() { return Ok(tool_err("VAULT_NOT_SET", "Vault 未設定", None)); }
+    validate_rel_path(rel_path).map_err(|e| e)?;
+    let full = std::path::Path::new(vault_path).join(rel_path);
+    if !full.exists() { return Ok(tool_err("NOT_FOUND", format!("筆記不存在：{}", rel_path), Some(rel_path))); }
+
+    // Conflict check: if file mtime has advanced since we read, someone else modified it.
+    if mtime_at_read > 0 {
+        let current_mtime = tokio::fs::metadata(&full).await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if current_mtime > mtime_at_read {
+            return Ok(json!({
+                "error_code": "WRITE_CONFLICT",
+                "conflict":   true,
+                "path":       rel_path,
+                "message":    format!(
+                    "檔案 {} 在你讀取後已被修改（讀取時 mtime={}, 現在={}）。\
+                     請用 read_note 重新讀取最新內容，或用 ask_user 詢問使用者要如何合併。",
+                    rel_path, mtime_at_read, current_mtime
+                ),
+            }));
+        }
+    }
+    vault_update_note_inner(rel_path, content, original, &full, client, db, vault_id).await
+}
+
+/// Variant that accepts a pre-read original to avoid double-reading.
+/// Kept for callers that do not need conflict detection (e.g. batch rollback paths).
+#[allow(dead_code)]
+pub(crate) async fn vault_update_note_with_original(
+    rel_path: &str,
+    content: &str,
+    original: &str,
+    vault_path: &str,
+    client: &reqwest::Client,
+    db: &SurrealDb,
+    vault_id: &str,
+) -> Result<Value, String> {
+    if vault_path.is_empty() { return Ok(tool_err("VAULT_NOT_SET", "Vault 未設定", None)); }
+    validate_rel_path(rel_path).map_err(|e| e)?;
+    let full = std::path::Path::new(vault_path).join(rel_path);
+    if !full.exists() { return Ok(tool_err("NOT_FOUND", format!("筆記不存在：{}", rel_path), Some(rel_path))); }
+    vault_update_note_inner(rel_path, content, original, &full, client, db, vault_id).await
+}
+
+async fn vault_update_note_inner(
+    rel_path: &str,
+    content: &str,
+    original: &str,
+    full: &std::path::Path,
+    client: &reqwest::Client,
+    db: &SurrealDb,
+    vault_id: &str,
+) -> Result<Value, String> {
+    tokio::fs::write(full, content).await.map_err(|e| e.to_string())?;
     sync_note_to_db(client, db, vault_id, rel_path, content).await;
-    Ok(json!({ "ok": true, "path": rel_path }))
+    let lines_before = original.lines().count();
+    let lines_after  = content.lines().count();
+    Ok(json!({
+        "ok":            true,
+        "path":          rel_path,
+        "lines_before":  lines_before,
+        "lines_after":   lines_after,
+        "lines_added":   lines_after.saturating_sub(lines_before),
+        "lines_removed": lines_before.saturating_sub(lines_after),
+    }))
+}
+
+/// Read a note and immediately write new content in one round-trip.
+/// Injects a synthetic `read_note` record into `working_memory` so that any
+/// subsequent `update_note` guard on the same path is automatically satisfied.
+pub(crate) async fn vault_read_then_write(
+    rel_path: &str,
+    new_content: &str,
+    mtime_hint: u64,        // mtime recorded just before this call (0 = skip conflict check)
+    vault_path: &str,
+    client: &reqwest::Client,
+    db: &SurrealDb,
+    vault_id: &str,
+    working_memory: &super::super::memory::working::WorkingMemory,
+) -> Result<Value, String> {
+    if vault_path.is_empty() { return Ok(tool_err("VAULT_NOT_SET", "Vault 未設定", None)); }
+    validate_rel_path(rel_path)?;
+    let full = std::path::Path::new(vault_path).join(rel_path);
+    if !full.exists() { return Ok(tool_err("NOT_FOUND", format!("筆記不存在：{}", rel_path), Some(rel_path))); }
+    let original = tokio::fs::read_to_string(&full).await.map_err(|e| e.to_string())?;
+
+    // Conflict check against the mtime recorded just before calling this function.
+    if mtime_hint > 0 {
+        let current_mtime = tokio::fs::metadata(&full).await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if current_mtime > mtime_hint {
+            return Ok(json!({
+                "error_code": "WRITE_CONFLICT",
+                "conflict":   true,
+                "path":       rel_path,
+                "message":    format!(
+                    "檔案 {} 在操作過程中已被修改。請重新讀取後再寫入。",
+                    rel_path
+                ),
+            }));
+        }
+    }
+
+    // Inject synthetic read_note record so future update_note guards are satisfied.
+    let synthetic_id = format!("rtw_read_{}", rel_path);
+    working_memory.record(
+        synthetic_id,
+        "read_note",
+        json!({ "path": rel_path }),
+        json!({ "error_code": null, "content": original, "path": rel_path }),
+        chrono::Utc::now().timestamp(),
+        0,
+        crate::state::GuardOutcome::Exempt,
+    ).await;
+
+    let original_chars = original.len();
+    let mut result = vault_update_note_inner(
+        rel_path, new_content, &original, &full, client, db, vault_id,
+    ).await?;
+    // Augment result with original_chars for the agent to know how much was replaced.
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("original_chars".to_string(), json!(original_chars));
+    }
+    Ok(result)
 }
 
 pub(crate) async fn vault_create_folder(
@@ -441,10 +666,10 @@ pub(crate) async fn vault_delete_note(
     db: &SurrealDb,
     vault_id: &str,
 ) -> Result<Value, String> {
-    if vault_path.is_empty() { return Err("Vault 未設定".to_string()); }
+    if vault_path.is_empty() { return Ok(tool_err("VAULT_NOT_SET", "Vault 未設定", None)); }
     validate_rel_path(rel_path)?;
     let full = std::path::Path::new(vault_path).join(rel_path);
-    if !full.exists() { return Err(format!("筆記不存在：{}", rel_path)); }
+    if !full.exists() { return Ok(tool_err("NOT_FOUND", format!("筆記不存在：{}", rel_path), Some(rel_path))); }
     tokio::fs::remove_file(&full).await.map_err(|e| format!("刪除失敗：{}", e))?;
     let _ = db
         .query("DELETE FROM notes WHERE vault_id = $vid AND path = $path")
@@ -1055,8 +1280,7 @@ pub(crate) async fn stream_llm_round(
     client: &reqwest::Client,
     llm_url: &str,
     body: Value,
-    state: &ApiState,
-    _session_id: &str,
+    emit_fn: &crate::service_agent::types::EmitEventFn,
     cancel: &Arc<AtomicBool>,
     working_memory: Option<&crate::service_agent::harness::memory::working::WorkingMemory>,
 ) -> Result<(String, String, Vec<(String, String, String)>), String> {
@@ -1130,7 +1354,7 @@ pub(crate) async fn stream_llm_round(
                                                             "[citation] invalid cite ids: [cite:{}]",
                                                             cite_inner
                                                         );
-                                                        state.daemon.emit("agent:citation_missing", json!({}));
+                                                        (emit_fn)("agent:citation_missing".to_string(), json!({}));
                                                     }
                                                     // Strip [cite:...] from what we forward
                                                     let rest = cite_buf[cite_end + 1..].to_string();
@@ -1148,7 +1372,7 @@ pub(crate) async fn stream_llm_round(
                                                 // Timeout: no [cite:...] found — treat as [cite:none]
                                                 if !cite_retry_done && working_memory.is_some() {
                                                     // Emit warning event; forward buffered content
-                                                    state.daemon.emit("agent:citation_missing", json!({}));
+                                                    (emit_fn)("agent:citation_missing".to_string(), json!({}));
                                                     cite_retry_done = true;
                                                 }
                                                 let flushed = cite_buf.clone();
@@ -1165,7 +1389,7 @@ pub(crate) async fn stream_llm_round(
                                         if pending_emit.contains("<tool_call>") {
                                             let pos = pending_emit.find("<tool_call>").unwrap_or(0);
                                             if pos > 0 {
-                                                state.daemon.emit("llm:token", json!(&pending_emit[..pos]));
+                                                (emit_fn)("llm:token".to_string(), json!(&pending_emit[..pos]));
                                             }
                                             pending_emit.clear();
                                             suppress_emit = true;
@@ -1174,7 +1398,7 @@ pub(crate) async fn stream_llm_round(
                                             if safe_end > 0 {
                                                 let chunk = pending_emit[..safe_end].to_string();
                                                 pending_emit = pending_emit[safe_end..].to_string();
-                                                state.daemon.emit("llm:token", json!(chunk));
+                                                (emit_fn)("llm:token".to_string(), json!(chunk));
                                             }
                                         }
                                     }
@@ -1206,7 +1430,7 @@ pub(crate) async fn stream_llm_round(
     }
     // Flush remaining pending (if stream ended without <tool_call>)
     if !suppress_emit && !pending_emit.is_empty() {
-        state.daemon.emit("llm:token", json!(pending_emit));
+        (emit_fn)("llm:token".to_string(), json!(pending_emit));
     }
 
     // Parse text-format tool calls from full_text (e.g. Qwen/Mistral <tool_call> style)

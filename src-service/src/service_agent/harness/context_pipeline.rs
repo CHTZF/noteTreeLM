@@ -59,6 +59,7 @@ impl Default for ContextBudget {
 pub(crate) struct ContextInput<'a> {
     pub db:               &'a SurrealDb,
     pub conv_id:          &'a str,
+    pub vault_id:         &'a str,
     pub user_input:       &'a str,
     /// Base system prompt from agent_def.
     pub system_prompt:    &'a str,
@@ -130,9 +131,33 @@ impl ContextPipeline {
         // ── Stage 3: Trim history if over budget ───────────────────────────
         let (history, was_trimmed) = self.trim_history(history, client, llm_url).await;
 
-        // Assemble: system first, then history (history already ends with user turn).
-        let mut messages = Vec::with_capacity(1 + history.len());
+        // ── Stage 1.5: Recent execution history for this conversation ──────────
+        // Injected as a separate system message after the main system prompt so it
+        // can be omitted under context pressure without touching the base prompt.
+        let exec_history = super::observability::trace_store::load_exec_history_for_conv(
+            input.db, input.conv_id, 3,
+        ).await;
+
+        // ── Stage 1.6: Task checkpoint (if any) ────────────────────────────────
+        // Injected after exec history so the agent sees "what happened" then "what to do next".
+        let checkpoint = load_checkpoint(input.db, input.conv_id).await;
+
+        // ── Stage 1.7: Agent knowledge for this vault ────────────────────────────
+        // Operational rules and patterns the agent has learned about this vault.
+        let agent_knowledge = load_agent_knowledge(input.db, input.vault_id).await;
+
+        // Assemble: system → exec history → checkpoint → agent knowledge → conversation history.
+        let mut messages = Vec::with_capacity(4 + history.len());
         messages.push(json!({"role": "system", "content": system_content}));
+        if let Some(hist_content) = exec_history {
+            messages.push(json!({"role": "system", "content": hist_content}));
+        }
+        if let Some(cp_content) = checkpoint {
+            messages.push(json!({"role": "system", "content": cp_content}));
+        }
+        if let Some(ak_content) = agent_knowledge {
+            messages.push(json!({"role": "system", "content": ak_content}));
+        }
         messages.extend(history);
 
         BuiltContext {
@@ -253,6 +278,63 @@ impl ContextPipeline {
         };
         (trimmed, true)
     }
+}
+
+// ── Checkpoint loader ─────────────────────────────────────────────────────────
+
+/// Load the task checkpoint for `conv_id` and format it as a system message string.
+/// Returns `None` when no checkpoint exists.
+async fn load_checkpoint(db: &SurrealDb, conv_id: &str) -> Option<String> {
+    if conv_id.is_empty() { return None; }
+
+    #[derive(serde::Deserialize)]
+    struct Row { summary: String, remaining: String }
+
+    let mut resp = db
+        .query("SELECT summary, remaining FROM task_checkpoints WHERE conv_id = $cid LIMIT 1")
+        .bind(("cid", conv_id.to_string()))
+        .await
+        .ok()?;
+
+    let rows: Vec<Row> = resp.take(0).ok()?;
+    let row = rows.into_iter().next()?;
+    if row.summary.is_empty() && row.remaining.is_empty() { return None; }
+
+    Some(format!(
+        "## 任務 Checkpoint（上次未完成）\n\
+         ### 已完成\n{}\n\n\
+         ### 尚待處理\n{}\n\n\
+         請根據以上進度繼續執行，完成後呼叫 clear_checkpoint。",
+        row.summary, row.remaining
+    ))
+}
+
+// ── Agent knowledge loader ────────────────────────────────────────────────────
+
+/// Load all agent knowledge entries for a vault and format them as a system message.
+/// Returns `None` when no knowledge has been saved yet.
+async fn load_agent_knowledge(db: &SurrealDb, vault_id: &str) -> Option<String> {
+    if vault_id.is_empty() { return None; }
+
+    #[derive(serde::Deserialize)]
+    struct Row { key: String, content: String }
+
+    let mut resp = db
+        .query("SELECT key, content FROM agent_knowledge \
+                WHERE vault_id = $vid ORDER BY updated_at ASC")
+        .bind(("vid", vault_id.to_string()))
+        .await
+        .ok()?;
+
+    let rows: Vec<Row> = resp.take(0).ok()?;
+    if rows.is_empty() { return None; }
+
+    let entries = rows.iter()
+        .map(|r| format!("**{}**: {}", r.key, r.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Some(format!("## 關於此 Vault 的操作知識\n{}", entries))
 }
 
 // ── LLM summariser (extracted from trim_context) ─────────────────────────────

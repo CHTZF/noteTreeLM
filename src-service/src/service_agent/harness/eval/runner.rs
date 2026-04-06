@@ -12,7 +12,7 @@ use crate::service_agent::harness::governance::guard::evaluate_guard;
 use crate::service_agent::harness::memory::working::WorkingMemory;
 use crate::service_agent::harness::observability::trace::SessionTrace;
 use crate::service_agent::harness::tool_def::find_tool_def;
-use crate::service_agent::types::{EmitEventFn, IsWriteFn, Tool};
+use crate::service_agent::types::{EmitEventFn, NeedConfirmFn, Tool};
 
 use super::{EvalCase, EvalResult, MockToolCall};
 
@@ -52,13 +52,13 @@ impl EvalRunner {
         // Treat all tools as read-only: skip write-confirmation flow entirely.
         // The guard is the protection mechanism being tested; the confirmation
         // UX is an orthogonal concern that requires a live frontend to resolve.
-        let is_write_fn: IsWriteFn = Arc::new(|_| false);
+        let need_confirm_fn: NeedConfirmFn = Arc::new(|_| false);
         let tx = Arc::new(Transaction::new());
 
         let executor = Executor::new(
             Arc::new(registry),
             emit_fn,
-            is_write_fn,
+            need_confirm_fn,
             working_memory.clone(),
         );
 

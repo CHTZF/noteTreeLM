@@ -104,3 +104,36 @@ impl Transaction {
         self.tools.lock().await.clone()
     }
 }
+
+/// One-shot channel for the `ask_user` tool / Step-0b resume flow.
+///
+/// Shared as `Arc<AnswerChannel>` between `AgentSession` (for Step-0b lookup)
+/// and the running tool handler (which calls `wait()`).
+/// Using interior mutability means callers only need `&self` — no `&mut AgentSession`.
+pub struct AnswerChannel {
+    tx: Mutex<Option<oneshot::Sender<String>>>,
+}
+
+impl AnswerChannel {
+    pub fn new() -> Self {
+        Self { tx: Mutex::new(None) }
+    }
+
+    /// Called by `ask_user` tool: registers a sender and returns the receiver to await on.
+    pub async fn wait(&self) -> oneshot::Receiver<String> {
+        let (tx, rx) = oneshot::channel();
+        *self.tx.lock().await = Some(tx);
+        rx
+    }
+
+    /// Called by Step-0b: if a sender is waiting, forward `answer` and return `true`.
+    /// Returns `false` if no sender is registered (normal new-turn case).
+    pub async fn try_resume(&self, answer: String) -> bool {
+        if let Some(tx) = self.tx.lock().await.take() {
+            let _ = tx.send(answer);
+            true
+        } else {
+            false
+        }
+    }
+}

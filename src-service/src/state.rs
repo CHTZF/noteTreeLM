@@ -57,7 +57,7 @@ pub enum GuardOutcome {
 }
 
 /// A single tool execution record within a session.
-/// Stored in AgentSession.tool_calls keyed by tool_call_id.
+/// Stored in AgentSession.working_memory keyed by tool_call_id.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolCallRecord {
     /// Tool name (e.g. "search_vault", "read_note")
@@ -75,17 +75,21 @@ pub struct ToolCallRecord {
 }
 
 /// Per-session state for interactive agent runs.
-/// `cancel` — set true to abort the agent loop.
-/// `transaction` — Arc<Transaction> managed by Executor; commit/cancel resolved by POST /agent/confirm.
-/// `tool_calls` — accumulates all tool executions for the session lifetime:
-///   - write tools read this to verify paths were previously seen by a read tool
-///   - citation interceptor reads this to validate [cite:id] references
+///
+/// Only the fields that are accessed by external callers (cancel/confirm endpoints,
+/// ask_user tool) live here. `session_id` and `conv_id` are `Arc<String>` so that
+/// `AgentEnv` holds the same allocation — they are guaranteed to be identical.
 pub struct AgentSession {
-    pub session_id: String,
+    /// Shared with `AgentEnv::session_id` — always the same value.
+    pub session_id: Arc<String>,
+    /// Shared with `AgentEnv::conv_id` — always the same value.
+    pub conv_id: Arc<String>,
+    /// Shared with `AgentEnv::cancel` — set true to abort the agent loop.
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
     pub transaction: Option<Arc<crate::service_agent::engine::transaction::Transaction>>,
-    pub conversation_id: String,
-    pub tool_calls: Arc<Mutex<HashMap<String, ToolCallRecord>>>,
+    /// Channel for the `ask_user` tool / Step-0b resume flow.
+    /// Shared via `Arc` so Step-0b only needs `sessions.get()`, not `get_mut()`.
+    pub answer_channel: Arc<crate::service_agent::engine::transaction::AnswerChannel>,
 }
 
 #[derive(Clone)]

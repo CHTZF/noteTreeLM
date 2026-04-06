@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use super::super::tool_def::ALL_TOOL_DEFS;
+use crate::service_agent::types::NeedConfirmFn;
 
 /// Write tools that are exempt from the path-existence guard requirement.
 ///
@@ -16,12 +18,32 @@ pub(crate) const GUARD_EXEMPT_WRITE_TOOLS: &[&str] = &[
     "condense_memory_facts",
 ];
 
-/// Returns true if `name` is a write tool (i.e., modifies vault/DB state and requires
-/// user confirmation). Delegates to the ToolDef registry — single source of truth.
-pub(crate) fn is_interactive_write_tool(name: &str) -> bool {
-    super::super::tool_def::find_tool_def(name)
-        .map(|d| d.is_write)
-        .unwrap_or(false)
+/// Non-write tools that still require user confirmation before execution
+/// (e.g. tools that call external services or have irreversible side effects).
+const EXTRA_CONFIRM_TOOLS: &[&str] = &[
+    "call_external_ai",
+];
+
+/// Build a confirmation predicate based on agent `kind`.
+///
+/// - `"background"` / `"sub"` / `"scheduled"` → never confirm (no frontend listener).
+/// - `"chat"` or any unknown kind → default list: all `is_write` tools + `EXTRA_CONFIRM_TOOLS`.
+///
+/// New kinds can be handled here independently as requirements evolve.
+pub(crate) fn build_need_confirm_fn(kind: &str) -> NeedConfirmFn {
+    match kind {
+        "background" | "sub" | "scheduled" => std::sync::Arc::new(|_| false),
+        _ => {
+            let mut set: HashSet<&'static str> = ALL_TOOL_DEFS.iter()
+                .filter(|d| d.is_write)
+                .map(|d| d.name)
+                .collect();
+            for &name in EXTRA_CONFIRM_TOOLS {
+                set.insert(name);
+            }
+            std::sync::Arc::new(move |name: &str| set.contains(name))
+        }
+    }
 }
 
 /// Check that every destructive write tool has a guard spec or appears in

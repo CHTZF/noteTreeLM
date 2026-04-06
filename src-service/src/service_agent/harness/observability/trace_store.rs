@@ -1,3 +1,4 @@
+use serde_json::Value;
 use crate::db::SurrealDb;
 use super::trace::SessionTrace;
 
@@ -77,4 +78,76 @@ pub(crate) async fn save_session_trace(
             .bind(("n",   overflow))
             .await;
     }
+}
+
+/// Load recent session traces for a conversation and format them as a brief
+/// execution summary string for injection into the agent's context window.
+///
+/// Returns `None` when there are no prior traces for this conversation.
+pub(crate) async fn load_exec_history_for_conv(
+    db: &SurrealDb,
+    conv_id: &str,
+    limit: usize,
+) -> Option<String> {
+    if conv_id.is_empty() { return None; }
+
+    #[derive(serde::Deserialize)]
+    struct TraceRow {
+        started_at:  i64,
+        round_count: u32,
+        tool_calls:  Option<Vec<Value>>,
+    }
+
+    let mut resp = db
+        .query(
+            "SELECT started_at, round_count, tool_calls FROM session_traces \
+             WHERE conv_id = $cid ORDER BY started_at DESC LIMIT $n"
+        )
+        .bind(("cid", conv_id.to_string()))
+        .bind(("n",   limit))
+        .await
+        .ok()?;
+
+    let rows: Vec<TraceRow> = resp.take(0).ok()?;
+    if rows.is_empty() { return None; }
+
+    let mut lines: Vec<String> = Vec::new();
+    for row in rows.iter().rev() {
+        let date = chrono::DateTime::from_timestamp(row.started_at, 0)
+            .map(|dt| dt.format("%m-%d").to_string())
+            .unwrap_or_default();
+
+        let tool_seq = if let Some(ref calls) = row.tool_calls {
+            // Compress consecutive same-tool calls into "name ×N".
+            let mut segments: Vec<String> = Vec::new();
+            let mut prev = "";
+            let mut count = 0usize;
+            for call in calls {
+                let name = call["name"].as_str().unwrap_or("");
+                if name == prev {
+                    count += 1;
+                } else {
+                    if !prev.is_empty() {
+                        segments.push(if count > 1 { format!("{} ×{}", prev, count) } else { prev.to_string() });
+                    }
+                    prev = name;
+                    count = 1;
+                }
+            }
+            if !prev.is_empty() {
+                segments.push(if count > 1 { format!("{} ×{}", prev, count) } else { prev.to_string() });
+            }
+            segments.join(" → ")
+        } else {
+            String::new()
+        };
+
+        lines.push(if tool_seq.is_empty() {
+            format!("{}: （無工具呼叫，{} rounds）", date, row.round_count)
+        } else {
+            format!("{}: {} （{} rounds）", date, tool_seq, row.round_count)
+        });
+    }
+
+    Some(format!("## 本對話近期執行記錄\n{}", lines.join("\n")))
 }

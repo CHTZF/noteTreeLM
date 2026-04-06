@@ -34,15 +34,10 @@ pub async fn run(
         .map(String::from)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    // Load agent_def by name (default: "chat"); inject session_id for run_agent.
     let agent_name = body["agent"].as_str().unwrap_or("chat");
-    let agent_def = {
-        let mut def = crate::service_agent::helpers::load_agent_def(&state.db, agent_name, &account_id)
-            .await
-            .unwrap_or_else(|| json!({}));
-        def["session_id"] = json!(session_id.clone());
-        def
-    };
+    let agent_def = crate::service_agent::helpers::load_agent_def(&state.db, agent_name, &account_id)
+        .await
+        .unwrap_or_else(|| json!({}));
 
     // Upsert conversation + seed messages before spawning.
     if !messages.is_empty() {
@@ -67,6 +62,7 @@ pub async fn run(
         vault_id, account_id, conversation_id.clone(),
         true,  // streaming
         activity_context,
+        Some(session_id.clone()),
     ).await;
 
     Ok(Json(json!({ "session_id": session_id, "conversation_id": conversation_id })))
@@ -82,7 +78,7 @@ pub async fn cancel(
     let session_id = body["session_id"].as_str().unwrap_or("");
     let (cancel_flag, tx_opt) = {
         let sessions = state.daemon.agent_sessions.lock().await;
-        if let Some(sess) = sessions.values().find(|s| s.session_id == session_id) {
+        if let Some(sess) = sessions.values().find(|s| s.session_id.as_str() == session_id) {
             (Some(Arc::clone(&sess.cancel)), sess.transaction.clone())
         } else {
             (None, None)
@@ -109,7 +105,7 @@ pub async fn confirm(
     let tx_opt: Option<Arc<Transaction>> = {
         let sessions = state.daemon.agent_sessions.lock().await;
         sessions.values()
-            .find(|s| s.session_id == session_id)
+            .find(|s| s.session_id.as_str() == session_id)
             .and_then(|s| s.transaction.clone())
     };
     if let Some(tx) = tx_opt {
@@ -141,16 +137,12 @@ pub async fn live_chat(
     let conversation_id = body["conversation_id"].as_str().unwrap_or("").to_string();
 
     // Load live_chat agent_def; fall back to empty def (skill pre-pass will fill tool_names).
-    let agent_def = {
-        let mut def = crate::service_agent::helpers::load_agent_def(&state.db, "live_chat", &account_id)
-            .await
-            .unwrap_or_else(|| json!({
-                "system_prompt": "",
-                "tool_names": ["think", "search_skills"],
-            }));
-        def["session_id"] = json!(session_id.clone());
-        def
-    };
+    let agent_def = crate::service_agent::helpers::load_agent_def(&state.db, "live_chat", &account_id)
+        .await
+        .unwrap_or_else(|| json!({
+            "system_prompt": "",
+            "tool_names": ["think", "search_skills"],
+        }));
 
     // Phase 1: run_agent (streaming:false) — tool execution (think + skill tools).
     // live_respond is intentionally excluded; it's called separately below.
@@ -160,6 +152,7 @@ pub async fn live_chat(
         conversation_id.clone(),
         false,          // non-streaming: no llm:done / skill_suggestion events
         activity_context,
+        Some(session_id.clone()),
     ).await;
 
     // Phase 2: one final live_respond call to format speech.

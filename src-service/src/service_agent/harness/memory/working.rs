@@ -13,7 +13,7 @@ use crate::state::ToolCallRecord;
 ///   Used by guard evaluation (path-seen checks) and citation validation.
 /// - **evict** — [`clear`]: wipe all records at end-of-session or on cancel.
 ///   The inner `Arc` is not dropped; only the `HashMap` contents are removed.
-///   Other holders (e.g. `AgentSession.tool_calls`) keep their reference to the same data.
+///   Other holders (e.g. `AgentSession.working_memory`) keep their reference to the same data.
 ///
 /// `WorkingMemory` is `Clone` — cloning only bumps the refcount on the inner `Arc`;
 /// all clones share the same backing store.
@@ -128,12 +128,4 @@ impl WorkingMemory {
         }).collect()
     }
 
-    /// Expose the raw `Arc<Mutex<HashMap<...>>>` for callers that still hold the legacy
-    /// `Arc<Mutex<HashMap>>` type (e.g. `AgentSession.tool_calls` in `state.rs`).
-    ///
-    /// Use typed methods above for all write and query operations; this accessor is
-    /// a bridge shim only — do not introduce new direct-lock callers.
-    pub(crate) fn as_raw(&self) -> &Arc<Mutex<HashMap<String, ToolCallRecord>>> {
-        &self.inner
-    }
 }

@@ -78,8 +78,8 @@ pub type SummarizeFn = Arc<
     + Send + Sync
 >;
 
-/// 判斷工具名稱是否需要寫入確認的謂詞
-pub type IsWriteFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+/// 判斷工具名稱是否需要使用者確認的謂詞（write tools 預設需要，可擴充至特殊 non-write tools）
+pub type NeedConfirmFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 // ── NewSkillSpec（create_agent 工具傳入的 skill 規格）────────────────────────
 

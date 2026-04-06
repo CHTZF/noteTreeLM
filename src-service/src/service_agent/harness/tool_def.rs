@@ -40,8 +40,9 @@ pub(crate) static ALL_TOOL_DEFS: &[ToolDef] = &[
 
     // ── Vault read tools ─────────────────────────────────────────────────────
     ToolDef { name: "list_structure", schema_fn: schema_list_structure, is_write: false, guard: None, handler: handle_list_structure, rollback: None },
-    ToolDef { name: "read_note",      schema_fn: schema_read_note,      is_write: false, guard: None, handler: handle_read_note,      rollback: None },
-    ToolDef { name: "search_vault",   schema_fn: schema_search_vault,   is_write: false, guard: None, handler: handle_search_vault,   rollback: None },
+    ToolDef { name: "read_note",        schema_fn: schema_read_note,        is_write: false, guard: None, handler: handle_read_note,        rollback: None },
+    ToolDef { name: "search_in_note",  schema_fn: schema_search_in_note,  is_write: false, guard: None, handler: handle_search_in_note,  rollback: None },
+    ToolDef { name: "search_vault",    schema_fn: schema_search_vault,    is_write: false, guard: None, handler: handle_search_vault,    rollback: None },
     ToolDef { name: "query_memory",          schema_fn: schema_query_memory,          is_write: false, guard: None, handler: handle_query_memory,          rollback: None },
     ToolDef { name: "get_current_datetime",  schema_fn: schema_get_current_datetime,  is_write: false, guard: None, handler: handle_get_current_datetime,  rollback: None },
     ToolDef { name: "list_recent_notes",     schema_fn: schema_list_recent_notes,     is_write: false, guard: None, handler: handle_list_recent_notes,     rollback: None },
@@ -49,6 +50,9 @@ pub(crate) static ALL_TOOL_DEFS: &[ToolDef] = &[
     ToolDef { name: "get_vault_stats",       schema_fn: schema_get_vault_stats,       is_write: false, guard: None, handler: handle_get_vault_stats,       rollback: None },
     ToolDef { name: "get_note_backlinks",    schema_fn: schema_get_note_backlinks,    is_write: false, guard: None, handler: handle_get_note_backlinks,    rollback: None },
     ToolDef { name: "find_orphan_notes",     schema_fn: schema_find_orphan_notes,     is_write: false, guard: None, handler: handle_find_orphan_notes,     rollback: None },
+
+    // ── Composite read-write tools ───────────────────────────────────────────
+    ToolDef { name: "read_then_write",  schema_fn: schema_read_then_write,  is_write: true,  guard: None, handler: handle_read_then_write, rollback: Some(rollback_overwrite_note) },
 
     // ── Vault write tools ────────────────────────────────────────────────────
     // create_note: rollback = delete the file (if it didn't exist before).
@@ -84,6 +88,14 @@ pub(crate) static ALL_TOOL_DEFS: &[ToolDef] = &[
 
     // ── Agent / UI tools ─────────────────────────────────────────────────────
     ToolDef { name: "get_session_state",   schema_fn: schema_get_session_state,   is_write: false, guard: None, handler: handle_get_session_state,   rollback: None },
+    ToolDef { name: "ask_user",            schema_fn: schema_ask_user,            is_write: false, guard: None, handler: handle_ask_user,            rollback: None },
+    ToolDef { name: "checkpoint",          schema_fn: schema_checkpoint,          is_write: false, guard: None, handler: handle_checkpoint,          rollback: None },
+    ToolDef { name: "clear_checkpoint",    schema_fn: schema_clear_checkpoint,    is_write: false, guard: None, handler: handle_clear_checkpoint,    rollback: None },
+    ToolDef { name: "progress",            schema_fn: schema_progress,            is_write: false, guard: None, handler: handle_progress,            rollback: None },
+    ToolDef { name: "batch_apply",         schema_fn: schema_batch_apply,         is_write: true,  guard: None, handler: handle_batch_apply,         rollback: None },
+    ToolDef { name: "save_agent_knowledge",schema_fn: schema_save_agent_knowledge,is_write: false, guard: None, handler: handle_save_agent_knowledge,rollback: None },
+    ToolDef { name: "get_agent_knowledge", schema_fn: schema_get_agent_knowledge, is_write: false, guard: None, handler: handle_get_agent_knowledge, rollback: None },
+    ToolDef { name: "get_vault_changes",   schema_fn: schema_get_vault_changes,   is_write: false, guard: None, handler: handle_get_vault_changes,   rollback: None },
     ToolDef { name: "plan_announce",       schema_fn: schema_plan_announce,       is_write: false, guard: None, handler: handle_plan_announce,       rollback: None },
     ToolDef { name: "open_note",           schema_fn: schema_open_note,           is_write: false, guard: None, handler: handle_open_note,           rollback: None },
     ToolDef { name: "create_agent_skill",  schema_fn: schema_create_agent_skill,  is_write: true,  guard: None, handler: handle_create_agent_skill,  rollback: None },
@@ -184,10 +196,19 @@ fn schema_list_structure() -> Value { json!({ "type": "function", "function": {
 
 fn schema_read_note() -> Value { json!({ "type": "function", "function": {
     "name": "read_note",
-    "description": "讀取指定路徑的筆記內容",
+    "description": "讀取指定路徑的筆記內容。回傳 {error_code, content, path}：成功時 error_code 為 null，content 為筆記全文；失敗時 error_code 為 NOT_FOUND / READ_FAILED 等，並附 message 說明原因。",
     "parameters": { "type": "object", "properties": {
         "path": { "type": "string", "description": "筆記的相對路徑（可省略 .md）" }
     }, "required": ["path"] }
+}})}
+
+fn schema_search_in_note() -> Value { json!({ "type": "function", "function": {
+    "name": "search_in_note",
+    "description": "在單一筆記中搜尋特定段落，返回命中段落和行號。當 read_note 回傳的內容過長時，用此工具精準定位目標段落，節省 context 用量。",
+    "parameters": { "type": "object", "properties": {
+        "path":  { "type": "string", "description": "筆記路徑（可省略 .md）" },
+        "query": { "type": "string", "description": "要搜尋的關鍵字或片語" }
+    }, "required": ["path", "query"] }
 }})}
 
 fn schema_search_vault() -> Value { json!({ "type": "function", "function": {
@@ -378,6 +399,87 @@ fn schema_get_session_state() -> Value { json!({ "type": "function", "function":
     "parameters": { "type": "object", "properties": {} }
 }})}
 
+fn schema_progress() -> Value { json!({ "type": "function", "function": {
+    "name": "progress",
+    "description": "回報長任務的執行進度，讓使用者知道目前完成了幾步、還剩多少。對需要多個步驟的任務，每完成一個子任務就呼叫一次。",
+    "parameters": { "type": "object", "properties": {
+        "current": { "type": "number", "description": "目前已完成的步驟數（從 1 開始）" },
+        "total":   { "type": "number", "description": "任務總步驟數" },
+        "message": { "type": "string", "description": "本步驟的說明（例如「已更新 notes/x.md」）" }
+    }, "required": ["current", "total", "message"] }
+}})}
+
+fn schema_batch_apply() -> Value { json!({ "type": "function", "function": {
+    "name": "batch_apply",
+    "description": "對多個目標套用同一個工具操作，在單一 round 完成批次任務。比逐個呼叫更高效。支援的工具：read_note, search_in_note, update_note, append_to_note, read_then_write, update_note_frontmatter, delete_note。",
+    "parameters": { "type": "object", "properties": {
+        "tool":  { "type": "string", "description": "要套用的工具名稱（限上方支援清單）" },
+        "items": {
+            "type": "array",
+            "description": "每個元素是傳給該工具的 args 物件（與單獨呼叫相同格式）",
+            "items": { "type": "object" }
+        }
+    }, "required": ["tool", "items"] }
+}})}
+
+fn schema_save_agent_knowledge() -> Value { json!({ "type": "function", "function": {
+    "name": "save_agent_knowledge",
+    "description": "儲存關於此 vault 的操作知識或規則，供未來 session 使用。用於記錄使用者偏好、vault 結構規則、或常用操作模式。每個 key 對應一條知識，重複儲存同一 key 會更新。",
+    "parameters": { "type": "object", "properties": {
+        "key":     { "type": "string", "description": "知識識別鍵（例如 'naming_convention', 'folder_structure', 'user_preference'）" },
+        "content": { "type": "string", "description": "知識內容（具體的規則或模式描述）" }
+    }, "required": ["key", "content"] }
+}})}
+
+fn schema_get_agent_knowledge() -> Value { json!({ "type": "function", "function": {
+    "name": "get_agent_knowledge",
+    "description": "查詢已儲存的 vault 操作知識。當 context 中沒有注入知識、或需要查詢特定 key 時使用。",
+    "parameters": { "type": "object", "properties": {
+        "key": { "type": "string", "description": "要查詢的知識鍵（省略則返回所有知識）" }
+    }, "required": [] }
+}})}
+
+fn schema_get_vault_changes() -> Value { json!({ "type": "function", "function": {
+    "name": "get_vault_changes",
+    "description": "返回自指定時間點以來在 vault 中被修改過的筆記清單。用於在兩次 session 之間偵測使用者手動修改了哪些檔案，以便 invalidate 舊的知識或重新讀取。",
+    "parameters": { "type": "object", "properties": {
+        "since_ts": { "type": "number", "description": "Unix 時間戳（秒），只返回 updated_at > since_ts 的筆記。省略則返回最近 24 小時的修改。" },
+        "limit":    { "type": "number", "description": "最多返回幾筆，預設 20，最多 50" }
+    }, "required": [] }
+}})}
+
+fn schema_read_then_write() -> Value { json!({ "type": "function", "function": {
+    "name": "read_then_write",
+    "description": "在單一工具呼叫中讀取並覆寫筆記。跳過 read_note → update_note 兩步流程，直接完成讀後寫，節省一個 round。回傳 diff 統計讓你確認寫入結果。",
+    "parameters": { "type": "object", "properties": {
+        "path":    { "type": "string", "description": "筆記路徑（可省略 .md）" },
+        "content": { "type": "string", "description": "完整的新筆記內容（覆蓋原有內容）" }
+    }, "required": ["path", "content"] }
+}})}
+
+fn schema_checkpoint() -> Value { json!({ "type": "function", "function": {
+    "name": "checkpoint",
+    "description": "儲存當前任務進度，下次對話開始時自動注入 context。當你完成一部分長任務、但任務尚未全部完成時呼叫，讓下次 session 知道從哪裡繼續。",
+    "parameters": { "type": "object", "properties": {
+        "summary":   { "type": "string", "description": "已完成的工作摘要（簡短條列）" },
+        "remaining": { "type": "string", "description": "尚未完成的工作清單（條列格式，讓下次 agent 能直接執行）" }
+    }, "required": ["summary", "remaining"] }
+}})}
+
+fn schema_clear_checkpoint() -> Value { json!({ "type": "function", "function": {
+    "name": "clear_checkpoint",
+    "description": "清除本對話的任務 checkpoint。當長任務全部完成後呼叫，避免舊進度繼續出現在 context 中。",
+    "parameters": { "type": "object", "properties": {} }
+}})}
+
+fn schema_ask_user() -> Value { json!({ "type": "function", "function": {
+    "name": "ask_user",
+    "description": "向使用者提問，暫停執行等待補充資訊，收到回覆後自動繼續。當你需要更多資訊才能安全或正確地繼續任務時使用（例如：不確定目標路徑、操作範圍有歧義）。",
+    "parameters": { "type": "object", "properties": {
+        "question": { "type": "string", "description": "要問使用者的問題，具體說明你需要什麼資訊以及為什麼" }
+    }, "required": ["question"] }
+}})}
+
 fn schema_plan_announce() -> Value { json!({ "type": "function", "function": {
     "name": "plan_announce",
     "description": "在執行寫入操作前，向使用者宣告計畫。呼叫後自動繼續執行，不需確認。",
@@ -499,9 +601,47 @@ fn handle_read_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let raw = args["path"].as_str().unwrap_or("");
         let path = norm_path(raw);
-        Ok(Value::String(
-            vault_tools::vault_read_note(&path, &env.vault_path)
-        ))
+        Ok(vault_tools::vault_read_note(&path, &env.vault_path))
+    })
+}
+
+fn handle_search_in_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let raw   = args["path"].as_str().unwrap_or("");
+        let query = args["query"].as_str().unwrap_or("");
+        let path  = norm_path(raw);
+        Ok(vault_tools::vault_search_in_note(&path, query, &env.vault_path))
+    })
+}
+
+fn handle_get_vault_changes(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let since_ts = args["since_ts"].as_i64()
+            .unwrap_or_else(|| chrono::Utc::now().timestamp() - 86_400);
+        let limit = args["limit"].as_u64().unwrap_or(20).min(50);
+
+        #[derive(serde::Deserialize)]
+        struct Row { path: String, updated_at: Option<i64> }
+
+        let mut resp = env.db
+            .query("SELECT path, updated_at FROM notes \
+                    WHERE vault_id = $vid AND updated_at > $since \
+                    ORDER BY updated_at DESC LIMIT $lim")
+            .bind(("vid",   env.vault_id.clone()))
+            .bind(("since", since_ts))
+            .bind(("lim",   limit))
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let rows: Vec<Row> = resp.take(0).map_err(|e| e.to_string())?;
+        if rows.is_empty() {
+            return Ok(json!({ "changes": [], "since_ts": since_ts, "message": "此時間段內無修改" }));
+        }
+        let changes: Vec<Value> = rows.iter().map(|r| json!({
+            "path":       r.path,
+            "updated_at": r.updated_at,
+        })).collect();
+        Ok(json!({ "changes": changes, "count": changes.len(), "since_ts": since_ts }))
     })
 }
 
@@ -546,6 +686,27 @@ fn handle_query_memory(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
 
 // ── Write tools ───────────────────────────────────────────────────────────────
 
+fn handle_read_then_write(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let path    = norm_path(args["path"].as_str().unwrap_or(""));
+        let content = args["content"].as_str().unwrap_or("").to_string();
+        let full = std::path::Path::new(&env.vault_path).join(&path);
+        // read_then_write reads the file itself; just pre-record mtime for snapshot key.
+        let mtime_at_read = tokio::fs::metadata(&full).await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        env.write_mtimes.lock().await.entry(path.clone()).or_insert(mtime_at_read);
+        vault_tools::vault_read_then_write(
+            &path, &content, mtime_at_read,
+            &env.vault_path, &env.client, &env.db, &env.vault_id,
+            &env.working_memory,
+        ).await
+    })
+}
+
 fn handle_create_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path    = norm_path(args["path"].as_str().unwrap_or(""));
@@ -560,12 +721,21 @@ fn handle_update_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path    = norm_path(args["path"].as_str().unwrap_or(""));
         let content = args["content"].as_str().unwrap_or("").to_string();
-        // Snapshot original content before overwriting so rollback can restore it.
+        // Read original once — used for rollback snapshot, diff, and conflict detection.
         let full = std::path::Path::new(&env.vault_path).join(&path);
         let original = tokio::fs::read_to_string(&full).await.unwrap_or_default();
-        env.write_snapshots.lock().await.insert(path.clone(), original);
-        vault_tools::vault_update_note(
-            &path, &content, &env.vault_path, &env.client, &env.db, &env.vault_id,
+        // Record mtime at read time for conflict detection.
+        let mtime_at_read = tokio::fs::metadata(&full).await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        env.write_snapshots.lock().await.entry(path.clone()).or_insert(original.clone());
+        env.write_mtimes.lock().await.entry(path.clone()).or_insert(mtime_at_read);
+        vault_tools::vault_update_note_with_conflict_check(
+            &path, &content, &original, mtime_at_read,
+            &env.vault_path, &env.client, &env.db, &env.vault_id,
         ).await
     })
 }
@@ -577,7 +747,7 @@ fn handle_append_to_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
         // Snapshot original content before appending so rollback can restore it.
         let full = std::path::Path::new(&env.vault_path).join(&path);
         let original = tokio::fs::read_to_string(&full).await.unwrap_or_default();
-        env.write_snapshots.lock().await.insert(path.clone(), original);
+        env.write_snapshots.lock().await.entry(path.clone()).or_insert(original);
         vault_tools::vault_append_to_note(
             &path, &content, &env.vault_path, &env.client, &env.db, &env.vault_id,
         ).await
@@ -599,7 +769,7 @@ fn handle_delete_note(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
         // Snapshot original content before deleting so rollback can restore it.
         let full = std::path::Path::new(&env.vault_path).join(&path);
         let original = tokio::fs::read_to_string(&full).await.unwrap_or_default();
-        env.write_snapshots.lock().await.insert(path.clone(), original);
+        env.write_snapshots.lock().await.entry(path.clone()).or_insert(original);
         vault_tools::vault_delete_note(
             &path, &env.vault_path, &env.db, &env.vault_id,
         ).await
@@ -632,7 +802,7 @@ fn handle_update_note_frontmatter(env: Arc<VaultEnv>, args: Value) -> ToolFuture
         // Snapshot original content before modifying so rollback can restore it.
         let full = std::path::Path::new(&env.vault_path).join(&path);
         let original = tokio::fs::read_to_string(&full).await.unwrap_or_default();
-        env.write_snapshots.lock().await.insert(path.clone(), original);
+        env.write_snapshots.lock().await.entry(path.clone()).or_insert(original);
         vault_tools::vault_update_note_frontmatter(
             &path, &fields, &env.vault_path, &env.client, &env.db, &env.vault_id,
         ).await
@@ -718,7 +888,7 @@ fn handle_link_notes(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
         // Snapshot source content before modification for rollback.
         let full = std::path::Path::new(&env.vault_path).join(&source);
         let original = tokio::fs::read_to_string(&full).await.unwrap_or_default();
-        env.write_snapshots.lock().await.insert(source.clone(), original);
+        env.write_snapshots.lock().await.entry(source.clone()).or_insert(original);
         vault_tools::vault_link_notes(
             &source, &target, &env.vault_path, &env.client, &env.db, &env.vault_id,
         ).await
@@ -746,7 +916,7 @@ fn handle_generate_moc(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
         let moc_rel = format!("{}/_moc.md", folder);
         let full = std::path::Path::new(&env.vault_path).join(&moc_rel);
         let original = tokio::fs::read_to_string(&full).await.unwrap_or_default();
-        env.write_snapshots.lock().await.insert(moc_rel, original);
+        env.write_snapshots.lock().await.entry(moc_rel).or_insert(original);
         vault_tools::vault_generate_moc(
             &folder, title.as_deref(), &env.vault_path, &env.client, &env.db, &env.vault_id,
         ).await
@@ -843,6 +1013,222 @@ fn handle_get_session_state(env: Arc<VaultEnv>, _args: Value) -> ToolFuture {
             "tool_calls": calls,
             "repeated_calls": repeat_warnings,
         }))
+    })
+}
+
+fn handle_checkpoint(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let summary   = args["summary"].as_str().unwrap_or("").to_string();
+        let remaining = args["remaining"].as_str().unwrap_or("").to_string();
+        if summary.is_empty() && remaining.is_empty() {
+            return Ok(json!("summary 和 remaining 不能都為空"));
+        }
+        let now = chrono::Utc::now().timestamp();
+        // Delete any existing checkpoint for this conversation, then insert fresh.
+        // Simpler than an upsert and avoids SurrealQL version compatibility issues.
+        let _ = env.db
+            .query("DELETE task_checkpoints WHERE conv_id = $cid")
+            .bind(("cid", env.conv_id.clone()))
+            .await;
+        let _ = env.db
+            .query("CREATE task_checkpoints CONTENT $data")
+            .bind(("data", serde_json::json!({
+                "conv_id":    env.conv_id,
+                "account_id": env.account_id,
+                "summary":    summary,
+                "remaining":  remaining,
+                "updated_at": now,
+            })))
+            .await;
+        Ok(json!("✅ 進度已儲存，下次 session 開始時將自動載入"))
+    })
+}
+
+fn handle_clear_checkpoint(env: Arc<VaultEnv>, _args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let _ = env.db
+            .query("DELETE task_checkpoints WHERE conv_id = $cid")
+            .bind(("cid", env.conv_id.clone()))
+            .await;
+        Ok(json!("✅ checkpoint 已清除"))
+    })
+}
+
+fn handle_progress(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let current = args["current"].as_u64().unwrap_or(0);
+        let total   = args["total"].as_u64().unwrap_or(0);
+        let message = args["message"].as_str().unwrap_or("").to_string();
+        env.state.daemon.emit("agent:progress", json!({
+            "session_id": env.session_id,
+            "current":    current,
+            "total":      total,
+            "message":    message,
+        }));
+        Ok(json!("✅"))
+    })
+}
+
+fn handle_batch_apply(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        use super::governance::guard::evaluate_guard;
+
+        let tool_name = args["tool"].as_str().unwrap_or("").to_string();
+        let items     = args["items"].as_array().cloned().unwrap_or_default();
+
+        // Whitelist: only tools that make semantic sense in batch.
+        const ALLOWED: &[&str] = &[
+            "read_note", "search_in_note", "update_note", "append_to_note",
+            "read_then_write", "update_note_frontmatter", "delete_note",
+        ];
+        if !ALLOWED.contains(&tool_name.as_str()) {
+            return Ok(json!(format!(
+                "batch_apply 不支援 '{}'。支援的工具：{}",
+                tool_name, ALLOWED.join(", ")
+            )));
+        }
+        let def = match find_tool_def(&tool_name) {
+            Some(d) => d,
+            None    => return Ok(json!(format!("工具 '{}' 不存在", tool_name))),
+        };
+
+        let mut results: Vec<Value> = Vec::with_capacity(items.len());
+        for (i, item_args) in items.iter().enumerate() {
+            // Evaluate guard (same logic as build_interactive_registry).
+            if let Some(ref spec) = def.guard {
+                let hint = env.working_memory.with_records(|store| {
+                    evaluate_guard(spec, item_args, store)
+                }).await;
+                if let Some(h) = hint {
+                    results.push(json!({
+                        "index":   i,
+                        "blocked": true,
+                        "reason":  h.message,
+                        "required_tool": h.required_tool,
+                        "required_path": h.required_path,
+                    }));
+                    continue;
+                }
+            }
+
+            match (def.handler)(Arc::clone(&env), item_args.clone()).await {
+                Ok(r)  => results.push(json!({ "index": i, "ok": true,  "result": r })),
+                Err(e) => results.push(json!({ "index": i, "ok": false, "error":  e })),
+            }
+        }
+
+        let ok_count      = results.iter().filter(|r| r["ok"] == json!(true)).count();
+        let blocked_count = results.iter().filter(|r| r["blocked"] == json!(true)).count();
+        let err_count     = results.iter().filter(|r| r["ok"] == json!(false)).count();
+
+        Ok(json!({
+            "results":       results,
+            "total":         items.len(),
+            "ok":            ok_count,
+            "blocked":       blocked_count,
+            "errors":        err_count,
+        }))
+    })
+}
+
+fn handle_save_agent_knowledge(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let key     = args["key"].as_str().unwrap_or("").to_string();
+        let content = args["content"].as_str().unwrap_or("").to_string();
+        if key.is_empty() {
+            return Ok(json!("key 不能為空"));
+        }
+        let now = chrono::Utc::now().timestamp();
+        // Delete existing entry for this vault+key, then insert fresh.
+        let _ = env.db
+            .query("DELETE agent_knowledge WHERE vault_id = $vid AND key = $key")
+            .bind(("vid", env.vault_id.clone()))
+            .bind(("key", key.clone()))
+            .await;
+        let _ = env.db
+            .query("CREATE agent_knowledge CONTENT $data")
+            .bind(("data", json!({
+                "vault_id":   env.vault_id,
+                "account_id": env.account_id,
+                "key":        key.clone(),
+                "content":    content,
+                "updated_at": now,
+            })))
+            .await;
+        Ok(json!(format!("✅ 已儲存知識：{}", key)))
+    })
+}
+
+fn handle_get_agent_knowledge(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let key_filter = args["key"].as_str().map(String::from);
+
+        #[derive(serde::Deserialize)]
+        struct Row { key: String, content: String }
+
+        let mut resp = if let Some(ref k) = key_filter {
+            env.db
+                .query("SELECT key, content FROM agent_knowledge \
+                        WHERE vault_id = $vid AND key = $key LIMIT 1")
+                .bind(("vid", env.vault_id.clone()))
+                .bind(("key", k.clone()))
+                .await
+        } else {
+            env.db
+                .query("SELECT key, content FROM agent_knowledge \
+                        WHERE vault_id = $vid ORDER BY updated_at DESC")
+                .bind(("vid", env.vault_id.clone()))
+                .await
+        }.map_err(|e| e.to_string())?;
+
+        let rows: Vec<Row> = resp.take(0).map_err(|e| e.to_string())?;
+        if rows.is_empty() {
+            return Ok(json!("（尚無儲存的 agent 知識）"));
+        }
+        let entries: Vec<Value> = rows.iter()
+            .map(|r| json!({ "key": r.key, "content": r.content }))
+            .collect();
+        Ok(json!(entries))
+    })
+}
+
+/// ask_user: suspend the agent and wait for the user to reply via the chat box.
+///
+/// The question is emitted as `llm:done` so the frontend renders it as an assistant
+/// message and exits loading state (allowing the user to type).  The tool then
+/// blocks on a oneshot channel; `run_agent` detects `waiting_for_answer` on the
+/// next user message and forwards it to this channel to resume execution.
+fn handle_ask_user(env: Arc<VaultEnv>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        use std::sync::atomic::Ordering;
+
+        let question = args["question"].as_str().unwrap_or("").to_string();
+        if question.is_empty() {
+            return Ok(json!("問題不能為空"));
+        }
+
+        // Register via AnswerChannel — no &mut session needed.
+        let rx = env.answer_channel.wait().await;
+
+        // Emit the question as a regular assistant message so the frontend
+        // exits loading state and lets the user type their reply.
+        env.state.daemon.emit("llm:done", serde_json::json!(question));
+
+        // Wait for the answer or cancellation.
+        let cancel = Arc::clone(&env.cancel);
+        tokio::select! {
+            result = rx => {
+                Ok(json!(result.unwrap_or_default()))
+            }
+            _ = async {
+                loop {
+                    if cancel.load(Ordering::Relaxed) { break; }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+            } => {
+                Ok(json!("（使用者取消）"))
+            }
+        }
     })
 }
 

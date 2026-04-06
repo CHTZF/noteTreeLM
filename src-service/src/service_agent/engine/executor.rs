@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use super::graph::ToolGraph;
 use super::tool_registry::ToolRegistry;
 use super::transaction::{Transaction, TransactionState};
-use super::super::types::{EmitEventFn, IsWriteFn, ToolCall};
+use super::super::types::{EmitEventFn, NeedConfirmFn, ToolCall};
 use super::super::harness::memory::working::WorkingMemory;
 use crate::state::GuardOutcome;
 use crate::service_agent::harness::governance::policy::GUARD_EXEMPT_WRITE_TOOLS;
@@ -15,7 +15,7 @@ use crate::service_agent::harness::governance::policy::GUARD_EXEMPT_WRITE_TOOLS;
 pub struct Executor {
     registry: Arc<ToolRegistry>,
     emit_fn: EmitEventFn,
-    is_write_fn: IsWriteFn,
+    need_confirm_fn: NeedConfirmFn,
     working_memory: WorkingMemory,
 }
 
@@ -24,10 +24,10 @@ impl Executor {
     pub(crate) fn new(
         registry: Arc<ToolRegistry>,
         emit_fn: EmitEventFn,
-        is_write_fn: IsWriteFn,
+        need_confirm_fn: NeedConfirmFn,
         working_memory: WorkingMemory,
     ) -> Self {
-        Self { registry, emit_fn, is_write_fn, working_memory }
+        Self { registry, emit_fn, need_confirm_fn, working_memory }
     }
 
     pub async fn execute_graph(
@@ -97,7 +97,7 @@ impl Executor {
                 }
 
                 // ── Pre-execute: emit SSE + write confirmation ──────────────
-                let approved = if (self.is_write_fn)(&node.call.name) {
+                let approved = if (self.need_confirm_fn)(&node.call.name) {
                     (self.emit_fn)(
                         "agent:write_request".to_string(),
                         json!({ "display": node.call.name }),
