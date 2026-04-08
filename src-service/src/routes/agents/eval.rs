@@ -71,13 +71,14 @@ pub async fn run_trace_analysis(
         .map(String::from)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    let runtime = match crate::service::build_agent_runtime(&state, 
+    let runtime = match crate::service::build_agent_runtime(&state,
         &vault_id, &account_id,
         Some(session_id.clone()),
         conversation_id,
         agent_def,
         false, // silent background run — no SSE streaming
         None,  // no ui_language for eval runs
+        None, None,
     ).await {
         Some(r) => r,
         None => return Ok(Json(json!({ "error": "LLM not configured" }))),

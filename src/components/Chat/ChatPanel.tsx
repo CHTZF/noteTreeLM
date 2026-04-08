@@ -74,7 +74,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const inputRef2 = useRef('')  // mirrors `input` state for save-on-switch (avoids stale closure)
   useEffect(() => { inputRef2.current = input }, [input])
 
-  // Track note suggestions from agent:note_refs for "打開它" shortcut
+  // Track note suggestions from agent:refs for "打開它" shortcut
   const [noteSuggestions, setNoteSuggestions] = useState<{ absPath: string; label: string }[]>([])
   const noteSuggestionsRef = useRef<{ absPath: string; label: string }[]>([])
   useEffect(() => { noteSuggestionsRef.current = noteSuggestions }, [noteSuggestions])
@@ -494,15 +494,16 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
           if (display === 'think') return  // think is visualized in MemoryLinksView, not chat
           setMessages((prev) => [...prev, { role: 'tool', content: display }])
         }),
-        listen<string[]>('agent:note_refs', (e) => {
-          const suggestions = e.payload.map(absPath => {
+        listen<{ session_id: string; refs: { path: string; title?: string; excerpt?: string }[] }>('agent:refs', (e) => {
+          const suggestions = e.payload.refs.map(ref => {
+            const absPath = ref.path
             const hashIdx = absPath.indexOf('#')
             const filePart = hashIdx >= 0 ? absPath.slice(0, hashIdx) : absPath
             const section = hashIdx >= 0 ? absPath.slice(hashIdx + 1) : ''
             const filename = filePart.split('/').pop()?.replace(/\.md$/, '') ?? filePart
             const label = section ? `${filename} § ${section}` : filename
             // Accumulate for graph edge creation on memory extraction
-            e.payload.forEach(p => referencedNotePathsRef.current.add(p.split('#')[0]))
+            e.payload.refs.forEach(r => referencedNotePathsRef.current.add(r.path.split('#')[0]))
             return { absPath, label }
           })
           setNoteSuggestions(suggestions)

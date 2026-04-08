@@ -177,8 +177,8 @@ export default function KnowledgeAssistant({ onOpenNote }: Props) {
       })
     })
 
-    const unRefs = await listen<{ query_id: string; refs: KnowledgeRef[] }>('knowledge:refs', e => {
-      if (e.payload.query_id !== queryId) return
+    const unRefs = await listen<{ session_id: string; refs: KnowledgeRef[] }>('agent:refs', e => {
+      if (e.payload.session_id !== queryId) return
       pendingRefsRef.current = e.payload.refs
     })
 

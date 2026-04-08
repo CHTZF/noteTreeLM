@@ -34,6 +34,8 @@ pub async fn run(
     let conversation_id = body["conversation_id"].as_str()
         .map(String::from)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let source_type = body["source_type"].as_str().map(String::from);
+    let source_id   = body["source_id"].as_str().map(String::from);
 
     let agent_name = body["agent"].as_str().unwrap_or("chat");
     let agent_def = crate::service::helpers::load_agent_def(&state.db, agent_name, &account_id)
@@ -65,6 +67,8 @@ pub async fn run(
         agent_def,
         true, // streaming
         ui_language.as_deref(),
+        source_type,
+        source_id,
     ).await {
         Some(r) => r,
         None => {
@@ -167,6 +171,7 @@ pub async fn live_chat(
         agent_def,
         false, // non-streaming: no llm:done / skill_suggestion events
         ui_language.as_deref(),
+        None, None,
     ).await {
         Some(r) => r,
         None => return Ok(Json(json!({ "error": "LLM not configured" }))),

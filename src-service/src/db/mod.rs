@@ -220,6 +220,7 @@ async fn run_migrations(db: &SurrealDb) -> Result<(), surrealdb::Error> {
         "DEFINE FIELD IF NOT EXISTS status        ON import_pages TYPE string DEFAULT 'pending';",
         "DEFINE FIELD IF NOT EXISTS last_crawled  ON import_pages TYPE option<int>;",
         "DEFINE FIELD IF NOT EXISTS created_at    ON import_pages TYPE int DEFAULT 0;",
+        "DEFINE FIELD IF NOT EXISTS embedding     ON import_pages TYPE option<array>;",
         "DEFINE INDEX IF NOT EXISTS idx_import_pages_id ON import_pages FIELDS page_id UNIQUE;",
 
         // ── knowledge items ──────────────────────────────────────────────────

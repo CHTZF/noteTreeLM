@@ -115,6 +115,7 @@ pub(crate) async fn run(
                     None, conversation_id, agent_def,
                     false, // background — no llm:token SSE
                     None,  // no ui_language for scheduled tasks
+                    None, None,
                 ).await {
                     Some(r) => r,
                     None => {

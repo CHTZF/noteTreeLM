@@ -393,6 +393,7 @@ async fn maybe_trigger_memory_agent(state: ApiState, conv_id: String, messages_j
             None, conv_id, agent_def,
             false,
             None, // no ui_language for background tasks
+            None, None,
         ).await {
             Some(r) => r,
             None => return,

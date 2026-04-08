@@ -80,6 +80,9 @@ pub(crate) static ALL_TOOL_DEFS: &[ToolDef] = &[
     // schedule_task: rollback = delete the created task note.
     ToolDef { name: "schedule_task",         schema_fn: schema_schedule_task,         is_write: true,  guard: None,                     handler: handle_schedule_task,         rollback: Some(rollback_schedule_task) },
 
+    // ── KB search (knowledge base import pages) ──────────────────────────────
+    ToolDef { name: "search_kb_pages",     schema_fn: schema_search_kb_pages,     is_write: false, guard: None, handler: handle_search_kb_pages,     rollback: None },
+
     // ── Web search (Brave Search API) ────────────────────────────────────────
     ToolDef { name: "web_search",          schema_fn: schema_web_search,          is_write: false, guard: None, handler: handle_web_search,          rollback: None },
 
@@ -673,6 +676,25 @@ fn handle_search_vault(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFutu
         let query = args["query"].as_str().unwrap_or("");
         vault_tools::vault_search(
             &env.client, &env.embedding_url, &env.db, &env.vault_id, query,
+        ).await
+    })
+}
+
+fn schema_search_kb_pages() -> Value { json!({ "type": "function", "function": {
+    "name": "search_kb_pages",
+    "description": "搜尋知識庫已匯入頁面。若尚未匯入的相關頁面，會自動擷取後回傳。每個結果帶有 __cite_id__ 欄位，請在回答中用 [cite:id] 格式引用。",
+    "parameters": { "type": "object", "properties": {
+        "query": { "type": "string", "description": "搜尋關鍵字或問題" },
+    }, "required": ["query"] }
+}})}
+
+fn handle_search_kb_pages(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let query = args["query"].as_str().unwrap_or("").to_string();
+        vault_tools::vault_search_kb_pages(
+            &env.client, &env.embedding_url, &env.db, &env.vault_id,
+            env.source_type.as_deref(), env.source_id.as_deref(),
+            &query,
         ).await
     })
 }

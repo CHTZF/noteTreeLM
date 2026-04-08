@@ -287,8 +287,9 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
     })
     // Note refs
     let localNoteRefs: { label: string; absPath: string }[] = []
-    const unlistenNoteRefs = await listen<{ paths: string[] }>('agent:note_refs', (e) => {
-      const suggestions = e.payload.paths.map(absPath => {
+    const unlistenNoteRefs = await listen<{ session_id: string; refs: { path: string; title?: string; excerpt?: string }[] }>('agent:refs', (e) => {
+      const suggestions = e.payload.refs.map(ref => {
+        const absPath = ref.path
         const hashIdx = absPath.indexOf('#')
         const filePart = hashIdx >= 0 ? absPath.slice(0, hashIdx) : absPath
         const section = hashIdx >= 0 ? absPath.slice(hashIdx + 1) : ''

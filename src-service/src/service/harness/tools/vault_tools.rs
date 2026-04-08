@@ -971,6 +971,334 @@ async fn brave_search_api(
         .collect())
 }
 
+// ── KB page search ────────────────────────────────────────────────────────────
+
+fn remove_block(html: &str, tag: &str) -> String {
+    let open  = format!("<{}", tag);
+    let close = format!("</{}>", tag);
+    let mut result = String::new();
+    let mut remaining = html;
+    loop {
+        let lower = remaining.to_lowercase();
+        match lower.find(&open) {
+            Some(start) => {
+                result.push_str(&remaining[..start]);
+                match lower[start..].find(&close) {
+                    Some(end) => { remaining = &remaining[start + end + close.len()..]; }
+                    None => break,
+                }
+            }
+            None => { result.push_str(remaining); break; }
+        }
+    }
+    result
+}
+
+fn decode_entities(s: &str) -> String {
+    s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+     .replace("&quot;", "\"").replace("&apos;", "'").replace("&nbsp;", " ")
+     .replace("&#39;", "'").replace("&#34;", "\"")
+}
+
+fn html_to_markdown(html: &str) -> String {
+    let html = remove_block(html, "script");
+    let html = remove_block(&html, "style");
+    let html = remove_block(&html, "nav");
+    let html = remove_block(&html, "header");
+    let html = remove_block(&html, "footer");
+
+    let lower = html.to_lowercase();
+    let bytes = html.as_bytes();
+    let len   = bytes.len();
+    let mut out = String::new();
+    let mut buf = String::new();
+    let mut i   = 0usize;
+
+    while i < len {
+        if bytes[i] == b'<' {
+            let tag_end = lower[i..].find('>').map(|e| i + e + 1).unwrap_or(len);
+            let tag_inner = &html[i + 1..tag_end - 1];
+            let tag_lower = tag_inner.trim().to_lowercase();
+            let is_closing = tag_lower.starts_with('/');
+            let tag_name = tag_lower.trim_start_matches('/').split_whitespace().next().unwrap_or("").to_string();
+            match tag_name.as_str() {
+                "h1" if !is_closing => out.push_str("\n\n# "),
+                "h2" if !is_closing => out.push_str("\n\n## "),
+                "h3" if !is_closing => out.push_str("\n\n### "),
+                "h4" if !is_closing => out.push_str("\n\n#### "),
+                "h5" if !is_closing => out.push_str("\n\n##### "),
+                "h6" if !is_closing => out.push_str("\n\n###### "),
+                "h1"|"h2"|"h3"|"h4"|"h5"|"h6" if is_closing => out.push('\n'),
+                "p" if !is_closing  => out.push_str("\n\n"),
+                "p" if is_closing   => out.push('\n'),
+                "br"                => out.push('\n'),
+                "strong"|"b" if !is_closing => out.push_str("**"),
+                "strong"|"b" if is_closing  => out.push_str("**"),
+                "em"|"i" if !is_closing => out.push('*'),
+                "em"|"i" if is_closing  => out.push('*'),
+                "code" if !is_closing => out.push('`'),
+                "code" if is_closing  => out.push('`'),
+                "pre" if !is_closing  => out.push_str("\n\n```\n"),
+                "pre" if is_closing   => out.push_str("\n```\n\n"),
+                "li" if !is_closing   => out.push_str("\n- "),
+                "ul"|"ol" if !is_closing => out.push('\n'),
+                "ul"|"ol" if is_closing  => out.push('\n'),
+                "a" if !is_closing => {
+                    let href = {
+                        let ti_lower = tag_inner.to_lowercase();
+                        if let Some(hp) = ti_lower.find("href=") {
+                            let after = &tag_inner[hp + 5..];
+                            if after.starts_with('"') { after[1..].split('"').next().unwrap_or("").to_string() }
+                            else if after.starts_with('\'') { after[1..].split('\'').next().unwrap_or("").to_string() }
+                            else { after.split_whitespace().next().unwrap_or("").trim_end_matches('>').to_string() }
+                        } else { String::new() }
+                    };
+                    out.push('[');
+                    buf = href;
+                }
+                "a" if is_closing => { out.push_str("]("); out.push_str(&buf); out.push(')'); buf.clear(); }
+                _ => {}
+            }
+            i = tag_end;
+        } else {
+            let text_end = lower[i..].find('<').map(|e| i + e).unwrap_or(len);
+            out.push_str(&decode_entities(&html[i..text_end]));
+            i = text_end;
+        }
+    }
+
+    let mut final_lines: Vec<&str> = Vec::new();
+    let mut blank_count = 0u32;
+    for line in out.lines() {
+        let t = line.trim();
+        if t.is_empty() { blank_count += 1; if blank_count <= 2 { final_lines.push(""); } }
+        else { blank_count = 0; final_lines.push(t); }
+    }
+    final_lines.join("\n").trim().to_string()
+}
+
+fn sha256_hex(content: &str) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(content.as_bytes()))
+}
+
+/// Search imported KB pages.
+/// - source_type="kb_session" + source_id=<session_id>: filter to that import session
+/// - otherwise: search all imported pages for this vault
+/// Search order: embedding (cosine) → FTS fallback.
+/// On-demand fetches pending pages matching by title if no imported results found.
+/// Returns JSON array of `{ __cite_id__, url, title, content }`.
+pub(crate) async fn vault_search_kb_pages(
+    client:      &reqwest::Client,
+    embedding_url: &Option<String>,
+    db:          &SurrealDb,
+    vault_id:    &str,
+    source_type: Option<&str>,
+    source_id:   Option<&str>,
+    query:       &str,
+) -> Result<Value, String> {
+    #[derive(serde::Deserialize)]
+    struct PageRow {
+        page_id:      String,
+        url:          String,
+        title:        Option<String>,
+        content_md:   Option<String>,
+        session_id:   Option<String>,
+        #[allow(dead_code)]
+        content_hash: Option<String>,
+    }
+
+    impl AsPageRow for PageRow {
+        fn page_id(&self)    -> &str          { &self.page_id }
+        fn url(&self)        -> &str          { &self.url }
+        fn title(&self)      -> Option<&str>  { self.title.as_deref() }
+        fn content_md(&self) -> Option<&str>  { self.content_md.as_deref() }
+    }
+
+    let kb_session_id = if source_type == Some("kb_session") { source_id } else { None };
+
+    // ── 1. Embedding search ──────────────────────────────────────────────────
+    if let Some(vec) = crate::embedding::embedder::embed_text(client, embedding_url, query).await {
+        #[derive(serde::Deserialize)]
+        struct EmbRow { page_id: String, score: f32 }
+        let mut resp = if let Some(sid) = kb_session_id {
+            db.query(
+                "SELECT page_id, vector::similarity::cosine(embedding, $vec) AS score \
+                 FROM import_pages WHERE vault_id = $vid AND session_id = $sid \
+                 AND status = 'imported' AND embedding IS NOT NONE \
+                 ORDER BY score DESC LIMIT 8"
+            )
+            .bind(("vid", vault_id.to_string()))
+            .bind(("sid", sid.to_string()))
+            .bind(("vec", vec))
+            .await.map_err(|e| e.to_string())?
+        } else {
+            db.query(
+                "SELECT page_id, vector::similarity::cosine(embedding, $vec) AS score \
+                 FROM import_pages WHERE vault_id = $vid AND status = 'imported' \
+                 AND embedding IS NOT NONE ORDER BY score DESC LIMIT 8"
+            )
+            .bind(("vid", vault_id.to_string()))
+            .bind(("vec", vec))
+            .await.map_err(|e| e.to_string())?
+        };
+        let emb_rows: Vec<EmbRow> = resp.take(0).unwrap_or_default();
+
+        if !emb_rows.is_empty() {
+            let ids: Vec<String> = emb_rows.iter().map(|r| r.page_id.clone()).collect();
+            let score_map: std::collections::HashMap<String, f32> =
+                emb_rows.into_iter().map(|r| (r.page_id, r.score)).collect();
+            let mut pr = db.query(
+                "SELECT page_id, url, title, content_md, session_id, content_hash \
+                 FROM import_pages WHERE page_id INSIDE $ids"
+            )
+            .bind(("ids", ids))
+            .await.map_err(|e| e.to_string())?;
+            let mut rows: Vec<PageRow> = pr.take(0).unwrap_or_default();
+            rows.sort_by(|a, b| {
+                let sa = score_map.get(&a.page_id).copied().unwrap_or(0.0);
+                let sb = score_map.get(&b.page_id).copied().unwrap_or(0.0);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            return Ok(build_kb_results(&rows));
+        }
+    }
+
+    // ── 2. FTS fallback: already imported ────────────────────────────────────
+    let q_lower = format!("%{}%", query.to_lowercase());
+    let mut imported: Vec<PageRow> = {
+        let mut resp = if let Some(sid) = kb_session_id {
+            db.query(
+                "SELECT page_id, url, title, content_md, session_id, content_hash \
+                 FROM import_pages WHERE vault_id = $vid AND session_id = $sid \
+                 AND status = 'imported' \
+                 AND (string::lowercase(title ?? '') CONTAINS $q \
+                      OR string::lowercase(content_md ?? '') CONTAINS $q) \
+                 ORDER BY last_crawled DESC LIMIT 8"
+            )
+            .bind(("vid", vault_id.to_string()))
+            .bind(("sid", sid.to_string()))
+            .bind(("q",   q_lower.clone()))
+            .await.map_err(|e| e.to_string())?
+        } else {
+            db.query(
+                "SELECT page_id, url, title, content_md, session_id, content_hash \
+                 FROM import_pages WHERE vault_id = $vid AND status = 'imported' \
+                 AND (string::lowercase(title ?? '') CONTAINS $q \
+                      OR string::lowercase(content_md ?? '') CONTAINS $q) \
+                 ORDER BY last_crawled DESC LIMIT 8"
+            )
+            .bind(("vid", vault_id.to_string()))
+            .bind(("q",   q_lower.clone()))
+            .await.map_err(|e| e.to_string())?
+        };
+        resp.take(0).unwrap_or_default()
+    };
+
+    // ── 3. On-demand fetch: pending pages matching by title ──────────────────
+    if imported.is_empty() {
+        let pending: Vec<PageRow> = {
+            let mut resp = if let Some(sid) = kb_session_id {
+                db.query(
+                    "SELECT page_id, url, title, content_md, session_id, content_hash \
+                     FROM import_pages WHERE vault_id = $vid AND session_id = $sid \
+                     AND status = 'pending' AND string::lowercase(title ?? '') CONTAINS $q LIMIT 5"
+                )
+                .bind(("vid", vault_id.to_string()))
+                .bind(("sid", sid.to_string()))
+                .bind(("q",   q_lower.clone()))
+                .await.map_err(|e| e.to_string())?
+            } else {
+                db.query(
+                    "SELECT page_id, url, title, content_md, session_id, content_hash \
+                     FROM import_pages WHERE vault_id = $vid AND status = 'pending' \
+                     AND string::lowercase(title ?? '') CONTAINS $q LIMIT 5"
+                )
+                .bind(("vid", vault_id.to_string()))
+                .bind(("q",   q_lower.clone()))
+                .await.map_err(|e| e.to_string())?
+            };
+            resp.take(0).unwrap_or_default()
+        };
+
+        for page in pending {
+            let result = async {
+                let html = client
+                    .get(&page.url)
+                    .header("User-Agent", "noteTreeLM/1.0")
+                    .timeout(std::time::Duration::from_secs(30))
+                    .send().await.map_err(|e| e.to_string())?
+                    .text().await.map_err(|e| e.to_string())?;
+                let content_md = html_to_markdown(&html);
+                let hash = sha256_hex(&content_md);
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                // Embed on fetch
+                let embedding = crate::embedding::embedder::embed_text(client, embedding_url, &content_md).await;
+                let emb_val: Value = embedding.map(|v| json!(v)).unwrap_or(Value::Null);
+                db.query(
+                    "UPDATE import_pages SET status = 'imported', content_md = $cmd, \
+                     content_hash = $hash, last_crawled = $now, embedding = $emb \
+                     WHERE page_id = $pid AND vault_id = $vid"
+                )
+                .bind(("cmd",  content_md.clone()))
+                .bind(("hash", hash))
+                .bind(("now",  now_ms))
+                .bind(("emb",  emb_val))
+                .bind(("pid",  page.page_id.clone()))
+                .bind(("vid",  vault_id.to_string()))
+                .await.map_err(|e| e.to_string())?;
+                Ok::<_, String>(content_md)
+            }.await;
+
+            match result {
+                Ok(content_md) => {
+                    let q_l = query.to_lowercase();
+                    if content_md.to_lowercase().contains(&q_l)
+                        || page.title.as_deref().unwrap_or("").to_lowercase().contains(&q_l)
+                    {
+                        imported.push(PageRow {
+                            page_id:      page.page_id,
+                            url:          page.url,
+                            title:        page.title,
+                            content_md:   Some(content_md),
+                            session_id:   page.session_id,
+                            content_hash: None,
+                        });
+                    }
+                }
+                Err(e) => tracing::warn!("[search_kb_pages] on-demand fetch failed: {}", e),
+            }
+        }
+    }
+
+    if imported.is_empty() { return Ok(json!([])); }
+    Ok(build_kb_results(&imported))
+}
+
+fn build_kb_results(rows: &[impl AsPageRow]) -> Value {
+    let results: Vec<Value> = rows.iter().enumerate().map(|(i, p)| {
+        let cite_id = format!("kb_{}", i + 1);
+        let body = p.content_md().unwrap_or("");
+        let body = if body.starts_with("---") {
+            body.splitn(4, "---").nth(2).unwrap_or(body).trim_start()
+        } else { body };
+        json!({
+            "__cite_id__": cite_id,
+            "url":         p.url(),
+            "title":       p.title().unwrap_or_else(|| p.url()),
+            "content":     body.chars().take(1200).collect::<String>(),
+        })
+    }).collect();
+    json!(results)
+}
+
+trait AsPageRow {
+    fn page_id(&self) -> &str;
+    fn url(&self) -> &str;
+    fn title(&self) -> Option<&str>;
+    fn content_md(&self) -> Option<&str>;
+}
+
 /// Web search tool handler: reads Brave API key from DB, checks quota, calls API.
 pub(crate) async fn vault_web_search(
     client: &reqwest::Client,

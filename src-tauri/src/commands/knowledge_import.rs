@@ -1139,116 +1139,33 @@ async fn find_matching_pending_pages(
 }
 
 async fn run_knowledge_query(
-    app: &AppHandle,
+    _app: &AppHandle,
     vault_id: &str,
     question: &str,
     session_id: Option<&str>,
     query_id: &str,
     app_state: &AppState,
 ) -> Result<(), AppError> {
-    // ── 1. FTS search on already-imported pages ────────────────────────────────
-    let mut notes = find_relevant_imported_pages(vault_id, session_id, question).await;
-
-    // ── 2. On-demand import of matching pending pages if no content found ──────
-    if notes.is_empty() {
-        let pending = find_matching_pending_pages(vault_id, session_id, question, None).await;
-        if !pending.is_empty() {
-            let titles: Vec<&str> = pending.iter().map(|p| p.title.as_str()).collect();
-            let _ = app.emit("knowledge:importing_pages", serde_json::json!({
-                "query_id": query_id,
-                "titles": &titles,
-            }));
-
-            // Fetch all pending pages sequentially to avoid concurrent write issues
-            let mut import_errors: Vec<String> = Vec::new();
-            for page in &pending {
-                if let Err(e) = fetch_page_content_for_qa(page, vault_id, &app_state.http_client).await {
-                    import_errors.push(format!("{}: {}", page.title, e));
-                }
-            }
-            if !import_errors.is_empty() {
-                log::warn!("[knowledge] on-demand import errors: {:?}", import_errors);
-            }
-
-            // Re-search with newly imported content
-            notes = find_relevant_imported_pages(vault_id, session_id, question).await;
-        }
-    }
-
-    if notes.is_empty() {
-        let msg = "目前沒有相關的知識點。請嘗試重新表述問題，或到「管理來源」手動匯入更多頁面。";
-        let _ = app.emit("knowledge:token", serde_json::json!({ "query_id": query_id, "content": msg }));
-        let _ = app.emit("knowledge:done", serde_json::json!({ "query_id": query_id }));
-        return Ok(());
-    }
-
-    // 2. Build refs (emitted immediately so UI can show sources while LLM streams)
-    let refs: Vec<KnowledgeRef> = notes.iter().map(|n| {
-        let title = if n.title.is_empty() {
-            n.url.clone()
-        } else {
-            n.title.clone()
-        };
-        // Strip frontmatter for excerpt
-        let body = if n.content.starts_with("---") {
-            n.content.splitn(4, "---").nth(2).unwrap_or(&n.content).trim_start().to_string()
-        } else {
-            n.content.clone()
-        };
-        let excerpt: String = body.chars().take(180).collect();
-        KnowledgeRef { path: n.url.clone(), title, excerpt }
-    }).collect();
-
-    let _ = app.emit("knowledge:refs", serde_json::json!({ "query_id": query_id, "refs": refs }));
-
-    // 3. Build RAG context
-    let is_cross_note = {
-        let q = question.to_lowercase();
-        q.contains("比較") || q.contains("對比") || q.contains("異同") || q.contains("差異")
-        || q.contains("總結") || q.contains("綜合") || q.contains("差別") || q.contains("共同")
-        || q.contains("相同") || q.contains("不同") || q.contains("compare") || q.contains("synthesize")
+    // All logic (FTS, on-demand fetch, LLM streaming, cite enforcement, agent:refs)
+    // is handled by the kb_query agent in the service via /vaults/:vid/agent/run.
+    // source_type/source_id are forwarded so search_kb_pages can scope by session.
+    let mut body = serde_json::json!({
+        "agent":           "kb_query",
+        "session_id":      query_id,
+        "input":           question,
+        "conversation_id": query_id,
+    });
+    if let Some(sid) = session_id {
+        body["source_type"] = serde_json::json!("kb_session");
+        body["source_id"]   = serde_json::json!(sid);
     };
-    if is_cross_note {
-        let _ = app.emit("knowledge:cross_note", serde_json::json!({ "query_id": query_id }));
-    }
-
-    let context = notes.iter().enumerate().map(|(i, n)| {
-        let body = if n.content.starts_with("---") {
-            n.content.splitn(4, "---").nth(2).unwrap_or(&n.content).trim_start().to_string()
-        } else {
-            n.content.clone()
-        };
-        let excerpt: String = body.chars().take(1200).collect();
-        format!("[{}] 標題：{}\n{}", i + 1, n.title, excerpt)
-    }).collect::<Vec<_>>().join("\n\n---\n\n");
-
-    let system = if is_cross_note {
-        format!(
-            "你是知識庫跨筆記推理助手。根據以下多篇筆記進行比較、對比或綜合分析。\
-            如有引用，以 [1][2] 格式標示來源編號。\
-            若有多個來源可以比較，請用結構化方式（如對比清單）呈現。\
-            若筆記內容不足，誠實說明。用繁體中文回答。\n\n筆記：\n\n{}",
-            context
-        )
-    } else {
-        format!(
-            "你是知識庫問答助手。根據以下筆記回答使用者問題。\
-            如有引用，以 [1][2] 格式標示來源編號。\
-            若筆記內容不足，誠實說明。用繁體中文回答。\n\n筆記：\n\n{}",
-            context
-        )
-    };
-
-    // 5. Delegate streaming to service endpoint; events emitted as llm:token / llm:done
-    crate::api_client::daemon_post::<_, serde_json::Value>(
-        app_state,
-        &format!("/vaults/{}/kb/query", vault_id),
-        &serde_json::json!({
-            "question":      question,
-            "context":       context,
-            "is_cross_note": is_cross_note,
-            "session_id":    query_id,
-        }),
+    let token = app_state.get_auth_token().await;
+    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
+    daemon_post::<_, serde_json::Value>(
+        &app_state.http_client,
+        &format!("/vaults/{}/agent/run", vault_id),
+        &body,
+        tok,
     )
     .await
     .map_err(|e| AppError::AI(format!("KB query 失敗：{}", e)))?;

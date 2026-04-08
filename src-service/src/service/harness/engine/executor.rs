@@ -199,15 +199,23 @@ impl Executor {
                     Ok(v) => {
                         tx.record_tool(&node.call.name).await;
                         let (guard_outcome, v) = extract_guard_outcome(v, &node.call.name);
-                        // ── Post-dispatch: emit agent:note_refs (interactive only) ─
+                        // ── Post-dispatch: emit agent:refs ────────────────────────
                         if let Some(ref env) = self.env {
-                            let refs = vault_tools::extract_note_refs(
-                                &node.call.name, &actual_args, &v, &env.vault_path,
-                            );
+                            let refs: Vec<serde_json::Value> = if node.call.name == "search_kb_pages" {
+                                v.as_array().map(|arr| arr.iter().map(|item| json!({
+                                    "path":    item["url"].as_str().unwrap_or(""),
+                                    "title":   item["title"].as_str().unwrap_or(""),
+                                    "excerpt": item["content"].as_str().unwrap_or("").chars().take(180).collect::<String>(),
+                                })).collect()).unwrap_or_default()
+                            } else {
+                                vault_tools::extract_note_refs(
+                                    &node.call.name, &actual_args, &v, &env.vault_path,
+                                ).into_iter().map(|path| json!({ "path": path })).collect()
+                            };
                             if !refs.is_empty() {
-                                (self.emit_fn)("agent:note_refs".to_string(), json!({
+                                (self.emit_fn)("agent:refs".to_string(), json!({
                                     "session_id": env.session_id,
-                                    "paths": refs,
+                                    "refs": refs,
                                 }));
                             }
                         }

@@ -60,6 +60,11 @@ pub struct HarnessRequestRuntime {
     /// Use `is_background()` / `needs_frontend()` rather than comparing directly.
     pub kind:           String,
     pub streaming:      bool,
+    /// Scoped knowledge source for tools like search_kb_pages.
+    /// e.g. source_type="kb_session", source_id=<import_session_id>
+    ///      source_type="vault",      source_id=<vault_id>
+    pub source_type:    Option<String>,
+    pub source_id:      Option<String>,
     /// UI language used to localise agent system messages.
     pub(crate) locale:  Locale,
     /// Raw agent definition from DB.
@@ -119,6 +124,8 @@ impl HarnessRequestRuntime {
             client:           reqwest::Client::new(),
             kind:             String::new(),
             streaming:        false,
+            source_type:      None,
+            source_id:        None,
             locale:           Locale::default(),
             agent_def:        Value::Null,
             write_snapshots:  Arc::new(Mutex::new(Default::default())),
@@ -187,6 +194,8 @@ impl HarnessRequestRuntime {
                                 }),
             kind,
             streaming: false,
+            source_type: self.source_type.clone(),
+            source_id:   self.source_id.clone(),
             locale: Locale::default(),
             agent_def,
             write_snapshots: Arc::new(Mutex::new(HashMap::new())),
@@ -414,7 +423,13 @@ impl HarnessRequestRuntime {
     ) -> AgentContextResult {
         let system_prompt = self.agent_def["system_prompt"].as_str().unwrap_or("").to_string();
 
-        let do_skill_pass      = !self.vault_path.is_empty() && self.agent_def["use_skill_pass"].as_bool().unwrap_or(false);
+        let pinned_skill_ids: Vec<String> = self.agent_def["skill_ids"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).map(String::from).collect())
+            .unwrap_or_default();
+        let do_skill_pass = !self.vault_path.is_empty()
+            && self.agent_def["use_skill_pass"].as_bool().unwrap_or(false)
+            && pinned_skill_ids.is_empty();
         let do_memory_prefetch = self.needs_frontend() && !self.vault_id.is_empty() && !self.account_id.is_empty();
         let keywords: Vec<String> = input.split_whitespace()
             .filter(|w| w.chars().count() >= 2)
@@ -422,9 +437,16 @@ impl HarnessRequestRuntime {
             .map(String::from)
             .collect();
 
+        let use_pinned = !self.agent_def["use_skill_pass"].as_bool().unwrap_or(false)
+            && !pinned_skill_ids.is_empty();
+
         let (skill_result, prefetched_memory) = tokio::join!(
             async {
-                if do_skill_pass {
+                if use_pinned {
+                    Some(crate::service::harness::tools::skill_tools::load_skills_by_ids(
+                        &self.db, &pinned_skill_ids,
+                    ).await)
+                } else if do_skill_pass {
                     Some(crate::service::helpers::run_skill_pass(
                         &self.client, &self.embedding_url, &self.db,
                         &self.vault_id, &self.account_id, input,

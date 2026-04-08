@@ -252,6 +252,14 @@ const SKILLS: &[BuiltinSkill] = &[
         seed_version: 1,
     },
     BuiltinSkill {
+        id: "builtin_kb_search",
+        title: "知識庫問答",
+        trigger: "__kb_query__",
+        behavior: "步驟1：呼叫 @[search_kb_pages]（query 填使用者問題，session_id 若有則帶入）搜尋知識庫已匯入頁面，取得含 __cite_id__ 的結果。步驟2：根據結果回答使用者問題。回答第一句必須以 [cite:id1,id2] 格式標明所引用的結果 cite_id；若結果為空，回覆「目前沒有相關的知識點」。",
+        injection_mode: "passive",
+        seed_version: 1,
+    },
+    BuiltinSkill {
         id: "builtin_organize_memory",
         title: "整理/提取記憶",
         trigger: "整理記憶、提取記憶、分析對話記憶、幫我整理記憶、記憶整理、萃取記憶、從對話提取知識、記憶分析、幫我歸納記憶、organize memory、extract memory、memory cleanup、分析我的對話記憶、整理過去的對話、把對話轉成記憶、記憶萃取",

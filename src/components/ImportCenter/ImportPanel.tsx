@@ -230,8 +230,8 @@ export default function ImportPanel() {
         ))
       })
 
-      unRefs = await listen<{ query_id: string; refs: KnowledgeRef[] }>('knowledge:refs', e => {
-        if (e.payload.query_id !== queryId) return
+      unRefs = await listen<{ session_id: string; refs: KnowledgeRef[] }>('agent:refs', e => {
+        if (e.payload.session_id !== queryId) return
         pendingRefsRef.current = e.payload.refs
         setMessages(sessionId, prev => prev.map(m =>
           m.id === asstMsgId ? { ...m, refs: e.payload.refs } : m

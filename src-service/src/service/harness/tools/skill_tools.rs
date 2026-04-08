@@ -203,6 +203,56 @@ pub(crate) fn strip_tool_markers(text: &str) -> String {
     result
 }
 
+/// Load skills directly by their skill_ids, bypassing semantic/keyword matching.
+/// Used when agent_def has `use_skill_pass: false` and `skill_ids` is non-empty.
+pub(crate) async fn load_skills_by_ids(db: &SurrealDb, skill_ids: &[String]) -> SkillPassResult {
+    if skill_ids.is_empty() {
+        return SkillPassResult { system_injection: String::new(), skill_titles: vec![], skill_tool_names: vec![] };
+    }
+    let ids_json = serde_json::Value::Array(
+        skill_ids.iter().map(|s| serde_json::Value::String(s.clone())).collect()
+    );
+    let mut resp = match db
+        .query("SELECT skill_id, title, behavior, injection_mode FROM agent_skills WHERE skill_id INSIDE $ids AND is_active = true")
+        .bind(("ids", ids_json))
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return SkillPassResult { system_injection: String::new(), skill_titles: vec![], skill_tool_names: vec![] },
+    };
+    let skills: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+    let rows: Vec<SkillRow> = skills.iter().map(skill_row_to_tuple).collect();
+    if rows.is_empty() {
+        return SkillPassResult { system_injection: String::new(), skill_titles: vec![], skill_tool_names: vec![] };
+    }
+
+    let mut chain_tool_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut injection_parts: Vec<String> = Vec::new();
+
+    for (_, title, behavior, _) in &rows {
+        let chain = extract_chain_from_behavior(behavior);
+        chain.iter().for_each(|t| { chain_tool_set.insert(t.clone()); });
+        let clean_desc = strip_tool_markers(behavior);
+        if !chain.is_empty() {
+            let step_hint = chain.iter()
+                .filter(|t| t.as_str() != "plan_announce")
+                .cloned().collect::<Vec<_>>().join(" → ");
+            injection_parts.push(
+                format!("[技能：{}]\n建議操作順序：{}\n{}", title, step_hint, clean_desc)
+                    .chars().take(600).collect()
+            );
+        } else if !behavior.is_empty() {
+            injection_parts.push(format!("[技能：{}]\n{}", title, clean_desc).chars().take(500).collect());
+        }
+    }
+
+    SkillPassResult {
+        system_injection: injection_parts.join("\n\n").chars().take(2000).collect(),
+        skill_titles: rows.iter().map(|(_, t, _, _)| t.clone()).collect(),
+        skill_tool_names: chain_tool_set.into_iter().collect(),
+    }
+}
+
 /// When use_skill_pass is true but no skill matched the user's input,
 /// inject a skill-discovery prompt so LLM can guide the user to select an
 /// existing skill or compose a new one with @[tool_name] chain syntax.

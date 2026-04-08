@@ -51,7 +51,36 @@ fn builtin_agents(account_id: &str, now: i64) -> Vec<serde_json::Value> {
     vec![
         trace_analyst_def(account_id, now),
         memory_agent_def(account_id, now),
+        kb_query_def(account_id, now),
     ]
+}
+
+fn kb_query_def(account_id: &str, now: i64) -> serde_json::Value {
+    json!({
+        "account_id":    account_id,
+        "def_id":        "builtin_kb_query",
+        "name":          "kb_query",
+        "description":   "知識庫問答 agent：搜尋已匯入頁面並回答問題，支援 cite_id 引用追蹤。",
+        "kind":          "chat",
+        "is_active":     true,
+        "is_builtin":    true,
+        "enable_think":  false,
+        "use_skill_pass": false,
+        "skill_ids":     ["builtin_kb_search"],
+        "tool_names":    ["search_kb_pages"],
+        "trigger":       "",
+        "status":        "active",
+        "use_count":     0,
+        "created_at":    now,
+        "system_prompt": "你是知識庫問答助理。使用 search_kb_pages 工具搜尋已匯入的知識頁面，根據結果回答使用者問題。\n\
+            ## 規則\n\
+            1. 先呼叫 search_kb_pages（query 填使用者問題）取得相關頁面（含 __cite_id__ 欄位）。\n\
+            2. 回答的第一句必須以 [cite:id1,id2] 格式標明所依據的 cite_id（例如 [cite:kb_1,kb_2]）；若未使用任何工具則輸出 [cite:none]。\n\
+            3. 若結果為空，回覆「目前沒有相關的知識點。請嘗試重新表述問題，或到管理來源手動匯入更多頁面。」\n\
+            4. 可進行比較、對比、綜合分析；若引用多個來源，以結構化方式呈現。",
+        "system_prompt_version": 1,
+        "max_rounds":    3,
+    })
 }
 
 fn trace_analyst_def(account_id: &str, now: i64) -> serde_json::Value {

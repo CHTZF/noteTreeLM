@@ -20,14 +20,16 @@ pub use agents::scheduled_agents::execute_scheduled_task;
 /// Build a fully-populated [`HarnessRequestRuntime`] for a specific vault + account.
 /// Returns `None` if the LLM URL is not yet configured.
 pub async fn build_agent_runtime(
-    state:      &crate::app_state::ApiState,
-    vault_id:   &str,
-    account_id: &str,
-    session_id: Option<String>,
-    conv_id:    String,
-    agent_def:  serde_json::Value,
-    streaming:  bool,
+    state:       &crate::app_state::ApiState,
+    vault_id:    &str,
+    account_id:  &str,
+    session_id:  Option<String>,
+    conv_id:     String,
+    agent_def:   serde_json::Value,
+    streaming:   bool,
     ui_language: Option<&str>,
+    source_type: Option<String>,
+    source_id:   Option<String>,
 ) -> Option<HarnessRequestRuntime> {
     use std::sync::Arc;
     use crate::service::types::{EmitEventFn, ServiceEvent};
@@ -69,6 +71,8 @@ pub async fn build_agent_runtime(
                             .unwrap_or_default(),
         kind,
         streaming,
+        source_type,
+        source_id,
         locale: ui_language.map(Locale::from_tag).unwrap_or_default(),
         agent_def,
         write_snapshots: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),

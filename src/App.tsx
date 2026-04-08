@@ -701,7 +701,7 @@ function AppMain() {
     const rawPath = hashIdx >= 0 ? pathWithAnchor.slice(0, hashIdx) : pathWithAnchor
     const anchor  = hashIdx >= 0 ? pathWithAnchor.slice(hashIdx + 1) : undefined
 
-    // Convert absolute path → relative (DB stores relative; agent:note_refs emits absolute)
+    // Convert absolute path → relative (DB stores relative; agent:refs emits absolute)
     const vaultRoot = useSettingsStore.getState().settings.system_current_vault_path
     const normalizedVault = vaultRoot.replace(/\\/g, '/').replace(/\/$/, '')
     const normalizedRaw   = rawPath.replace(/\\/g, '/')
