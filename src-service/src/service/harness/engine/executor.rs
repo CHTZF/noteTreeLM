@@ -220,15 +220,19 @@ impl Executor {
                                 }));
                             }
                         }
-                        self.working_memory.record(
-                            node.call.id.clone(),
-                            node.call.name.clone(),
-                            actual_args.clone(),
-                            v.clone(),
-                            started_at,
-                            duration_ms,
-                            guard_outcome,
-                        ).await;
+                        // `recall` is never recorded — it reads working_memory and must
+                        // not appear in its own search results (prevents recall loops).
+                        if node.call.name != "recall" {
+                            self.working_memory.record(
+                                node.call.id.clone(),
+                                node.call.name.clone(),
+                                actual_args.clone(),
+                                v.clone(),
+                                started_at,
+                                duration_ms,
+                                guard_outcome,
+                            ).await;
+                        }
                         // Annotate result with cite_id so LLM can reference it in final reply.
                         let v_cited = annotate_cite_id(v, &node.call.id);
                         // Empty search result mid-chain: abort chain, return fallback sentinel.

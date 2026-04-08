@@ -92,6 +92,7 @@ pub(crate) static ALL_TOOL_DEFS: &[ToolDef] = &[
     // ── Agent / UI tools ─────────────────────────────────────────────────────
     ToolDef { name: "get_session_state",   schema_fn: schema_get_session_state,   is_write: false, guard: None, handler: handle_get_session_state,   rollback: None },
     ToolDef { name: "compress_context",    schema_fn: schema_compress_context,    is_write: false, guard: None, handler: handle_compress_context,    rollback: None },
+    ToolDef { name: "recall",              schema_fn: schema_recall,              is_write: false, guard: None, handler: handle_recall,              rollback: None },
     ToolDef { name: "finish",              schema_fn: schema_finish,              is_write: false, guard: None, handler: handle_finish,              rollback: None },
     ToolDef { name: "ask_user",            schema_fn: schema_ask_user,            is_write: false, guard: None, handler: handle_ask_user,            rollback: None },
     ToolDef { name: "checkpoint",          schema_fn: schema_checkpoint,          is_write: false, guard: None, handler: handle_checkpoint,          rollback: None },
@@ -413,6 +414,14 @@ fn schema_compress_context() -> Value { json!({ "type": "function", "function": 
         "summary":  { "type": "string", "description": "已收集到的關鍵資訊摘要（條列格式，保留後續任務需要的內容）" },
         "keep_ids": { "type": "array", "items": { "type": "string" }, "description": "需要保留的 tool_call id 清單（這些工具結果不會被刪除）" }
     }, "required": ["summary"] }
+}})}
+
+fn schema_recall() -> Value { json!({ "type": "function", "function": {
+    "name": "recall",
+    "description": "從本 session 的 working memory 搜尋先前工具呼叫的結果。當 context 被壓縮後需要找回之前搜尋過的內容時使用。每個 session 最多呼叫 5 次。",
+    "parameters": { "type": "object", "properties": {
+        "query": { "type": "string", "description": "搜尋關鍵字，例如工具名稱、路徑、或查詢內容" }
+    }, "required": ["query"] }
 }})}
 
 fn schema_finish() -> Value { json!({ "type": "function", "function": {
@@ -1057,6 +1066,21 @@ fn handle_get_session_state(env: Arc<HarnessRequestRuntime>, _args: Value) -> To
             "tool_calls": calls,
             "repeated_calls": repeat_warnings,
         }))
+    })
+}
+
+fn handle_recall(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let query = args["query"].as_str().unwrap_or("").to_string();
+        if query.is_empty() {
+            return Ok(json!("query 不能為空"));
+        }
+        match env.working_memory.recall(&query).await {
+            Ok(results) if results.is_empty() =>
+                Ok(json!(format!("working memory 中沒有包含「{}」的工具呼叫紀錄。", query))),
+            Ok(results) => Ok(json!(results)),
+            Err(msg) => Ok(json!(msg)),
+        }
     })
 }
 

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 use serde_json::Value;
 use crate::service::harness::governance::guard::{GuardOutcome, ToolCallRecord};
@@ -17,15 +18,23 @@ use crate::service::harness::governance::guard::{GuardOutcome, ToolCallRecord};
 ///
 /// `WorkingMemory` is `Clone` — cloning only bumps the refcount on the inner `Arc`;
 /// all clones share the same backing store.
+
+/// Max number of `recall` calls allowed per session to prevent recall-loop exhaustion.
+const MAX_RECALL_CALLS: usize = 5;
+
 #[derive(Clone)]
 pub(crate) struct WorkingMemory {
-    inner: Arc<Mutex<HashMap<String, ToolCallRecord>>>,
+    inner:        Arc<Mutex<HashMap<String, ToolCallRecord>>>,
+    recall_count: Arc<AtomicUsize>,
 }
 
 impl WorkingMemory {
     /// Create a new, empty `WorkingMemory` for the session.
     pub(crate) fn new() -> Self {
-        Self { inner: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            inner:        Arc::new(Mutex::new(HashMap::new())),
+            recall_count: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     /// Record a completed tool execution.
@@ -99,6 +108,45 @@ impl WorkingMemory {
             .filter(|(_, n)| *n >= 2)
             .map(|((name, arg), _)| (name, arg))
             .collect()
+    }
+
+    /// Keyword search over recorded tool calls.
+    ///
+    /// Returns compact summaries matching `query` (case-insensitive substring match on
+    /// tool_name, args JSON, and the first 500 chars of result JSON).
+    ///
+    /// Returns `Err` if the per-session recall cap (`MAX_RECALL_CALLS`) is exceeded,
+    /// preventing context-exhaustion loops where recall results trigger more recalls.
+    /// `recall` calls are never recorded in working_memory themselves, so they cannot
+    /// appear in their own results.
+    pub(crate) async fn recall(&self, query: &str) -> Result<Vec<Value>, String> {
+        let n = self.recall_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if n > MAX_RECALL_CALLS {
+            return Err(format!(
+                "recall 已達本 session 上限（{}次），請直接根據現有資訊回答。",
+                MAX_RECALL_CALLS
+            ));
+        }
+        let q = query.to_lowercase();
+        let map = self.inner.lock().await;
+        let mut records: Vec<_> = map.values().collect();
+        records.sort_by_key(|r| r.started_at);
+        let results: Vec<Value> = records.iter().filter_map(|r| {
+            let args_str  = r.args.to_string().to_lowercase();
+            let result_preview = r.result.to_string();
+            let result_str = result_preview[..result_preview.len().min(500)].to_lowercase();
+            let name_str  = r.name.to_lowercase();
+            if name_str.contains(&q) || args_str.contains(&q) || result_str.contains(&q) {
+                Some(serde_json::json!({
+                    "tool":     r.name,
+                    "args":     r.args,
+                    "result":   &result_preview[..result_preview.len().min(800)],
+                }))
+            } else {
+                None
+            }
+        }).take(6).collect();
+        Ok(results)
     }
 
     /// Snapshot all records as a JSON-serialisable summary for `get_session_state`.
