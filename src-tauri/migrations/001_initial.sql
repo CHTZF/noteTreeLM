@@ -217,7 +217,6 @@ INSERT OR IGNORE INTO settings(key, value) VALUES
   ('auto_save_delay',    '1000'),
   ('whisper_cli_path',   ''),
   ('whisper_model_path', ''),
-  ('whisper_language',   'auto'),
   ('whisper_auto_insert','true'),
   ('import_max_depth',   '3'),
   ('import_max_pages',   '50'),

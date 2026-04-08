@@ -35,7 +35,7 @@ interface LiveChatSheetProps {
 
 export default function LiveChatSheet({ open, onClose, onOpenNote, onOpenTab, onShowResults }: LiveChatSheetProps) {
   const { settings, currentVaultId } = useSettingsStore()
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
   const currentNotePath = useEditorStore(s => s.currentPath)
 
   // Read activePattern from store directly — no usePatternDetector here to avoid
@@ -86,7 +86,7 @@ export default function LiveChatSheet({ open, onClose, onOpenNote, onOpenTab, on
     undefined,
     settings.voice_noise_suppression ?? true,
     5000,
-    settings.whisper_language ?? 'auto',
+    i18n.language,
   )
 
   const voiceStateRef = useRef(voiceState)
@@ -107,7 +107,7 @@ export default function LiveChatSheet({ open, onClose, onOpenNote, onOpenTab, on
   // Web Speech onend sometimes never fires in Tauri webview; use a timeout as safety net.
   const speakWithFallback = useCallback((text: string) => {
     const utt = new SpeechSynthesisUtterance(text)
-    utt.lang = settings.whisper_language ?? 'zh-TW'
+    utt.lang = i18n.language
     utt.rate = 1.1
     // Estimate: ~150ms per char, min 3s, max 20s
     const fallbackMs = Math.min(Math.max(text.length * 150, 3000), 20000)
@@ -131,7 +131,7 @@ export default function LiveChatSheet({ open, onClose, onOpenNote, onOpenTab, on
       done()
     }
     window.speechSynthesis.speak(utt)
-  }, [settings.whisper_language, startListening])
+  }, [i18n.language, startListening])
 
   // ── sendToLLM ────────────────────────────────────────────────────────────
   const sendToLLM = useCallback(async (query: string) => {
@@ -207,7 +207,8 @@ export default function LiveChatSheet({ open, onClose, onOpenNote, onOpenTab, on
           input: query,
           noteContext: noteCtx,
           activityContext: snap.getContextString() || null,
-          language: settings.whisper_language ?? 'zh-TW',
+          language: i18n.language,
+          uiLanguage: i18n.language,
         }),
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error('live_chat timeout')), TIMEOUT_MS)
@@ -238,7 +239,7 @@ export default function LiveChatSheet({ open, onClose, onOpenNote, onOpenTab, on
       unlistenTool?.()
       unlistenAction?.()
     }
-  }, [currentNotePath, settings.whisper_language, startListening, speakWithFallback, onOpenNote, onOpenTab, onShowResults, clearPredictiveMode])
+  }, [currentNotePath, i18n.language, startListening, speakWithFallback, onOpenNote, onOpenTab, onShowResults, clearPredictiveMode])
 
   // ── Silence detection → send to LLM ─────────────────────────────────────
   useEffect(() => {

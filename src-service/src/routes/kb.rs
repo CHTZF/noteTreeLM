@@ -1,18 +1,21 @@
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
-    routing::{delete, get, patch},
+    http::{HeaderMap, StatusCode},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use chrono::Utc;
+use futures_util::StreamExt as _;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::app_state::ApiState;
+use super::agents::account_id_from_headers;
 
 pub fn router() -> Router<ApiState> {
     Router::new()
+        .route("/vaults/:vault_id/kb/query", post(query))
         .route(
             "/vaults/:vault_id/kb/sessions",
             get(list_import_sessions).post(create_import_session),
@@ -53,6 +56,102 @@ pub fn router() -> Router<ApiState> {
                 .patch(update_knowledge_item)
                 .delete(delete_knowledge_item),
         )
+}
+
+/// POST /vaults/:vault_id/kb/query
+/// Body: { question, context, is_cross_note, session_id }
+/// Streams LLM response, emitting llm:token / llm:done events with session_id.
+async fn query(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let _account_id = account_id_from_headers(&state, &headers).await?;
+    let question     = body["question"].as_str().unwrap_or("").to_string();
+    let context      = body["context"].as_str().unwrap_or("").to_string();
+    let is_cross_note = body["is_cross_note"].as_bool().unwrap_or(false);
+    let session_id   = body["session_id"].as_str().unwrap_or("").to_string();
+    let _ = vault_id; // vault scoping handled by caller
+
+    let system = if is_cross_note {
+        format!(
+            "你是知識庫跨筆記推理助手。根據以下多篇筆記進行比較、對比或綜合分析。\
+            如有引用，以 [1][2] 格式標示來源編號。\
+            若有多個來源可以比較，請用結構化方式（如對比清單）呈現。\
+            若筆記內容不足，誠實說明。用繁體中文回答。\n\n筆記：\n\n{}",
+            context
+        )
+    } else {
+        format!(
+            "你是知識庫問答助手。根據以下筆記回答使用者問題。\
+            如有引用，以 [1][2] 格式標示來源編號。\
+            若筆記內容不足，誠實說明。用繁體中文回答。\n\n筆記：\n\n{}",
+            context
+        )
+    };
+
+    let base_url = crate::routes::llm::ensure_llama_running(&state)
+        .await
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+
+    let client = reqwest::Client::new();
+    let req_body = json!({
+        "model": "local",
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user",   "content": question },
+        ],
+        "stream": true,
+        "temperature": 0.3,
+        "max_tokens": 1024,
+    });
+
+    let response = client
+        .post(format!("{}/v1/chat/completions", base_url))
+        .json(&req_body)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("LLM 請求失敗：{}", e)))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err((StatusCode::BAD_GATEWAY, format!("LLM 回應錯誤 {}：{}", status, text)));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut sse_buf = String::new();
+
+    while let Some(item) = stream.next().await {
+        let bytes = item.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        sse_buf.push_str(&String::from_utf8_lossy(&bytes));
+
+        while let Some(end) = sse_buf.find("\n\n") {
+            let event = sse_buf[..end].to_string();
+            sse_buf = sse_buf[end + 2..].to_string();
+            for line in event.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if data.trim() == "[DONE]" { continue; }
+                    if let Ok(j) = serde_json::from_str::<Value>(data) {
+                        if let Some(text) = j["choices"][0]["delta"]["content"].as_str() {
+                            if !text.is_empty() {
+                                state.daemon.emit("llm:token", json!({
+                                    "session_id": session_id,
+                                    "content": text,
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    state.daemon.emit("llm:done", json!({ "session_id": session_id }));
+
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn list_import_sessions(

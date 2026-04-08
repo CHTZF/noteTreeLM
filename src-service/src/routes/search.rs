@@ -45,7 +45,7 @@ async fn search_notes(
     let mut seen_chunk_ids: HashSet<String> = HashSet::new();
 
     // 1. Try vector search if embedding server is available
-    let emb_url = state.daemon.embedding_url.read().await.clone();
+    let emb_url = Some(state.daemon.embedding_url.clone());
     if emb_url.is_some() {
         let http_client = reqwest::Client::new();
         if let Some(embedding) =

@@ -15,7 +15,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # HTTP server
-axum = "0.7"
+axum = { version = "0.7", features = ["multipart"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
@@ -51,7 +51,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 dirs = "5"
 
 # HTTP client (embedding server calls)
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 
 # Regex (markdown cleaning)
 regex = "1"
@@ -60,3 +60,6 @@ once_cell = "1"
 # SSE event streaming
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
+
+# Config file
+toml = "0.8"

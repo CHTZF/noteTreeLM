@@ -1,7 +1,6 @@
 #![allow(dead_code)]
-use crate::{api_client::{daemon_delete, daemon_get, daemon_patch, daemon_post, daemon_put}, commands::ai::ensure_server_running, error::AppError, state::AppState};
+use crate::{api_client::{daemon_delete, daemon_get, daemon_patch, daemon_post, daemon_put}, error::AppError, state::AppState};
 use chrono::Datelike as _;
-use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, State};
@@ -1147,18 +1146,12 @@ async fn run_knowledge_query(
     query_id: &str,
     app_state: &AppState,
 ) -> Result<(), AppError> {
-    // ── Get embedding URL (only used for sitemap title vector search) ────────
-    let emb_url: Option<String> = {
-        let port = *app_state.embedding_actual_port.lock().await;
-        port.map(|p| format!("http://127.0.0.1:{}", p))
-    };
-
     // ── 1. FTS search on already-imported pages ────────────────────────────────
     let mut notes = find_relevant_imported_pages(vault_id, session_id, question).await;
 
     // ── 2. On-demand import of matching pending pages if no content found ──────
     if notes.is_empty() {
-        let pending = find_matching_pending_pages(vault_id, session_id, question, emb_url.as_deref()).await;
+        let pending = find_matching_pending_pages(vault_id, session_id, question, None).await;
         if !pending.is_empty() {
             let titles: Vec<&str> = pending.iter().map(|p| p.title.as_str()).collect();
             let _ = app.emit("knowledge:importing_pages", serde_json::json!({
@@ -1246,63 +1239,20 @@ async fn run_knowledge_query(
         )
     };
 
-    // 5. Stream tokens via local llama-server
-    let client = reqwest::Client::new();
-    let base_url = ensure_server_running(app_state, app).await?;
-    let body = serde_json::json!({
-        "model": "local",
-        "messages": [
-            { "role": "system", "content": system },
-            { "role": "user", "content": question }
-        ],
-        "stream": true,
-        "temperature": 0.3,
-        "max_tokens": 1024,
-    });
-    let response = client
-        .post(format!("{}/v1/chat/completions", base_url))
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(120))
-        .send()
-        .await
-        .map_err(|e| AppError::AI(format!("請求 LLM 失敗：{}", e)))?;
+    // 5. Delegate streaming to service endpoint; events emitted as llm:token / llm:done
+    crate::api_client::daemon_post::<_, serde_json::Value>(
+        app_state,
+        &format!("/vaults/{}/kb/query", vault_id),
+        &serde_json::json!({
+            "question":      question,
+            "context":       context,
+            "is_cross_note": is_cross_note,
+            "session_id":    query_id,
+        }),
+    )
+    .await
+    .map_err(|e| AppError::AI(format!("KB query 失敗：{}", e)))?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        return Err(AppError::AI(format!("LLM 回應錯誤 {}：{}", status, text)));
-    }
-
-    let mut stream = response.bytes_stream();
-    let mut sse_buf = String::new();
-
-    while let Some(item) = stream.next().await {
-        let bytes = item.map_err(|e| AppError::AI(e.to_string()))?;
-        sse_buf.push_str(&String::from_utf8_lossy(&bytes));
-
-        while let Some(end) = sse_buf.find("\n\n") {
-            let event = sse_buf[..end].to_string();
-            sse_buf = sse_buf[end + 2..].to_string();
-            for line in event.lines() {
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data.trim() == "[DONE]" { continue; }
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                        let content = json["choices"][0]["delta"]["content"].as_str().map(|s| s.to_string());
-                        if let Some(text) = content {
-                            if !text.is_empty() {
-                                let _ = app.emit("knowledge:token", serde_json::json!({
-                                    "query_id": query_id,
-                                    "content": text
-                                }));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let _ = app.emit("knowledge:done", serde_json::json!({ "query_id": query_id }));
     Ok(())
 }
 
@@ -1401,9 +1351,8 @@ pub async fn suggest_kb_cards(
         return Err(AppError::Import("頁面尚未匯入內容".to_string()));
     }
 
-    let base_url = ensure_server_running(state.inner(), &app).await
-        .map_err(|e| AppError::AI(e.to_string()))?;
-    let client = reqwest::Client::new();
+    let tok_owned = state.get_auth_token().await;
+    let tok = if tok_owned.is_empty() { None } else { Some(tok_owned.as_str()) };
 
     let user_content = format!(
         "頁面標題：{}\n\n內容：\n{}",
@@ -1411,24 +1360,19 @@ pub async fn suggest_kb_cards(
         &content_md.chars().take(2000).collect::<String>(),
     );
 
-    let body = serde_json::json!({
-        "messages": [
-            {"role": "system", "content": note_card_system_prompt()},
-            {"role": "user", "content": user_content},
-        ],
-        "stream": false,
-        "temperature": 0.3,
-        "max_tokens": 1500,
-    });
-    let response = client
-        .post(format!("{}/v1/chat/completions", base_url))
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(90))
-        .send().await.map_err(|e| AppError::AI(e.to_string()))?;
+    let resp: serde_json::Value = crate::api_client::daemon_post(
+        &state.http_client,
+        &format!("/vaults/{}/agent/invoke", urlencoding::encode(&vault_id)),
+        &serde_json::json!({
+            "system":      note_card_system_prompt(),
+            "input":       user_content,
+            "temperature": 0.3,
+            "max_tokens":  1500,
+        }),
+        tok,
+    ).await.map_err(|e| AppError::AI(e))?;
 
-    let json: serde_json::Value = response.json().await
-        .map_err(|e| AppError::AI(format!("回應解析失敗：{}", e)))?;
-    let raw = json["choices"][0]["message"]["content"].as_str().unwrap_or("").trim().to_string();
+    let raw = resp["text"].as_str().unwrap_or("").trim().to_string();
     let obj_start = raw.find('{').unwrap_or(0);
     let obj_end = raw.rfind('}').map(|i| i + 1).unwrap_or(raw.len());
 
@@ -2155,17 +2099,14 @@ fn parse_agent_skill(v: &serde_json::Value) -> Option<AgentSkillRecord> {
 /// LLM 唯一可呼叫的工具是 create_agent_skill，可呼叫 1-2 次。
 /// 回傳持久化後的 AgentSkillRecord 列表。
 pub async fn generate_skills_via_tool_call(
-    client: &reqwest::Client,
-    base_url: &str,
-    _db_unused: Option<()>,
+    app_state: &AppState,
     vault_id: &str,
     item_id: &str,
     knowledge_context: &str,
-    emb_url: Option<&str>,
     now_ms: i64,
 ) -> Vec<AgentSkillRecord> {
     // 從 vault_tools() 提取所有工具名稱+描述，以文字形式注入 system prompt
-    let tools_desc: String = crate::commands::ai::vault_tools()
+    let tools_desc: String = crate::commands::agent::vault_tools()
         .as_array()
         .map(|arr| {
             arr.iter().filter_map(|t| {
@@ -2218,32 +2159,25 @@ pub async fn generate_skills_via_tool_call(
         }
     }]);
 
-    let body = serde_json::json!({
-        "messages": [
-            { "role": "system", "content": system_prompt },
-            { "role": "user",   "content": knowledge_context },
-        ],
-        "tools": callable_tool,
-        "tool_choice": "auto",
-        "stream": false,
-        "temperature": 0.3,
-        "max_tokens": 1200,
-    });
-
-    let Ok(resp) = client
-        .post(format!("{}/v1/chat/completions", base_url))
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(90))
-        .send().await
-    else { return vec![]; };
-
-    let Ok(json) = resp.json::<serde_json::Value>().await
-    else { return vec![]; };
+    let tok_owned = app_state.get_auth_token().await;
+    let tok = if tok_owned.is_empty() { None } else { Some(tok_owned.as_str()) };
+    let Ok(resp) = crate::api_client::daemon_post::<_, serde_json::Value>(
+        &app_state.http_client,
+        &format!("/vaults/{}/agent/invoke", urlencoding::encode(vault_id)),
+        &serde_json::json!({
+            "system":      system_prompt,
+            "input":       knowledge_context,
+            "tools":       callable_tool,
+            "tool_choice": "auto",
+            "temperature": 0.3,
+            "max_tokens":  1200,
+        }),
+        tok,
+    ).await else { return vec![]; };
 
     // 解析 tool_calls（LLM 可能呼叫 1-2 次 create_agent_skill）
-    let tool_calls = json
-        .pointer("/choices/0/message/tool_calls")
-        .and_then(|v| v.as_array())
+    let tool_calls = resp["tool_calls"]
+        .as_array()
         .cloned()
         .unwrap_or_default();
 
@@ -2266,7 +2200,7 @@ pub async fn generate_skills_via_tool_call(
         let scope = valid_scope(args["agent_scope"].as_str().unwrap_or("all")).to_string();
 
         // 驗證 tool_calls：每個名稱必須存在於 vault_tools()
-        let valid_names: std::collections::HashSet<String> = crate::commands::ai::vault_tools()
+        let valid_names: std::collections::HashSet<String> = crate::commands::agent::vault_tools()
             .as_array().map(|arr| {
                 arr.iter().filter_map(|t| {
                     t.pointer("/function/name")?.as_str().map(|s| s.to_string())
@@ -2280,12 +2214,6 @@ pub async fn generate_skills_via_tool_call(
                 .filter(|n| valid_names.contains(n))
                 .collect())
             .unwrap_or_default();
-
-        // 計算 trigger embedding
-        let _trigger_embedding: Option<Vec<f32>> = if let Some(url) = emb_url {
-            let v = crate::commands::ai::get_embedding(client, url, &trigger).await;
-            if v.is_empty() { None } else { Some(v) }
-        } else { None };
 
         let skill_id = uuid::Uuid::new_v4().to_string();
         // Save to daemon (best-effort)
@@ -2421,29 +2349,22 @@ pub async fn suggest_note_cards_for_item(
     let vault_id = state.get_vault_id().await?;
     let (_, _, user_content) = load_ki_context(&vault_id, &item_id).await?;
 
-    let base_url = crate::commands::ai::ensure_server_running(state.inner(), &app).await
-        .map_err(|e| AppError::AI(e.to_string()))?;
-    let client = reqwest::Client::new();
+    let tok_owned = state.get_auth_token().await;
+    let tok = if tok_owned.is_empty() { None } else { Some(tok_owned.as_str()) };
 
-    let body = serde_json::json!({
-        "messages": [
-            {"role": "system", "content": note_card_system_prompt()},
-            {"role": "user",   "content": &user_content},
-        ],
-        "stream": false,
-        "temperature": 0.3,
-        "max_tokens": 1500,
-    });
-    let response = client
-        .post(format!("{}/v1/chat/completions", base_url))
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(90))
-        .send().await.map_err(|e| AppError::AI(e.to_string()))?;
+    let resp: serde_json::Value = crate::api_client::daemon_post(
+        &state.http_client,
+        &format!("/vaults/{}/agent/invoke", urlencoding::encode(&vault_id)),
+        &serde_json::json!({
+            "system":      note_card_system_prompt(),
+            "input":       &user_content,
+            "temperature": 0.3,
+            "max_tokens":  1500,
+        }),
+        tok,
+    ).await.map_err(|e| AppError::AI(e))?;
 
-    let json: serde_json::Value = response.json().await
-        .map_err(|e| AppError::AI(format!("回應解析失敗：{}", e)))?;
-    let raw = json["choices"][0]["message"]["content"]
-        .as_str().unwrap_or("").trim().to_string();
+    let raw = resp["text"].as_str().unwrap_or("").trim().to_string();
     let obj_start = raw.find('{').unwrap_or(0);
     let obj_end   = raw.rfind('}').map(|i| i + 1).unwrap_or(raw.len());
 
@@ -2470,20 +2391,10 @@ pub async fn suggest_skill_cards_for_item(
 ) -> Result<(), AppError> {
     let vault_id = state.get_vault_id().await?;
     let (_, _, user_content) = load_ki_context(&vault_id, &item_id).await?;
-
-    let base_url = crate::commands::ai::ensure_server_running(state.inner(), &app).await
-        .map_err(|e| AppError::AI(e.to_string()))?;
-    let client = reqwest::Client::new();
     let now_ms = chrono::Local::now().timestamp_millis();
 
-    let emb_url: Option<String> = {
-        let port = *state.embedding_actual_port.lock().await;
-        port.map(|p| format!("http://127.0.0.1:{}", p))
-    };
-
     let saved_skills = generate_skills_via_tool_call(
-        &client, &base_url, None, &vault_id, &item_id,
-        &user_content, emb_url.as_deref(), now_ms,
+        state.inner(), &vault_id, &item_id, &user_content, now_ms,
     ).await;
 
     let _ = app.emit("kb:skill_cards_ready", serde_json::json!({
@@ -2504,35 +2415,23 @@ pub async fn suggest_kb_cards_for_item(
 ) -> Result<(), AppError> {
     let vault_id = state.get_vault_id().await?;
     let (_, _, user_content) = load_ki_context(&vault_id, &item_id).await?;
-
-    let base_url = crate::commands::ai::ensure_server_running(state.inner(), &app).await
-        .map_err(|e| AppError::AI(e.to_string()))?;
-    let client = reqwest::Client::new();
     let now_ms = chrono::Local::now().timestamp_millis();
-
-    let emb_url: Option<String> = {
-        let port = *state.embedding_actual_port.lock().await;
-        port.map(|p| format!("http://127.0.0.1:{}", p))
-    };
+    let tok_owned = state.get_auth_token().await;
+    let tok = if tok_owned.is_empty() { None } else { Some(tok_owned.as_str()) };
 
     // Generate note cards
-    let body = serde_json::json!({
-        "messages": [
-            {"role": "system", "content": note_card_system_prompt()},
-            {"role": "user", "content": &user_content},
-        ],
-        "stream": false,
-        "temperature": 0.3,
-        "max_tokens": 1500,
-    });
-    let note_cards: Vec<KBCardSuggestion> = if let Ok(resp) = client
-        .post(format!("{}/v1/chat/completions", base_url))
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(90))
-        .send().await
-    {
-        let json: serde_json::Value = resp.json().await.unwrap_or_default();
-        let raw = json["choices"][0]["message"]["content"].as_str().unwrap_or("").trim().to_string();
+    let note_cards: Vec<KBCardSuggestion> = if let Ok(resp) = crate::api_client::daemon_post::<_, serde_json::Value>(
+        &state.http_client,
+        &format!("/vaults/{}/agent/invoke", urlencoding::encode(&vault_id)),
+        &serde_json::json!({
+            "system":      note_card_system_prompt(),
+            "input":       &user_content,
+            "temperature": 0.3,
+            "max_tokens":  1500,
+        }),
+        tok,
+    ).await {
+        let raw = resp["text"].as_str().unwrap_or("").trim().to_string();
         let obj_start = raw.find('{').unwrap_or(0);
         let obj_end = raw.rfind('}').map(|i| i + 1).unwrap_or(raw.len());
         #[derive(Deserialize, Default)]
@@ -2542,8 +2441,7 @@ pub async fn suggest_kb_cards_for_item(
 
     // Generate skill cards
     let saved_skills = generate_skills_via_tool_call(
-        &client, &base_url, None, &vault_id, &item_id,
-        &user_content, emb_url.as_deref(), now_ms,
+        state.inner(), &vault_id, &item_id, &user_content, now_ms,
     ).await;
 
     let _ = app.emit("kb:suggestions_ready", serde_json::json!({
@@ -2581,11 +2479,9 @@ pub async fn compress_conversation_to_knowledge(
     messages_json: String,
 ) -> Result<CompressedConvResult, AppError> {
     let vault_id = state.get_vault_id().await?;
-
-    let base_url = ensure_server_running(state.inner(), &app).await
-        .map_err(|e| AppError::AI(e.to_string()))?;
-    let client = reqwest::Client::new();
     let now_ms = chrono::Utc::now().timestamp_millis();
+    let tok_owned = state.get_auth_token().await;
+    let tok = if tok_owned.is_empty() { None } else { Some(tok_owned.as_str()) };
 
     let compress_system = r#"你是對話知識萃取助理。根據以下對話，回傳嚴格 JSON（不含其他文字）：
 {
@@ -2595,24 +2491,19 @@ pub async fn compress_conversation_to_knowledge(
 }
 skill_candidates 可為空陣列。如有可重用行為規則才填入。"#;
 
-    let body = serde_json::json!({
-        "messages": [
-            {"role": "system", "content": compress_system},
-            {"role": "user",   "content": messages_json},
-        ],
-        "stream": false,
-        "temperature": 0.2,
-        "max_tokens": 800,
-    });
+    let resp: serde_json::Value = crate::api_client::daemon_post(
+        &state.http_client,
+        &format!("/vaults/{}/agent/invoke", urlencoding::encode(&vault_id)),
+        &serde_json::json!({
+            "system":      compress_system,
+            "input":       messages_json,
+            "temperature": 0.2,
+            "max_tokens":  800,
+        }),
+        tok,
+    ).await.map_err(|e| AppError::AI(e))?;
 
-    let json: serde_json::Value = client
-        .post(format!("{}/v1/chat/completions", base_url))
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(90))
-        .send().await.map_err(|e| AppError::AI(e.to_string()))?
-        .json().await.map_err(|e| AppError::AI(e.to_string()))?;
-
-    let raw = json["choices"][0]["message"]["content"].as_str().unwrap_or("").trim().to_string();
+    let raw = resp["text"].as_str().unwrap_or("").trim().to_string();
     let obj_start = raw.find('{').unwrap_or(0);
     let obj_end = raw.rfind('}').map(|i| i + 1).unwrap_or(raw.len());
     let compressed: ConvCompression = serde_json::from_str(&raw[obj_start..obj_end])
@@ -2643,13 +2534,8 @@ skill_candidates 可為空陣列。如有可重用行為規則才填入。"#;
     ).await;
 
     // Generate skill cards from candidate suggestions
-    let emb_url: Option<String> = {
-        let port = *state.embedding_actual_port.lock().await;
-        port.map(|p| format!("http://127.0.0.1:{}", p))
-    };
     let saved_skills = generate_skills_via_tool_call(
-        &client, &base_url, None, &vault_id, &item_id,
-        &compressed.knowledge_summary, emb_url.as_deref(), now_ms,
+        state.inner(), &vault_id, &item_id, &compressed.knowledge_summary, now_ms,
     ).await;
     let skill_count = saved_skills.len();
 
@@ -2677,9 +2563,9 @@ pub async fn extract_skill_from_exchange(
     user_msg: String,
     assistant_msg: String,
 ) -> Result<AgentSkillSuggestion, AppError> {
-    let base_url = ensure_server_running(state.inner(), &app).await
-        .map_err(|e| AppError::AI(e.to_string()))?;
-    let client = reqwest::Client::new();
+    let vault_id = state.get_vault_id().await?;
+    let tok_owned = state.get_auth_token().await;
+    let tok = if tok_owned.is_empty() { None } else { Some(tok_owned.as_str()) };
 
     let system_prompt = r#"你是個人 AI 行為規則萃取器。根據以下對話交換，萃取一條可重用的技能規範。
 回傳嚴格 JSON（不含其他文字、不含 markdown code fence）：
@@ -2695,26 +2581,19 @@ tool_calls 只能包含：search_vault、read_note、list_structure（或空陣�
 若對話內容無可萃取的行為規則，trigger 欄填入「無法萃取」。"#;
 
     let conv = format!("使用者：{}\n\n助理：{}", user_msg, assistant_msg);
-    let body = serde_json::json!({
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": conv},
-        ],
-        "stream": false,
-        "temperature": 0.2,
-        "max_tokens": 400,
-    });
+    let resp: serde_json::Value = crate::api_client::daemon_post(
+        &state.http_client,
+        &format!("/vaults/{}/agent/invoke", urlencoding::encode(&vault_id)),
+        &serde_json::json!({
+            "system":      system_prompt,
+            "input":       conv,
+            "temperature": 0.2,
+            "max_tokens":  400,
+        }),
+        tok,
+    ).await.map_err(|e| AppError::AI(e))?;
 
-    let response = client
-        .post(format!("{}/v1/chat/completions", base_url))
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(60))
-        .send().await.map_err(|e| AppError::AI(e.to_string()))?;
-
-    let json: serde_json::Value = response.json().await
-        .map_err(|e| AppError::AI(format!("回應解析失敗：{}", e)))?;
-    let raw = json["choices"][0]["message"]["content"]
-        .as_str().unwrap_or("").trim().to_string();
+    let raw = resp["text"].as_str().unwrap_or("").trim().to_string();
 
     // 尋找 JSON 物件邊界（容錯 markdown code fence）
     let obj_start = raw.find('{').unwrap_or(0);

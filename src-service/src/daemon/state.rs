@@ -1,26 +1,15 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use serde::{Deserialize, Serialize};
 
+use crate::config::Config;
 use crate::service::types::{AgentSession, ServiceEvent};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerInfo {
-    pub name: String,
-    pub port: u16,
-    pub status: String,   // "running" | "stopped" | "error"
-    pub model: Option<String>,
-    pub updated_at: i64,
-}
 
 #[derive(Clone)]
 pub struct DaemonState {
-    pub servers: Arc<RwLock<Vec<ServerInfo>>>,
     pub sqlite: crate::db::sqlite::SqliteConn,
-    pub embedding_url: Arc<RwLock<Option<String>>>,
-    pub llm_url: Arc<RwLock<Option<String>>>,
     /// Public tunnel URL from cloudflared (None if cloudflared not running)
     pub tunnel_url: Arc<RwLock<Option<String>>>,
     /// Broadcast channel for server-sent events (capacity 64).
@@ -31,23 +20,48 @@ pub struct DaemonState {
     pub intent_centroids: Arc<Mutex<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>>>,
     /// vault_id → vault_path in-process cache (avoids a DB round-trip on every note read).
     pub vault_path_cache: Arc<std::sync::RwLock<HashMap<String, String>>>,
+
+    // ── 固定 URL（從 config 計算，runtime 不變）─────────────────────────────
+    pub llm_url: String,
+    pub embedding_url: String,
+    pub whisper_url: String,
+
+    // ── 子進程 handles（生命週期管理）──────────────────────────────────────
+    pub whisper_server: Arc<Mutex<Option<tokio::process::Child>>>,
+    pub whisper_start_lock: Arc<Mutex<()>>,
+    pub whisper_user_stopped: Arc<AtomicBool>,
+    pub llama_server: Arc<Mutex<Option<tokio::process::Child>>>,
+    pub llama_start_lock: Arc<Mutex<()>>,
+    pub llama_user_stopped: Arc<AtomicBool>,
+    pub embedding_server: Arc<Mutex<Option<tokio::process::Child>>>,
+    pub embedding_start_lock: Arc<Mutex<()>>,
+    pub embedding_user_stopped: Arc<AtomicBool>,
 }
 
 impl DaemonState {
-    pub fn new_with_data_dir(data_dir: &Path) -> Self {
+    pub fn new(data_dir: &Path, config: &Config) -> Self {
         let sqlite = crate::db::sqlite::init_sqlite(&data_dir.join("search.db"))
             .expect("SQLite FTS5 init failed");
         let (event_tx, _) = tokio::sync::broadcast::channel(64);
         Self {
-            servers: Arc::new(RwLock::new(Vec::new())),
             sqlite,
-            embedding_url: Arc::new(RwLock::new(None)),
-            llm_url: Arc::new(RwLock::new(None)),
             tunnel_url: Arc::new(RwLock::new(None)),
             event_tx,
             agent_sessions: Arc::new(Mutex::new(HashMap::new())),
             intent_centroids: Arc::new(Mutex::new(None)),
             vault_path_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            llm_url: config.llm_url(),
+            embedding_url: config.embedding_url(),
+            whisper_url: config.whisper_url(),
+            whisper_server: Arc::new(Mutex::new(None)),
+            whisper_start_lock: Arc::new(Mutex::new(())),
+            whisper_user_stopped: Arc::new(AtomicBool::new(false)),
+            llama_server: Arc::new(Mutex::new(None)),
+            llama_start_lock: Arc::new(Mutex::new(())),
+            llama_user_stopped: Arc::new(AtomicBool::new(false)),
+            embedding_server: Arc::new(Mutex::new(None)),
+            embedding_start_lock: Arc::new(Mutex::new(())),
+            embedding_user_stopped: Arc::new(AtomicBool::new(false)),
         }
     }
 

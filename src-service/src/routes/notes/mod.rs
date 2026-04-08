@@ -94,7 +94,7 @@ pub(super) async fn index_note_chunks(
         }
     }
 
-    let emb_url = state.daemon.embedding_url.read().await.clone();
+    let emb_url = Some(state.daemon.embedding_url.clone());
     let http_client = reqwest::Client::new();
 
     for chunk in &chunks {

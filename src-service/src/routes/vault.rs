@@ -131,7 +131,7 @@ async fn scan_vault(
     let mut indexed_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Get embedding URL once for the whole scan
-    let emb_url = state.daemon.embedding_url.read().await.clone();
+    let emb_url = Some(state.daemon.embedding_url.clone());
     let http_client = reqwest::Client::new();
 
     for file_path in md_files {

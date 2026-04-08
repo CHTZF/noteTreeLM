@@ -307,7 +307,7 @@ async fn query_memory(
 
     let rows: Vec<Value> = if let Some(q_text) = params.q.as_deref().filter(|s| !s.is_empty()) {
         // ── Semantic search: compute query embedding, rank by cosine similarity ──
-        let embedding_url = state.daemon.embedding_url.read().await.clone();
+        let embedding_url = Some(state.daemon.embedding_url.clone());
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
@@ -490,7 +490,7 @@ async fn store_facts(
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap_or_default();
-    let embedding_url = state.daemon.embedding_url.read().await.clone();
+    let embedding_url = Some(state.daemon.embedding_url.clone());
     let now_ts = Utc::now().timestamp();
     let mut inserted = 0u32;
     let note_refs = body.note_refs.unwrap_or_default();
@@ -635,7 +635,7 @@ async fn distill_facts(
     }
 
     // Compute embedding for the summary so it's discoverable by semantic search
-    let embedding_url = state.daemon.embedding_url.read().await.clone();
+    let embedding_url = Some(state.daemon.embedding_url.clone());
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()

@@ -54,10 +54,10 @@ use std::path::PathBuf;
 use tauri::State;
 
 /// 若 embedding server 正在運行，回傳其 base URL；否則回傳 None。
+/// （embedding server 現由 service 管理；此 stub 保留給潛在呼叫端）
 #[allow(dead_code)]
-async fn embedding_url(state: &AppState) -> Option<String> {
-    let port = *state.embedding_actual_port.lock().await;
-    port.map(|p| format!("http://127.0.0.1:{}", p))
+async fn embedding_url(_state: &AppState) -> Option<String> {
+    None
 }
 
 

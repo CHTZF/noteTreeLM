@@ -27,12 +27,14 @@ pub async fn build_agent_runtime(
     conv_id:    String,
     agent_def:  serde_json::Value,
     streaming:  bool,
+    ui_language: Option<&str>,
 ) -> Option<HarnessRequestRuntime> {
     use std::sync::Arc;
     use crate::service::types::{EmitEventFn, ServiceEvent};
+    use harness::prompt::Locale;
 
-    let llm_url       = state.daemon.llm_url.read().await.clone()?;
-    let embedding_url = state.daemon.embedding_url.read().await.clone();
+    let llm_url       = state.daemon.llm_url.clone();
+    let embedding_url = Some(state.daemon.embedding_url.clone());
     let event_tx      = state.daemon.event_tx.clone();
     let emit_fn: EmitEventFn = Arc::new(move |event: String, payload: serde_json::Value| {
         let _ = event_tx.send(ServiceEvent { event, payload });
@@ -67,11 +69,13 @@ pub async fn build_agent_runtime(
                             .unwrap_or_default(),
         kind,
         streaming,
+        locale: ui_language.map(Locale::from_tag).unwrap_or_default(),
         agent_def,
         write_snapshots: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         write_mtimes:    Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         emitter,
         dispatcher,
+        context: harness::context::ContextBuffer::new(),
     })
 }
 /// Re-export harness::tools at the legacy path so routes outside this crate

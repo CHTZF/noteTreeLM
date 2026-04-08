@@ -168,8 +168,8 @@ export default function KnowledgeAssistant({ onOpenNote }: Props) {
     setIsQuerying(true)
     pendingRefsRef.current = []
 
-    const unToken = await listen<{ query_id: string; content: string }>('knowledge:token', e => {
-      if (e.payload.query_id !== queryId) return
+    const unToken = await listen<{ session_id: string; content: string }>('llm:token', e => {
+      if (e.payload.session_id !== queryId) return
       setMessages(prev => {
         const last = prev[prev.length - 1]
         if (!last || last.role !== 'assistant') return prev
@@ -183,8 +183,8 @@ export default function KnowledgeAssistant({ onOpenNote }: Props) {
     })
 
     let unDone: (() => void) | null = null
-    unDone = await listen<{ query_id: string; error?: string }>('knowledge:done', e => {
-      if (e.payload.query_id !== queryId) return
+    unDone = await listen<{ session_id: string; error?: string }>('llm:done', e => {
+      if (e.payload.session_id !== queryId) return
       const currentRefs = pendingRefsRef.current
       pendingRefsRef.current = []
       setMessages(prev => {

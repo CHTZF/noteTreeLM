@@ -91,6 +91,7 @@ pub async fn invoke_agent(
     use_tools: Option<bool>,
     conversation_id: Option<String>,
     activity_context: Option<String>,
+    ui_language: Option<String>,
 ) -> Result<serde_json::Value, AppError> {
     // 1. 確保 llama-server 運行（service 需要 llm_url）
     ensure_server_running(state.inner(), &_app).await?;
@@ -125,6 +126,7 @@ pub async fn invoke_agent(
             "activity_context": activity_context,
             "vault_path": vault_path,
             "conversation_id": conversation_id,
+            "ui_language": ui_language,
         }),
         tok,
     ).await.map_err(|e| AppError::AI(e.to_string()))?;
@@ -150,6 +152,7 @@ pub async fn invoke_live_chat(
     note_context: Option<String>,
     activity_context: Option<String>,
     language: Option<String>,
+    ui_language: Option<String>,
 ) -> Result<String, AppError> {
     // 1. 確保 llama-server 運行
     ensure_server_running(state.inner(), &app).await?;
@@ -174,6 +177,7 @@ pub async fn invoke_live_chat(
             "session_id": session_id,
             "input": input,
             "language": language,
+            "ui_language": ui_language,
             "note_context": note_context,
             "activity_context": activity_context,
             "vault_path": vault_path,

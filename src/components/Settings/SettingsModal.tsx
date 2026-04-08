@@ -248,7 +248,7 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
       Math.sin(2 * Math.PI * 440 * i / sampleRate) * 0.3,
     )
     const t0 = Date.now()
-    invoke<{ text: string }>('transcribe_audio', { pcmData, sampleRate })
+    invoke<{ text: string }>('transcribe_audio', { pcmData, sampleRate, language: 'auto' })
       .then(() => { setWhisperBenchmarkMs(Date.now() - t0) })
       .catch(() => {})
       .finally(() => setWhisperBenchmarking(false))
@@ -1025,19 +1025,6 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
               {/* ── Recognition Settings ───────────────────────────────────── */}
               <SectionDivider />
               <SectionHeader label="辨識設定" />
-              <div style={fieldStyle}>
-                <label style={labelStyle}>辨識語言</label>
-                <select value={draft.whisper_language} onChange={(e) => up({ whisper_language: e.target.value })} style={inputStyle}>
-                  <option value="auto">自動偵測</option>
-                  <option value="zh-TW">繁體中文</option>
-                  <option value="zh-CN">简体中文</option>
-                  <option value="en">English</option>
-                  <option value="ja">日本語</option>
-                  <option value="ko">한국어</option>
-                  <option value="fr">Français</option>
-                  <option value="de">Deutsch</option>
-                </select>
-              </div>
               <ToggleRow
                 label="錄音時顯示即時預覽（定期送 Whisper 預測）"
                 value={draft.voice_preview_enabled ?? true}

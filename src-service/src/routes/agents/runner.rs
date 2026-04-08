@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     extract::{Path, State},
@@ -30,6 +30,7 @@ pub async fn run(
     let messages: Vec<Value> = body["messages"].as_array().cloned().unwrap_or_default();
     let now = chrono::Utc::now().timestamp();
     let activity_context = body["activity_context"].as_str().map(String::from);
+    let ui_language = body["ui_language"].as_str().map(String::from);
     let conversation_id = body["conversation_id"].as_str()
         .map(String::from)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -57,12 +58,13 @@ pub async fn run(
         }
     }
 
-    let runtime = match crate::service::build_agent_runtime(&state, 
+    let runtime = match crate::service::build_agent_runtime(&state,
         &vault_id, &account_id,
         Some(session_id.clone()),
         conversation_id.clone(),
         agent_def,
         true, // streaming
+        ui_language.as_deref(),
     ).await {
         Some(r) => r,
         None => {
@@ -143,6 +145,7 @@ pub async fn live_chat(
                             .unwrap_or_else(|| Uuid::new_v4().to_string());
     let input           = body["input"].as_str().unwrap_or("").to_string();
     let language        = body["language"].as_str().unwrap_or("zh-TW").to_string();
+    let ui_language     = body["ui_language"].as_str().map(String::from);
     let note_context    = body["note_context"].as_str().map(String::from);
     let activity_context = body["activity_context"].as_str().map(String::from);
     let conversation_id = body["conversation_id"].as_str().unwrap_or("").to_string();
@@ -157,12 +160,13 @@ pub async fn live_chat(
 
     // Phase 1: run_agent (streaming:false) — tool execution (think + skill tools).
     // live_respond is intentionally excluded; it's called separately below.
-    let runtime = match crate::service::build_agent_runtime(&state, 
+    let runtime = match crate::service::build_agent_runtime(&state,
         &vault_id, &account_id,
         Some(session_id.clone()),
         conversation_id.clone(),
         agent_def,
         false, // non-streaming: no llm:done / skill_suggestion events
+        ui_language.as_deref(),
     ).await {
         Some(r) => r,
         None => return Ok(Json(json!({ "error": "LLM not configured" }))),
@@ -174,15 +178,7 @@ pub async fn live_chat(
     ).await;
 
     // Phase 2: one final live_respond call to format speech.
-    let llm_url = match state.daemon.llm_url.read().await.clone() {
-        Some(u) => u,
-        None => {
-            state.daemon.emit("live_chat:action", json!({
-                "speech": "抱歉，語言模型尚未就緒。", "action": "show_error",
-            }));
-            return Ok(Json(json!({ "session_id": session_id, "speech": "" })));
-        }
-    };
+    let llm_url = state.daemon.llm_url.clone();
 
     let lang_hint = match language.as_str() {
         "en" => "Reply in English.",
@@ -237,4 +233,72 @@ pub async fn live_chat(
     };
 
     Ok(Json(json!({ "session_id": session_id, "speech": speech })))
+}
+
+/// POST /vaults/:vid/agent/invoke
+/// 同步 LLM 呼叫，直接等待回應後回傳。
+/// Body: { system, input, tools?, tool_choice?, max_tokens?, temperature? }
+/// Response: { text, tool_calls? }
+pub async fn invoke(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(_vault_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let _account_id = account_id_from_headers(&state, &headers).await?;
+
+    let system      = body["system"].as_str().unwrap_or("You are a helpful assistant.").to_string();
+    let input       = body["input"].as_str().unwrap_or("").to_string();
+    let max_tokens  = body["max_tokens"].as_u64().unwrap_or(1024) as u32;
+    let temperature = body["temperature"].as_f64().unwrap_or(0.3) as f32;
+    let tools       = body.get("tools").cloned();
+    let tool_choice = body["tool_choice"].as_str().unwrap_or("auto").to_string();
+
+    // Ensure llama is running
+    let base_url = crate::routes::llm::ensure_llama_running(&state)
+        .await
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+
+    let client = reqwest::Client::new();
+    let mut req = json!({
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user",   "content": input  },
+        ],
+        "stream":      false,
+        "max_tokens":  max_tokens,
+        "temperature": temperature,
+    });
+    if let Some(t) = tools {
+        req["tools"]       = t;
+        req["tool_choice"] = json!(tool_choice);
+    }
+
+    let resp = client
+        .post(format!("{}/v1/chat/completions", base_url))
+        .json(&req)
+        .timeout(Duration::from_secs(120))
+        .send().await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("llama 請求失敗：{}", e)))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err((StatusCode::BAD_GATEWAY, format!("llama 回應錯誤 {}：{}", status, text)));
+    }
+
+    let json: Value = resp.json().await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let text = json["choices"][0]["message"]["content"]
+        .as_str().unwrap_or("").trim().to_string();
+    let tool_calls = json.pointer("/choices/0/message/tool_calls").cloned();
+
+    let mut result = json!({ "text": text });
+    if let Some(tc) = tool_calls {
+        if !tc.is_null() {
+            result["tool_calls"] = tc;
+        }
+    }
+    Ok(Json(result))
 }

@@ -1,9 +1,6 @@
 #![allow(dead_code)]
 use crate::{error::AppError, state::AppState};
-use std::time::Duration;
 use tauri::{AppHandle, State};
-
-use super::server::ensure_server_running;
 
 /// 設定讀取快取輔助：先查快取，miss 時查 daemon 並寫入快取
 pub async fn get_cached_setting(
@@ -51,54 +48,23 @@ pub(crate) async fn read_api_key(
     key
 }
 
-/// 一次性 LLM 處理（語音後處理）：非串流，等待完整回應後回傳
+/// 一次性 LLM 處理（語音後處理）：委派給 service /llm/chat
 #[tauri::command]
 pub async fn process_with_llm(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, AppState>,
     system: String,
     user_content: String,
 ) -> Result<String, AppError> {
-    let base_url = ensure_server_running(state.inner(), &app).await?;
-    let client = reqwest::Client::new();
+    let tok_owned = state.get_auth_token().await;
+    let tok = if tok_owned.is_empty() { None } else { Some(tok_owned.as_str()) };
 
-    let body = serde_json::json!({
-        "messages": [
-            {"role": "system",    "content": system},
-            {"role": "user",      "content": user_content},
-        ],
-        "max_tokens": 1024,
-        "temperature": 0.3,
-        "stream": false,
-    });
+    let resp = crate::api_client::daemon_post::<_, serde_json::Value>(
+        &state.http_client,
+        "/llm/chat",
+        &serde_json::json!({"system": system, "user_content": user_content}),
+        tok,
+    ).await.map_err(|e| AppError::AI(e.to_string()))?;
 
-    let response = client
-        .post(format!("{}/v1/chat/completions", base_url))
-        .json(&body)
-        .timeout(Duration::from_secs(120))
-        .send()
-        .await
-        .map_err(|e| AppError::AI(format!("請求 llama-server 失敗：{}", e)))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        return Err(AppError::AI(format!(
-            "llama-server 回應錯誤 {}：{}",
-            status, text
-        )));
-    }
-
-    let json: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| AppError::AI(format!("解析 llama-server 回應失敗：{}", e)))?;
-
-    let text = json["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-
-    Ok(text)
+    Ok(resp["text"].as_str().unwrap_or("").to_string())
 }

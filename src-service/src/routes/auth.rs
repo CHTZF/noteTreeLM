@@ -104,7 +104,7 @@ async fn login(
     {
         let username_for_seed = user.username.clone();
         let db_for_seed = state.db.clone();
-        let embed_url = state.daemon.embedding_url.read().await.clone();
+        let embed_url = Some(state.daemon.embedding_url.clone());
         tokio::spawn(async move {
             crate::db::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
             crate::db::seeds::embed_skills_for_account(&db_for_seed, &username_for_seed, &embed_url).await;
@@ -222,7 +222,7 @@ async fn register(
     {
         let username_for_seed = req.username.clone();
         let db_for_seed = state.db.clone();
-        let embed_url = state.daemon.embedding_url.read().await.clone();
+        let embed_url = Some(state.daemon.embedding_url.clone());
         tokio::spawn(async move {
             crate::db::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
             crate::db::seeds::embed_skills_for_account(&db_for_seed, &username_for_seed, &embed_url).await;
@@ -315,7 +315,7 @@ async fn google_upsert(
     {
         let username_for_seed = username.clone();
         let db_for_seed = state.db.clone();
-        let embed_url = state.daemon.embedding_url.read().await.clone();
+        let embed_url = Some(state.daemon.embedding_url.clone());
         tokio::spawn(async move {
             crate::db::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
             crate::db::seeds::embed_skills_for_account(&db_for_seed, &username_for_seed, &embed_url).await;

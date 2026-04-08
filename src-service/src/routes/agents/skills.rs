@@ -50,7 +50,7 @@ pub async fn create(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let embed_url = state.daemon.embedding_url.read().await.clone();
+    let embed_url = Some(state.daemon.embedding_url.clone());
     tokio::spawn(async move {
         crate::db::seeds::embed_skills_for_account(&state.db, &account_id, &embed_url).await;
     });
@@ -120,7 +120,7 @@ pub async fn update(
     qb.await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if semantic_changed {
-        let embed_url = state.daemon.embedding_url.read().await.clone();
+        let embed_url = Some(state.daemon.embedding_url.clone());
         tokio::spawn(async move {
             crate::db::seeds::embed_skills_for_account(&state.db, &account_id_for_embed, &embed_url).await;
         });
@@ -180,7 +180,7 @@ pub async fn seed_builtins(
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let account_id = account_id_from_headers(&state, &headers).await?;
-    let embed_url = state.daemon.embedding_url.read().await.clone();
+    let embed_url = Some(state.daemon.embedding_url.clone());
     crate::db::seeds::seed_builtins(&state.db, &account_id).await;
     crate::db::seeds::embed_skills_for_account(&state.db, &account_id, &embed_url).await;
     Ok(Json(json!({ "ok": true, "account_id": account_id })))

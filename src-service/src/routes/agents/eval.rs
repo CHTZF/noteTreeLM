@@ -77,6 +77,7 @@ pub async fn run_trace_analysis(
         conversation_id,
         agent_def,
         false, // silent background run — no SSE streaming
+        None,  // no ui_language for eval runs
     ).await {
         Some(r) => r,
         None => return Ok(Json(json!({ "error": "LLM not configured" }))),

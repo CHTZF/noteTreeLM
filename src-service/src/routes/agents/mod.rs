@@ -44,6 +44,7 @@ pub fn router() -> Router<ApiState> {
         .route("/agent-tools/:tool_id", put(tools::update).delete(tools::delete))
         // ── Interactive agent run/cancel/confirm ─────────────────────────────
         .route("/vaults/:vid/agent/run", post(runner::run))
+        .route("/vaults/:vid/agent/invoke", post(runner::invoke))
         .route("/vaults/:vid/agent/cancel", post(runner::cancel))
         .route("/vaults/:vid/agent/confirm", post(runner::confirm))
         .route("/vaults/:vid/agent/live_chat", post(runner::live_chat))

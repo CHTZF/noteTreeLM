@@ -392,6 +392,7 @@ async fn maybe_trigger_memory_agent(state: ApiState, conv_id: String, messages_j
             &state, &vault_id, &account_id,
             None, conv_id, agent_def,
             false,
+            None, // no ui_language for background tasks
         ).await {
             Some(r) => r,
             None => return,
@@ -404,10 +405,7 @@ async fn maybe_trigger_memory_agent(state: ApiState, conv_id: String, messages_j
 /// Uses a 5s timeout and is fail-closed: if the LLM server is busy (serving chat),
 /// returns false and lets the 8h scheduler handle the conversation later.
 async fn llm_should_remember(state: &ApiState, msgs: &[Value]) -> bool {
-    let llm_url = match state.daemon.llm_url.read().await.clone() {
-        Some(u) => u,
-        None => return false, // fail-closed: no server, skip
-    };
+    let llm_url = state.daemon.llm_url.clone();
 
     let excerpt = msgs.iter().rev().take(6).collect::<Vec<_>>().into_iter().rev()
         .map(|m| {

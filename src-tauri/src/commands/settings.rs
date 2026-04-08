@@ -13,7 +13,6 @@ pub struct Settings {
     pub auto_save_delay: u32,
     pub whisper_cli_path: String,
     pub whisper_model_path: String,
-    pub whisper_language: String,
     pub whisper_threads: u32,
     pub whisper_auto_insert: bool,
     pub import_max_depth: u32,
@@ -82,7 +81,6 @@ pub async fn get_settings(state: State<'_, AppState>, username: String) -> Resul
         auto_save_delay: u(&usr, "auto_save_delay", 1000),
         whisper_cli_path: s(&sys, "whisper_cli_path", ""),
         whisper_model_path: s(&sys, "whisper_model_path", ""),
-        whisper_language: s(&sys, "whisper_language", "auto"),
         whisper_threads: u(&sys, "whisper_threads", 4),
         whisper_auto_insert: b(&sys, "whisper_auto_insert", true),
         import_max_depth: u(&usr, "import_max_depth", 3),
@@ -125,7 +123,6 @@ pub struct SystemSettings {
     pub ai_enable_vision: bool,
     pub whisper_cli_path: String,
     pub whisper_model_path: String,
-    pub whisper_language: String,
     pub whisper_threads: u32,
     pub whisper_auto_insert: bool,
     pub llm_model_path: String,
@@ -146,7 +143,6 @@ pub async fn get_system_settings(state: State<'_, AppState>) -> Result<SystemSet
         ai_enable_vision: b(&sys, "ai_enable_vision", true),
         whisper_cli_path: s(&sys, "whisper_cli_path", ""),
         whisper_model_path: s(&sys, "whisper_model_path", ""),
-        whisper_language: s(&sys, "whisper_language", "auto"),
         whisper_threads: u(&sys, "whisper_threads", 4),
         whisper_auto_insert: b(&sys, "whisper_auto_insert", true),
         llm_model_path: s(&sys, "llm_model_path", ""),
@@ -171,7 +167,6 @@ pub async fn save_system_settings(
     map.insert("ai_enable_vision", settings.ai_enable_vision.to_string());
     map.insert("whisper_cli_path", settings.whisper_cli_path.trim().to_string());
     map.insert("whisper_model_path", settings.whisper_model_path.trim().to_string());
-    map.insert("whisper_language", settings.whisper_language.clone());
     map.insert("whisper_threads", settings.whisper_threads.to_string());
     map.insert("whisper_auto_insert", settings.whisper_auto_insert.to_string());
     map.insert("llm_model_path", settings.llm_model_path.trim().to_string());

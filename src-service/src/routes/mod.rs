@@ -1,5 +1,7 @@
 pub mod auth;
 pub mod settings;
+pub mod whisper;
+pub mod llm;
 pub mod conversations;
 pub mod notes;
 pub mod vault;

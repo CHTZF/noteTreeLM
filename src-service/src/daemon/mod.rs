@@ -8,9 +8,10 @@ use std::path::PathBuf;
 use tokio::signal;
 use crate::app_state::ApiState;
 use crate::auth::store::AuthStore;
+use crate::config::Config;
 use crate::daemon::state::DaemonState;
 
-pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(data_dir: PathBuf, config: Config) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("noteTreeLM Service starting...");
 
     let db = crate::db::init_db(&data_dir).await?;
@@ -23,7 +24,9 @@ pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let _mdns = network::mdns::start_mdns_broadcast(&tls.spki_pin)?;
 
     let auth_store = AuthStore::new();
-    let daemon_state = DaemonState::new_with_data_dir(&data_dir);
+    let daemon_state = DaemonState::new(&data_dir, &config);
+    let http_port = config.service.port;
+    let https_port = config.service.https_port;
 
     // Graceful shutdown coordination
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
@@ -43,7 +46,7 @@ pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         let api_state = ApiState::new(auth_store.clone(), db.clone(), daemon_state.clone());
         let rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
-            if let Err(e) = server::run_http_server(7787, api_state, rx).await {
+            if let Err(e) = server::run_http_server(http_port, api_state, rx).await {
                 tracing::error!("HTTP server error: {}", e);
             }
         })
@@ -59,7 +62,7 @@ pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         let handle = https_handle.clone();
         tokio::spawn(async move {
             if let Err(e) = server::run_https_server(
-                cert_pem, key_pem, 7788, store_clone, db_clone, daemon_state_clone, handle,
+                cert_pem, key_pem, https_port, store_clone, db_clone, daemon_state_clone, handle,
             ).await {
                 tracing::error!("HTTPS server error: {}", e);
             }
@@ -74,7 +77,7 @@ pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    tracing::info!("Service ready — HTTP http://127.0.0.1:7787 | HTTPS https://0.0.0.0:7788");
+    tracing::info!("Service ready — HTTP http://127.0.0.1:{} | HTTPS https://0.0.0.0:{}", http_port, https_port);
     shutdown_signal().await;
     tracing::info!("Service shutting down gracefully — waiting for in-flight requests...");
 
@@ -89,6 +92,10 @@ pub async fn run(data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         std::time::Duration::from_secs(15),
         async { let _ = tokio::join!(http_task, https_task, sched_task); },
     ).await;
+
+    // Kill all managed server processes (service owns their lifecycle)
+    crate::routes::whisper::kill_on_shutdown(&daemon_state).await;
+    crate::routes::llm::kill_on_shutdown(&daemon_state).await;
 
     // Drop db last — all tasks that hold Arc<db> clones must have finished first
     // so that no in-flight transactions are abandoned when the connection closes.

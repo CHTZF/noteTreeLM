@@ -1,5 +1,3 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{json, Value};
 use crate::db::SurrealDb;
 use chrono::Datelike;
@@ -28,6 +26,16 @@ pub(crate) fn vault_list_structure(rel_path: &str, vault_path: &str) -> String {
     let target = if rel_path.is_empty() { base.to_path_buf() } else { base.join(rel_path) };
     if !target.exists() { return format!("路徑不存在：{}", rel_path); }
 
+    fn fmt_size(bytes: u64) -> String {
+        if bytes >= 1_024 * 1_024 {
+            format!("{:.1} MB", bytes as f64 / (1_024.0 * 1_024.0))
+        } else if bytes >= 1_024 {
+            format!("{:.1} KB", bytes as f64 / 1_024.0)
+        } else {
+            format!("{} B", bytes)
+        }
+    }
+
     fn list_dir(dir: &std::path::Path, base: &std::path::Path, depth: u32) -> String {
         if depth > 4 { return String::new(); }
         let mut out = String::new();
@@ -44,7 +52,8 @@ pub(crate) fn vault_list_structure(rel_path: &str, vault_path: &str) -> String {
                 out.push_str(&format!("{}{}/\n", indent, name));
                 out.push_str(&list_dir(&path, base, depth + 1));
             } else if name.ends_with(".md") {
-                out.push_str(&format!("{}{}\n", indent, rel));
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                out.push_str(&format!("{}{} ({})\n", indent, rel, fmt_size(size)));
             }
         }
         out
@@ -53,7 +62,12 @@ pub(crate) fn vault_list_structure(rel_path: &str, vault_path: &str) -> String {
     list_dir(&target, base, 0)
 }
 
-pub(crate) fn vault_read_note(rel_path: &str, vault_path: &str) -> Value {
+pub(crate) fn vault_read_note(
+    rel_path:   &str,
+    vault_path: &str,
+    offset:     Option<usize>,
+    limit:      Option<usize>,
+) -> Value {
     if vault_path.is_empty() {
         return tool_err("VAULT_NOT_SET", "Vault 未設定，請先設定 Vault 路徑", None);
     }
@@ -65,8 +79,29 @@ pub(crate) fn vault_read_note(rel_path: &str, vault_path: &str) -> Value {
         return tool_err("NOT_FOUND", format!("找不到筆記：{}", rel_path), Some(rel_path));
     }
     match std::fs::read_to_string(&full) {
-        Ok(c)  => json!({ "error_code": null, "content": c, "path": rel_path }),
         Err(e) => tool_err("READ_FAILED", format!("讀取失敗：{}", e), Some(rel_path)),
+        Ok(raw) => {
+            let total_lines = raw.lines().count();
+            let content = if offset.is_some() || limit.is_some() {
+                let off = offset.unwrap_or(0);
+                let lines: Vec<&str> = raw.lines().skip(off).take(limit.unwrap_or(usize::MAX)).collect();
+                lines.join("\n")
+            } else {
+                raw
+            };
+            let has_more = if let (_, Some(lim)) = (offset.unwrap_or(0), limit) {
+                offset.unwrap_or(0) + lim < total_lines
+            } else {
+                false
+            };
+            json!({
+                "error_code":  null,
+                "content":     content,
+                "path":        rel_path,
+                "total_lines": total_lines,
+                "has_more":    has_more,
+            })
+        }
     }
 }
 

@@ -9,7 +9,7 @@ mod vault;
 
 use commands::auth::{login, logout, get_session, restore_session, change_password, start_google_oauth};
 use commands::{
-    ai::{process_with_llm, stop_llama_server, warmup_llama_server,
+    agent::{process_with_llm, stop_llama_server, warmup_llama_server,
          get_llama_server_status, start_llama_server, restart_llama_server,
          warmup_embedding_server, get_embedding_server_status, start_embedding_server,
          stop_embedding_server, restart_embedding_server, check_embedding_endpoint,
@@ -126,6 +126,8 @@ async fn subscribe_service_events(app_handle: tauri::AppHandle) {
                         "agent:think", "agent:skills_activated", "agent:plan_announce",
                         "agent:open_note", "agent:skill_suggestion",
                         "memory:prefetched",
+                        "whisper:stderr",
+                        "llm:stderr",
                     ];
                     let payload: serde_json::Value = serde_json::from_str(&data_buf)
                         .unwrap_or(serde_json::json!({}));
@@ -145,28 +147,6 @@ async fn subscribe_service_events(app_handle: tauri::AppHandle) {
     }
 }
 
-/// POST server info to daemon's /servers/register (loopback, ignore errors)
-async fn register_server_with_daemon(name: &str, port: u16, status: &str, model: Option<&str>) {
-    let client = match reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(2))
-        .build() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-    let body = serde_json::json!({
-        "name": name,
-        "port": port,
-        "status": status,
-        "model": model,
-        "updated_at": chrono::Utc::now().timestamp(),
-    });
-    let _ = client
-        .post("https://127.0.0.1:7788/servers/register")
-        .json(&body)
-        .send()
-        .await;
-}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -249,22 +229,12 @@ pub fn run() {
                 let _ = window.set_decorations(false);
             }
 
-            // 攔截 Ctrl+C / SIGINT：kill servers + 走 Tauri graceful exit，確保 SurrealDB WAL flush
+            // 攔截 Ctrl+C / SIGINT：走 Tauri graceful exit
+            // llama/embedding/whisper 均由 service daemon 管理，不需在此 kill
             {
                 let ah = app_handle.clone();
                 tauri::async_runtime::spawn(async move {
                     let _ = tokio::signal::ctrl_c().await;
-                    if let Some(state) = ah.try_state::<AppState>() {
-                        if let Some(mut child) = state.llama_server.lock().await.take() {
-                            let _ = child.kill().await;
-                        }
-                        if let Some(mut child) = state.whisper_server.lock().await.take() {
-                            let _ = child.kill().await;
-                        }
-                        if let Some(mut child) = state.embedding_server.lock().await.take() {
-                            let _ = child.kill().await;
-                        }
-                    }
                     ah.exit(0);
                 });
             }
@@ -342,26 +312,7 @@ pub fn run() {
                     warmup_embedding_server(&state, &app_handle),
                 );
 
-                // 向 daemon 登記 AI server 狀態（daemon 未啟動時靜默忽略）
-                {
-                    let whisper_port = state.whisper_actual_port.lock().await;
-                    let llama_port = state.llama_actual_port.lock().await;
-                    let emb_port = *state.embedding_actual_port.lock().await;
-                    let wp = whisper_port.unwrap_or(8081);
-                    let lp = llama_port.unwrap_or(8080);
-                    drop(whisper_port);
-                    drop(llama_port);
-
-                    tokio::join!(
-                        register_server_with_daemon("whisper", wp, "running", None),
-                        register_server_with_daemon("llama", lp, "running", None),
-                        async {
-                            if let Some(p) = emb_port {
-                                register_server_with_daemon("embedding", p, "running", None).await;
-                            }
-                        },
-                    );
-                }
+                // AI server 狀態由 service 自行管理，Tauri 不再登記
 
                 // seed-builtins 由 service auth 層在 login/register 時處理（per-account 幂等）
                 // 通知前端刷新 agent/skill 面板
@@ -562,24 +513,8 @@ pub fn run() {
         .expect("noteTreeLM 構建失敗")
         .run(|app_handle, event| {
             // App 結束時自動 kill llama-server 與 whisper-server
-            if let tauri::RunEvent::Exit = event {
-                if let Some(state) = app_handle.try_state::<AppState>() {
-                    tauri::async_runtime::block_on(async {
-                        let mut llama_guard = state.llama_server.lock().await;
-                        if let Some(mut child) = llama_guard.take() {
-                            let _ = child.kill().await;
-                        }
-                        let mut whisper_guard = state.whisper_server.lock().await;
-                        if let Some(mut child) = whisper_guard.take() {
-                            let _ = child.kill().await;
-                        }
-                        let mut embedding_guard = state.embedding_server.lock().await;
-                        if let Some(mut child) = embedding_guard.take() {
-                            let _ = child.kill().await;
-                        }
-                    });
-                }
-            }
+            // llama/embedding/whisper 均由 service daemon 管理，不在 Tauri 端 kill
+            let _ = event;
         });
 }
 

@@ -4,7 +4,7 @@ import { api } from '../lib/api'
 
 export const SYSTEM_KEYS = ['system_current_vault_path',
   'ai_enable_topics', 'ai_enable_summary', 'ai_enable_vision',
-  'whisper_cli_path', 'whisper_model_path', 'whisper_language', 'whisper_threads', 'whisper_auto_insert',
+  'whisper_cli_path', 'whisper_model_path', 'whisper_threads', 'whisper_auto_insert',
   'llm_model_path', 'llama_cli_path', 'embedding_model_path'] as const
 
 export type SystemSettingsKey = typeof SYSTEM_KEYS[number]

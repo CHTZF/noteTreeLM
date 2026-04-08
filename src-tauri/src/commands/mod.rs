@@ -1,5 +1,5 @@
 pub mod agent_def;
-pub mod ai;
+pub mod agent;
 pub mod auth;
 pub mod conversation;
 pub mod daemon;

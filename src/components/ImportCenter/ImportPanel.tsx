@@ -223,8 +223,8 @@ export default function ImportPanel() {
     let unDone: (() => void) | null = null
 
     try {
-      unToken = await listen<{ query_id: string; content: string }>('knowledge:token', e => {
-        if (e.payload.query_id !== queryId) return
+      unToken = await listen<{ session_id: string; content: string }>('llm:token', e => {
+        if (e.payload.session_id !== queryId) return
         setMessages(sessionId, prev => prev.map(m =>
           m.id === asstMsgId ? { ...m, content: m.content + e.payload.content } : m
         ))
@@ -255,8 +255,8 @@ export default function ImportPanel() {
         unDebug()
       })
 
-      unDone = await listen<{ query_id: string; error?: string }>('knowledge:done', e => {
-        if (e.payload.query_id !== queryId) return
+      unDone = await listen<{ session_id: string; error?: string }>('llm:done', e => {
+        if (e.payload.session_id !== queryId) return
         setMessages(sessionId, prev => prev.map(m =>
           m.id === asstMsgId ? { ...m, isStreaming: false, error: e.payload.error } : m
         ))

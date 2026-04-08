@@ -17,7 +17,7 @@ import { Message, SkillPreview, DraftState, ORCHESTRATOR_SYSTEM } from './types'
 import type { AgentSkill } from '../../types/models'
 
 export default function ChatPanel({ liveChatActive = false, onActiveChange, onOpenNote }: { liveChatActive?: boolean; onActiveChange?: (active: boolean) => void; onOpenNote?: (path: string) => void }) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
   const { settings, currentVaultId } = useSettingsStore()
   const { session } = useAuthStore()
   const { content: noteContent, currentPath } = useEditorStore()
@@ -211,13 +211,12 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const previewEnabled          = settings.voice_preview_enabled !== false
   const noiseSuppressionEnabled = settings.voice_noise_suppression !== false
   const previewIntervalMs       = settings.voice_preview_interval ?? 5000
-  const whisperLanguage         = settings.whisper_language ?? 'auto'
   const { state: voiceState, isSpeaking: voiceIsSpeaking, toggle: toggleVoice } = useVoiceRecorder(
     handleTranscript,
     previewEnabled ? handlePreview : undefined,
     noiseSuppressionEnabled,
     previewIntervalMs,
-    whisperLanguage,
+    i18n.language,
   )
 
   // 錄音開始時顯示 overlay，並重置轉錄文字與預覽
@@ -616,6 +615,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         system,
         conversationId: conversationId ?? undefined,
         activityContext: useActivityStore.getState().getContextString() || null,
+        uiLanguage: i18n.language,
       })
 
       if (!conversationId && agentResp.conversation_id) {

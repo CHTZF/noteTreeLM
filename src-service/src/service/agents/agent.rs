@@ -69,19 +69,20 @@ pub async fn run_agent(
     let emitter = &runtime.emitter;
 
     // ── Step 5+6: Pre-pass + context ─────────────────────────────────────────
-    let AgentContextResult { messages: mut msgs, mem_facts_count, activated_skill_titles, tool_names } =
+    let AgentContextResult { mem_facts_count, activated_skill_titles, tool_names } =
         runtime.build_agent_context(&input, activity_context.as_deref(), tool_names).await;
     emitter.record_skill_activations(&activated_skill_titles);
 
     // ── Step 7: Tool loop ─────────────────────────────────────────────────────
     let full_response = run_tool_loop(
-        &runtime, &mut msgs, &tool_names,
+        &runtime, &tool_names,
         enable_think, max_rounds,
         Arc::clone(&tx),
     ).await;
 
     // ── Step 8: Post-processing ───────────────────────────────────────────────
-    runtime.post_process(&msgs, &full_response, &input, mem_facts_count).await;
+    let msgs_final = runtime.get_context_msgs(false).await;
+    runtime.post_process(&msgs_final, &full_response, &input, mem_facts_count).await;
 
     if runtime.is_background() {
         runtime.cleanup_session().await;
@@ -102,6 +103,7 @@ fn inject_required_tools(mut tool_names: Vec<String>, needs_frontend: bool) -> V
 
     for name in [
         "get_session_state",
+        "compress_context", "finish",
         "checkpoint", "clear_checkpoint",
         "save_agent_knowledge", "get_agent_knowledge",
         "batch_apply",
@@ -157,7 +159,6 @@ async fn run_one_llm_round(
 
 async fn run_tool_loop(
     runtime:      &HarnessRequestRuntime,
-    msgs:         &mut Vec<Value>,
     tool_names:   &[String],
     enable_think: bool,
     max_rounds:   usize,
@@ -189,9 +190,11 @@ async fn run_tool_loop(
                 (tools_value.clone(), json!("auto"))
             };
 
+            let msgs_snapshot = runtime.get_context_msgs(true).await;
+
             let llm_t0 = std::time::Instant::now();
             let (text, tool_chunks) = match run_one_llm_round(
-                runtime, msgs, round_tools, round_choice, emitter,
+                runtime, &msgs_snapshot, round_tools, round_choice, emitter,
             ).await {
                 Ok(r) => r,
                 Err(e) => { tracing::warn!("[agent/tools] llm error: {}", e); break; }
@@ -205,44 +208,25 @@ async fn run_tool_loop(
                     "id": tc.0, "type": "function",
                     "function": { "name": tc.1, "arguments": tc.2 },
                 })).collect();
-                msgs.push(json!({ "role": "assistant", "content": null, "tool_calls": tc_json }));
+                runtime.push_msg(json!({ "role": "assistant", "content": null, "tool_calls": tc_json })).await;
+
                 let graph = Planner::plan_from_chunks(&tool_chunks);
+                // During dispatch handlers may mutate msgs_buf (e.g. compress_context, finish).
                 let results = match runtime.dispatch(Arc::clone(&tx), graph).await {
                     Ok(r) => r,
                     Err(e) => { tracing::warn!("[agent/tools] dispatcher error: {}", e); break; }
                 };
-                msgs.extend(Planner::results_to_messages(&tool_chunks, results));
 
-                let repeats = runtime.working_memory.repeated_calls().await;
-                if !repeats.is_empty() {
-                    let names: Vec<String> = repeats.iter()
-                        .map(|(t, a)| if a.is_empty() { t.clone() } else { format!("{}({})", t, a) })
-                        .collect();
-                    msgs.push(json!({
-                        "role": "system",
-                        "content": format!(
-                            "[系統提示] 你在本 session 已重複呼叫：{}。請換策略，或呼叫 get_session_state 查看完整執行歷史再決定下一步，或直接根據已取得的資訊回覆使用者。",
-                            names.join("、")
-                        )
-                    }));
+                // Check finish signal before extending (handler may have set it).
+                if let Some(answer) = runtime.take_finish_answer().await {
+                    if runtime.streaming {
+                        runtime.emit("llm:token", json!(answer));
+                    }
+                    full_response = answer;
+                    break;
                 }
 
-                const CONTEXT_WARN_CHARS: usize     = 28_000;
-                const CONTEXT_CRITICAL_CHARS: usize = 40_000;
-                let msgs_chars: usize = msgs.iter()
-                    .map(|m| m["content"].as_str().unwrap_or("").len())
-                    .sum();
-                if msgs_chars >= CONTEXT_CRITICAL_CHARS {
-                    msgs.push(json!({
-                        "role": "system",
-                        "content": format!("[系統提示] ⚠️ context 已接近上限（約 {} 字元）。請立即根據已取得的資訊作出最終回覆，不要再呼叫 read_note 或其他大型工具。", CONTEXT_CRITICAL_CHARS),
-                    }));
-                } else if msgs_chars >= CONTEXT_WARN_CHARS {
-                    msgs.push(json!({
-                        "role": "system",
-                        "content": format!("[系統提示] context 已使用約 70%（{}+ 字元）。建議改用 search_in_note 取代 read_note 以精準定位段落，避免繼續擴大 context。", CONTEXT_WARN_CHARS),
-                    }));
-                }
+                runtime.extend_msgs_guarded(Planner::results_to_messages(&tool_chunks, results)).await;
 
                 if runtime.cancel.load(Ordering::Relaxed) { break; }
             } else {
@@ -251,8 +235,9 @@ async fn run_tool_loop(
         }
     } else {
         emitter.increment_round();
+        let msgs_snapshot = runtime.get_context_msgs(false).await;
         let llm_t0 = std::time::Instant::now();
-        match run_one_llm_round(runtime, msgs, None, json!("auto"), emitter).await {
+        match run_one_llm_round(runtime, &msgs_snapshot, None, json!("auto"), emitter).await {
             Ok((text, _)) => { full_response = text; }
             Err(e) => { tracing::warn!("[agent/pure] llm error: {}", e); }
         }

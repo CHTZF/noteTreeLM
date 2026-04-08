@@ -397,18 +397,11 @@ pub async fn add_skill_trigger(
         format!("{}、{}", current_trigger, use_ask)
     };
 
-    let emb_url = {
-        let port = *state.embedding_actual_port.lock().await;
-        port.map(|p| format!("http://127.0.0.1:{}", p))
-    };
-
     let mut update_body = serde_json::json!({"trigger": new_trigger});
 
-    if let Some(url) = &emb_url {
-        let new_embedding: Vec<f32> = crate::commands::server::get_embedding(&state.http_client, &url, &new_trigger).await;
-        if !new_embedding.is_empty() {
-            update_body["trigger_embedding"] = serde_json::json!(new_embedding);
-        }
+    let new_embedding = crate::commands::server::get_embedding_via_service(state.inner(), &new_trigger).await;
+    if !new_embedding.is_empty() {
+        update_body["trigger_embedding"] = serde_json::json!(new_embedding);
     }
 
     daemon_put::<_, serde_json::Value>(

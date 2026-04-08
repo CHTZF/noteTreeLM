@@ -88,6 +88,8 @@ pub(crate) static ALL_TOOL_DEFS: &[ToolDef] = &[
 
     // ── Agent / UI tools ─────────────────────────────────────────────────────
     ToolDef { name: "get_session_state",   schema_fn: schema_get_session_state,   is_write: false, guard: None, handler: handle_get_session_state,   rollback: None },
+    ToolDef { name: "compress_context",    schema_fn: schema_compress_context,    is_write: false, guard: None, handler: handle_compress_context,    rollback: None },
+    ToolDef { name: "finish",              schema_fn: schema_finish,              is_write: false, guard: None, handler: handle_finish,              rollback: None },
     ToolDef { name: "ask_user",            schema_fn: schema_ask_user,            is_write: false, guard: None, handler: handle_ask_user,            rollback: None },
     ToolDef { name: "checkpoint",          schema_fn: schema_checkpoint,          is_write: false, guard: None, handler: handle_checkpoint,          rollback: None },
     ToolDef { name: "clear_checkpoint",    schema_fn: schema_clear_checkpoint,    is_write: false, guard: None, handler: handle_clear_checkpoint,    rollback: None },
@@ -188,7 +190,7 @@ fn schema_think() -> Value { json!({ "type": "function", "function": {
 
 fn schema_list_structure() -> Value { json!({ "type": "function", "function": {
     "name": "list_structure",
-    "description": "列出 vault 的資料夾和筆記結構",
+    "description": "列出 vault 的資料夾和筆記結構，每個 .md 檔案附帶檔案大小。大於 5 KB 的筆記建議用 read_note 的 offset/limit 分頁讀取，而非一次全讀。",
     "parameters": { "type": "object", "properties": {
         "path": { "type": "string", "description": "子路徑，省略則顯示根目錄" }
     }, "required": [] }
@@ -196,9 +198,11 @@ fn schema_list_structure() -> Value { json!({ "type": "function", "function": {
 
 fn schema_read_note() -> Value { json!({ "type": "function", "function": {
     "name": "read_note",
-    "description": "讀取指定路徑的筆記內容。回傳 {error_code, content, path}：成功時 error_code 為 null，content 為筆記全文；失敗時 error_code 為 NOT_FOUND / READ_FAILED 等，並附 message 說明原因。",
+    "description": "讀取指定路徑的筆記內容。回傳 {error_code, content, path, total_lines, has_more}：成功時 error_code 為 null；失敗時 error_code 為 NOT_FOUND / READ_FAILED。使用 offset + limit 分頁讀取長筆記，避免 context 暴增。",
     "parameters": { "type": "object", "properties": {
-        "path": { "type": "string", "description": "筆記的相對路徑（可省略 .md）" }
+        "path":   { "type": "string", "description": "筆記的相對路徑（可省略 .md）" },
+        "offset": { "type": "number", "description": "從第幾行開始讀取（0-indexed，省略則從頭讀）" },
+        "limit":  { "type": "number", "description": "最多讀取幾行（省略則讀全文）" }
     }, "required": ["path"] }
 }})}
 
@@ -397,6 +401,23 @@ fn schema_get_session_state() -> Value { json!({ "type": "function", "function":
     "name": "get_session_state",
     "description": "回傳本輪 session 已執行的工具清單（name、args 摘要、guard 結果、耗時）及重複呼叫警告。當你不確定自己是否已讀取某個路徑、或要避免重複操作時，先呼叫此工具。",
     "parameters": { "type": "object", "properties": {} }
+}})}
+
+fn schema_compress_context() -> Value { json!({ "type": "function", "function": {
+    "name": "compress_context",
+    "description": "壓縮目前 context 中過長的工具結果，釋放 context 空間。保留所有 system 訊息、keep_ids 指定的工具呼叫結果、以及最近 4 則訊息，其餘替換成 summary。在 context 使用量超過 70% 時呼叫。",
+    "parameters": { "type": "object", "properties": {
+        "summary":  { "type": "string", "description": "已收集到的關鍵資訊摘要（條列格式，保留後續任務需要的內容）" },
+        "keep_ids": { "type": "array", "items": { "type": "string" }, "description": "需要保留的 tool_call id 清單（這些工具結果不會被刪除）" }
+    }, "required": ["summary"] }
+}})}
+
+fn schema_finish() -> Value { json!({ "type": "function", "function": {
+    "name": "finish",
+    "description": "明確宣告任務完成並提交最終回覆。呼叫後立即結束工具循環。當你已收集到足夠資訊、可以給出完整回覆時使用，避免多餘的 round。",
+    "parameters": { "type": "object", "properties": {
+        "answer": { "type": "string", "description": "給使用者的最終回覆（完整的 Markdown 格式）" }
+    }, "required": ["answer"] }
 }})}
 
 fn schema_progress() -> Value { json!({ "type": "function", "function": {
@@ -599,9 +620,11 @@ fn handle_list_structure(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFu
 
 fn handle_read_note(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
-        let raw = args["path"].as_str().unwrap_or("");
-        let path = norm_path(raw);
-        Ok(vault_tools::vault_read_note(&path, &env.vault_path))
+        let raw    = args["path"].as_str().unwrap_or("");
+        let path   = norm_path(raw);
+        let offset = args["offset"].as_u64().map(|v| v as usize);
+        let limit  = args["limit"].as_u64().map(|v| v as usize);
+        Ok(vault_tools::vault_read_note(&path, &env.vault_path, offset, limit))
     })
 }
 
@@ -698,7 +721,7 @@ fn handle_read_then_write(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolF
             .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        env.write_mtimes.lock().await.entry(path.clone()).or_insert(mtime_at_read);
+        env.record_mtime_if_absent(path.clone(), mtime_at_read).await;
         vault_tools::vault_read_then_write(
             &path, &content, mtime_at_read,
             &env.vault_path, &env.client, &env.db, &env.vault_id,
@@ -731,8 +754,7 @@ fn handle_update_note(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFutur
             .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        env.write_snapshots.lock().await.entry(path.clone()).or_insert(original.clone());
-        env.write_mtimes.lock().await.entry(path.clone()).or_insert(mtime_at_read);
+        env.snapshot_and_mtime_if_absent(path.clone(), original.clone(), mtime_at_read).await;
         vault_tools::vault_update_note_with_conflict_check(
             &path, &content, &original, mtime_at_read,
             &env.vault_path, &env.client, &env.db, &env.vault_id,
@@ -747,7 +769,7 @@ fn handle_append_to_note(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFu
         // Snapshot original content before appending so rollback can restore it.
         let full = std::path::Path::new(&env.vault_path).join(&path);
         let original = tokio::fs::read_to_string(&full).await.unwrap_or_default();
-        env.write_snapshots.lock().await.entry(path.clone()).or_insert(original);
+        env.snapshot_if_absent(path.clone(), original).await;
         vault_tools::vault_append_to_note(
             &path, &content, &env.vault_path, &env.client, &env.db, &env.vault_id,
         ).await
@@ -769,7 +791,7 @@ fn handle_delete_note(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFutur
         // Snapshot original content before deleting so rollback can restore it.
         let full = std::path::Path::new(&env.vault_path).join(&path);
         let original = tokio::fs::read_to_string(&full).await.unwrap_or_default();
-        env.write_snapshots.lock().await.entry(path.clone()).or_insert(original);
+        env.snapshot_if_absent(path.clone(), original).await;
         vault_tools::vault_delete_note(
             &path, &env.vault_path, &env.db, &env.vault_id,
         ).await
@@ -802,7 +824,7 @@ fn handle_update_note_frontmatter(env: Arc<HarnessRequestRuntime>, args: Value) 
         // Snapshot original content before modifying so rollback can restore it.
         let full = std::path::Path::new(&env.vault_path).join(&path);
         let original = tokio::fs::read_to_string(&full).await.unwrap_or_default();
-        env.write_snapshots.lock().await.entry(path.clone()).or_insert(original);
+        env.snapshot_if_absent(path.clone(), original).await;
         vault_tools::vault_update_note_frontmatter(
             &path, &fields, &env.vault_path, &env.client, &env.db, &env.vault_id,
         ).await
@@ -888,7 +910,7 @@ fn handle_link_notes(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture
         // Snapshot source content before modification for rollback.
         let full = std::path::Path::new(&env.vault_path).join(&source);
         let original = tokio::fs::read_to_string(&full).await.unwrap_or_default();
-        env.write_snapshots.lock().await.entry(source.clone()).or_insert(original);
+        env.snapshot_if_absent(source.clone(), original).await;
         vault_tools::vault_link_notes(
             &source, &target, &env.vault_path, &env.client, &env.db, &env.vault_id,
         ).await
@@ -916,7 +938,7 @@ fn handle_generate_moc(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFutu
         let moc_rel = format!("{}/_moc.md", folder);
         let full = std::path::Path::new(&env.vault_path).join(&moc_rel);
         let original = tokio::fs::read_to_string(&full).await.unwrap_or_default();
-        env.write_snapshots.lock().await.entry(moc_rel).or_insert(original);
+        env.snapshot_if_absent(moc_rel, original).await;
         vault_tools::vault_generate_moc(
             &folder, title.as_deref(), &env.vault_path, &env.client, &env.db, &env.vault_id,
         ).await
@@ -1013,6 +1035,31 @@ fn handle_get_session_state(env: Arc<HarnessRequestRuntime>, _args: Value) -> To
             "tool_calls": calls,
             "repeated_calls": repeat_warnings,
         }))
+    })
+}
+
+fn handle_compress_context(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let summary = args["summary"].as_str().unwrap_or("").to_string();
+        if summary.is_empty() {
+            return Ok(json!("summary 不能為空"));
+        }
+        let keep_ids: Vec<String> = args["keep_ids"].as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let after = env.compress_msgs(&summary, 4, &keep_ids).await;
+        Ok(json!(format!("✅ context 已壓縮，剩餘 {} 則訊息", after)))
+    })
+}
+
+fn handle_finish(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let answer = args["answer"].as_str().unwrap_or("").to_string();
+        if answer.is_empty() {
+            return Ok(json!("answer 不能為空"));
+        }
+        env.set_finish_answer(answer).await;
+        Ok(json!("✅"))
     })
 }
 
@@ -1368,7 +1415,7 @@ fn rollback_create_folder(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolF
 fn rollback_overwrite_note(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path     = norm_path(args["path"].as_str().unwrap_or(""));
-        let original = match env.write_snapshots.lock().await.get(&path).cloned() {
+        let original = match env.get_snapshot(&path).await {
             Some(s) => s,
             None    => return Ok(json!(null)),
         };
@@ -1384,7 +1431,7 @@ fn rollback_overwrite_note(env: Arc<HarnessRequestRuntime>, args: Value) -> Tool
 fn rollback_restore_note(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let path     = norm_path(args["path"].as_str().unwrap_or(""));
-        let original = match env.write_snapshots.lock().await.get(&path).cloned() {
+        let original = match env.get_snapshot(&path).await {
             Some(s) => s,
             None    => return Ok(json!(null)),
         };
@@ -1417,7 +1464,7 @@ fn rollback_move_note(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFutur
 fn rollback_link_notes(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
         let source = norm_path(args["source"].as_str().unwrap_or(""));
-        let original = match env.write_snapshots.lock().await.get(&source).cloned() {
+        let original = match env.get_snapshot(&source).await {
             Some(s) => s,
             None    => return Ok(json!(null)),
         };
@@ -1446,7 +1493,7 @@ fn rollback_generate_moc(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFu
         let folder = args["path"].as_str().unwrap_or("").to_string();
         if folder.is_empty() { return Ok(json!(null)); }
         let moc_rel = format!("{}/_moc.md", folder);
-        let original = env.write_snapshots.lock().await.get(&moc_rel).cloned();
+        let original = env.get_snapshot(&moc_rel).await;
         let full = std::path::Path::new(&env.vault_path).join(&moc_rel);
         match original {
             Some(s) if !s.is_empty() => {

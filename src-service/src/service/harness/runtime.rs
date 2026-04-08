@@ -4,14 +4,16 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use serde_json::{json, Value};
+use super::context::ContextBuffer;
+use super::prompt::{templates, Locale};
 
 use crate::db::SurrealDb;
 use crate::service::types::{EmitEventFn, EmbedFn, AgentSession};
-use crate::service::harness::engine::transaction::{Transaction, TransactionState, AnswerChannel};
+use crate::service::harness::engine::transaction::{TransactionState, AnswerChannel};
 use crate::service::harness::engine::intent_classifier::{Intent, IntentClassifier};
 use super::memory::working::WorkingMemory;
 use super::engine::dispatcher::Dispatcher;
-use super::context_pipeline::{ContextBudget, ContextInput, ContextPipeline};
+use super::context::{ContextPipeline, ContextBudget, ContextInput};
 use super::memory::episodic::EpisodicMemory;
 use super::observability::emitter::ObservabilityEmitter;
 use super::governance::policy::build_need_confirm_fn;
@@ -58,6 +60,8 @@ pub struct HarnessRequestRuntime {
     /// Use `is_background()` / `needs_frontend()` rather than comparing directly.
     pub kind:           String,
     pub streaming:      bool,
+    /// UI language used to localise agent system messages.
+    pub(crate) locale:  Locale,
     /// Raw agent definition from DB.
     pub agent_def:      Value,
     /// Pre-write file snapshots keyed by vault-relative path.
@@ -66,6 +70,12 @@ pub struct HarnessRequestRuntime {
     /// Modification times (secs since epoch) at snapshot time.
     /// Used by write conflict detection.
     pub(crate) write_mtimes:    Arc<Mutex<HashMap<String, u64>>>,
+
+    // ── Shared loop state (accessible from tool handlers) ────────────────────
+    /// Message buffer + finish-signal for the current tool loop.
+    /// All message management goes through this; working_memory lives separately
+    /// because it is used by executor, emitter, and tool handlers as well.
+    pub(crate) context: ContextBuffer,
 
     // ── Eagerly-built execution helpers ──────────────────────────────────────
     /// Session-stamped SSE emitter (built at construction time).
@@ -76,13 +86,13 @@ pub struct HarnessRequestRuntime {
 
 /// Output of the skill pre-pass + context pipeline step.
 pub(crate) struct AgentContextResult {
-    pub messages:               Vec<Value>,
     pub mem_facts_count:        usize,
     pub activated_skill_titles: Vec<String>,
     pub tool_names:             Vec<String>,
 }
 
 impl HarnessRequestRuntime {
+
     // ── Lifecycle helpers ─────────────────────────────────────────────────────
 
     /// Create a minimal stub runtime for eval test runs.
@@ -109,11 +119,13 @@ impl HarnessRequestRuntime {
             client:           reqwest::Client::new(),
             kind:             String::new(),
             streaming:        false,
+            locale:           Locale::default(),
             agent_def:        Value::Null,
             write_snapshots:  Arc::new(Mutex::new(Default::default())),
             write_mtimes:     Arc::new(Mutex::new(Default::default())),
             emitter,
             dispatcher: None,
+            context:    ContextBuffer::new(),
         }
     }
 
@@ -175,11 +187,13 @@ impl HarnessRequestRuntime {
                                 }),
             kind,
             streaming: false,
+            locale: Locale::default(),
             agent_def,
             write_snapshots: Arc::new(Mutex::new(HashMap::new())),
             write_mtimes:    Arc::new(Mutex::new(HashMap::new())),
             emitter,
             dispatcher,
+            context: ContextBuffer::new(),
         }
     }
 
@@ -261,6 +275,112 @@ impl HarnessRequestRuntime {
         }
 
         false
+    }
+
+    // ── Context buffer delegates ─────────────────────────────────────────────
+
+    /// Initialize the message buffer (called once inside build_agent_context).
+    async fn init_msgs(&self, messages: Vec<Value>) {
+        self.context.init(messages).await;
+    }
+
+    /// Snapshot the message buffer.
+    /// If `with_context_usage` is true, appends transient system messages for context
+    /// pressure and stall detection — computed fresh each round, never stored.
+    pub(crate) async fn get_context_msgs(&self, with_context_usage: bool) -> Vec<Value> {
+        let mut snapshot = self.context.snapshot().await;
+        if with_context_usage {
+            // ── Context pressure ─────────────────────────────────────────────
+            let bytes = snapshot.iter().map(ContextBuffer::msg_size).sum::<usize>();
+            let pct   = bytes * 100 / ContextBuffer::CONTEXT_CRITICAL_BYTES;
+            let budget = ContextBuffer::CONTEXT_CRITICAL_BYTES;
+            let ctx_msg = if bytes >= ContextBuffer::CONTEXT_CRITICAL_BYTES {
+                templates::context_critical_msg(pct, bytes, budget, self.locale)
+            } else if bytes >= ContextBuffer::CONTEXT_WARN_BYTES {
+                templates::context_warn_msg(pct, bytes, budget, self.locale)
+            } else {
+                templates::context_info_msg(pct, bytes, budget, self.locale)
+            };
+            snapshot.push(json!({ "role": "system", "content": ctx_msg }));
+
+            // ── Stall detection ──────────────────────────────────────────────
+            let repeats = self.working_memory.repeated_calls().await;
+            if !repeats.is_empty() {
+                let names: Vec<String> = repeats.iter()
+                    .map(|(t, a)| if a.is_empty() { t.clone() } else { format!("{}({})", t, a) })
+                    .collect();
+                snapshot.push(json!({
+                    "role": "system",
+                    "content": templates::stall_warning(&names, self.locale),
+                }));
+            }
+        }
+        snapshot
+    }
+
+    /// Append one message to the buffer.
+    pub(crate) async fn push_msg(&self, msg: Value) {
+        self.context.push(msg).await;
+    }
+
+    /// Append messages with two safety nets:
+    /// 1. Per-message cap via `ContextBuffer`.
+    /// 2. Total budget: if current + incoming ≥ CONTEXT_CRITICAL_BYTES, auto-compress first.
+    pub(crate) async fn extend_msgs_guarded(&self, new_msgs: Vec<Value>) {
+        let current = self.context.byte_count().await;
+        let incoming: usize = new_msgs.iter().map(ContextBuffer::msg_size).sum();
+
+        if current + incoming >= ContextBuffer::CONTEXT_CRITICAL_BYTES {
+            let calls = self.working_memory.snapshot_summary().await;
+            let names: Vec<String> = calls.iter()
+                .filter_map(|c| c["name"].as_str().map(String::from))
+                .collect();
+            let summary = templates::auto_compress_summary(calls.len(), &names, self.locale);
+            self.context.compress(&summary, 4, &[], self.locale).await;
+        }
+
+        self.context.extend(new_msgs, self.locale).await;
+    }
+
+    // ── finish_answer delegates ──────────────────────────────────────────────
+
+    /// Signal the tool loop to stop with `answer` as the final response.
+    pub(crate) async fn set_finish_answer(&self, answer: String) {
+        self.context.set_finish(answer).await;
+    }
+
+    /// Consume the finish signal (returns `Some` once, then `None`).
+    pub(crate) async fn take_finish_answer(&self) -> Option<String> {
+        self.context.take_finish().await
+    }
+
+    // ── write_snapshots / write_mtimes ───────────────────────────────────────
+
+    /// Record the pre-write snapshot for `path` (only if not already recorded).
+    pub(crate) async fn snapshot_if_absent(&self, path: String, content: String) {
+        self.write_snapshots.lock().await.entry(path).or_insert(content);
+    }
+
+    /// Record the pre-write mtime for `path` (only if not already recorded).
+    pub(crate) async fn record_mtime_if_absent(&self, path: String, mtime: u64) {
+        self.write_mtimes.lock().await.entry(path).or_insert(mtime);
+    }
+
+    /// Record both snapshot and mtime (common pattern in write handlers).
+    /// Each lock is acquired and released independently to avoid holding two locks at once.
+    pub(crate) async fn snapshot_and_mtime_if_absent(&self, path: String, content: String, mtime: u64) {
+        self.write_snapshots.lock().await.entry(path.clone()).or_insert(content);
+        self.write_mtimes.lock().await.entry(path).or_insert(mtime);
+    }
+
+    /// Return the previously recorded snapshot for `path`, if any.
+    pub(crate) async fn get_snapshot(&self, path: &str) -> Option<String> {
+        self.write_snapshots.lock().await.get(path).cloned()
+    }
+
+    /// Compress the buffer — delegates to `ContextBuffer::compress`.
+    pub(crate) async fn compress_msgs(&self, summary: &str, tail: usize, keep_ids: &[String]) -> usize {
+        self.context.compress(summary, tail, keep_ids, self.locale).await
     }
 
     /// Remove this runtime's session from the active sessions map.
@@ -367,7 +487,8 @@ impl HarnessRequestRuntime {
                 skill_injection:  &system_injection,
                 activity_context,
                 memory_facts:     &mem_facts,
-                is_chat: self.streaming,
+                is_chat:          self.streaming,
+                locale:           self.locale,
             },
             &self.client,
             &self.llm_url,
@@ -386,8 +507,8 @@ impl HarnessRequestRuntime {
             }));
         }
 
+        self.init_msgs(built.messages).await;
         AgentContextResult {
-            messages: built.messages,
             mem_facts_count: mem_facts.len(),
             activated_skill_titles,
             tool_names,

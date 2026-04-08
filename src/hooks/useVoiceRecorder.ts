@@ -89,8 +89,7 @@ const COMPACT_THRESHOLD_SAMPLES = 5 * WHISPER_SAMPLE_RATE  // 5 秒
 const DS_RATIO = 3  // 48 kHz → 16 kHz downsampling ratio
 
 // ─── Preview separator（CJK 語言不加空格）────────────────────────────────────
-// whisper_language 設定為 CJK 語系時段落拼接不插入空格；
-// 設為 'auto' 時依文字內容自動偵測，兼容混合語言。
+// CJK 語系不插入空格；'auto' 依文字內容自動偵測。
 const CJK_LANGUAGES = new Set(['zh', 'zh-TW', 'zh-CN', 'ja', 'ko', 'yue', 'cantonese'])
 
 function isCJKChar(ch: string): boolean {
@@ -301,6 +300,7 @@ export function useVoiceRecorder(
           const result = await invoke<{ text: string }>('transcribe_audio', {
             pcmData: chunk,
             sampleRate: sampleRateRef.current,
+            language: whisperLanguageRef.current,
           })
           const text = normalizeTranscript(result.text, whisperLanguageRef.current)
           if (!text) {
@@ -576,6 +576,7 @@ export function useVoiceRecorder(
           const result = await invoke<{ text: string }>('transcribe_audio', {
             pcmData: [...unprocessed],
             sampleRate: sampleRateRef.current,
+            language: whisperLanguageRef.current,
           })
           if (previewGenRef.current !== myGen) return  // VAD 已沖出，結果已過期
           const text = normalizeTranscript(result.text, whisperLanguageRef.current)

@@ -15,7 +15,7 @@ use tracing::Span;
 use crate::app_state::ApiState;
 use crate::auth::{handlers, middleware::auth_middleware, store::AuthStore};
 use crate::db::SurrealDb;
-use crate::daemon::state::{DaemonState, ServerInfo};
+use crate::daemon::state::DaemonState;
 
 /// Build the shared API router with all routes.
 /// Used by both HTTP :7787 and HTTPS :7788.
@@ -38,10 +38,8 @@ pub fn build_api_router(app_state: ApiState) -> Router {
         .layer(middleware::from_fn_with_state(auth_store.clone(), auth_middleware))
         .with_state(auth_store);
 
-    // Server registry + admin routes
+    // Admin routes
     let admin_routes = Router::new()
-        .route("/servers/status", get(servers_status_handler))
-        .route("/servers/register", post(servers_register_handler))
         .route("/db/repair", post(db_repair_handler))
         .with_state(app_state.clone());
 
@@ -58,6 +56,8 @@ pub fn build_api_router(app_state: ApiState) -> Router {
         .merge(crate::routes::memory::router())
         .merge(crate::routes::scheduled::router())
         .merge(crate::routes::events::router())
+        .merge(crate::routes::whisper::router())
+        .merge(crate::routes::llm::router())
         .route("/pairing-info", get(pairing_info_handler))
         .with_state(app_state);
 
@@ -144,36 +144,6 @@ async fn health_handler() -> Json<serde_json::Value> {
     }))
 }
 
-async fn servers_status_handler(
-    State(state): State<ApiState>,
-) -> Json<serde_json::Value> {
-    let servers = state.daemon.servers.read().await;
-    Json(json!({ "servers": *servers }))
-}
-
-async fn servers_register_handler(
-    State(state): State<ApiState>,
-    Json(info): Json<ServerInfo>,
-) -> Json<serde_json::Value> {
-    // If an embedding server is registering, store its URL for vector search
-    if info.name == "embedding" {
-        let url = format!("http://127.0.0.1:{}", info.port);
-        *state.daemon.embedding_url.write().await = Some(url);
-    }
-    if info.name == "llama" {
-        let url = format!("http://127.0.0.1:{}", info.port);
-        *state.daemon.llm_url.write().await = Some(url);
-    }
-
-    let mut servers = state.daemon.servers.write().await;
-    if let Some(existing) = servers.iter_mut().find(|s| s.name == info.name) {
-        *existing = info;
-    } else {
-        servers.push(info);
-    }
-    Json(json!({ "ok": true }))
-}
-
 async fn db_repair_handler(
     State(state): State<ApiState>,
 ) -> Json<serde_json::Value> {
@@ -188,7 +158,7 @@ async fn db_repair_handler(
 async fn pairing_info_handler(
     State(state): State<ApiState>,
 ) -> Json<serde_json::Value> {
-    let tunnel_url = state.daemon.tunnel_url.read().await.clone();
+    let tunnel_url: Option<String> = state.daemon.tunnel_url.read().await.clone();
     Json(json!({
         "tunnel_url": tunnel_url,
         "local_url": "http://127.0.0.1:7787",

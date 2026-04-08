@@ -6,7 +6,6 @@ export interface Settings {
   auto_save_delay: number
   whisper_cli_path: string
   whisper_model_path: string
-  whisper_language: string
   whisper_threads: number
   whisper_auto_insert: boolean
   import_max_depth: number
@@ -66,7 +65,6 @@ export const DEFAULT_SETTINGS: Settings = {
   auto_save_delay: 1000,
   whisper_cli_path: '',
   whisper_model_path: '',
-  whisper_language: 'auto',
   whisper_threads: 4,
   whisper_auto_insert: true,
   import_max_depth: 3,

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import { useTranslation } from 'react-i18next'
 import { listen } from '@tauri-apps/api/event'
 import { api } from '../../lib/api'
 import { useSettingsStore } from '../../stores/settingsStore'
@@ -73,6 +74,7 @@ interface LiveChatPanelProps {
 
 export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPanelProps) {
   const { settings } = useSettingsStore()
+  const { i18n } = useTranslation()
   const addLog = useDebugStore(s => s.addLog)
 
   // ── UI state ──────────────────────────────────────────────────────────────
@@ -168,7 +170,7 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
     undefined,
     settings.voice_noise_suppression ?? true,
     5000,
-    settings.whisper_language ?? 'auto',
+    i18n.language,
   )
 
   const handleNewConversation = useCallback((id: string) => {
@@ -316,7 +318,8 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
         input: query,
         noteContext: null,
         activityContext: null,
-        language: settings.whisper_language ?? 'zh-TW',
+        language: i18n.language,
+        uiLanguage: i18n.language,
       })
       cleanup()
 
@@ -341,7 +344,7 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
 
       setLiveChatState('speaking')
       const utt = new SpeechSynthesisUtterance(speech_text)
-      utt.lang = settings.whisper_language ?? 'zh-TW'
+      utt.lang = i18n.language
       utt.rate = 1.15
       utt.onend = () => {
         if (liveChatStateRef.current === 'speaking') {
@@ -365,7 +368,7 @@ export default function LiveChatPanel({ onOpenNote, onActiveChange }: LiveChatPa
         toggle()
       }, 200)
     }
-  }, [toggle, addLog, conversationId, settings.whisper_language, onOpenNote])
+  }, [toggle, addLog, conversationId, i18n.language, onOpenNote])
 
   // ── Barge-in: user speaks while AI is speaking → cancel TTS + LLM stream ──
   useEffect(() => {
