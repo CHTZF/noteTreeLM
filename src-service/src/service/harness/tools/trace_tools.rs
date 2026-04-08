@@ -2,11 +2,14 @@
 ///
 /// These tools are NOT in the standard vault tool set — they are only available
 /// to agents whose `tool_names` explicitly includes them. The `trace_analyst`
-/// seed agent uses all three to form its analysis loop:
+/// seed agent uses all six to form its analysis loop:
 ///
-/// 1. `list_session_traces`          — discover recent sessions
+/// 1. `list_session_traces`            — discover recent sessions
 /// 2. `read_session_with_conversation` — load full context for one session
-/// 3. `propose_eval_case`            — save a proposed case to `proposed_eval_cases`
+/// 3. `propose_eval_case`              — save a proposed case to `proposed_eval_cases`
+/// 4. `list_proposed_eval_cases`       — see existing proposals + status + last_run_result
+/// 5. `run_eval_case`                  — run a single approved/enabled case, see pass/fail
+/// 6. `search_traces_by_pattern`       — filter traces by blocked_calls, round_count, etc.
 
 use std::sync::Arc;
 use serde_json::{json, Value};
@@ -90,6 +93,69 @@ pub(crate) fn schema_propose_eval_case() -> Value {
                 }
             },
             "required": ["name", "description", "tool_sequence", "assertions"]
+        }
+    })
+}
+
+pub(crate) fn schema_list_proposed_eval_cases() -> Value {
+    json!({
+        "name": "list_proposed_eval_cases",
+        "description": "List eval cases you have previously proposed, including their status (pending_review/enabled/disabled) and last run result. Use this to avoid duplicate proposals and to check whether your cases are passing.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "description": "Filter by status: 'pending_review', 'enabled', 'disabled'. Omit to return all."
+                }
+            },
+            "required": []
+        }
+    })
+}
+
+pub(crate) fn schema_run_eval_case() -> Value {
+    json!({
+        "name": "run_eval_case",
+        "description": "Run a single eval case by name or case_id and return pass/fail with failure details. Use this to verify that a proposed case correctly catches the pattern it was designed for.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The exact name of the eval case (from list_proposed_eval_cases)."
+                }
+            },
+            "required": ["name"]
+        }
+    })
+}
+
+pub(crate) fn schema_search_traces_by_pattern() -> Value {
+    json!({
+        "name": "search_traces_by_pattern",
+        "description": "Filter session traces by behavioural patterns. More precise than list_session_traces for finding problematic sessions.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "min_blocked_calls": {
+                    "type": "integer",
+                    "description": "Only return traces with at least this many blocked tool calls."
+                },
+                "min_round_count": {
+                    "type": "integer",
+                    "description": "Only return traces with at least this many rounds (high round count = potential stall)."
+                },
+                "min_repeated_calls": {
+                    "type": "integer",
+                    "description": "Only return traces where repeated_call_count >= this value."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max results to return (default 10, max 30)."
+                }
+            },
+            "required": []
         }
     })
 }
@@ -235,5 +301,138 @@ pub(crate) fn handle_propose_eval_case(env: Arc<HarnessRequestRuntime>, args: Va
             .map_err(|e| format!("propose_eval_case write error: {}", e))?;
 
         Ok(json!({ "ok": true, "name": name, "status": "pending_review" }))
+    })
+}
+
+pub(crate) fn handle_list_proposed_eval_cases(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let status_filter = args["status"].as_str().map(String::from);
+        let mut resp = if let Some(ref status) = status_filter {
+            env.db
+                .query("SELECT meta::id(id) AS case_id, name, description, status, source, \
+                        last_run_result, last_run_at, source_trace_ids \
+                        FROM proposed_eval_cases \
+                        WHERE account_id = $aid AND status = $status \
+                        ORDER BY last_run_at DESC")
+                .bind(("aid",    env.account_id.clone()))
+                .bind(("status", status.clone()))
+                .await
+                .map_err(|e| format!("list_proposed_eval_cases error: {}", e))?
+        } else {
+            env.db
+                .query("SELECT meta::id(id) AS case_id, name, description, status, source, \
+                        last_run_result, last_run_at, source_trace_ids \
+                        FROM proposed_eval_cases \
+                        WHERE account_id = $aid \
+                        ORDER BY last_run_at DESC")
+                .bind(("aid", env.account_id.clone()))
+                .await
+                .map_err(|e| format!("list_proposed_eval_cases error: {}", e))?
+        };
+        let rows: Vec<Value> = resp.take(0).unwrap_or_default();
+        Ok(json!(rows))
+    })
+}
+
+pub(crate) fn handle_run_eval_case(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let name = args["name"].as_str().unwrap_or("").trim().to_string();
+        if name.is_empty() {
+            return Ok(json!({"error": "name is required"}));
+        }
+
+        let mut resp = env.db
+            .query("SELECT * FROM proposed_eval_cases \
+                    WHERE account_id = $aid AND name = $name LIMIT 1")
+            .bind(("aid",  env.account_id.clone()))
+            .bind(("name", name.clone()))
+            .await
+            .map_err(|e| format!("run_eval_case query error: {}", e))?;
+
+        let rows: Vec<Value> = resp.take(0).unwrap_or_default();
+        let row = match rows.into_iter().next() {
+            Some(r) => r,
+            None => return Ok(json!({"error": format!("eval case '{}' not found", name)})),
+        };
+
+        let case: crate::service::harness::eval::EvalCase = match serde_json::from_value(row.clone()) {
+            Ok(c) => c,
+            Err(e) => return Ok(json!({"error": format!("failed to deserialise case: {}", e)})),
+        };
+
+        let result = crate::service::harness::eval::EvalRunner::run(&case).await;
+        let now = chrono::Utc::now().timestamp();
+        let passed = result.passed();
+        let result_json = json!({
+            "passed":   passed,
+            "failures": result.failures,
+        });
+
+        // Persist last_run_result back to DB.
+        let _ = env.db
+            .query("UPDATE proposed_eval_cases SET last_run_result = $res, last_run_at = $now \
+                    WHERE account_id = $aid AND name = $name")
+            .bind(("res",  result_json.clone()))
+            .bind(("now",  now))
+            .bind(("aid",  env.account_id.clone()))
+            .bind(("name", name.clone()))
+            .await;
+
+        Ok(json!({
+            "name":    name,
+            "passed":  passed,
+            "result":  result_json,
+        }))
+    })
+}
+
+pub(crate) fn handle_search_traces_by_pattern(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let min_blocked   = args["min_blocked_calls"].as_u64().unwrap_or(0);
+        let min_rounds    = args["min_round_count"].as_u64().unwrap_or(0);
+        let min_repeated  = args["min_repeated_calls"].as_u64().unwrap_or(0);
+        let limit         = args["limit"].as_u64().unwrap_or(10).min(30) as usize;
+
+        let mut resp = env.db
+            .query(
+                "SELECT meta::id(id) AS trace_id, conv_id, started_at, ended_at, \
+                 round_count, repeated_call_count, skill_activations, \
+                 memory_facts_injected, tool_calls \
+                 FROM session_traces \
+                 WHERE account_id = $aid \
+                 ORDER BY started_at DESC \
+                 LIMIT 200"  // over-fetch then filter in Rust (SurrealQL array math is limited)
+            )
+            .bind(("aid", env.account_id.clone()))
+            .await
+            .map_err(|e| format!("search_traces_by_pattern error: {}", e))?;
+
+        let rows: Vec<Value> = resp.take(0).unwrap_or_default();
+
+        let matched: Vec<Value> = rows.into_iter().filter_map(|mut row| {
+            let tool_calls = row["tool_calls"].as_array().cloned().unwrap_or_default();
+            let blocked_count = tool_calls.iter().filter(|t| {
+                t["guard_outcome"]["type"].as_str() == Some("Blocked")
+            }).count() as u64;
+            let round_count   = row["round_count"].as_u64().unwrap_or(0);
+            let repeated      = row["repeated_call_count"].as_u64().unwrap_or(0);
+
+            if blocked_count < min_blocked || round_count < min_rounds || repeated < min_repeated {
+                return None;
+            }
+
+            if let Some(obj) = row.as_object_mut() {
+                obj.remove("tool_calls");
+                obj.insert("blocked_calls".to_string(),   json!(blocked_count));
+                obj.insert("repeated_calls".to_string(),  json!(repeated));
+            }
+            Some(row)
+        }).take(limit).collect();
+
+        if matched.is_empty() {
+            Ok(json!("No traces matched the given pattern criteria."))
+        } else {
+            Ok(json!(matched))
+        }
     })
 }

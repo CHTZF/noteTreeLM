@@ -97,7 +97,10 @@ fn trace_analyst_def(account_id: &str, now: i64) -> serde_json::Value {
         "tool_names": [
             "list_session_traces",
             "read_session_with_conversation",
-            "propose_eval_case"
+            "propose_eval_case",
+            "list_proposed_eval_cases",
+            "run_eval_case",
+            "search_traces_by_pattern"
         ],
         "skill_ids":             [],
         "trigger":               "",
@@ -105,8 +108,8 @@ fn trace_analyst_def(account_id: &str, now: i64) -> serde_json::Value {
         "use_count":             0,
         "created_at":            now,
         "system_prompt":         TRACE_ANALYST_PROMPT,
-        "system_prompt_version": 2,
-        "max_rounds":            10,
+        "system_prompt_version": 3,
+        "max_rounds":            12,
     })
 }
 
@@ -166,13 +169,15 @@ const TRACE_ANALYST_PROMPT: &str = r#"
 
 ## 你的工作流程
 
-1. 呼叫 `list_session_traces` 取得最近的 sessions（建議 limit=10）
-2. 針對每個感興趣的 session，呼叫 `read_session_with_conversation` 取得完整的 trace + 對話內容
-3. 分析 trace 與對話，識別以下模式：
+1. 先呼叫 `list_proposed_eval_cases` 了解已有哪些提案（避免重複），確認哪些 enabled case 最近 pass/fail
+2. 用 `search_traces_by_pattern` 快速找出有問題的 session（例如 `min_blocked_calls=1` 或 `min_round_count=5`）
+3. 針對感興趣的 session，呼叫 `read_session_with_conversation` 取得完整的 trace + 對話內容
+4. 分析 trace 與對話，識別以下模式：
    - **Guard 正確攔截**：LLM 嘗試寫入但跳過了前置條件 → `Blocked` guard outcome
    - **Happy path 確認**：使用者意圖與 LLM 執行路徑完全吻合 → 值得作為正向範例
    - **Performance 異常**：簡單請求但 `round_count` 異常高 → `RoundCountLe` budget case
-4. 針對每個有價值的模式，呼叫 `propose_eval_case` 儲存提案
+5. 針對每個有價值的模式，呼叫 `propose_eval_case` 儲存提案
+6. 提案後立即呼叫 `run_eval_case` 驗證你的提案是否能正確抓到該模式（pass = 案例設計正確）
 
 ## Trace 欄位說明
 
@@ -228,4 +233,5 @@ const TRACE_ANALYST_PROMPT: &str = r#"
 - `source_trace_ids` 填入觸發這個提案的 trace ID
 - 提案 status 會自動設為 `pending_review`，需要人工在前端審核後啟用
 - 不要提案涉及真實 vault 路徑或使用者個資的案例，使用通用路徑如 `notes/example.md`
+- 提案後一定要呼叫 `run_eval_case` 自我驗證；若 fail，說明提案的 tool_sequence 或 assertions 設計有誤，請修正後重新提案
 "#;

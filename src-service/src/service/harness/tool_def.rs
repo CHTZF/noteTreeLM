@@ -120,6 +120,9 @@ pub(crate) static ALL_TOOL_DEFS: &[ToolDef] = &[
     ToolDef { name: "list_session_traces",            schema_fn: trace_tools::schema_list_session_traces,            is_write: false, guard: None, handler: trace_tools::handle_list_session_traces,            rollback: None },
     ToolDef { name: "read_session_with_conversation", schema_fn: trace_tools::schema_read_session_with_conversation, is_write: false, guard: None, handler: trace_tools::handle_read_session_with_conversation, rollback: None },
     ToolDef { name: "propose_eval_case",              schema_fn: trace_tools::schema_propose_eval_case,              is_write: true,  guard: None, handler: trace_tools::handle_propose_eval_case,              rollback: None },
+    ToolDef { name: "list_proposed_eval_cases",       schema_fn: trace_tools::schema_list_proposed_eval_cases,       is_write: false, guard: None, handler: trace_tools::handle_list_proposed_eval_cases,       rollback: None },
+    ToolDef { name: "run_eval_case",                  schema_fn: trace_tools::schema_run_eval_case,                  is_write: true,  guard: None, handler: trace_tools::handle_run_eval_case,                  rollback: None },
+    ToolDef { name: "search_traces_by_pattern",       schema_fn: trace_tools::schema_search_traces_by_pattern,       is_write: false, guard: None, handler: trace_tools::handle_search_traces_by_pattern,       rollback: None },
 ];
 
 /// Convenience: look up a ToolDef by name.
