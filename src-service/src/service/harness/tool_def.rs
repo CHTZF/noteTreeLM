@@ -105,7 +105,8 @@ pub(crate) static ALL_TOOL_DEFS: &[ToolDef] = &[
     ToolDef { name: "plan_announce",       schema_fn: schema_plan_announce,       is_write: false, guard: None, handler: handle_plan_announce,       rollback: None },
     ToolDef { name: "open_note",           schema_fn: schema_open_note,           is_write: false, guard: None, handler: handle_open_note,           rollback: None },
     ToolDef { name: "create_agent_skill",  schema_fn: schema_create_agent_skill,  is_write: true,  guard: None, handler: handle_create_agent_skill,  rollback: None },
-    ToolDef { name: "call_agent",          schema_fn: schema_call_agent,          is_write: false, guard: None, handler: handle_call_agent,          rollback: None },
+    ToolDef { name: "call_agent",           schema_fn: schema_call_agent,           is_write: false, guard: None, handler: handle_call_agent,           rollback: None },
+    ToolDef { name: "call_agents_parallel", schema_fn: schema_call_agents_parallel, is_write: false, guard: None, handler: handle_call_agents_parallel, rollback: None },
     ToolDef { name: "live_respond",        schema_fn: schema_live_respond,        is_write: false, guard: None, handler: handle_live_respond,        rollback: None },
 
     // ── Memory agent tools ───────────────────────────────────────────────────
@@ -547,6 +548,27 @@ fn schema_call_agent() -> Value { json!({ "type": "function", "function": {
         "name":  { "type": "string", "description": "agent 定義的名稱" },
         "input": { "type": "string", "description": "傳給 sub-agent 的任務描述或問題" }
     }, "required": ["name", "input"] }
+}})}
+
+fn schema_call_agents_parallel() -> Value { json!({ "type": "function", "function": {
+    "name": "call_agents_parallel",
+    "description": "同時呼叫多個 agent 執行獨立的子任務，等所有任務完成後一起回傳結果。每個子任務互相獨立、有各自的 working memory。最多 4 個並行任務。",
+    "parameters": { "type": "object", "properties": {
+        "tasks": {
+            "type": "array",
+            "description": "要並行執行的任務列表",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name":  { "type": "string", "description": "agent 定義的名稱" },
+                    "input": { "type": "string", "description": "傳給該 sub-agent 的任務描述" },
+                    "label": { "type": "string", "description": "結果識別標籤，方便整合時引用（例如 'topic_A'）" }
+                },
+                "required": ["name", "input"]
+            },
+            "maxItems": 4
+        }
+    }, "required": ["tasks"] }
 }})}
 
 fn schema_live_respond() -> Value { json!({ "type": "function", "function": {
@@ -1370,6 +1392,63 @@ fn handle_call_agent(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture
             Arc::clone(&env.cancel),
         ).await;
         Ok(json!(result))
+    })
+}
+
+/// call_agents_parallel: spawn multiple independent sub-agents concurrently.
+fn handle_call_agents_parallel(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let tasks = match args["tasks"].as_array() {
+            Some(t) if !t.is_empty() => t.clone(),
+            _ => return Ok(json!("tasks 不能為空")),
+        };
+        if tasks.len() > 4 {
+            return Ok(json!("最多支援 4 個並行任務"));
+        }
+
+        // Pre-load all agent defs before spawning (avoids parallel DB queries fighting each other).
+        let mut resolved: Vec<(String, String, String, serde_json::Value)> = Vec::new();
+        for task in &tasks {
+            let agent_name = task["name"].as_str().unwrap_or("").to_string();
+            let input      = task["input"].as_str().unwrap_or("").to_string();
+            let label      = task["label"].as_str().unwrap_or(&agent_name).to_string();
+            if agent_name.is_empty() {
+                return Ok(json!("每個 task 必須指定 name"));
+            }
+            let def = match crate::service::helpers::load_agent_def(
+                &env.db, &agent_name, &env.account_id,
+            ).await {
+                Some(d) => d,
+                None => return Ok(json!(format!("call_agents_parallel: agent '{}' not found", agent_name))),
+            };
+            resolved.push((agent_name, input, label, def));
+        }
+
+        // Spawn all sub-agents concurrently.
+        let mut handles = Vec::new();
+        for (agent_name, input, label, def) in resolved {
+            let env_c = Arc::clone(&env);
+            handles.push(tokio::spawn(async move {
+                let result = crate::service::agents::sub_agent::run_sub_agent(
+                    &env_c,
+                    &env_c.session_id,
+                    &agent_name,
+                    def,
+                    &input,
+                    Arc::clone(&env_c.cancel),
+                ).await;
+                (label, result)
+            }));
+        }
+
+        let mut results = serde_json::Map::new();
+        for handle in handles {
+            match handle.await {
+                Ok((label, result)) => { results.insert(label, json!(result)); }
+                Err(e) => { results.insert("error".into(), json!(e.to_string())); }
+            }
+        }
+        Ok(Value::Object(results))
     })
 }
 
