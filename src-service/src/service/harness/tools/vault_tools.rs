@@ -229,7 +229,7 @@ pub(crate) async fn vault_search(
         .await
         .map_err(|e| e.to_string())?;
     let rows: Vec<Row> = resp.take(0).map_err(|e| e.to_string())?;
-    Ok(json!(rows.iter().map(|r| json!({"path": r.path, "title": r.title})).collect::<Vec<_>>()))
+    Ok(json!(rows.iter().map(|r| json!({"path": r.path, "title": r.title, "score": null})).collect::<Vec<_>>()))
 }
 
 /// Same as vault_query_memory but also returns the matched fact_ids for memory:prefetched.
@@ -1160,7 +1160,7 @@ pub(crate) async fn vault_search_kb_pages(
                 let sb = score_map.get(&b.page_id).copied().unwrap_or(0.0);
                 sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
             });
-            return Ok(build_kb_results(&rows));
+            return Ok(build_kb_results(&rows, Some(&score_map)));
         }
     }
 
@@ -1272,22 +1272,30 @@ pub(crate) async fn vault_search_kb_pages(
     }
 
     if imported.is_empty() { return Ok(json!([])); }
-    Ok(build_kb_results(&imported))
+    Ok(build_kb_results(&imported, None))
 }
 
-fn build_kb_results(rows: &[impl AsPageRow]) -> Value {
+fn build_kb_results(
+    rows:      &[impl AsPageRow],
+    score_map: Option<&std::collections::HashMap<String, f32>>,
+) -> Value {
     let results: Vec<Value> = rows.iter().enumerate().map(|(i, p)| {
         let cite_id = format!("kb_{}", i + 1);
         let body = p.content_md().unwrap_or("");
         let body = if body.starts_with("---") {
             body.splitn(4, "---").nth(2).unwrap_or(body).trim_start()
         } else { body };
-        json!({
+        let score = score_map.and_then(|m| m.get(p.page_id())).copied();
+        let mut obj = json!({
             "__cite_id__": cite_id,
             "url":         p.url(),
             "title":       p.title().unwrap_or_else(|| p.url()),
             "content":     body.chars().take(1200).collect::<String>(),
-        })
+        });
+        if let Some(s) = score {
+            obj["score"] = json!((s * 100.0).round() / 100.0);
+        }
+        obj
     }).collect();
     json!(results)
 }
