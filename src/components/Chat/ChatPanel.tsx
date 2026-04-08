@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { open as openUrl } from '@tauri-apps/plugin-shell'
 import { api } from '../../lib/api'
 import { useTranslation } from 'react-i18next'
 import { useSettingsStore } from '../../stores/settingsStore'
@@ -75,8 +76,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   useEffect(() => { inputRef2.current = input }, [input])
 
   // Track note suggestions from agent:refs for "打開它" shortcut
-  const [noteSuggestions, setNoteSuggestions] = useState<{ absPath: string; label: string }[]>([])
-  const noteSuggestionsRef = useRef<{ absPath: string; label: string }[]>([])
+  const [noteSuggestions, setNoteSuggestions] = useState<{ absPath: string; label: string; isUrl: boolean; excerpt?: string; toolName?: string }[]>([])
+  const noteSuggestionsRef = useRef<{ absPath: string; label: string; isUrl: boolean; excerpt?: string; toolName?: string }[]>([])
   useEffect(() => { noteSuggestionsRef.current = noteSuggestions }, [noteSuggestions])
   // Accumulate all note abs-paths referenced in this conversation (for graph edges)
   const referencedNotePathsRef = useRef<Set<string>>(new Set())
@@ -494,17 +495,23 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
           if (display === 'think') return  // think is visualized in MemoryLinksView, not chat
           setMessages((prev) => [...prev, { role: 'tool', content: display }])
         }),
-        listen<{ session_id: string; refs: { path: string; title?: string; excerpt?: string }[] }>('agent:refs', (e) => {
+        listen<{ session_id: string; refs: { path: string; title?: string; excerpt?: string; tool_name?: string }[] }>('agent:refs', (e) => {
           const suggestions = e.payload.refs.map(ref => {
             const absPath = ref.path
-            const hashIdx = absPath.indexOf('#')
-            const filePart = hashIdx >= 0 ? absPath.slice(0, hashIdx) : absPath
-            const section = hashIdx >= 0 ? absPath.slice(hashIdx + 1) : ''
-            const filename = filePart.split('/').pop()?.replace(/\.md$/, '') ?? filePart
-            const label = section ? `${filename} § ${section}` : filename
-            // Accumulate for graph edge creation on memory extraction
-            e.payload.refs.forEach(r => referencedNotePathsRef.current.add(r.path.split('#')[0]))
-            return { absPath, label }
+            const isUrl = absPath.startsWith('http')
+            let label: string
+            if (isUrl) {
+              label = ref.title ?? (() => { try { return new URL(absPath).hostname } catch { return absPath } })()
+            } else {
+              const hashIdx = absPath.indexOf('#')
+              const filePart = hashIdx >= 0 ? absPath.slice(0, hashIdx) : absPath
+              const section = hashIdx >= 0 ? absPath.slice(hashIdx + 1) : ''
+              const filename = filePart.split('/').pop()?.replace(/\.md$/, '') ?? filePart
+              label = ref.title ?? (section ? `${filename} § ${section}` : filename)
+              // Accumulate for graph edge creation on memory extraction
+              referencedNotePathsRef.current.add(filePart)
+            }
+            return { absPath, label, isUrl, excerpt: ref.excerpt, toolName: ref.tool_name }
           })
           setNoteSuggestions(suggestions)
           noteSuggestionsRef.current = suggestions
@@ -1112,21 +1119,30 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
           <div ref={bottomRef} />
         </div>
 
-        {/* 筆記建議捷徑 */}
-        {noteSuggestions.length > 0 && onOpenNote && (
+        {/* 來源建議捷徑（筆記 + 網頁） */}
+        {noteSuggestions.length > 0 && (
           <div style={{ padding: '4px 8px', display: 'flex', flexWrap: 'wrap', gap: '4px', flexShrink: 0 }}>
-            <span style={{ fontSize: '11px', color: 'var(--color-text-muted)', alignSelf: 'center' }}>找到相關段落，要打開嗎？</span>
+            <span style={{ fontSize: '11px', color: 'var(--color-text-muted)', alignSelf: 'center' }}>找到相關來源：</span>
             {noteSuggestions.map((note, i) => (
               <button
                 key={i}
-                onClick={() => { setNoteSuggestions([]); noteSuggestionsRef.current = []; onOpenNote(note.absPath) }}
+                title={note.excerpt ?? note.absPath}
+                onClick={() => {
+                  setNoteSuggestions([])
+                  noteSuggestionsRef.current = []
+                  if (note.isUrl) {
+                    openUrl(note.absPath)
+                  } else if (onOpenNote) {
+                    onOpenNote(note.absPath)
+                  }
+                }}
                 style={{
                   fontSize: '11px', padding: '2px 8px', borderRadius: '12px',
                   border: '1px solid var(--color-accent)', background: 'var(--color-accent-dim)',
                   color: 'var(--color-accent)', cursor: 'pointer',
                 }}
               >
-                {note.label}
+                {note.toolName === 'web_search' ? '🔍 ' : note.isUrl ? '🔗 ' : '📄 '}{note.label}
               </button>
             ))}
           </div>

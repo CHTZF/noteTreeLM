@@ -203,14 +203,15 @@ impl Executor {
                         if let Some(ref env) = self.env {
                             let refs: Vec<serde_json::Value> = if node.call.name == "search_kb_pages" {
                                 v.as_array().map(|arr| arr.iter().map(|item| json!({
-                                    "path":    item["url"].as_str().unwrap_or(""),
-                                    "title":   item["title"].as_str().unwrap_or(""),
-                                    "excerpt": item["content"].as_str().unwrap_or("").chars().take(180).collect::<String>(),
+                                    "path":      item["url"].as_str().unwrap_or(""),
+                                    "title":     item["title"].as_str().unwrap_or(""),
+                                    "excerpt":   item["content"].as_str().unwrap_or("").chars().take(180).collect::<String>(),
+                                    "tool_name": "search_kb_pages",
                                 })).collect()).unwrap_or_default()
                             } else {
                                 vault_tools::extract_note_refs(
                                     &node.call.name, &actual_args, &v, &env.vault_path,
-                                ).into_iter().map(|path| json!({ "path": path })).collect()
+                                )
                             };
                             if !refs.is_empty() {
                                 (self.emit_fn)("agent:refs".to_string(), json!({

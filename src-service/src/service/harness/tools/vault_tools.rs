@@ -1349,13 +1349,21 @@ pub(crate) async fn vault_web_search(
 
     increment_brave_used(db, &key_id).await;
 
-    // Emit web refs for frontend "儲存為知識" button
+    // Emit web refs for frontend "儲存為知識" button + agent:refs for source chips
     let refs: Vec<Value> = results.iter().take(3).map(|(title, url, snippet)| {
         json!({ "path": url, "title": title, "excerpt": snippet })
     }).collect();
     state_emit("agent:web_refs", json!({
         "session_id": session_id,
-        "refs": refs,
+        "refs": refs.clone(),
+    }));
+    state_emit("agent:refs", json!({
+        "session_id": session_id,
+        "refs": refs.iter().map(|r| {
+            let mut v = r.clone();
+            v["tool_name"] = json!("web_search");
+            v
+        }).collect::<Vec<_>>(),
     }));
 
     let formatted = results.iter().enumerate()
@@ -1531,30 +1539,37 @@ pub(crate) async fn vault_schedule_task(
     Ok(json!({ "ok": true, "path": rel_path }))
 }
 
-/// Extract note paths for agent:note_refs event
-pub(crate) fn extract_note_refs(tool_name: &str, args: &Value, _result: &Value, _vault_path: &str) -> Vec<String> {
+///// Extract source refs for agent:refs event.
+/// Returns `[{ path, title?, excerpt?, tool_name }]`.
+pub(crate) fn extract_note_refs(tool_name: &str, args: &Value, result: &Value, _vault_path: &str) -> Vec<Value> {
     match tool_name {
         "read_note" => {
             let p = args["path"].as_str().unwrap_or("");
             if p.is_empty() { return vec![]; }
             let lower = p.to_lowercase();
             let full = if lower.ends_with(".md") { lower } else { format!("{}.md", lower) };
-            vec![full]
+            vec![json!({ "path": full, "tool_name": "read_note" })]
         }
         "open_note" => {
-            args["paths"].as_array()
+            let paths: Vec<String> = args["paths"].as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str()).map(String::from).collect())
                 .unwrap_or_else(|| {
                     args["path"].as_str().map(|p| vec![p.to_string()]).unwrap_or_default()
-                })
+                });
+            paths.into_iter()
+                .map(|p| json!({ "path": p, "tool_name": "open_note" }))
+                .collect()
         }
         "search_vault" => {
-            // result is a JSON array of {path, title}
-            _result.as_array()
-                .map(|arr| arr.iter()
-                    .filter_map(|v| v["path"].as_str())
-                    .map(String::from)
-                    .collect())
+            result.as_array()
+                .map(|arr| arr.iter().filter_map(|v| {
+                    let path = v["path"].as_str()?;
+                    let mut obj = json!({ "path": path, "tool_name": "search_vault" });
+                    if let Some(title) = v["title"].as_str() {
+                        obj["title"] = json!(title);
+                    }
+                    Some(obj)
+                }).collect())
                 .unwrap_or_default()
         }
         _ => vec![],

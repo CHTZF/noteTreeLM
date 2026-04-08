@@ -16,7 +16,7 @@ export type SkillPreview = {
   injectionMode: 'passive' | 'active'
 }
 
-export type DraftState = { input: string; noteSuggestions: { absPath: string; label: string }[] }
+export type DraftState = { input: string; noteSuggestions: { absPath: string; label: string; isUrl: boolean; excerpt?: string; toolName?: string }[] }
 
 export const ORCHESTRATOR_SYSTEM =
   `你是一個筆記助理，可以直接使用工具完成使用者的請求。\n` +
