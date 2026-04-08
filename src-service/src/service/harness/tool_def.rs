@@ -122,6 +122,7 @@ pub(crate) static ALL_TOOL_DEFS: &[ToolDef] = &[
     ToolDef { name: "propose_eval_case",              schema_fn: trace_tools::schema_propose_eval_case,              is_write: true,  guard: None, handler: trace_tools::handle_propose_eval_case,              rollback: None },
     ToolDef { name: "list_proposed_eval_cases",       schema_fn: trace_tools::schema_list_proposed_eval_cases,       is_write: false, guard: None, handler: trace_tools::handle_list_proposed_eval_cases,       rollback: None },
     ToolDef { name: "run_eval_case",                  schema_fn: trace_tools::schema_run_eval_case,                  is_write: true,  guard: None, handler: trace_tools::handle_run_eval_case,                  rollback: None },
+    ToolDef { name: "update_proposed_eval_case",      schema_fn: trace_tools::schema_update_proposed_eval_case,      is_write: true,  guard: None, handler: trace_tools::handle_update_proposed_eval_case,      rollback: None },
     ToolDef { name: "search_traces_by_pattern",       schema_fn: trace_tools::schema_search_traces_by_pattern,       is_write: false, guard: None, handler: trace_tools::handle_search_traces_by_pattern,       rollback: None },
 ];
 

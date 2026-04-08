@@ -97,6 +97,37 @@ pub(crate) fn schema_propose_eval_case() -> Value {
     })
 }
 
+pub(crate) fn schema_update_proposed_eval_case() -> Value {
+    json!({
+        "name": "update_proposed_eval_case",
+        "description": "Update the tool_sequence, assertions, or description of an existing proposed eval case by name. Use this after run_eval_case returns fail — fix the case design without creating a duplicate. Does NOT change status (that is human-controlled).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Exact name of the eval case to update."
+                },
+                "tool_sequence": {
+                    "type": "array",
+                    "description": "Replacement tool_sequence. Omit to keep existing.",
+                    "items": { "type": "object" }
+                },
+                "assertions": {
+                    "type": "array",
+                    "description": "Replacement assertions. Omit to keep existing.",
+                    "items": { "type": "object" }
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Replacement description. Omit to keep existing."
+                }
+            },
+            "required": ["name"]
+        }
+    })
+}
+
 pub(crate) fn schema_list_proposed_eval_cases() -> Value {
     json!({
         "name": "list_proposed_eval_cases",
@@ -301,6 +332,56 @@ pub(crate) fn handle_propose_eval_case(env: Arc<HarnessRequestRuntime>, args: Va
             .map_err(|e| format!("propose_eval_case write error: {}", e))?;
 
         Ok(json!({ "ok": true, "name": name, "status": "pending_review" }))
+    })
+}
+
+pub(crate) fn handle_update_proposed_eval_case(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let name = args["name"].as_str().unwrap_or("").trim().to_string();
+        if name.is_empty() {
+            return Ok(json!({"error": "name is required"}));
+        }
+
+        // Check case exists and belongs to this account.
+        #[derive(serde::Deserialize)]
+        struct Row { id: Value }
+        let existing = env.db
+            .query("SELECT id FROM proposed_eval_cases WHERE account_id = $aid AND name = $name LIMIT 1")
+            .bind(("aid",  env.account_id.clone()))
+            .bind(("name", name.clone()))
+            .await.ok()
+            .and_then(|mut r| r.take::<Vec<Row>>(0).ok())
+            .and_then(|rows| rows.into_iter().next());
+
+        let row = match existing {
+            Some(r) => r,
+            None => return Ok(json!({ "error": format!("eval case '{}' not found", name) })),
+        };
+
+        // Build MERGE patch from only the fields provided.
+        let mut patch = serde_json::Map::new();
+        if let Some(ts) = args.get("tool_sequence") {
+            if !ts.is_null() { patch.insert("tool_sequence".into(), ts.clone()); }
+        }
+        if let Some(as_) = args.get("assertions") {
+            if !as_.is_null() { patch.insert("assertions".into(), as_.clone()); }
+        }
+        if let Some(desc) = args["description"].as_str() {
+            patch.insert("description".into(), json!(desc));
+        }
+
+        if patch.is_empty() {
+            return Ok(json!({ "ok": false, "message": "No fields to update — provide at least one of tool_sequence, assertions, description." }));
+        }
+
+        env.db
+            .query("UPDATE $rid MERGE $patch")
+            .bind(("rid",   row.id))
+            .bind(("patch", Value::Object(patch)))
+            .await
+            .map_err(|e| format!("update_proposed_eval_case error: {}", e))?;
+
+        Ok(json!({ "ok": true, "name": name, "message": "Case updated. Call run_eval_case to re-verify." }))
     })
 }
 

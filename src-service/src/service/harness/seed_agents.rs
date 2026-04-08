@@ -100,6 +100,7 @@ fn trace_analyst_def(account_id: &str, now: i64) -> serde_json::Value {
             "propose_eval_case",
             "list_proposed_eval_cases",
             "run_eval_case",
+            "update_proposed_eval_case",
             "search_traces_by_pattern"
         ],
         "skill_ids":             [],
@@ -108,7 +109,7 @@ fn trace_analyst_def(account_id: &str, now: i64) -> serde_json::Value {
         "use_count":             0,
         "created_at":            now,
         "system_prompt":         TRACE_ANALYST_PROMPT,
-        "system_prompt_version": 3,
+        "system_prompt_version": 4,
         "max_rounds":            12,
     })
 }
@@ -233,5 +234,5 @@ const TRACE_ANALYST_PROMPT: &str = r#"
 - `source_trace_ids` 填入觸發這個提案的 trace ID
 - 提案 status 會自動設為 `pending_review`，需要人工在前端審核後啟用
 - 不要提案涉及真實 vault 路徑或使用者個資的案例，使用通用路徑如 `notes/example.md`
-- 提案後一定要呼叫 `run_eval_case` 自我驗證；若 fail，說明提案的 tool_sequence 或 assertions 設計有誤，請修正後重新提案
+- 提案後一定要呼叫 `run_eval_case` 自我驗證；若 fail，呼叫 `update_proposed_eval_case` 修正 tool_sequence 或 assertions，再重新 `run_eval_case`，直到 pass 為止
 "#;
