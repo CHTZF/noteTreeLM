@@ -14,35 +14,52 @@ use serde_json::json;
 pub(crate) async fn seed_builtin_agents(db: &SurrealDb, account_id: &str) {
     let now = chrono::Utc::now().timestamp();
     let agents = builtin_agents(account_id, now);
+
+    // Fetch existing agent defs for this account in one query.
+    #[derive(serde::Deserialize)]
+    struct AgentRow { name: String, system_prompt_version: Option<u64> }
+    let existing: std::collections::HashMap<String, u64> = db
+        .query("SELECT name, system_prompt_version FROM agent_definitions WHERE account_id = $aid")
+        .bind(("aid", account_id.to_string()))
+        .await
+        .ok()
+        .and_then(|mut r| r.take::<Vec<AgentRow>>(0).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.name, r.system_prompt_version.unwrap_or(0)))
+        .collect();
+
     for agent in agents {
         let name    = agent["name"].as_str().unwrap_or("").to_string();
         let prompt  = agent["system_prompt"].as_str().unwrap_or("").to_string();
         let version = agent["system_prompt_version"].as_u64().unwrap_or(1);
 
-        if let Err(e) = db
-            .query(
-                // Create if new; update system_prompt when version in code exceeds DB version.
-                // Other fields (tool_names, max_rounds, etc.) are left untouched so user
-                // edits made via the frontend are preserved.
-                "IF (SELECT count() FROM agent_definitions \
-                     WHERE account_id = $aid AND name = $name GROUP ALL)[0].count = 0 \
-                 THEN (CREATE agent_definitions CONTENT $data) \
-                 ELSE IF (SELECT VALUE system_prompt_version FROM agent_definitions \
-                          WHERE account_id = $aid AND name = $name \
-                          LIMIT 1)[0] < $ver \
-                 THEN (UPDATE agent_definitions \
-                       SET system_prompt = $prompt, system_prompt_version = $ver \
-                       WHERE account_id = $aid AND name = $name) \
-                 END"
-            )
-            .bind(("aid",    account_id.to_string()))
-            .bind(("name",   name.clone()))
-            .bind(("data",   agent))
-            .bind(("prompt", prompt))
-            .bind(("ver",    version))
-            .await
-        {
-            tracing::warn!("[seed_builtin_agents] upsert '{}' error: {}", name, e);
+        match existing.get(&name).copied() {
+            None => {
+                // Not found — INSERT
+                if let Err(e) = db.query("CREATE agent_definitions CONTENT $data")
+                    .bind(("data", agent))
+                    .await
+                {
+                    tracing::warn!("[seed_builtin_agents] INSERT '{}' error: {}", name, e);
+                }
+            }
+            Some(db_ver) if db_ver < version => {
+                // Stale — update system_prompt only (preserve user's other edits)
+                if let Err(e) = db
+                    .query("UPDATE agent_definitions \
+                            SET system_prompt = $prompt, system_prompt_version = $ver \
+                            WHERE account_id = $aid AND name = $name")
+                    .bind(("aid",    account_id.to_string()))
+                    .bind(("name",   name.clone()))
+                    .bind(("prompt", prompt))
+                    .bind(("ver",    version))
+                    .await
+                {
+                    tracing::warn!("[seed_builtin_agents] UPDATE '{}' error: {}", name, e);
+                }
+            }
+            _ => {} // up-to-date, skip
         }
     }
 }

@@ -11,11 +11,15 @@ pub(crate) const GUARD_EXEMPT_WRITE_TOOLS: &[&str] = &[
     "create_note",
     "create_folder",
     "create_agent_skill",
-    "compress_to_knowledge",   // creates a new knowledge note, target path doesn't pre-exist
-    "schedule_task",           // creates a new task note, target path doesn't pre-exist
+    "compress_to_knowledge",        // creates a new knowledge note, target path doesn't pre-exist
+    "schedule_task",                // creates a new task note, target path doesn't pre-exist
     "save_memory_facts",
     "mark_conversation_processed",
     "condense_memory_facts",
+    "batch_apply",                  // meta-tool: dispatches to sub-tools that carry their own guards
+    "propose_eval_case",            // writes to DB eval records, not vault files
+    "run_eval_case",                // executes eval, no direct vault file write
+    "update_proposed_eval_case",    // updates DB eval record
 ];
 
 /// Non-write tools that still require user confirmation before execution

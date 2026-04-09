@@ -52,7 +52,7 @@ pub(crate) static ALL_TOOL_DEFS: &[ToolDef] = &[
     ToolDef { name: "find_orphan_notes",     schema_fn: schema_find_orphan_notes,     is_write: false, guard: None, handler: handle_find_orphan_notes,     rollback: None },
 
     // ── Composite read-write tools ───────────────────────────────────────────
-    ToolDef { name: "read_then_write",  schema_fn: schema_read_then_write,  is_write: true,  guard: None, handler: handle_read_then_write, rollback: Some(rollback_overwrite_note) },
+    ToolDef { name: "read_then_write",  schema_fn: schema_read_then_write,  is_write: true,  guard: Some(GUARD_READ_THEN_WRITE), handler: handle_read_then_write, rollback: Some(rollback_overwrite_note) },
 
     // ── Vault write tools ────────────────────────────────────────────────────
     // create_note: rollback = delete the file (if it didn't exist before).
@@ -142,6 +142,11 @@ pub(crate) fn build_tools_schema(tool_names: &[String]) -> Vec<Value> {
 
 // ── Guard specs ───────────────────────────────────────────────────────────────
 
+const GUARD_READ_THEN_WRITE: ToolGuardSpec = ToolGuardSpec {
+    path_extractor: |args| args["path"].as_str().unwrap_or("").to_string(),
+    require:        GuardLevel::ContentRead,
+    is_folder:      false,
+};
 const GUARD_UPDATE_NOTE: ToolGuardSpec = ToolGuardSpec {
     path_extractor: |args| args["path"].as_str().unwrap_or("").to_string(),
     require:        GuardLevel::ContentRead,

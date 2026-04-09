@@ -101,13 +101,15 @@ async fn login(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Seed builtin skills/agents for this account on first login (idempotent)
+    // Seed builtin skills/agents synchronously (must complete before returning token
+    // so the user can immediately use the chat agent after login).
+    // embed_skills_for_account is slow (embedding inference) — keep that in background.
+    crate::db::seeds::seed_builtins(&state.db, &user.username).await;
     {
         let username_for_seed = user.username.clone();
         let db_for_seed = state.db.clone();
         let embed_url = Some(state.daemon.embedding_url.clone());
         tokio::spawn(async move {
-            crate::db::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
             crate::db::seeds::embed_skills_for_account(&db_for_seed, &username_for_seed, &embed_url).await;
         });
     }
@@ -219,13 +221,13 @@ async fn register(
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
 
-    // Seed on first registration
+    // Seed synchronously so the user can immediately use the chat agent after register.
+    crate::db::seeds::seed_builtins(&state.db, &req.username).await;
     {
         let username_for_seed = req.username.clone();
         let db_for_seed = state.db.clone();
         let embed_url = Some(state.daemon.embedding_url.clone());
         tokio::spawn(async move {
-            crate::db::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
             crate::db::seeds::embed_skills_for_account(&db_for_seed, &username_for_seed, &embed_url).await;
         });
     }
@@ -312,13 +314,13 @@ async fn google_upsert(
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
 
-    // Seed builtin skills/agents for this account (idempotent)
+    // Seed synchronously so the user can immediately use the chat agent after Google login.
+    crate::db::seeds::seed_builtins(&state.db, &username).await;
     {
         let username_for_seed = username.clone();
         let db_for_seed = state.db.clone();
         let embed_url = Some(state.daemon.embedding_url.clone());
         tokio::spawn(async move {
-            crate::db::seeds::seed_builtins(&db_for_seed, &username_for_seed).await;
             crate::db::seeds::embed_skills_for_account(&db_for_seed, &username_for_seed, &embed_url).await;
         });
     }

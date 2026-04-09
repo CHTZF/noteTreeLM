@@ -458,10 +458,25 @@ pub async fn seed_builtins(db: &SurrealDb, account_id: &str) {
         );
     }
 
-    // ── Agent Definitions: conditional INSERT (preserve user edits) ─────────
-    // Same pattern as seed_builtin_agents: only insert if the agent doesn't exist yet.
+    // ── Agent Definitions: INSERT missing ones (preserve user edits) ──────────
+    // Fetch existing def_ids for this account in one query, then insert only missing ones.
     // Users may customise system_prompt / tool_names via the frontend; we never overwrite.
+    #[derive(serde::Deserialize)]
+    struct DefIdRow { def_id: String }
+    let existing_defs: std::collections::HashSet<String> = db
+        .query("SELECT def_id FROM agent_definitions WHERE account_id = $aid")
+        .bind(("aid", account_id.to_string()))
+        .await
+        .ok()
+        .and_then(|mut r| r.take::<Vec<DefIdRow>>(0).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| r.def_id)
+        .collect();
+
+    let mut agents_inserted = 0usize;
     for a in AGENTS {
+        if existing_defs.contains(a.id) { continue; }
         let tool_names_json: serde_json::Value = serde_json::Value::Array(
             a.tool_names.iter().map(|t| serde_json::Value::String(t.to_string())).collect(),
         );
@@ -484,18 +499,17 @@ pub async fn seed_builtins(db: &SurrealDb, account_id: &str) {
             "use_count":      0,
             "created_at":     now,
         });
-        if let Err(e) = db.query(
-            "IF (SELECT count() FROM agent_definitions \
-                 WHERE account_id = $aid AND def_id = $did GROUP ALL)[0].count = 0 \
-             THEN (CREATE agent_definitions CONTENT $data) END"
-        )
-        .bind(("aid",  account_id.to_string()))
-        .bind(("did",  a.id.to_string()))
-        .bind(("data", payload))
-        .await
+        if let Err(e) = db.query("CREATE agent_definitions CONTENT $data")
+            .bind(("data", payload))
+            .await
         {
-            tracing::error!("[seeds] conditional INSERT agent_definitions '{}' failed: {}", a.name, e);
+            tracing::error!("[seeds] INSERT agent_definitions '{}' failed: {}", a.name, e);
+        } else {
+            agents_inserted += 1;
         }
+    }
+    if agents_inserted > 0 {
+        tracing::info!("seed_builtins: account {} — {} agent defs inserted", account_id, agents_inserted);
     }
 
     // ── Harness built-ins: conditional INSERT ────────────────────────────────

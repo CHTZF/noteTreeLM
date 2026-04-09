@@ -34,7 +34,7 @@ pub fn router() -> Router<ApiState> {
 async fn get_setting(db: &SurrealDb, key: &str) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct Row { value: String }
-    db.query("SELECT value FROM settings WHERE key = $key LIMIT 1")
+    db.query("SELECT `value` FROM `settings` WHERE `key` = $key LIMIT 1")
         .bind(("key", key.to_string()))
         .await.ok()?
         .take::<Vec<Row>>(0).ok()?
