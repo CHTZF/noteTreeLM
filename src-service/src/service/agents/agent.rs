@@ -130,14 +130,15 @@ fn inject_required_tools(mut tool_names: Vec<String>, needs_frontend: bool) -> V
 }
 
 /// Single LLM invocation — handles both streaming and non-streaming, with or without tools.
-/// Returns `(full_text, tool_chunks)` where each chunk is `(id, name, args_json_string)`.
+/// Returns `(full_text, tool_chunks, cite_invalid)`.
+/// `cite_invalid` is true when a streaming round detected a fabricated citation ID.
 async fn run_one_llm_round(
     runtime:     &HarnessRequestRuntime,
     msgs:        &[Value],
     tools:       Option<Value>,
     tool_choice: Value,
     emitter:     &super::super::harness::observability::emitter::ObservabilityEmitter,
-) -> Result<(String, Vec<(String, String, String)>), String> {
+) -> Result<(String, Vec<(String, String, String)>, bool), String> {
     use super::super::harness::tools::llm;
     let has_tools = tools.is_some();
     if runtime.streaming {
@@ -149,11 +150,11 @@ async fn run_one_llm_round(
         let wm = if has_tools { Some(&runtime.working_memory) } else { None };
         llm::stream_llm_round(
             &runtime.client, &runtime.llm_url, body, emitter, &runtime.cancel, wm,
-        ).await.map(|(t, _, chunks)| (t, chunks))
+        ).await.map(|(t, _, chunks, ci)| (t, chunks, ci))
     } else {
         llm::call_llm_once(
             &runtime.client, &runtime.llm_url, msgs, tools, &runtime.cancel,
-        ).await
+        ).await.map(|(t, chunks)| (t, chunks, false))
     }
 }
 
@@ -193,7 +194,7 @@ async fn run_tool_loop(
             let msgs_snapshot = runtime.get_context_msgs(true).await;
 
             let llm_t0 = std::time::Instant::now();
-            let (text, tool_chunks) = match run_one_llm_round(
+            let (text, tool_chunks, cite_invalid) = match run_one_llm_round(
                 runtime, &msgs_snapshot, round_tools, round_choice, emitter,
             ).await {
                 Ok(r) => r,
@@ -201,7 +202,7 @@ async fn run_tool_loop(
             };
             emitter.record_llm_latency(llm_t0.elapsed().as_millis() as u64);
 
-            if !text.is_empty() { full_response = text; }
+            if !text.is_empty() { full_response = text.clone(); }
 
             if !tool_chunks.is_empty() {
                 let tc_json: Vec<Value> = tool_chunks.iter().map(|tc| json!({
@@ -229,6 +230,47 @@ async fn run_tool_loop(
                 runtime.extend_msgs_guarded(Planner::results_to_messages(&tool_chunks, results)).await;
 
                 if runtime.cancel.load(Ordering::Relaxed) { break; }
+            } else if cite_invalid && round + 1 < max_rounds.min(super::super::MAX_ROUNDS) {
+                // LLM fabricated a citation ID — push its reply as assistant message and
+                // inject a correction so it can fix the citation in the next round.
+                // Include the list of valid IDs from WorkingMemory so the LLM can cite
+                // correctly even when context was compressed and tool results are no longer visible.
+                if !text.is_empty() {
+                    runtime.push_msg(json!({ "role": "assistant", "content": text })).await;
+                }
+                let valid_ids = runtime.working_memory.all_valid_cite_ids().await;
+                let ids_list: Vec<&str> = valid_ids.iter().map(String::as_str).collect();
+                let correction = if valid_ids.is_empty() {
+                    match runtime.locale {
+                        super::super::harness::prompt::Locale::En =>
+                            "[System] Your citation is invalid. No tools were called this session, \
+                             so you must write [cite:none]. Please rewrite your answer.".to_string(),
+                        _ =>
+                            "[系統] 你的引用無效。本輪未呼叫任何工具，請改寫 [cite:none] 並重新回覆。".to_string(),
+                    }
+                } else {
+                    let ids_str = ids_list.join(", ");
+                    match runtime.locale {
+                        super::super::harness::prompt::Locale::En => format!(
+                            "[System] Your citation IDs are invalid. \
+                             Valid IDs for this session are: {}. \
+                             Use one or more of these in [cite:id1,id2] format, \
+                             or write [cite:none] if none apply. \
+                             Please rewrite your answer with the correct citation.",
+                            ids_str
+                        ),
+                        _ => format!(
+                            "[系統] 你的 cite ID 無效。本 session 中有效的 cite ID 為：{}。\
+                             請在第一句使用 [cite:id1,id2] 格式引用其中一個或多個，\
+                             或若均不適用則寫 [cite:none]。請重新回覆。",
+                            ids_str
+                        ),
+                    }
+                };
+                runtime.push_msg(json!({ "role": "user", "content": correction })).await;
+                // Signal frontend to clear the streaming buffer before correction round
+                emitter.emit("agent:cite_correction_start".to_string(), json!({}));
+                // continue to next round for correction
             } else {
                 break;
             }
@@ -238,7 +280,7 @@ async fn run_tool_loop(
         let msgs_snapshot = runtime.get_context_msgs(false).await;
         let llm_t0 = std::time::Instant::now();
         match run_one_llm_round(runtime, &msgs_snapshot, None, json!("auto"), emitter).await {
-            Ok((text, _)) => { full_response = text; }
+            Ok((text, _, _)) => { full_response = text; }
             Err(e) => { tracing::warn!("[agent/pure] llm error: {}", e); }
         }
         emitter.record_llm_latency(llm_t0.elapsed().as_millis() as u64);

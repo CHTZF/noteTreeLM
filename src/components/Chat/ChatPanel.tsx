@@ -60,6 +60,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const streamingRef = useRef('')
+  const llmDoneContentRef = useRef('')  // authoritative final content from llm:done (citation-stripped)
   const tokenCountRef = useRef(0)
   const sessionWriteApprovedRef = useRef(false)
   const userMsgCountRef = useRef(0)
@@ -440,11 +441,14 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     let unlistenThink: (() => void) = () => {}
     let unlistenPlanAnnounce: (() => void) = () => {}
     let unlistenCitationMissing: (() => void) = () => {}
+    let unlistenCitation: (() => void) = () => {}
+    let unlistenCiteCorrectionStart: (() => void) = () => {}
 
     // Clear previous suggestions at the start of each send
     setNoteSuggestions([])
     noteSuggestionsRef.current = []
     pendingWebRefsRef.current = []
+    llmDoneContentRef.current = ''
 
     try {
       // 快取 notePart：同一筆記的前 200 字未變時跳過重建
@@ -487,6 +491,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         unlistenWriteTimeout,
         unlistenPlanAnnounce,
         unlistenCitationMissing,
+        unlistenCitation,
+        unlistenCiteCorrectionStart,
       ] = await Promise.all([
         listen<{ session_id?: string; display?: string } | string>('agent:tool_call', (event) => {
           const display = typeof event.payload === 'string'
@@ -544,7 +550,9 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
           }
         }),
         listen<string>('llm:done', (e) => {
-          log(`⏹ llm:done 事件收到，共 ${(e.payload || '').length} 字元`)
+          // Backend sends citation-stripped full response — use as authoritative final content.
+          llmDoneContentRef.current = e.payload || ''
+          log(`⏹ llm:done 事件收到，共 ${llmDoneContentRef.current.length} 字元`)
         }),
         listen<Array<{ path: string; title: string; excerpt: string }>>('agent:web_refs', (e) => {
           pendingWebRefsRef.current = [...pendingWebRefsRef.current, ...e.payload]
@@ -614,6 +622,32 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         listen<Record<string, never>>('agent:citation_missing', () => {
           console.warn('[citation] LLM response missing or invalid [cite:...] tag')
         }),
+        listen<{ ids: string[] }>('agent:citation', (e) => {
+          // Valid citation IDs confirmed by backend — show as source chips
+          const ids = e.payload?.ids ?? []
+          if (ids.length === 0) return
+          const chips = ids
+            .filter(id => id !== 'none')
+            .map(id => ({
+              absPath: id,
+              label: id,
+              isUrl: false,
+              toolName: 'citation' as const,
+            }))
+          if (chips.length > 0) {
+            setNoteSuggestions(prev => [...prev, ...chips])
+            noteSuggestionsRef.current = [...noteSuggestionsRef.current, ...chips]
+          }
+        }),
+        listen<Record<string, never>>('agent:cite_correction_start', () => {
+          // LLM produced a fabricated citation; backend is retrying with correction.
+          // Reset streaming buffer so the corrected response displays cleanly.
+          streamingRef.current = ''
+          tokenCountRef.current = 0
+          setStreamingText('')
+          setNoteSuggestions([])
+          noteSuggestionsRef.current = []
+        }),
       ])
 
       log('  呼叫 invoke("invoke_agent")')
@@ -634,7 +668,9 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         }).catch(() => {})
       }
 
-      const finalContent = streamingRef.current
+      // Prefer llm:done payload (citation-stripped, authoritative) over streamed tokens.
+      // Streaming tokens are for live display; llm:done is the canonical final content.
+      const finalContent = llmDoneContentRef.current || streamingRef.current
       log(`✓ invoke_agent 完成，回覆 ${finalContent.length} 字元`)
       const webRefs = pendingWebRefsRef.current.length > 0
         ? pendingWebRefsRef.current
@@ -676,11 +712,14 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       unlistenWriteTimeout()
       unlistenPlanAnnounce()
       unlistenCitationMissing()
+      unlistenCitation()
+      unlistenCiteCorrectionStart()
       setPendingWriteDisplay(null)
       setIsStreaming(false)
       isStreamingRef.current = false
       setStreamingText('')
       streamingRef.current = ''
+      llmDoneContentRef.current = ''
     }
   }, [input, isStreaming, messages, useNoteContext, writeConfirmMode, currentPath, noteContent, conversationId, onOpenNote, log, err])
 
@@ -1142,7 +1181,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
                   color: 'var(--color-accent)', cursor: 'pointer',
                 }}
               >
-                {note.toolName === 'web_search' ? '🔍 ' : note.isUrl ? '🔗 ' : '📄 '}{note.label}
+                {note.toolName === 'web_search' ? '🔍 ' : note.toolName === 'citation' ? '🔖 ' : note.isUrl ? '🔗 ' : '📄 '}{note.label}
               </button>
             ))}
           </div>

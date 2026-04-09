@@ -5,6 +5,27 @@ use tokio::sync::Mutex;
 use serde_json::Value;
 use crate::service::harness::governance::guard::{GuardOutcome, ToolCallRecord};
 
+/// Recursively collect all `__cite_id__` string values from a JSON value.
+/// Used to discover nested cite IDs (e.g. `kb_1`, `kb_2`) embedded inside tool results.
+fn collect_cite_ids_from_value(v: &Value, out: &mut std::collections::HashSet<String>) {
+    match v {
+        Value::Object(map) => {
+            if let Some(Value::String(id)) = map.get("__cite_id__") {
+                out.insert(id.clone());
+            }
+            for child in map.values() {
+                collect_cite_ids_from_value(child, out);
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                collect_cite_ids_from_value(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Per-session, in-memory store of tool execution evidence.
 ///
 /// # Memory semantics
@@ -147,6 +168,24 @@ impl WorkingMemory {
             }
         }).take(6).collect();
         Ok(results)
+    }
+
+    /// Collect all cite IDs that are valid for this session.
+    ///
+    /// Includes:
+    /// - Every tool_call_id key (outer `__cite_id__` injected by `annotate_cite_id`)
+    /// - Any `__cite_id__` string values found recursively inside tool results
+    ///   (e.g. `kb_1`, `kb_2` embedded by `search_kb_pages`)
+    ///
+    /// Used by citation validation so IDs from both levels are accepted.
+    pub(crate) async fn all_valid_cite_ids(&self) -> std::collections::HashSet<String> {
+        let map = self.inner.lock().await;
+        let mut ids = std::collections::HashSet::new();
+        for (key, rec) in map.iter() {
+            ids.insert(key.clone());
+            collect_cite_ids_from_value(&rec.result, &mut ids);
+        }
+        ids
     }
 
     /// Snapshot all records as a JSON-serialisable summary for `get_session_state`.
