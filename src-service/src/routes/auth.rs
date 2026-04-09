@@ -41,6 +41,7 @@ pub fn router() -> Router<ApiState> {
         .route("/auth/google-upsert", post(google_upsert))
         .route("/auth/change-password", post(change_password))
         .route("/auth/generate-pairing-code", post(generate_pairing_code))
+        .route("/auth/mobile-pair", post(mobile_pair))
 }
 
 async fn generate_pairing_code(
@@ -388,6 +389,63 @@ async fn change_password(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({ "ok": true })))
+}
+
+/// POST /auth/mobile-pair — validate a short-lived pairing code and issue
+/// a 30-day session token (same as login) so the mobile client can call all
+/// API v1 routes using the same Bearer-token scheme as the desktop.
+async fn mobile_pair(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pairing_code = body["pairing_code"]
+        .as_str()
+        .ok_or((StatusCode::BAD_REQUEST, "missing pairing_code".to_string()))?;
+    let device_name = body["device_name"].as_str().unwrap_or("Mobile");
+
+    // Consume (one-time) the pairing code
+    let ok = state.auth.consume_pairing_code(pairing_code).await;
+    if !ok {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid or expired pairing code".to_string()));
+    }
+
+    // Find the system user (single-user system)
+    #[derive(serde::Deserialize)]
+    struct UserRow { username: String }
+    let mut resp = state
+        .db
+        .query("SELECT username FROM users LIMIT 1")
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let users: Vec<UserRow> = resp.take(0).unwrap_or_default();
+    let username = users
+        .into_iter()
+        .next()
+        .map(|u| u.username)
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "No user found".to_string()))?;
+
+    // Create a 30-day session (identical to password login)
+    let token = Uuid::new_v4().to_string();
+    let now = Utc::now().timestamp();
+    let expires_at = now + 86400 * 30;
+
+    state
+        .db
+        .query("INSERT INTO sessions (token, username, expires_at, auth_provider, created_at) \
+                VALUES ($tok, $uname, $expires_at, 'device', $now)")
+        .bind(("tok",        token.clone()))
+        .bind(("uname",      username.clone()))
+        .bind(("expires_at", expires_at))
+        .bind(("now",        now))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    tracing::info!("mobile_pair: session created for {} via device '{}'", username, device_name);
+    Ok(Json(serde_json::json!({
+        "token":      token,
+        "username":   username,
+        "expires_at": expires_at,
+    })))
 }
 
 pub fn extract_bearer(headers: &HeaderMap) -> Option<String> {

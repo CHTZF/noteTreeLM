@@ -10,7 +10,9 @@
     "vite:dev": "vite",
     "vite:build": "tsc && vite build",
     "service": "cargo run --manifest-path src-service/Cargo.toml",
-    "reset_data": "rm -rf ~/Library/WebKit/notetreelm && rm -rf \"$HOME/Library/Application Support/com.notetreelm.app/service.db\" && rm -f \"$HOME/Library/Application Support/com.notetreelm.app/search.db\" \"$HOME/Library/Application Support/com.notetreelm.app/search.db-shm\" \"$HOME/Library/Application Support/com.notetreelm.app/search.db-wal\" \"$HOME/Library/Application Support/com.notetreelm.app/session.json\""
+    "reset_data": "rm -rf ~/Library/WebKit/notetreelm && rm -rf \"$HOME/Library/Application Support/com.notetreelm.app/service.db\" && rm -f \"$HOME/Library/Application Support/com.notetreelm.app/search.db\" \"$HOME/Library/Application Support/com.notetreelm.app/search.db-shm\" \"$HOME/Library/Application Support/com.notetreelm.app/search.db-wal\" \"$HOME/Library/Application Support/com.notetreelm.app/session.json\"",
+    "mobile:dev": "vite --config vite.mobile.config.ts",
+    "mobile:build": "tsc --noEmit && vite build --config vite.mobile.config.ts"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.18.6",

@@ -11,6 +11,7 @@ use serde_json::json;
 use std::{net::SocketAddr, time::Duration};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
+use tower_http::services::{ServeDir, ServeFile};
 use tracing::Span;
 use crate::app_state::ApiState;
 use crate::auth::{handlers, middleware::auth_middleware, store::AuthStore};
@@ -66,8 +67,16 @@ pub fn build_api_router(app_state: ApiState) -> Router {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    // Mobile PWA static files — served at /mobile/*
+    // Built by `npm run build:mobile` into src-service/mobile-dist/
+    // SPA fallback: unknown paths under /mobile/ serve index.html
+    let mobile_dist = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mobile-dist");
+    let mobile_service = ServeDir::new(&mobile_dist)
+        .fallback(ServeFile::new(mobile_dist.join("index.html")));
+
     Router::new()
         .nest("/api/v1", api_v1)
+        .nest_service("/mobile", mobile_service)
         .merge(public_routes)
         .merge(device_routes)
         .merge(admin_routes)
