@@ -741,8 +741,10 @@ fn handle_search_kb_pages(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolF
 
 fn handle_web_search(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
     Box::pin(async move {
+        tracing::info!("[web_search] handler called, args={}", args);
         let query = args["query"].as_str().unwrap_or("").to_string();
         if query.is_empty() {
+            tracing::warn!("[web_search] empty query, args={}", args);
             return Ok(json!("查詢不能為空"));
         }
         let session_id = env.session_id.clone();

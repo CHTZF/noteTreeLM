@@ -17,6 +17,7 @@ const MAX_CITE_INNER_LEN: usize = 128;
 const HOLD_BACK: usize = 160;
 
 /// Remove all `[cite:...]` tags from `text`, collecting the inner content of each.
+/// Also strips bare `cite:xxx` (without brackets) that small models sometimes output.
 /// Returns `(cleaned_text, collected_inners)`.
 /// Used for `full_text` post-processing and for `llm:done` payload.
 fn strip_and_collect_cite_tags(text: &str) -> (String, Vec<String>) {
@@ -37,8 +38,123 @@ fn strip_and_collect_cite_tags(text: &str) -> (String, Vec<String>) {
         }
     }
     result.push_str(rest);
-    (result.trim_end().to_string(), inners)
+    // Also strip bare `cite:xxx` patterns (no brackets) that small models output,
+    // and collect their inners for validation (so correction loop can fire).
+    let (cleaned, bare_inners) = strip_bare_cite_tags(&result);
+    inners.extend(bare_inners);
+    // Strip bracketed malformed tags like [cite_id1] where model used _ instead of :
+    let cleaned = strip_malformed_cite_brackets(&cleaned);
+    // Strip [tool_name:tool_call_id] patterns where model used tool name instead of "cite"
+    // e.g. [web_search:wEZxy8LBBpi55PQjmqUK4Uspp1XkIixh]
+    let cleaned = strip_tool_name_cite_brackets(&cleaned);
+    (cleaned.trim_end().to_string(), inners)
 }
+
+/// Strip bare `cite:xxx` tokens (without surrounding `[` `]`) from text.
+/// Returns `(cleaned_text, collected_inners)` — inners are fed into validation
+/// so correction loop can fire even when the model omits brackets.
+fn strip_bare_cite_tags(text: &str) -> (String, Vec<String>) {
+    let mut result = String::new();
+    let mut inners = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("cite:") {
+        let is_bracketed = start > 0 && rest.as_bytes().get(start - 1) == Some(&b'[');
+        if is_bracketed {
+            let end = start + 5;
+            result.push_str(&rest[..end]);
+            rest = &rest[end..];
+            continue;
+        }
+        result.push_str(&rest[..start]);
+        let after = &rest[start + 5..]; // skip "cite:"
+        let token_end = after.find(|c: char| c.is_whitespace()).unwrap_or(after.len());
+        let inner = after[..token_end].trim().to_string();
+        if !inner.is_empty() { inners.push(inner); }
+        let skip_ws = if after[token_end..].starts_with(' ') || after[token_end..].starts_with('\n') { 1 } else { 0 };
+        rest = &after[token_end + skip_ws..];
+    }
+    result.push_str(rest);
+    (result, inners)
+}
+
+/// Strip malformed bracketed cite tags like `[cite_id1]` where the model used
+/// `_` instead of `:`. Matches `[cite` followed by non-`]` chars up to `]`.
+fn strip_malformed_cite_brackets(text: &str) -> String {
+    let mut result = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("[cite") {
+        // Check the char right after "[cite" — if it's `:` it was already handled above.
+        let after_tag = &rest[start + 5..];
+        if after_tag.starts_with(':') {
+            // Already handled by strip_and_collect_cite_tags — keep and advance past it
+            if let Some(end) = after_tag.find(']') {
+                result.push_str(&rest[..start + 6 + end + 1]);
+                rest = &after_tag[end + 1..];
+            } else {
+                result.push_str(&rest[..start + 5]);
+                rest = after_tag;
+            }
+            continue;
+        }
+        // Malformed: strip up to and including the closing `]`
+        result.push_str(&rest[..start]);
+        if let Some(end) = after_tag.find(']') {
+            rest = &after_tag[end + 1..];
+        } else {
+            // No closing bracket — drop "[cite" prefix, keep the rest
+            rest = after_tag;
+        }
+    }
+    result.push_str(rest);
+    result
+}
+
+/// Strip malformed citation brackets where the model references tool call IDs directly.
+/// Handles two patterns:
+///   1. `[tool_name:tool_call_id]` — snake_case name + colon + 16+ alphanumeric ID
+///      e.g. `[web_search:wEZxy8LBBpi55PQjmqUK4Uspp1XkIixh]`
+///   2. `[tool_call_id]` — bare 16+ alphanumeric ID with no prefix
+///      e.g. `[9TcC6KKSkwlhSC5ynDU0MCuXLevxdBlr]`
+fn strip_tool_name_cite_brackets(text: &str) -> String {
+    let mut result = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('[') {
+        let after_bracket = &rest[start + 1..];
+
+        // Case 1: [snake_name:long_id]
+        let name_end = after_bracket
+            .find(|c: char| !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '_')
+            .unwrap_or(after_bracket.len());
+        let name = &after_bracket[..name_end];
+        if name.len() >= 2 && after_bracket[name_end..].starts_with(':') {
+            let after_colon = &after_bracket[name_end + 1..];
+            let id_end = after_colon
+                .find(|c: char| !c.is_ascii_alphanumeric())
+                .unwrap_or(after_colon.len());
+            if id_end >= 16 && after_colon[id_end..].starts_with(']') {
+                result.push_str(&rest[..start]);
+                rest = &after_colon[id_end + 1..];
+                continue;
+            }
+        }
+
+        // Case 2: [long_alphanumeric_id] — bare tool_call_id with no prefix
+        let id_end = after_bracket
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(after_bracket.len());
+        if id_end >= 16 && after_bracket[id_end..].starts_with(']') {
+            result.push_str(&rest[..start]);
+            rest = &after_bracket[id_end + 1..];
+            continue;
+        }
+
+        result.push_str(&rest[..start + 1]);
+        rest = after_bracket;
+    }
+    result.push_str(rest);
+    result
+}
+
 
 /// Convenience wrapper: strip cite tags without collecting inners.
 fn strip_all_cite_tags(text: &str) -> String {
@@ -71,11 +187,15 @@ fn scan_and_strip_cites(buf: &str) -> (String, String, Vec<String>) {
                 // No cite tag start — check if the tail is a partial prefix of "[cite:"
                 let leftover = trailing_cite_prefix(rest);
                 let emit_end = rest.len() - leftover.len();
-                clean.push_str(&rest[..emit_end]);
+                let (bare_clean, bare_inners) = strip_bare_cite_tags(&rest[..emit_end]);
+                clean.push_str(&bare_clean);
+                inners.extend(bare_inners);
                 return (clean, leftover.to_string(), inners);
             }
             Some(start) => {
-                clean.push_str(&rest[..start]);
+                let (bare_clean, bare_inners) = strip_bare_cite_tags(&rest[..start]);
+                clean.push_str(&bare_clean);
+                inners.extend(bare_inners);
                 let after_start = &rest[start + 6..]; // skip "[cite:"
                 match after_start.find(']') {
                     Some(end) if end <= MAX_CITE_INNER_LEN => {

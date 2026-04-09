@@ -55,7 +55,17 @@ async fn save_settings(
             Value::String(s) => s,
             other => other.to_string(),
         };
-        upsert_setting(&state, key, value_str, now).await
+        // Encrypt API keys at rest; service is the single encryption point.
+        let store_value = if key.starts_with("api_key_") && !value_str.is_empty() {
+            let enc = crate::service::harness::crypto::encrypt_api_key_db(&state.db, &value_str).await;
+            if enc.is_empty() {
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, "API key encryption failed".to_string()));
+            }
+            enc
+        } else {
+            value_str
+        };
+        upsert_setting(&state, key, store_value, now).await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     }
     Ok(Json(json!({ "ok": true })))
@@ -134,7 +144,16 @@ async fn get_setting_by_key(
         })?;
 
     match rows.into_iter().next() {
-        Some(r) => Ok(Json(json!({ "value": r.value }))),
+        Some(r) => {
+            // Decrypt API keys transparently before returning to caller.
+            let value = if key.starts_with("api_key_") && !r.value.is_empty() {
+                let plain = crate::service::harness::crypto::decrypt_api_key_db(&state.db, &r.value).await;
+                if plain.is_empty() { r.value } else { plain }
+            } else {
+                r.value
+            };
+            Ok(Json(json!({ "value": value })))
+        }
         None => Ok(Json(json!({ "value": null }))),
     }
 }
@@ -304,7 +323,13 @@ async fn get_api_key(
         tracing::error!("get_api_key take failed key={}: {}", db_key, e);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
-    let key = rows.into_iter().next().map(|r| r.value).filter(|v| !v.is_empty());
+    let key = match rows.into_iter().next().map(|r| r.value).filter(|v| !v.is_empty()) {
+        Some(enc) => {
+            let plain = crate::service::harness::crypto::decrypt_api_key_db(&state.db, &enc).await;
+            if plain.is_empty() { None } else { Some(plain) }
+        }
+        None => None,
+    };
     Ok(Json(json!({ "key": key })))
 }
 
@@ -318,7 +343,11 @@ async fn set_api_key(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let db_key = format!("api_key_{}", provider);
     let now = Utc::now().timestamp();
-    upsert_setting(&state, db_key, body.key, now).await
+    let encrypted = crate::service::harness::crypto::encrypt_api_key_db(&state.db, &body.key).await;
+    if encrypted.is_empty() {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "API key encryption failed".to_string()));
+    }
+    upsert_setting(&state, db_key, encrypted, now).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(json!({ "ok": true })))
 }

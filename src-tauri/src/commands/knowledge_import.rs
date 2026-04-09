@@ -1909,14 +1909,14 @@ pub async fn list_agent_skills(
     knowledge_item_id: Option<String>,
     active_only: bool,
 ) -> Result<Vec<AgentSkillRecord>, AppError> {
-    let vault_id = state.get_vault_uuid().await;
-    if vault_id.is_empty() { return Ok(vec![]); }
     let token = state.get_auth_token().await;
-    let tok = if token.is_empty() { None } else { Some(token.as_str()) };
-    let path = format!("/vaults/{}/skills", urlencoding::encode(&vault_id));
-    let result: serde_json::Value = daemon_get(&state.http_client, &path, tok)
-        .await
-        .unwrap_or(serde_json::json!([]));
+    log::info!("[list_agent_skills] token_len={}", token.len());
+    if token.is_empty() { return Ok(vec![]); }
+    let tok = Some(token.as_str());
+    let path = "/skills";
+    let raw = daemon_get::<serde_json::Value>(&state.http_client, path, tok).await;
+    log::info!("[list_agent_skills] daemon_get result: {:?}", raw.as_ref().map(|v| v.to_string()).unwrap_or_else(|e| format!("ERR: {}", e)));
+    let result = raw.unwrap_or(serde_json::json!([]));
     let arr = result.as_array().cloned().unwrap_or_default();
     let skills = arr
         .iter()

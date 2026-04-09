@@ -433,22 +433,26 @@ pub async fn seed_builtins(db: &SurrealDb, account_id: &str) {
             None => { inserted += 1; } // Missing: just insert
         }
 
-        let _ = db.query(
-            "INSERT INTO agent_skills \
-             (skill_id, account_id, knowledge_item_id, title, trigger, behavior, \
-              is_active, injection_mode, agent_scope, trigger_count, created_at, seed_skill_version) \
-             VALUES ($sid, $aid, '__builtin__', $title, $trigger, $behavior, \
-                     true, $imode, 'all', 0, $now, $ver)"
+        if let Err(e) = db.query(
+            "CREATE agent_skills CONTENT { \
+                skill_id: $sid, account_id: $aid, knowledge_item_id: '__builtin__', \
+                title: $title, trigger: $trig, behavior: $behavior, \
+                is_active: true, injection_mode: $imode, agent_scope: 'all', \
+                trigger_count: 0, tool_chain_order: [], created_at: $now, \
+                seed_skill_version: $ver \
+            }"
         )
         .bind(("sid",     s.id.to_string()))
         .bind(("aid",     account_id.to_string()))
         .bind(("title",   s.title.to_string()))
-        .bind(("trigger", s.trigger.to_string()))
+        .bind(("trig",    s.trigger.to_string()))
         .bind(("behavior",s.behavior.to_string()))
         .bind(("imode",   s.injection_mode.to_string()))
         .bind(("now",     now))
         .bind(("ver",     s.seed_version))
-        .await;
+        .await {
+            tracing::error!("[seeds] INSERT skill '{}' failed: {}", s.id, e);
+        }
     }
 
     if inserted > 0 || updated > 0 {

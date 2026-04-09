@@ -26,17 +26,6 @@ interface AgentDefinition {
   last_used_at: number | null
 }
 
-interface EphemeralAgent {
-  sub_session_id: string
-  def_id: string
-  def_name: string
-  task: string
-  status: 'running' | 'done' | 'error'
-  result_preview: string
-  started_at: number
-  ended_at: number | null
-}
-
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const ALL_TOOLS = [
@@ -50,7 +39,6 @@ const ALL_TOOLS = [
 export default function AgentsPage() {
   const [defs, setDefs] = useState<AgentDefinition[]>([])
   const [skills, setSkills] = useState<AgentSkill[]>([])
-  const [ephemeral, setEphemeral] = useState<EphemeralAgent[]>([])
   const [loading, setLoading] = useState(true)
   const [showCreate, setShowCreate] = useState(false)
 
@@ -69,25 +57,10 @@ export default function AgentsPage() {
       .catch(() => {})
   }, [])
 
-  const loadEphemeral = useCallback(() => {
-    invoke<EphemeralAgent[]>('list_ephemeral_agents')
-      .then(setEphemeral)
-      .catch(() => {})
-  }, [])
-
   useEffect(() => {
     loadDefs()
     loadSkills()
-    loadEphemeral()
-  }, [loadDefs, loadSkills, loadEphemeral])
-
-  // 監聽 ephemeral 更新事件
-  useEffect(() => {
-    const unlisten = listen('system_agent:ephemeral_updated', () => {
-      loadEphemeral()
-    })
-    return () => { unlisten.then(fn => fn()) }
-  }, [loadEphemeral])
+  }, [loadDefs, loadSkills])
 
   // 監聽種子完成事件（解決 builtin agent/skill 在 2s warmup 後才插入的 race condition）
   useEffect(() => {
@@ -111,11 +84,6 @@ export default function AgentsPage() {
   const handleWake = async (def_id: string) => {
     await api.wakeAgentDefinition(def_id)
     setDefs(prev => prev.map(d => d.def_id === def_id ? { ...d, status: 'active' as const, slept_at: null } : d))
-  }
-
-  const handleClearEphemeral = async () => {
-    await invoke('clear_ephemeral_agents')
-    setEphemeral([])
   }
 
   return (
@@ -196,30 +164,6 @@ export default function AgentsPage() {
           </div>
         )}
 
-        {/* ── 本次 Session 臨時 Agents ── */}
-        <div>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-            <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-              本次對話 ({ephemeral.length})
-            </span>
-            {ephemeral.length > 0 && (
-              <button
-                style={{ fontSize: 11, padding: '2px 8px', borderRadius: 4, background: 'var(--color-bg-overlay)', color: 'var(--color-text-muted)', border: '1px solid var(--color-border)', cursor: 'pointer' }}
-                onClick={handleClearEphemeral}
-              >
-                清除
-              </button>
-            )}
-          </div>
-          {ephemeral.length === 0 && (
-            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', fontStyle: 'italic' }}>
-              本次對話尚無動態建立的 agent
-            </div>
-          )}
-          {ephemeral.map(e => (
-            <EphemeralCard key={e.sub_session_id} agent={e} />
-          ))}
-        </div>
       </div>
     </div>
   )
@@ -462,29 +406,3 @@ function CreateDefForm({ skills, onCreated, onCancel }: { skills: AgentSkill[], 
   )
 }
 
-// ── EphemeralCard ─────────────────────────────────────────────────────────────
-
-function EphemeralCard({ agent }: { agent: EphemeralAgent }) {
-  const statusColor = { running: '#f59e0b', done: '#22c55e', error: '#ef4444' }[agent.status]
-  const elapsed = agent.ended_at ? Math.round((agent.ended_at - agent.started_at) / 1000) : null
-
-  return (
-    <div style={{ border: '1px solid var(--color-border)', borderRadius: 6, marginBottom: 6, padding: '8px 10px', background: 'var(--color-bg-surface, var(--color-bg-overlay))' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
-        <span style={{ width: 8, height: 8, borderRadius: '50%', background: statusColor, flexShrink: 0, display: 'inline-block' }} />
-        <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--color-text-primary)' }}>{agent.def_name}</span>
-        <span style={{ fontSize: 10, color: 'var(--color-text-muted)', marginLeft: 'auto' }}>
-          {agent.status === 'running' ? '執行中…' : elapsed !== null ? `${elapsed}s` : ''}
-        </span>
-      </div>
-      <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginBottom: 2 }}>
-        <strong>任務：</strong>{agent.task.slice(0, 80)}{agent.task.length > 80 ? '…' : ''}
-      </div>
-      {agent.result_preview && (
-        <div style={{ fontSize: 11, color: 'var(--color-text-muted)', fontStyle: 'italic' }}>
-          {agent.result_preview.slice(0, 100)}{agent.result_preview.length > 100 ? '…' : ''}
-        </div>
-      )}
-    </div>
-  )
-}

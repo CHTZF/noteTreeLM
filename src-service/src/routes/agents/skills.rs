@@ -40,13 +40,16 @@ pub async fn create(
     let tool_calls: Option<Value> = body.get("tool_calls").cloned();
     let now = Utc::now().timestamp();
 
+    let tool_chain_order: Value = body.get("tool_chain_order")
+        .cloned()
+        .unwrap_or(Value::Array(vec![]));
     state.db
-        .query("INSERT INTO agent_skills (skill_id, account_id, knowledge_item_id, title, trigger, behavior, tool_calls, is_active, trigger_count, injection_mode, agent_scope, created_at) VALUES ($sid, $aid, $kiid, $title, $trigger, $behavior, $tc, true, 0, $imode, $scope, $now)")
+        .query("CREATE agent_skills CONTENT { skill_id: $sid, account_id: $aid, knowledge_item_id: $kiid, title: $title, trigger: $trig, behavior: $behavior, tool_calls: $tc, is_active: true, trigger_count: 0, injection_mode: $imode, agent_scope: $scope, tool_chain_order: $tco, created_at: $now }")
         .bind(("sid", skill_id.clone())).bind(("aid", account_id.clone()))
         .bind(("kiid", knowledge_item_id)).bind(("title", title))
-        .bind(("trigger", trigger)).bind(("behavior", behavior))
+        .bind(("trig", trigger)).bind(("behavior", behavior))
         .bind(("tc", tool_calls)).bind(("imode", injection_mode))
-        .bind(("scope", agent_scope)).bind(("now", now))
+        .bind(("scope", agent_scope)).bind(("tco", tool_chain_order)).bind(("now", now))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -89,7 +92,7 @@ pub async fn update(
         || body.get("behavior").is_some();
 
     if body.get("title").is_some()          { set_parts.push("title = $title".to_string()); }
-    if body.get("trigger").is_some()        { set_parts.push("trigger = $trigger".to_string()); }
+    if body.get("trigger").is_some()        { set_parts.push("trigger = $trig".to_string()); }
     if body.get("behavior").is_some()       { set_parts.push("behavior = $behavior".to_string()); }
     if body.get("is_active").is_some()      { set_parts.push("is_active = $active".to_string()); }
     if body.get("tool_calls").is_some()       { set_parts.push("tool_calls = $tool_calls".to_string()); }
@@ -108,7 +111,7 @@ pub async fn update(
         .bind(("now", now)).bind(("sid", skill_id)).bind(("aid", account_id));
 
     if let Some(v) = body["title"].as_str()          { qb = qb.bind(("title", v.to_string())); }
-    if let Some(v) = body["trigger"].as_str()        { qb = qb.bind(("trigger", v.to_string())); }
+    if let Some(v) = body["trigger"].as_str()        { qb = qb.bind(("trig", v.to_string())); }
     if let Some(v) = body["behavior"].as_str()       { qb = qb.bind(("behavior", v.to_string())); }
     if let Some(v) = body["is_active"].as_bool()     { qb = qb.bind(("active", v)); }
     if let Some(v) = body.get("tool_calls")           { qb = qb.bind(("tool_calls", v.clone())); }

@@ -36,8 +36,7 @@ use commands::{
                        get_skill_usage_stats, extract_skill_from_exchange},
     knowledge_import::auto_check_all_sessions,
     agent_def::{list_agent_definitions, save_agent_definition, update_agent_definition,
-                delete_agent_definition, toggle_agent_definition, wake_agent_definition,
-                list_ephemeral_agents, clear_ephemeral_agents},
+                delete_agent_definition, toggle_agent_definition, wake_agent_definition},
     settings::{get_settings, save_personal_settings, get_system_settings, save_system_settings, get_api_key, set_api_key,
                get_vault_last_note, set_vault_last_note, check_vcredist,
                get_last_chat_conversation_id, set_last_chat_conversation_id,
@@ -472,8 +471,6 @@ pub fn run() {
             delete_agent_definition,
             toggle_agent_definition,
             wake_agent_definition,
-            list_ephemeral_agents,
-            clear_ephemeral_agents,
             // Conversation management
             create_conversation,
             list_conversations,

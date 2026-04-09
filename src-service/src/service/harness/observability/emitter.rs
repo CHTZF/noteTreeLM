@@ -106,6 +106,9 @@ impl ObservabilityEmitter {
         if let Ok(mut s) = self.state.lock() {
             s.skill_activations.extend_from_slice(titles);
         }
+        // Also emit to frontend so it can display activated skills.
+        let titles_json: Vec<Value> = titles.iter().map(|t| Value::String(t.clone())).collect();
+        (self.inner)("agent:skills_activated".to_string(), serde_json::json!({ "titles": titles_json }));
     }
 
     /// Assemble the final [`SessionTrace`] from accumulated state + `WorkingMemory`.

@@ -40,10 +40,10 @@ pub(crate) async fn read_api_key(
         }
     }
     let db_key = format!("api_key_{}", provider);
-    let encrypted = crate::api_client::daemon_get_setting(client, tok, &db_key)
+    // Service returns decrypted plaintext for api_key_* keys.
+    let key = crate::api_client::daemon_get_setting(client, tok, &db_key)
         .await
         .unwrap_or_default();
-    let key = crate::crypto::decrypt_api_key(&encrypted);
     cache.lock().await.insert(provider.to_string(), key.clone());
     key
 }

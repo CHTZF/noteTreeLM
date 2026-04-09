@@ -936,7 +936,12 @@ async fn brave_search_api(
     query: &str,
 ) -> Result<Vec<(String, String, String)>, String> {
     #[derive(serde::Deserialize)]
-    struct BraveResult { title: Option<String>, url: Option<String>, description: Option<String> }
+    struct BraveResult {
+        title: Option<String>,
+        url: Option<String>,
+        description: Option<String>,
+        extra_snippets: Option<Vec<String>>,
+    }
     #[derive(serde::Deserialize)]
     struct BraveWeb { results: Option<Vec<BraveResult>> }
     #[derive(serde::Deserialize)]
@@ -946,7 +951,7 @@ async fn brave_search_api(
         .get("https://api.search.brave.com/res/v1/web/search")
         .header("Accept", "application/json")
         .header("X-Subscription-Token", api_key)
-        .query(&[("q", query), ("count", "5")])
+        .query(&[("q", query), ("count", "5"), ("extra_snippets", "true")])
         .send().await
         .map_err(|e| format!("網路請求失敗：{}", e))?;
 
@@ -966,7 +971,22 @@ async fn brave_search_api(
         .filter_map(|r| {
             let url = r.url.unwrap_or_default();
             if url.is_empty() { return None; }
-            Some((r.title.unwrap_or_default(), url, r.description.unwrap_or_default()))
+            // Combine description + extra_snippets for richer context
+            let mut snippet = r.description.unwrap_or_default();
+            if let Some(extras) = r.extra_snippets {
+                let extra_text: String = extras.into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !extra_text.is_empty() {
+                    if snippet.is_empty() {
+                        snippet = extra_text;
+                    } else {
+                        snippet = format!("{} {}", snippet, extra_text);
+                    }
+                }
+            }
+            Some((r.title.unwrap_or_default(), url, snippet))
         })
         .collect())
 }
@@ -1328,11 +1348,13 @@ pub(crate) async fn vault_web_search(
         .unwrap_or_default();
 
     if enc.is_empty() {
+        tracing::warn!("[web_search] query={:?} → no API key configured", query);
         return Ok(json!("請至設定頁面設定 Brave Search API Key"));
     }
 
     let api_key = crate::service::harness::crypto::decrypt_api_key_db(db, &enc).await;
     if api_key.is_empty() {
+        tracing::warn!("[web_search] query={:?} → API key decrypt failed", query);
         return Ok(json!("Brave Search API Key 解密失敗，請重新設定"));
     }
 
@@ -1349,11 +1371,17 @@ pub(crate) async fn vault_web_search(
         )));
     }
 
+    tracing::info!("[web_search] query={:?}", query);
     let results = brave_search_api(client, &api_key, query).await?;
 
     if results.is_empty() {
+        tracing::info!("[web_search] query={:?} → 0 results", query);
         return Ok(json!(format!("Brave Search 未找到「{}」的搜尋結果。", query)));
     }
+    tracing::info!("[web_search] query={:?} → {} results, titles={:?}",
+        query, results.len(),
+        results.iter().map(|(t, _, _)| t.as_str()).collect::<Vec<_>>(),
+    );
 
     increment_brave_used(db, &key_id).await;
 

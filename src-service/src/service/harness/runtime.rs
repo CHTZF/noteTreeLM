@@ -421,15 +421,26 @@ impl HarnessRequestRuntime {
         activity_context: Option<&str>,
         mut tool_names:   Vec<String>,
     ) -> AgentContextResult {
-        let system_prompt = self.agent_def["system_prompt"].as_str().unwrap_or("").to_string();
+        let base_prompt = self.agent_def["system_prompt"].as_str().unwrap_or("").to_string();
+        // Prepend user_image (free-text personal background) to the system prompt so the model
+        // has location/language/occupation context without going through semantic search.
+        let user_image = if !self.account_id.is_empty() {
+            crate::service::harness::memory::user_image::load_user_image(&self.db, &self.account_id).await
+        } else {
+            String::new()
+        };
+        let system_prompt = if user_image.is_empty() {
+            base_prompt
+        } else {
+            format!("【使用者背景】\n{}\n\n{}", user_image, base_prompt)
+        };
 
         let pinned_skill_ids: Vec<String> = self.agent_def["skill_ids"]
             .as_array()
             .map(|a| a.iter().filter_map(|v| v.as_str()).map(String::from).collect())
             .unwrap_or_default();
         let do_skill_pass = !self.vault_path.is_empty()
-            && self.agent_def["use_skill_pass"].as_bool().unwrap_or(false)
-            && pinned_skill_ids.is_empty();
+            && self.agent_def["use_skill_pass"].as_bool().unwrap_or(false);
         let do_memory_prefetch = self.needs_frontend() && !self.vault_id.is_empty() && !self.account_id.is_empty();
         let keywords: Vec<String> = input.split_whitespace()
             .filter(|w| w.chars().count() >= 2)
@@ -437,8 +448,17 @@ impl HarnessRequestRuntime {
             .map(String::from)
             .collect();
 
+        // use_pinned: agent has explicitly pinned skills AND skill_pass is disabled
         let use_pinned = !self.agent_def["use_skill_pass"].as_bool().unwrap_or(false)
             && !pinned_skill_ids.is_empty();
+
+        // Sticky skill: if a previous round already matched skills, re-use them without
+        // re-running semantic search. Skills stay active until a round with no tool calls.
+        let cached_skill = if do_skill_pass {
+            self.working_memory.clone_active_skills().await
+        } else {
+            None
+        };
 
         let (skill_result, prefetched_memory) = tokio::join!(
             async {
@@ -447,10 +467,36 @@ impl HarnessRequestRuntime {
                         &self.db, &pinned_skill_ids,
                     ).await)
                 } else if do_skill_pass {
-                    Some(crate::service::helpers::run_skill_pass(
+                    let new_result = crate::service::helpers::run_skill_pass(
                         &self.client, &self.embedding_url, &self.db,
                         &self.vault_id, &self.account_id, input,
-                    ).await)
+                    ).await;
+                    if let Some(mut cached) = cached_skill {
+                        // Merge: carry forward sticky skills and append any newly matched ones.
+                        // This lets mid-conversation new requirements add skills without losing
+                        // skills that were matched in earlier rounds.
+                        for title in &new_result.skill_titles {
+                            if !cached.skill_titles.contains(title) {
+                                cached.skill_titles.push(title.clone());
+                            }
+                        }
+                        for tool in &new_result.skill_tool_names {
+                            if !cached.skill_tool_names.contains(tool) {
+                                cached.skill_tool_names.push(tool.clone());
+                            }
+                        }
+                        if !new_result.system_injection.is_empty() {
+                            cached.system_injection = if cached.system_injection.is_empty() {
+                                new_result.system_injection
+                            } else {
+                                format!("{}\n\n{}", cached.system_injection, new_result.system_injection)
+                                    .chars().take(2000).collect()
+                            };
+                        }
+                        Some(cached)
+                    } else {
+                        Some(new_result)
+                    }
                 } else {
                     None
                 }
@@ -481,13 +527,19 @@ impl HarnessRequestRuntime {
                 }
                 discovery
             } else {
+                tracing::info!("[skill_pass] activated {} skills: {:?}", skill.skill_titles.len(), skill.skill_titles);
                 if self.streaming {
                     self.emit("agent:skills_activated", json!({
                         "titles": skill.skill_titles,
                         "source": "pre_pass",
                     }));
                 }
-                activated_skill_titles = skill.skill_titles;
+                activated_skill_titles = skill.skill_titles.clone();
+                // Persist skills in WorkingMemory so subsequent ReAct rounds can re-use them
+                // without re-running semantic search. Cleared when a round produces no tool calls.
+                if !self.working_memory.has_active_skills().await {
+                    self.working_memory.set_active_skills(skill.clone()).await;
+                }
                 for t in skill.skill_tool_names {
                     if !tool_names.contains(&t) { tool_names.push(t); }
                 }

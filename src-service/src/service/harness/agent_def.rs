@@ -8,7 +8,7 @@ pub(crate) async fn load_agent_def(
     account_id: &str,
 ) -> Option<Value> {
     let mut resp = match db
-        .query("SELECT meta::id(id) as id, def_id, account_id, name, description, kind, tool_names, system_prompt, max_rounds, is_active, is_builtin, trigger, status, skill_ids FROM agent_definitions WHERE name = $name AND account_id = $aid LIMIT 1")
+        .query("SELECT meta::id(id) as id, def_id, account_id, name, description, kind, tool_names, system_prompt, max_rounds, is_active, is_builtin, trigger, status, skill_ids, use_skill_pass, enable_think FROM agent_definitions WHERE name = $name AND account_id = $aid LIMIT 1")
         .bind(("name", name.to_string()))
         .bind(("aid", account_id.to_string()))
         .await

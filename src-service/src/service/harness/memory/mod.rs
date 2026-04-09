@@ -8,3 +8,4 @@
 pub(crate) mod working;
 pub(crate) mod episodic;
 pub(crate) mod semantic;
+pub(crate) mod user_image;

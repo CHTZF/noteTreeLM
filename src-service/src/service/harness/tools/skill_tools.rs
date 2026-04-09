@@ -3,6 +3,7 @@ use crate::db::SurrealDb;
 use crate::embedding::embedder::cosine_sim;
 use crate::service::harness::memory::semantic::vault_query_memory_with_limit;
 
+#[derive(Clone)]
 pub(crate) struct SkillPassResult {
     pub system_injection: String,
     pub skill_titles: Vec<String>,
@@ -55,8 +56,8 @@ pub(crate) async fn search_skills_db(
         let mode = s["injection_mode"].as_str().unwrap_or("passive");
         if mode == "active" || mode == "proactive" { return true; }
         trigger.split(['、', ',', '，']).any(|kw| {
-            let kw = kw.trim();
-            !kw.is_empty() && input_lower.contains(kw)
+            let kw = kw.trim().to_lowercase();
+            !kw.is_empty() && input_lower.contains(kw.as_str())
         })
     }).map(skill_row_to_tuple).collect()
 }
@@ -88,18 +89,24 @@ async fn semantic_skill_search(
     let skills: Vec<Value> = resp.take(0).ok()?;
     if skills.is_empty() { return None; }
 
-    let mut scored: Vec<(f32, &Value)> = skills.iter().filter_map(|s| {
+    let mut all_scores: Vec<(f32, &Value)> = skills.iter().filter_map(|s| {
         let emb: Vec<f32> = s["embedding"].as_array()?
             .iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
         if emb.is_empty() { return None; }
         let mode = s["injection_mode"].as_str().unwrap_or("passive");
         if mode == "active" || mode == "proactive" { return Some((1.0f32, s)); }
-        let score = cosine_sim(&input_vec, &emb);
-        if score >= threshold { Some((score, s)) } else { None }
+        Some((cosine_sim(&input_vec, &emb), s))
     }).collect();
 
+    all_scores.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Log top-3 scores for debugging skill matching
+    for (score, s) in all_scores.iter().take(3) {
+        tracing::info!("[skill_pass] top score={:.3} title={:?}", score, s["title"].as_str().unwrap_or("?"));
+    }
+
+    let scored: Vec<(f32, &Value)> = all_scores.into_iter().filter(|(score, _)| *score >= threshold).collect();
     if scored.is_empty() { return None; }
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     Some(scored.into_iter().map(|(_, s)| skill_row_to_tuple(s)).collect())
 }
 
@@ -170,8 +177,10 @@ pub(crate) async fn run_skill_pass(
             if !step_hint.is_empty() {
                 let clean_desc = strip_tool_markers(behavior);
                 injection_parts.push(
-                    format!("[技能：{}]\n建議操作順序：{}\n{}", title, step_hint, clean_desc)
-                        .chars().take(600).collect()
+                    format!(
+                        "[技能：{}]\n必須依序呼叫工具（在工具回傳結果前，不得直接回覆）：{}\n{}",
+                        title, step_hint, clean_desc
+                    ).chars().take(600).collect()
                 );
             }
         }
@@ -238,8 +247,10 @@ pub(crate) async fn load_skills_by_ids(db: &SurrealDb, skill_ids: &[String]) -> 
                 .filter(|t| t.as_str() != "plan_announce")
                 .cloned().collect::<Vec<_>>().join(" → ");
             injection_parts.push(
-                format!("[技能：{}]\n建議操作順序：{}\n{}", title, step_hint, clean_desc)
-                    .chars().take(600).collect()
+                format!(
+                    "[技能：{}]\n必須依序呼叫工具（在工具回傳結果前，不得直接回覆）：{}\n{}",
+                    title, step_hint, clean_desc
+                ).chars().take(600).collect()
             );
         } else if !behavior.is_empty() {
             injection_parts.push(format!("[技能：{}]\n{}", title, clean_desc).chars().take(500).collect());

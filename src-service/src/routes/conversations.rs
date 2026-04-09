@@ -304,7 +304,9 @@ async fn save_messages(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Trigger memory agent check in background (non-blocking)
-    tokio::spawn(maybe_trigger_memory_agent(state, id, messages_json));
+    tokio::spawn(maybe_trigger_memory_agent(state.clone(), id.clone(), messages_json.clone()));
+    // Trigger user_image update in background (non-blocking)
+    tokio::spawn(trigger_user_image_update(state, id, messages_json));
 
     Ok(Json(json!({ "ok": true })))
 }
@@ -400,6 +402,40 @@ async fn maybe_trigger_memory_agent(state: ApiState, conv_id: String, messages_j
         };
         crate::service::execute_scheduled_task(runtime, task_id, description, initial_msg).await;
     });
+}
+
+/// Background task: extract personal facts from conversation and update user_image.
+async fn trigger_user_image_update(state: ApiState, conv_id: String, messages_json: String) {
+    let msgs: Vec<Value> = serde_json::from_str::<Vec<Value>>(&messages_json)
+        .ok()
+        .map(|arr| arr.into_iter().filter(|m| {
+            matches!(m["role"].as_str(), Some("user") | Some("assistant"))
+        }).collect())
+        .unwrap_or_default();
+    if msgs.is_empty() { return; }
+
+    // Fetch account_id from conversation record
+    #[derive(serde::Deserialize)]
+    struct ConvMeta { account_id: Option<String> }
+    let Ok(mut resp) = state.db
+        .query("SELECT account_id FROM conversations WHERE id = type::thing(\"conversations\", $id) LIMIT 1")
+        .bind(("id", conv_id.clone()))
+        .await
+    else { return };
+    let rows: Vec<ConvMeta> = resp.take(0).unwrap_or_default();
+    let Some(meta) = rows.into_iter().next() else { return };
+    let account_id = meta.account_id.unwrap_or_default();
+    if account_id.is_empty() { return; }
+
+    let llm_url = state.daemon.llm_url.clone();
+    let client = reqwest::Client::default();
+    crate::service::harness::memory::user_image::maybe_update_user_image(
+        client,
+        llm_url,
+        state.db.clone(),
+        account_id,
+        msgs,
+    ).await;
 }
 
 /// LLM-based judgment for ambiguous cases not caught by keyword heuristic.

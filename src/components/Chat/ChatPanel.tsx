@@ -559,7 +559,10 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         }),
         // 透明度：skill pre-pass 觸發時，顯示哪些技能正在作用
         listen<{ titles: string[] }>('agent:skills_activated', (e) => {
-          const names = e.payload.titles.join('、')
+          console.log('[skills_activated] payload:', JSON.stringify(e.payload))
+          const titles = e.payload?.titles
+          if (!Array.isArray(titles) || titles.length === 0) return
+          const names = titles.join('、')
           setMessages(prev => [...prev, {
             role: 'tool' as const,
             content: `⚡ 套用技能：${names}`,

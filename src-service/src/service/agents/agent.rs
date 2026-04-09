@@ -181,14 +181,24 @@ async fn run_tool_loop(
             if runtime.cancel.load(Ordering::Relaxed) { break; }
             emitter.increment_round();
 
+            // In the first content round (round 0 without think, round 1 after think),
+            // force tool_choice="required" when chain skills are active so the model
+            // cannot skip tool calls and fabricate an answer.
+            let is_first_content_round = if enable_think { round == 1 } else { round == 0 };
+            let force_tool_use = is_first_content_round
+                && !tool_names.is_empty()
+                && runtime.working_memory.has_active_skills().await;
+
             let (round_tools, round_choice) = if round == 0 {
                 if let Some(ref ts) = think_schema {
                     (Some(json!(ts)), json!({ "type": "function", "function": { "name": "think" } }))
                 } else {
-                    (tools_value.clone(), json!("auto"))
+                    let choice = if force_tool_use { json!("required") } else { json!("auto") };
+                    (tools_value.clone(), choice)
                 }
             } else {
-                (tools_value.clone(), json!("auto"))
+                let choice = if force_tool_use { json!("required") } else { json!("auto") };
+                (tools_value.clone(), choice)
             };
 
             let msgs_snapshot = runtime.get_context_msgs(true).await;
@@ -243,10 +253,13 @@ async fn run_tool_loop(
                 let correction = if valid_ids.is_empty() {
                     match runtime.locale {
                         super::super::harness::prompt::Locale::En =>
-                            "[System] Your citation is invalid. No tools were called this session, \
-                             so you must write [cite:none]. Please rewrite your answer.".to_string(),
+                            "[System] Your reply cited tool results, but no tools have been called yet. \
+                             You must call the required tool(s) first and wait for their results before answering. \
+                             Do not fabricate answers or citation IDs. Please call the appropriate tool now.".to_string(),
                         _ =>
-                            "[系統] 你的引用無效。本輪未呼叫任何工具，請改寫 [cite:none] 並重新回覆。".to_string(),
+                            "[系統] 你的回覆引用了工具結果，但本 session 尚未呼叫任何工具。\
+                             請先呼叫對應工具（例如 web_search），等待工具回傳結果後再根據結果回覆。\
+                             不可自行捏造答案或 cite ID。請立即呼叫工具。".to_string(),
                     }
                 } else {
                     let ids_str = ids_list.join(", ");
@@ -254,15 +267,13 @@ async fn run_tool_loop(
                         super::super::harness::prompt::Locale::En => format!(
                             "[System] Your citation IDs are invalid. \
                              Valid IDs for this session are: {}. \
-                             Use one or more of these in [cite:id1,id2] format, \
-                             or write [cite:none] if none apply. \
+                             Use one or more of these in [cite:id1,id2] format. \
                              Please rewrite your answer with the correct citation.",
                             ids_str
                         ),
                         _ => format!(
                             "[系統] 你的 cite ID 無效。本 session 中有效的 cite ID 為：{}。\
-                             請在第一句使用 [cite:id1,id2] 格式引用其中一個或多個，\
-                             或若均不適用則寫 [cite:none]。請重新回覆。",
+                             請在第一句使用 [cite:id1,id2] 格式引用其中一個或多個。請重新回覆。",
                             ids_str
                         ),
                     }
@@ -272,6 +283,9 @@ async fn run_tool_loop(
                 emitter.emit("agent:cite_correction_start".to_string(), json!({}));
                 // continue to next round for correction
             } else {
+                // Final answer round — no tool calls and no cite correction needed.
+                // Clear sticky skills so a subsequent user message starts a fresh skill pass.
+                runtime.working_memory.clear_active_skills().await;
                 break;
             }
         }

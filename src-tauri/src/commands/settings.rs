@@ -467,8 +467,8 @@ pub async fn get_api_key(
         &format!("/settings/key/{}", urlencoding::encode(&db_key)),
         tok,
     ).await.unwrap_or_default();
-    let enc = res["value"].as_str().unwrap_or("").to_string();
-    let plain = if enc.is_empty() { String::new() } else { crate::crypto::decrypt_api_key(&enc) };
+    // Service now returns decrypted plaintext for api_key_* keys.
+    let plain = res["value"].as_str().unwrap_or("").to_string();
     let result = if plain.is_empty() { None } else { Some(plain.clone()) };
     state.api_key_cache.lock().await.insert(provider, plain);
     Ok(result)
@@ -483,11 +483,11 @@ pub async fn set_api_key(
     let token = state.get_auth_token().await;
     let tok = if token.is_empty() { None } else { Some(token.as_str()) };
     let db_key = format!("api_key_{}", provider);
-    let encrypted = crate::crypto::encrypt_api_key(&key);
+    // Send plaintext — service encrypts at rest.
     daemon_post::<_, serde_json::Value>(
         &state.http_client,
         "/settings",
-        &serde_json::json!({db_key: encrypted}),
+        &serde_json::json!({db_key: key.clone()}),
         tok,
     ).await.map_err(|e| AppError::Settings(e))?;
     state.api_key_cache.lock().await.insert(provider, key);

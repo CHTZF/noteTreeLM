@@ -216,39 +216,6 @@ pub async fn wake_agent_definition(
     ).await.map(|_| ()).map_err(|e| AppError::Database(e))
 }
 
-/// 列出本次 session 中所有 ephemeral agents（供 AgentsPage UI 顯示）
-#[tauri::command]
-pub async fn list_ephemeral_agents(
-    state: State<'_, AppState>,
-) -> Result<Vec<serde_json::Value>, AppError> {
-    let vault_id = state.get_vault_id().await.unwrap_or_default();
-    let auth_token = state.get_auth_token().await;
-    let tok = if auth_token.is_empty() { None } else { Some(auth_token.as_str()) };
-    let result = crate::api_client::daemon_get::<Vec<serde_json::Value>>(
-        &state.http_client,
-        &format!("/vaults/{}/agents/ephemeral", urlencoding::encode(&vault_id)),
-        tok,
-    ).await.unwrap_or_default();
-    Ok(result)
-}
-
-/// 清除本次 session 的 ephemeral agents 記錄
-#[tauri::command]
-pub async fn clear_ephemeral_agents(
-    state: State<'_, AppState>,
-) -> Result<(), AppError> {
-    let vault_id = state.get_vault_id().await.unwrap_or_default();
-    let auth_token = state.get_auth_token().await;
-    let tok = if auth_token.is_empty() { None } else { Some(auth_token.as_str()) };
-    let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
-        &state.http_client,
-        &format!("/vaults/{}/agents/ephemeral/clear", urlencoding::encode(&vault_id)),
-        &serde_json::json!({}),
-        tok,
-    ).await;
-    Ok(())
-}
-
 // ── Internal helpers (Phase 8: use daemon API) ────────────────────────────────
 
 /// 從 daemon 取得單一 definition（供 SystemAgentService 路由用）

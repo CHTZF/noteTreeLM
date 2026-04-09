@@ -108,16 +108,17 @@ pub(crate) fn history_summary_msg(summary: &str, locale: Locale) -> String {
 pub(crate) fn citation_protocol(locale: Locale) -> &'static str {
     match locale {
         Locale::En =>
-            "Tool results contain __cite_id__ field; the first sentence of your final reply \
-             must cite the tool results used in [cite:id1,id2] format, \
-             or output [cite:none] if no tools were used this round. \
+            "Tool results contain __cite_id__ field; when you use tool results in your reply, \
+             the first sentence must cite them in [cite:id1,id2] format. \
              NEVER fabricate citation IDs — only use IDs that appear in actual tool results. \
-             Do NOT place [cite:...] anywhere except the very first sentence.",
+             Do NOT place [cite:...] anywhere except the very first sentence. \
+             If no tools were used, reply normally without any [cite:...] tag.",
         _ =>
-            "工具結果中含有 __cite_id__ 欄位；最終文字回覆的第一句必須以 \
-             [cite:id1,id2] 格式引用所依據的工具結果，若本輪未使用任何工具則輸出 [cite:none]。\
+            "工具結果中含有 __cite_id__ 欄位；若你的回覆引用了工具結果，\
+             第一句必須以 [cite:id1,id2] 格式標明所依據的 __cite_id__。\
              絕對禁止捏造 cite_id——只能引用實際工具結果中出現的 __cite_id__ 值。\
-             [cite:...] 只能出現在回覆的第一句，禁止在其他位置插入。",
+             [cite:...] 只能出現在回覆的第一句，禁止在其他位置插入。\
+             若本輪未使用任何工具，直接正常回覆即可，不要輸出任何 [cite:...] 標記。",
     }
 }
 
