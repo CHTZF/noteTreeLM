@@ -332,7 +332,9 @@ impl HarnessRequestRuntime {
             } else {
                 templates::context_info_msg(pct, bytes, budget, self.locale)
             };
-            snapshot.push(json!({ "role": "system", "content": ctx_msg }));
+            // Use role:user for all mid-conversation directives — some models (e.g. Qwen3.5)
+            // only allow a single system message at position 0.
+            snapshot.push(json!({ "role": "user", "content": ctx_msg }));
 
             // ── Stall detection ──────────────────────────────────────────────
             let repeats = self.working_memory.repeated_calls().await;
@@ -341,7 +343,7 @@ impl HarnessRequestRuntime {
                     .map(|(t, a)| if a.is_empty() { t.clone() } else { format!("{}({})", t, a) })
                     .collect();
                 snapshot.push(json!({
-                    "role": "system",
+                    "role": "user",
                     "content": templates::stall_warning(&names, self.locale),
                 }));
             }
@@ -356,7 +358,7 @@ impl HarnessRequestRuntime {
             let current_pairs = self.working_memory.current_run_cite_pairs().await;
             if !current_pairs.is_empty() {
                 snapshot.push(json!({
-                    "role": "system",
+                    "role": "user",
                     "content": templates::cite_reminder(&current_pairs, self.locale),
                 }));
             }
