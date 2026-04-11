@@ -304,9 +304,7 @@ async fn save_messages(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Trigger memory agent check in background (non-blocking)
-    tokio::spawn(maybe_trigger_memory_agent(state.clone(), id.clone(), messages_json.clone()));
-    // Trigger user_image update in background (non-blocking)
-    tokio::spawn(trigger_user_image_update(state, id, messages_json));
+    tokio::spawn(maybe_trigger_memory_agent(state, id, messages_json));
 
     Ok(Json(json!({ "ok": true })))
 }
@@ -349,18 +347,11 @@ async fn maybe_trigger_memory_agent(state: ApiState, conv_id: String, messages_j
     // Trigger only at exact multiples of threshold
     if msgs.len() % threshold as usize != 0 { return }
 
-    // Two-stage judgment:
-    // Stage 1 — keyword fast path: obvious personal-info signals → trigger immediately (no LLM call).
-    // Stage 2 — LLM judgment for ambiguous cases (multilingual / synonyms).
-    //            Short 5s timeout + fail-closed: if LLM is busy serving chat, skip this trigger
-    //            silently; the 8h scheduler will pick up unprocessed conversations later.
-    let positives_found = keyword_should_remember(&msgs);
-    if !positives_found {
-        let should_trigger = llm_should_remember(&state, &msgs).await;
-        if !should_trigger {
-            tracing::debug!("[memory] conv {} skipped: LLM judged no memory value", conv_id);
-            return;
-        }
+    // LLM judgment: short 5s timeout + fail-closed.
+    // If LLM is busy serving chat, skip silently; the 8h scheduler picks it up later.
+    if !llm_should_remember(&state, &msgs).await {
+        tracing::debug!("[memory] conv {} skipped: LLM judged no memory value", conv_id);
+        return;
     }
 
     // Fetch the watermark so the agent can skip already-processed messages
@@ -404,40 +395,6 @@ async fn maybe_trigger_memory_agent(state: ApiState, conv_id: String, messages_j
     });
 }
 
-/// Background task: extract personal facts from conversation and update user_image.
-async fn trigger_user_image_update(state: ApiState, conv_id: String, messages_json: String) {
-    let msgs: Vec<Value> = serde_json::from_str::<Vec<Value>>(&messages_json)
-        .ok()
-        .map(|arr| arr.into_iter().filter(|m| {
-            matches!(m["role"].as_str(), Some("user") | Some("assistant"))
-        }).collect())
-        .unwrap_or_default();
-    if msgs.is_empty() { return; }
-
-    // Fetch account_id from conversation record
-    #[derive(serde::Deserialize)]
-    struct ConvMeta { account_id: Option<String> }
-    let Ok(mut resp) = state.db
-        .query("SELECT account_id FROM conversations WHERE id = type::thing(\"conversations\", $id) LIMIT 1")
-        .bind(("id", conv_id.clone()))
-        .await
-    else { return };
-    let rows: Vec<ConvMeta> = resp.take(0).unwrap_or_default();
-    let Some(meta) = rows.into_iter().next() else { return };
-    let account_id = meta.account_id.unwrap_or_default();
-    if account_id.is_empty() { return; }
-
-    let llm_url = state.daemon.llm_url.clone();
-    let client = reqwest::Client::default();
-    crate::service::harness::memory::user_image::maybe_update_user_image(
-        client,
-        llm_url,
-        state.db.clone(),
-        account_id,
-        msgs,
-    ).await;
-}
-
 /// LLM-based judgment for ambiguous cases not caught by keyword heuristic.
 /// Uses a 5s timeout and is fail-closed: if the LLM server is busy (serving chat),
 /// returns false and lets the 8h scheduler handle the conversation later.
@@ -457,7 +414,7 @@ async fn llm_should_remember(state: &ApiState, msgs: &[Value]) -> bool {
         "messages": [
             {
                 "role": "system",
-                "content": "你是記憶價值評估器。判斷以下對話片段是否包含值得長期記憶的資訊（例如：使用者偏好、個人背景、重要決策、習慣規則）。一般問答、搜尋、閒聊不具記憶價值。只回答 yes 或 no，不要解釋。"
+                "content": "你是記憶價值評估器。判斷以下對話片段是否包含值得記憶的資訊。以下任一情況回答 yes：使用者提到居住地點或所在城市、慣用語言、職業身份、交通習慣；或提到偏好、重要決策、習慣規則、專案背景。純粹問答、搜尋結果、閒聊回答 no。只回答 yes 或 no，不要解釋。"
             },
             { "role": "user", "content": excerpt }
         ],
@@ -490,31 +447,6 @@ async fn llm_should_remember(state: &ApiState, msgs: &[Value]) -> bool {
     answer.contains("yes")
 }
 
-/// Fast keyword heuristic to decide if a conversation is worth remembering.
-/// Returns `true` if user messages contain clear personal-info signals.
-/// Runs in microseconds, no LLM call needed.
-fn keyword_should_remember(msgs: &[Value]) -> bool {
-    // Personal-info / preference signals (zh + en)
-    const POSITIVE: &[&str] = &[
-        // Chinese
-        "我喜歡", "我偏好", "我習慣", "我是", "我有", "我想要", "我覺得",
-        "我不喜歡", "我討厭", "我都", "每次", "一直", "請記住", "記住",
-        "偏好", "規則", "習慣", "我的", "我用", "我在", "我需要",
-        "決定", "決策", "選擇", "我選", "以後", "下次", "記得",
-        // English
-        "i like", "i prefer", "i always", "i usually", "i am", "i have",
-        "i hate", "i love", "i need", "i want", "i think", "remember",
-        "my preference", "my rule", "i decided", "i chose",
-    ];
-
-    // Check only user messages from the last 10 turns
-    msgs.iter().rev().take(10)
-        .filter(|m| m["role"].as_str() == Some("user"))
-        .any(|m| {
-            let content = m["content"].as_str().unwrap_or("").to_lowercase();
-            POSITIVE.iter().any(|kw| content.contains(kw))
-        })
-}
 
 async fn get_user_memory_settings(db: &crate::db::SurrealDb, account_id: &str) -> (bool, u32) {
     #[derive(serde::Deserialize)]

@@ -122,6 +122,26 @@ pub(crate) fn citation_protocol(locale: Locale) -> &'static str {
     }
 }
 
+/// Short cite reminder injected just before the final-answer round (as a tail system message).
+/// Placed at the end of the context so the model sees it with high attention weight.
+/// Lists the available cite IDs so the model can pick the right one without guessing.
+pub(crate) fn cite_reminder(ids_with_tools: &[(String, String)], locale: Locale) -> String {
+    let mapping: String = ids_with_tools.iter()
+        .map(|(id, name)| format!("  [cite:{}] ← {}", id, name))
+        .collect::<Vec<_>>()
+        .join("\n");
+    match locale {
+        Locale::En => format!(
+            "REMINDER: start your reply with [cite:ID] using one of the IDs below.\n{}",
+            mapping
+        ),
+        _ => format!(
+            "提醒：回覆第一句必須加上 [cite:ID]，從以下 ID 中選擇：\n{}",
+            mapping
+        ),
+    }
+}
+
 pub(crate) fn activity_context_block(ac: &str, locale: Locale) -> String {
     match locale {
         Locale::En => format!("[User Activity Log]\n{}", ac),

@@ -61,6 +61,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const streamingRef = useRef('')
   const llmDoneContentRef = useRef('')  // authoritative final content from llm:done (citation-stripped)
+  const citeFailedRef = useRef<boolean | undefined>(undefined)  // undefined=no event, false=passed, true=failed
+  const citeDetailsRef = useRef<Array<{ id: string; tool: string; preview: string }>>([])  // details from agent:citation
   const tokenCountRef = useRef(0)
   const sessionWriteApprovedRef = useRef(false)
   const userMsgCountRef = useRef(0)
@@ -120,7 +122,10 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         api.getConversationRatings(id).catch(() => [] as Array<{ content_hash: string; rating: string }>),
       ])
       const msgs: Array<{ role: string; content: string }> = JSON.parse(snap.messages_json)
-      const filtered = msgs.filter(m => m.role === 'user' || m.role === 'assistant')
+      const filtered = msgs
+        .filter(m => m.role === 'user' || m.role === 'assistant')
+        // Strip internal system correction messages injected by the cite validation loop
+        .filter(m => !m.content.startsWith('[系統]') && !m.content.startsWith('[System]'))
       const loadedMsgs = filtered.map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }))
       setMessages(loadedMsgs)
 
@@ -443,12 +448,15 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     let unlistenCitationMissing: (() => void) = () => {}
     let unlistenCitation: (() => void) = () => {}
     let unlistenCiteCorrectionStart: (() => void) = () => {}
+    let unlistenCiteStatus: (() => void) = () => {}
 
     // Clear previous suggestions at the start of each send
     setNoteSuggestions([])
     noteSuggestionsRef.current = []
     pendingWebRefsRef.current = []
     llmDoneContentRef.current = ''
+    citeFailedRef.current = undefined
+    citeDetailsRef.current = []
 
     try {
       // 快取 notePart：同一筆記的前 200 字未變時跳過重建
@@ -493,6 +501,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         unlistenCitationMissing,
         unlistenCitation,
         unlistenCiteCorrectionStart,
+        unlistenCiteStatus,
       ] = await Promise.all([
         listen<{ session_id?: string; display?: string } | string>('agent:tool_call', (event) => {
           const display = typeof event.payload === 'string'
@@ -625,10 +634,14 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         listen<Record<string, never>>('agent:citation_missing', () => {
           console.warn('[citation] LLM response missing or invalid [cite:...] tag')
         }),
-        listen<{ ids: string[] }>('agent:citation', (e) => {
+        listen<{ ids: string[]; details?: Array<{ id: string; tool: string; preview: string }> }>('agent:citation', (e) => {
           // Valid citation IDs confirmed by backend — show as source chips
           const ids = e.payload?.ids ?? []
           if (ids.length === 0) return
+          // Accumulate cite details for the expandable badge in MessageBubble
+          if (e.payload?.details?.length) {
+            citeDetailsRef.current = [...citeDetailsRef.current, ...e.payload.details]
+          }
           const chips = ids
             .filter(id => id !== 'none')
             .map(id => ({
@@ -651,10 +664,20 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
           setNoteSuggestions([])
           noteSuggestionsRef.current = []
         }),
+        listen<Record<string, never>>('agent:clear_stream', () => {
+          // LLM output a <tool_call> tag mid-stream — backend is suppressing the rest.
+          // Clear whatever preamble text was already streamed to the user.
+          streamingRef.current = ''
+          tokenCountRef.current = 0
+          setStreamingText('')
+        }),
+        listen<{ passed: boolean }>('agent:cite_status', (e) => {
+          citeFailedRef.current = !e.payload.passed
+        }),
       ])
 
       log('  呼叫 invoke("invoke_agent")')
-      const agentResp = await invoke<{ session_id: string; conversation_id: string }>('invoke_agent', {
+      const agentResp = await invoke<{ session_id: string; conversation_id: string; cite_passed?: boolean | null }>('invoke_agent', {
         input: text,
         messages: conversationId ? [] : llmMessages,
         system,
@@ -662,6 +685,13 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         activityContext: useActivityStore.getState().getContextString() || null,
         uiLanguage: i18n.language,
       })
+      // cite_passed is included in the HTTP response to avoid the race condition
+      // where agent:cite_status (SSE) may arrive after invoke() resolves.
+      // If the SSE listener already set citeFailedRef (early delivery), keep it;
+      // otherwise use the HTTP response value.
+      if (citeFailedRef.current === undefined && agentResp.cite_passed !== undefined && agentResp.cite_passed !== null) {
+        citeFailedRef.current = !agentResp.cite_passed
+      }
 
       if (!conversationId && agentResp.conversation_id) {
         setConversationId(agentResp.conversation_id)
@@ -678,7 +708,13 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       const webRefs = pendingWebRefsRef.current.length > 0
         ? pendingWebRefsRef.current
         : undefined
-      setMessages(prev => [...prev, { role: 'assistant' as const, content: finalContent, webRefs }])
+      setMessages(prev => [...prev, {
+        role: 'assistant' as const,
+        content: finalContent,
+        webRefs,
+        citeFailed: citeFailedRef.current,
+        citeDetails: citeDetailsRef.current.length > 0 ? citeDetailsRef.current : undefined,
+      }])
 
       if (hasSkillIntent(text) && finalContent.length > 0) {
         doExtractSkill(text, finalContent)
@@ -717,6 +753,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       unlistenCitationMissing()
       unlistenCitation()
       unlistenCiteCorrectionStart()
+      unlistenCiteStatus()
       setPendingWriteDisplay(null)
       setIsStreaming(false)
       isStreamingRef.current = false

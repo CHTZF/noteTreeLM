@@ -16,11 +16,33 @@ const MAX_CITE_INNER_LEN: usize = 128;
 /// Round up to 160 for safety.
 const HOLD_BACK: usize = 160;
 
+/// Normalise cite tag variants the LLM commonly produces into the canonical `[cite:` form.
+///
+/// Handles:
+///   `[cita:`  — LLM drops 'e' (most common)
+///   `[ cite:` — LLM adds space after bracket
+///   `[ cita:` — both variants combined
+///   `[CITE:`  — uppercase (case-insensitive normalisation)
+fn normalize_cite_variants(text: &str) -> String {
+    // Use a single-pass replace chain; order matters only to avoid double-replacement.
+    text
+        .replace("[ cita:", "[cite:")
+        .replace("[cita:", "[cite:")
+        .replace("[ cite:", "[cite:")
+        // Case-insensitive: lowercase the prefix if the LLM used uppercase.
+        // Only handles the common ALL-CAPS case; mixed case is handled below.
+        .replace("[CITE:", "[cite:")
+        .replace("[CITA:", "[cite:")
+}
+
 /// Remove all `[cite:...]` tags from `text`, collecting the inner content of each.
 /// Also strips bare `cite:xxx` (without brackets) that small models sometimes output.
 /// Returns `(cleaned_text, collected_inners)`.
 /// Used for `full_text` post-processing and for `llm:done` payload.
 fn strip_and_collect_cite_tags(text: &str) -> (String, Vec<String>) {
+    // Normalise variants before processing so [cita:id] is treated identically to [cite:id].
+    let text = normalize_cite_variants(text);
+    let text = text.as_str();
     let mut result  = String::new();
     let mut inners  = Vec::new();
     let mut rest    = text;
@@ -54,6 +76,9 @@ fn strip_and_collect_cite_tags(text: &str) -> (String, Vec<String>) {
 /// Returns `(cleaned_text, collected_inners)` — inners are fed into validation
 /// so correction loop can fire even when the model omits brackets.
 fn strip_bare_cite_tags(text: &str) -> (String, Vec<String>) {
+    // Normalise variants so bare `cita:xxx` is treated as `cite:xxx`.
+    let text = normalize_cite_variants(text);
+    let text = text.as_str();
     let mut result = String::new();
     let mut inners = Vec::new();
     let mut rest = text;
@@ -177,6 +202,10 @@ fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
 ///                       (must be moved back to hold-back, not emitted yet)
 /// - `collected_inners`: inner content of each stripped tag
 fn scan_and_strip_cites(buf: &str) -> (String, String, Vec<String>) {
+    // Normalise cite variants BEFORE scanning so [cita:id] is treated as [cite:id].
+    // We operate on the owned normalised string; `rest` slices into it.
+    let normalised = normalize_cite_variants(buf);
+    let buf = normalised.as_str();
     let mut clean   = String::new();
     let mut inners  = Vec::new();
     let mut rest    = buf;
@@ -287,6 +316,102 @@ async fn validate_citation(
     ids.iter().all(|id| valid.contains(id.as_str()))
 }
 
+// ── Citation similarity helpers ───────────────────────────────────────────────
+
+/// Extract content tokens from a JSON value tree (recursively over string/number leaves).
+/// - Latin/alphanumeric sequences ≥ 3 chars → lowercased word token
+/// - CJK / Hangul / Hiragana / Katakana → each character is a token
+fn extract_json_value_tokens(v: &Value, out: &mut std::collections::HashSet<String>) {
+    match v {
+        Value::String(s) => extract_text_tokens_into(s, out),
+        Value::Number(n) => { out.insert(n.to_string()); }
+        Value::Array(arr) => { for item in arr { extract_json_value_tokens(item, out); } }
+        Value::Object(map) => { for val in map.values() { extract_json_value_tokens(val, out); } }
+        _ => {}
+    }
+}
+
+fn extract_text_tokens_into(text: &str, out: &mut std::collections::HashSet<String>) {
+    let mut word = String::new();
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            word.push(c);
+        } else {
+            if word.chars().count() >= 3 {
+                out.insert(word.to_lowercase());
+            }
+            word.clear();
+            let cp = c as u32;
+            // CJK unified ideographs, Hiragana, Katakana, Hangul syllables
+            if (0x4E00..=0x9FFF).contains(&cp)
+                || (0x3040..=0x30FF).contains(&cp)
+                || (0xAC00..=0xD7AF).contains(&cp)
+            {
+                out.insert(c.to_string());
+            }
+        }
+    }
+    if word.chars().count() >= 3 {
+        out.insert(word.to_lowercase());
+    }
+}
+
+/// Return `false` when the LLM response has suspiciously low token overlap with the
+/// combined content of all cited tool results — a signal that the response was fabricated.
+///
+/// Threshold: at least 15% of unique response tokens must appear in the cited results.
+/// Short responses (< 80 chars) or results with < 15 unique tokens are skipped (not enough
+/// signal to distinguish legitimate paraphrase from fabrication).
+async fn check_response_cite_similarity(
+    response: &str,
+    cite_inner: &str,
+    working_memory: Option<&WorkingMemory>,
+) -> bool {
+    let wm = match working_memory {
+        Some(w) => w,
+        None    => return true,
+    };
+    if cite_inner.trim() == "none" { return true; }
+    // Skip very short responses — not enough signal.
+    if response.chars().count() < 80 { return true; }
+
+    let ids: Vec<&str> = cite_inner.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Collect result values for all cited IDs (top-level tool_call_id keys only).
+    let results: Vec<Value> = wm.with_records(|map| {
+        ids.iter()
+            .filter_map(|id| map.get(*id).map(|r| r.result.clone()))
+            .collect()
+    }).await;
+
+    if results.is_empty() { return true; } // nested __cite_id__ — skip check
+
+    let mut result_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for rv in &results {
+        extract_json_value_tokens(rv, &mut result_tokens);
+    }
+    // Not enough data in the result to make a meaningful comparison.
+    if result_tokens.len() < 15 { return true; }
+
+    let mut response_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
+    extract_text_tokens_into(response, &mut response_tokens);
+
+    if response_tokens.is_empty() { return true; }
+
+    let overlap = response_tokens.iter().filter(|t| result_tokens.contains(*t)).count();
+    let score   = overlap as f32 / response_tokens.len() as f32;
+
+    tracing::debug!(
+        "[citation/similarity] cite={} score={:.3} overlap={}/{} result_tokens={}",
+        cite_inner, score, overlap, response_tokens.len(), result_tokens.len()
+    );
+
+    score >= 0.15
+}
+
 /// Stream one LLM round, emitting llm:token events.
 /// Returns (text, finish_reason, tool_chunks, cite_invalid).
 /// `cite_invalid` is true when the LLM produced a fabricated [cite:...] that did not
@@ -298,6 +423,7 @@ pub(crate) async fn stream_llm_round(
     emitter: &ObservabilityEmitter,
     cancel: &Arc<AtomicBool>,
     working_memory: Option<&WorkingMemory>,
+    tool_names: &[String],
 ) -> Result<(String, String, Vec<(String, String, String)>, bool), String> {
     let resp = client
         .post(format!("{}/v1/chat/completions", llm_url))
@@ -318,57 +444,49 @@ pub(crate) async fn stream_llm_round(
     let mut finish_reason = "stop".to_string();
     let mut tool_chunks: Vec<(String, String, String)> = Vec::new();
 
-    // pending_emit: tail hold-back buffer.
-    // We keep the last HOLD_BACK bytes un-emitted so that:
-    //   (a) [cite:...] tags anywhere in the output can be stripped before the user sees them
-    //   (b) partial <tool_call> prefixes are not accidentally emitted
-    // suppress_emit: true once we detect a text-format <tool_call> tag (Qwen/Mistral style).
+    // ── Streaming state ───────────────────────────────────────────────────────
+    // pending_emit: hold-back buffer for the last HOLD_BACK bytes so that
+    //   [cite:...] tags and partial <tool_call> prefixes are not prematurely emitted.
+    // json_buf / json_depth: JSON object accumulator.
+    //   Once a '{' is seen in delta.content we stop emitting and buffer the entire
+    //   JSON object. When depth returns to 0, we inspect the parsed result:
+    //     - name matches a known tool → treat as tool call (fill tool_chunks)
+    //     - otherwise → flush as regular text
+    //   This handles both "proper" <tool_call>…</tool_call> format AND the case
+    //   where <tool_call> is a special GGUF token decoded to garbage ("leton"):
+    //   the JSON object is still intact and follows immediately.
+    // suppress_emit: set when we enter JSON-buffering mode or detect <tool_call>.
+    //   Cleared when JSON object is resolved (either as tool or as text).
+    let tool_name_set: std::collections::HashSet<&str> =
+        tool_names.iter().map(String::as_str).collect();
     let mut pending_emit = String::new();
     let mut suppress_emit = false;
+    let mut json_buf = String::new();
+    let mut json_depth: i32 = 0;
     // cite tags stripped during streaming, collected for post-stream validation
     let mut collected_cites: Vec<String> = Vec::new();
+    // text accumulated before the JSON object started (preamble to discard)
+    let mut pre_json_buf = String::new();
+    let mut tc_text_idx = 0usize;
 
-    // ── Helper: process the safe (non-held-back) portion of pending_emit ─────
-    // Strips cite tags, detects <tool_call>, emits clean tokens.
-    // Returns true if suppress_emit was set.
-    macro_rules! flush_safe {
-        () => {{
-            if suppress_emit { } else {
-                // Compute how many bytes to hold back
-                let hold = HOLD_BACK.min(pending_emit.len());
-                let safe_end = floor_char_boundary(&pending_emit, pending_emit.len() - hold);
+    // Emit text through the cite-stripping pipeline and HOLD_BACK buffer.
+    macro_rules! emit_text {
+        ($text:expr) => {{
+            let s: &str = $text;
+            if !s.is_empty() {
+                let hold = HOLD_BACK.min(pending_emit.len() + s.len());
+                pending_emit.push_str(s);
+                let safe_end = floor_char_boundary(&pending_emit, pending_emit.len().saturating_sub(hold));
                 if safe_end > 0 {
                     let safe_portion = pending_emit[..safe_end].to_string();
                     pending_emit = pending_emit[safe_end..].to_string();
-
-                    // ── Artifact scanner: strip [cite:...] ───────────────────
                     let (clean, leftover, cites) = scan_and_strip_cites(&safe_portion);
                     collected_cites.extend(cites);
-                    // leftover is a partial [cite: prefix — move back to hold-back
-                    let to_emit = if leftover.is_empty() {
-                        clean
-                    } else {
+                    if !leftover.is_empty() {
                         pending_emit.insert_str(0, &leftover);
-                        clean
-                    };
-
-                    // ── tool_call suppressor ─────────────────────────────────
-                    if to_emit.contains("<tool_call>") {
-                        let pos = to_emit.find("<tool_call>").unwrap_or(0);
-                        if pos > 0 {
-                            emitter.emit("llm:token".to_string(), json!(&to_emit[..pos]));
-                        }
-                        pending_emit.clear();
-                        suppress_emit = true;
-                    } else {
-                        // Hold back potential <tool_call> prefix at the tail of to_emit
-                        let tc_safe = safe_emit_end(&to_emit, "<tool_call>");
-                        if tc_safe > 0 {
-                            emitter.emit("llm:token".to_string(), json!(&to_emit[..tc_safe]));
-                        }
-                        if tc_safe < to_emit.len() {
-                            pending_emit.insert_str(0, &to_emit[tc_safe..]);
-                        }
+                    }
+                    if !clean.is_empty() {
+                        emitter.emit("llm:token".to_string(), json!(clean));
                     }
                 }
             }
@@ -396,13 +514,129 @@ pub(crate) async fn stream_llm_round(
                         if let Some(content) = delta["content"].as_str() {
                             if !content.is_empty() {
                                 full_text.push_str(content);
-                                if !suppress_emit {
-                                    pending_emit.push_str(content);
-                                    flush_safe!();
+                                // ── JSON depth tracker ───────────────────────
+                                // Walk the incoming chunk character by character.
+                                // Once we see '{' we enter JSON-buffering mode and
+                                // stop emitting. Strings inside JSON are handled by
+                                // tracking whether we're inside a quoted string.
+                                let mut chunk_rest = content;
+                                while !chunk_rest.is_empty() {
+                                    if json_depth == 0 {
+                                        // Not yet inside a JSON object.
+                                        if let Some(brace) = chunk_rest.find('{') {
+                                            // Only enter JSON-buffering mode if the character
+                                            // immediately after '{' (ignoring whitespace) is '"'.
+                                            // Tool call JSON always starts with {"name": ...
+                                            // This avoids buffering informal text like {xxxx}
+                                            // or {中文} which would cause streaming delays or
+                                            // silent text loss if the brace is unmatched.
+                                            let after_brace = chunk_rest[brace + 1..].trim_start();
+                                            let looks_like_json = after_brace.starts_with('"')
+                                                || after_brace.is_empty(); // brace at end of chunk — wait for next
+                                            if !looks_like_json {
+                                                // Not a JSON object — emit '{' as regular text and continue.
+                                                let up_to_and_including_brace = &chunk_rest[..brace + 1];
+                                                if !suppress_emit {
+                                                    emit_text!(up_to_and_including_brace);
+                                                }
+                                                chunk_rest = &chunk_rest[brace + 1..];
+                                                continue;
+                                            }
+                                            // Emit everything before '{' as normal text.
+                                            let before = &chunk_rest[..brace];
+                                            if !suppress_emit && !before.is_empty() {
+                                                emit_text!(before);
+                                            }
+                                            // Start buffering JSON.
+                                            json_depth = 1;
+                                            suppress_emit = true;
+                                            pre_json_buf.clear();
+                                            json_buf.clear();
+                                            json_buf.push('{');
+                                            chunk_rest = &chunk_rest[brace + 1..];
+                                        } else {
+                                            // No '{' in this chunk — emit normally.
+                                            if !suppress_emit {
+                                                emit_text!(chunk_rest);
+                                            }
+                                            chunk_rest = "";
+                                        }
+                                    } else {
+                                        // Inside a JSON object — buffer everything, track depth.
+                                        // We need to respect string boundaries so that '{' / '}'
+                                        // inside string values don't affect depth.
+                                        let mut i = 0;
+                                        let bytes = chunk_rest.as_bytes();
+                                        let mut in_string = false;
+                                        let mut escape = false;
+                                        while i < bytes.len() {
+                                            let b = bytes[i];
+                                            if escape {
+                                                escape = false;
+                                            } else if b == b'\\' && in_string {
+                                                escape = true;
+                                            } else if b == b'"' {
+                                                in_string = !in_string;
+                                            } else if !in_string {
+                                                if b == b'{' { json_depth += 1; }
+                                                else if b == b'}' {
+                                                    json_depth -= 1;
+                                                    if json_depth == 0 {
+                                                        // Closing brace found — complete object.
+                                                        json_buf.push('}');
+                                                        // Consume up to and including '}'
+                                                        chunk_rest = &chunk_rest[i + 1..];
+
+                                                        // ── Resolve: tool call or plain text? ──
+                                                        let resolved = if let Ok(parsed) = serde_json::from_str::<Value>(&json_buf) {
+                                                            let name = parsed["name"].as_str().unwrap_or("").to_string();
+                                                            if !name.is_empty() && tool_name_set.contains(name.as_str()) {
+                                                                // Recognised tool call.
+                                                                let args = &parsed["arguments"];
+                                                                let args_str = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
+                                                                tracing::debug!("[llm/stream] json-tracker tool call: name={}", name);
+                                                                tool_chunks.push((format!("tc_text_{}", tc_text_idx), name, args_str));
+                                                                tc_text_idx += 1;
+                                                                // Discard any remaining </tool_call> on this chunk
+                                                                let after = chunk_rest.trim_start();
+                                                                if after.starts_with("</tool_call>") {
+                                                                    chunk_rest = &chunk_rest[chunk_rest.find("</tool_call>").unwrap() + "</tool_call>".len()..];
+                                                                }
+                                                                true // suppress — do not emit json_buf
+                                                            } else {
+                                                                false // not a tool call
+                                                            }
+                                                        } else {
+                                                            false // parse failed
+                                                        };
+
+                                                        if !resolved {
+                                                            // Not a tool call — emit the buffered JSON as text.
+                                                            let text_to_emit = json_buf.clone();
+                                                            suppress_emit = false;
+                                                            emit_text!(&text_to_emit);
+                                                        } else {
+                                                            suppress_emit = false;
+                                                        }
+                                                        json_buf.clear();
+                                                        break; // restart outer while with updated chunk_rest
+                                                    }
+                                                }
+                                            }
+                                            json_buf.push(b as char);
+                                            i += 1;
+                                        }
+                                        if json_depth > 0 {
+                                            // Object not yet complete — consumed entire chunk.
+                                            chunk_rest = "";
+                                        }
+                                    }
                                 }
                             }
                         }
-                        // Native format tool calls (OpenAI-compatible)
+                        // Native format tool calls (OpenAI-compatible delta.tool_calls).
+                        // When llama.cpp correctly parses the hermes/qwen tool call format,
+                        // the structured call appears here — not in delta.content.
                         if let Some(tc_arr) = delta["tool_calls"].as_array() {
                             for tc in tc_arr {
                                 let idx = tc["index"].as_u64().unwrap_or(0) as usize;
@@ -410,8 +644,22 @@ pub(crate) async fn stream_llm_round(
                                     tool_chunks.push((String::new(), String::new(), String::new()));
                                 }
                                 let acc = &mut tool_chunks[idx];
-                                if let Some(id) = tc["id"].as_str() { if !id.is_empty() { acc.0 = id.to_string(); } }
-                                if let Some(n) = tc["function"]["name"].as_str() { if !n.is_empty() { acc.1 = n.to_string(); } }
+                                if let Some(id) = tc["id"].as_str() {
+                                    if !id.is_empty() {
+                                        if acc.0.is_empty() {
+                                            tracing::debug!("[llm/stream] native tool_call[{}] id={}", idx, id);
+                                        }
+                                        acc.0 = id.to_string();
+                                    }
+                                }
+                                if let Some(n) = tc["function"]["name"].as_str() {
+                                    if !n.is_empty() {
+                                        if acc.1.is_empty() {
+                                            tracing::debug!("[llm/stream] native tool_call[{}] name={}", idx, n);
+                                        }
+                                        acc.1 = n.to_string();
+                                    }
+                                }
                                 if let Some(a) = tc["function"]["arguments"].as_str() { acc.2.push_str(a); }
                             }
                         }
@@ -422,76 +670,156 @@ pub(crate) async fn stream_llm_round(
     }
 
     // ── Stream end flush ──────────────────────────────────────────────────────
-    // pending_emit still holds HOLD_BACK bytes (or less if response was short).
-    // Run the full artifact scanner + emit whatever is clean.
+    // Emit whatever remains in pending_emit (cite-strip it first).
+    // If json_depth > 0, the stream was cut mid-JSON — try to parse what we have.
+    if json_depth > 0 && !json_buf.is_empty() {
+        // Stream ended while we were buffering a JSON object.
+        // Try to parse what we have as a tool call (e.g. max_tokens truncation mid-JSON).
+        let resolved = if let Ok(parsed) = serde_json::from_str::<Value>(&json_buf) {
+            let name = parsed["name"].as_str().unwrap_or("").to_string();
+            if !name.is_empty() && tool_name_set.contains(name.as_str()) {
+                let args = &parsed["arguments"];
+                let args_str = serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string());
+                tracing::debug!("[llm/stream] json-tracker truncated tool call: name={}", name);
+                tool_chunks.push((format!("tc_text_{}", tc_text_idx), name, args_str));
+                true
+            } else { false }
+        } else { false };
+        if !resolved {
+            // Not a tool call (or parse failed) — the buffered content is regular text.
+            // Emit it so the user sees it rather than silently losing it.
+            let leftover = json_buf.clone();
+            emit_text!(&leftover);
+        }
+        json_buf.clear();
+        suppress_emit = false;
+    }
     if !suppress_emit && !pending_emit.is_empty() {
         let (clean, _leftover, cites) = scan_and_strip_cites(&pending_emit);
         collected_cites.extend(cites);
-        // _leftover here is an incomplete [cite: at the very end — drop it (LLM truncated)
         if !clean.is_empty() {
-            // Still apply tool_call guard even at flush
-            let tc_safe = safe_emit_end(&clean, "<tool_call>");
-            emitter.emit("llm:token".to_string(), json!(&clean[..tc_safe]));
+            emitter.emit("llm:token".to_string(), json!(clean));
         }
         pending_emit.clear();
     }
 
-    // Parse text-format tool calls from full_text (e.g. Qwen/Mistral <tool_call> style)
-    // and strip them from the display text
-    if tool_chunks.is_empty() && full_text.contains("<tool_call>") {
-        let mut clean_text = String::new();
-        let mut rest = full_text.as_str();
-        let mut tc_idx = 0usize;
-        while let Some(start) = rest.find("<tool_call>") {
-            clean_text.push_str(&rest[..start]);
-            let after_open = &rest[start + "<tool_call>".len()..];
-            if let Some(end) = after_open.find("</tool_call>") {
-                let json_str = after_open[..end].trim();
-                if let Ok(tc) = serde_json::from_str::<Value>(json_str) {
-                    let name = tc["name"].as_str().unwrap_or("").to_string();
-                    let args = tc["arguments"].clone();
-                    let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
-                    if !name.is_empty() {
-                        tool_chunks.push((format!("tc_text_{}", tc_idx), name, args_str));
-                        tc_idx += 1;
-                    }
-                }
-                rest = &after_open[end + "</tool_call>".len()..];
-            } else {
-                // Incomplete tag — keep remainder as-is
-                clean_text.push_str("<tool_call>");
-                clean_text.push_str(after_open);
-                rest = "";
-                break;
-            }
-        }
-        clean_text.push_str(rest);
-        full_text = clean_text.trim().to_string();
+    // Tool call parsing is now done during streaming via the JSON depth tracker.
+    // full_text at this point contains only non-tool-call text (preamble was discarded
+    // when the JSON was resolved as a tool call in the streaming loop above).
+
+    // ── Tool-call round cleanup ───────────────────────────────────────────────
+    // Unified preamble elimination: whenever tools ran this round (either native
+    // delta.tool_calls format or text <tool_call> format), the model may have
+    // emitted noise text ("leton", "Let me check…", etc.) before the tool call.
+    // That text is never a valid final answer and must not reach the frontend or
+    // the stored response. Handle it in ONE place here rather than patching each
+    // individual flush path:
+    //   1. Discard full_text — prevents preamble from becoming full_response.
+    //   2. Emit agent:clear_stream — clears whatever already streamed to frontend
+    //      from the mid-stream or stream-end flush paths this round.
+    // The stream-end flush and mid-stream flush_safe! still suppress most
+    // preamble proactively, but this is the authoritative safety net.
+    if !tool_chunks.is_empty() {
+        full_text = String::new();
+        emitter.emit("agent:clear_stream".to_string(), json!({}));
     }
 
     // ── Post-stream validation ────────────────────────────────────────────────
     // Stream is fully consumed. Validate cite IDs collected during streaming.
-    // We do this here (not during streaming) so:
-    //   (a) validate_citation is async but not in the hot streaming path
-    //   (b) correction loop in run_tool_loop still works (we return cite_invalid)
-    //   (c) agent:citation is only emitted after validation passes
+    // Rules (enforced when working_memory is Some, i.e. tool-enabled agents):
+    //   1. Every non-empty final answer MUST include [cite:none] or [cite:valid_id].
+    //   2. If no cite tag present at all → cite_invalid = true (forces correction loop).
+    //   3. If cite tag present with unknown ID → cite_invalid = true.
+    // This prevents LLM from fabricating tool results without going through correction.
     let mut cite_invalid = false;
-    if !collected_cites.is_empty() {
+    // If the full_text contains <tool_call> markers, the LLM tried to call a tool
+    // but it was truncated or malformed (tool_chunks is empty). This is not a valid
+    // final answer — treat it as no-output so cite validation and cite_status are skipped.
+    // Also check for </tool_call> alone (opening tag missing): model sometimes skips
+    // the opening tag, leaving raw JSON + closing tag in full_text.
+    // Tool call syntax is resolved during streaming by the JSON depth tracker.
+    // full_text no longer contains raw <tool_call>/<tool_call> fragments — they were
+    // consumed during streaming. The only remaining case where full_text might contain
+    // stray </tool_call> is if the native delta.tool_calls path ran and some closing
+    // tag leaked into content. Discard such remnants.
+    if full_text.contains("</tool_call>") || full_text.contains("<tool_call>") {
+        full_text = String::new();
+        emitter.emit("agent:clear_stream".to_string(), json!({}));
+    }
+    let is_final_answer = tool_chunks.is_empty() && !full_text.trim().is_empty();
+    // Enforce cite when either:
+    // (a) tools ran this round (run_has_results), OR
+    // (b) WM has accumulated data from previous rounds in this session (wm_has_any) —
+    //     the LLM may be answering from carry-over results without calling tools,
+    //     which is still fabrication if no cite tag is present.
+    // Exception: if wm_has_any but not run_has_results, the LLM *could* legitimately
+    // answer a pure follow-up question (e.g. "translate that") — so we only block if
+    // the response looks data-bearing (> 120 chars). Short acknowledgements are allowed.
+    let (run_has_results, wm_has_any) = match working_memory {
+        Some(wm) => (wm.current_run_has_results().await, !wm.is_empty().await),
+        None     => (false, false),
+    };
+    let cite_required = if run_has_results {
+        true
+    } else if wm_has_any && full_text.chars().count() > 120 {
+        true
+    } else {
+        false
+    };
+    if is_final_answer && cite_required && collected_cites.is_empty() {
+        // LLM produced a substantive answer with NO cite tag at all — treat as fabrication.
+        tracing::warn!("[citation] missing cite tag in final answer — triggering correction");
+        cite_invalid = true;
+        emitter.emit("agent:citation_missing".to_string(), json!({}));
+    } else if !collected_cites.is_empty() {
+        // Deduplicate: LLM sometimes repeats the same [cite:id] multiple times.
+        let mut seen = std::collections::HashSet::new();
+        let collected_cites: Vec<_> = collected_cites.into_iter().filter(|id| seen.insert(id.clone())).collect();
+
+        // Two-pass validation:
+        // Pass 1: check all IDs and track whether at least one valid+similar cite exists.
+        // Pass 2: only trigger correction if NO valid cite passed — invalid IDs mixed in
+        //         alongside a valid one are a format mistake (e.g. LLM confused Gmail
+        //         message IDs with WM tool_call_ids), not fabrication.
+        let has_none = collected_cites.iter().any(|id| id == "none");
+        let mut any_valid_and_similar = has_none; // [cite:none] counts as valid
+        let mut valid_details: Vec<Value> = Vec::new();
+        let mut valid_ids: Vec<String> = Vec::new();
+
         for cite_inner in &collected_cites {
-            if cite_inner == "none" {
-                // [cite:none] is always valid — no tools used this round
-                continue;
-            }
+            if cite_inner == "none" { continue; }
             let valid = validate_citation(cite_inner, working_memory).await;
             if valid {
-                // Emit citation event so frontend can display source chips
-                let ids: Vec<&str> = cite_inner.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
-                emitter.emit("agent:citation".to_string(), json!({ "ids": ids }));
+                let similar = check_response_cite_similarity(&full_text, cite_inner, working_memory).await;
+                if similar {
+                    any_valid_and_similar = true;
+                    valid_ids.push(cite_inner.clone());
+                    // Collect details for frontend expand UI
+                    let ids: Vec<&str> = cite_inner.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+                    if let Some(wm) = working_memory {
+                        for id in &ids {
+                            if let Some((tool, preview)) = wm.cite_detail(id).await {
+                                valid_details.push(json!({ "id": id, "tool": tool, "preview": preview }));
+                            }
+                        }
+                    }
+                } else {
+                    tracing::warn!("[citation] response has low content overlap with cited result [cite:{}]", cite_inner);
+                }
             } else {
                 tracing::warn!("[citation] invalid cite ids: [cite:{}]", cite_inner);
-                cite_invalid = true;
-                emitter.emit("agent:citation_missing".to_string(), json!({}));
             }
+        }
+
+        if any_valid_and_similar {
+            // At least one cite ID is valid and content-consistent — accept the response.
+            let ids_ref: Vec<&str> = valid_ids.iter().map(String::as_str).collect();
+            emitter.emit("agent:citation".to_string(), json!({ "ids": ids_ref, "details": valid_details }));
+        } else {
+            // No valid cite passed — trigger correction.
+            tracing::warn!("[citation] no valid cite found — triggering correction");
+            cite_invalid = true;
+            emitter.emit("agent:citation_missing".to_string(), json!({}));
         }
     }
 
@@ -517,7 +845,7 @@ pub(crate) async fn call_llm_once(
         "messages": messages,
         "stream": false,
         "temperature": 0.7,
-        "max_tokens": 2048,
+        "max_tokens": 4096,
     });
     if let Some(t) = tools {
         body["tools"] = t;

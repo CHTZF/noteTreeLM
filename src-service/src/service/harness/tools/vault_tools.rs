@@ -281,7 +281,8 @@ pub(crate) async fn vault_query_memory_with_ids(
         }
     }
 
-    // Fallback: keyword regex or recency sort
+    // Fallback: keyword regex or recency sort.
+    // For CJK keywords, enrich with bigrams to improve substring-match recall.
     let rows: Vec<Row> = if keywords.is_empty() {
         let mut r = db
             .query("SELECT fact_id, content, category FROM memory_facts WHERE vault_id = $vid AND account_id = $aid AND expires_at > $now ORDER BY created_at DESC LIMIT $lim")
@@ -293,8 +294,10 @@ pub(crate) async fn vault_query_memory_with_ids(
             .map_err(|e| e.to_string())?;
         r.take(0).map_err(|e| e.to_string())?
     } else {
+        use crate::service::harness::memory::semantic::enrich_keywords_for_fallback;
+        let enriched = enrich_keywords_for_fallback(keywords);
         let mut collected: Vec<Row> = Vec::new();
-        for kw in keywords.iter().take(3) {
+        for kw in enriched.iter().take(8) {
             let mut r = db
                 .query("SELECT fact_id, content, category FROM memory_facts WHERE vault_id = $vid AND account_id = $aid AND content ~ $kw AND expires_at > $now LIMIT $lim")
                 .bind(("vid", vault_id.to_string()))
@@ -307,6 +310,14 @@ pub(crate) async fn vault_query_memory_with_ids(
             let rows: Vec<Row> = r.take(0).map_err(|e| e.to_string())?;
             collected.extend(rows);
         }
+        // Deduplicate by fact_id.
+        let mut seen = std::collections::HashSet::new();
+        collected.retain(|r| {
+            let fid = r.fact_id.clone().unwrap_or_default();
+            if fid.is_empty() { return true; }
+            seen.insert(fid)
+        });
+        collected.truncate(limit as usize);
         collected
     };
     let fact_ids: Vec<String> = rows.iter()
@@ -573,6 +584,112 @@ async fn vault_update_note_inner(
         "lines_after":   lines_after,
         "lines_added":   lines_after.saturating_sub(lines_before),
         "lines_removed": lines_before.saturating_sub(lines_after),
+    }))
+}
+
+/// Replace the first occurrence of `old_text` with `new_text` in a note.
+/// Returns an error if `old_text` is not found (prevents silent mis-edits).
+/// Cheaper than a full `update_note` round-trip: caller does not need to read
+/// the entire file first.
+pub(crate) async fn vault_patch_note(
+    rel_path: &str,
+    old_text: &str,
+    new_text: &str,
+    vault_path: &str,
+    client: &reqwest::Client,
+    db: &SurrealDb,
+    vault_id: &str,
+) -> Result<Value, String> {
+    if vault_path.is_empty() { return Ok(tool_err("VAULT_NOT_SET", "Vault 未設定", None)); }
+    validate_rel_path(rel_path)?;
+    if old_text.is_empty() { return Ok(tool_err("EMPTY_OLD_TEXT", "old_text 不可為空", Some(rel_path))); }
+    let full = std::path::Path::new(vault_path).join(rel_path);
+    if !full.exists() { return Ok(tool_err("NOT_FOUND", format!("筆記不存在：{}", rel_path), Some(rel_path))); }
+
+    let original = tokio::fs::read_to_string(&full).await.map_err(|e| e.to_string())?;
+    if !original.contains(old_text) {
+        return Ok(tool_err("NOT_FOUND_IN_FILE",
+            format!("在 {} 中找不到指定的 old_text（前50字：{:?}）", rel_path, old_text.chars().take(50).collect::<String>()),
+            Some(rel_path),
+        ));
+    }
+
+    let patched = original.replacen(old_text, new_text, 1);
+    tokio::fs::write(&full, &patched).await.map_err(|e| e.to_string())?;
+    sync_note_to_db(client, db, vault_id, rel_path, &patched).await;
+
+    Ok(json!({
+        "ok":            true,
+        "path":          rel_path,
+        "lines_before":  original.lines().count(),
+        "lines_after":   patched.lines().count(),
+    }))
+}
+
+/// Replace lines `start_line..=end_line` (1-indexed, inclusive) in a note with `new_text`.
+///
+/// Preferred over `patch_note` when the agent knows which lines to change but cannot
+/// guarantee an exact string match (e.g., after reading with line numbers, or when the
+/// selection spans a predictable block that may contain minor whitespace variation).
+///
+/// `new_text` replaces the entire line range; it may contain any number of lines.
+/// Returns an error if the line range is out of bounds.
+pub(crate) async fn vault_line_range_patch(
+    rel_path: &str,
+    start_line: usize, // 1-indexed
+    end_line:   usize, // 1-indexed, inclusive
+    new_text:   &str,
+    vault_path: &str,
+    client: &reqwest::Client,
+    db: &SurrealDb,
+    vault_id: &str,
+) -> Result<Value, String> {
+    if vault_path.is_empty() { return Ok(tool_err("VAULT_NOT_SET", "Vault 未設定", None)); }
+    validate_rel_path(rel_path)?;
+    if start_line == 0 { return Ok(tool_err("INVALID_RANGE", "start_line 必須 ≥ 1", Some(rel_path))); }
+    let full = std::path::Path::new(vault_path).join(rel_path);
+    if !full.exists() { return Ok(tool_err("NOT_FOUND", format!("筆記不存在：{}", rel_path), Some(rel_path))); }
+
+    let original = tokio::fs::read_to_string(&full).await.map_err(|e| e.to_string())?;
+    let mut lines: Vec<&str> = original.split('\n').collect();
+    // Remove trailing empty element that split('\n') produces for files ending with \n
+    if lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+
+    let total = lines.len();
+    let s = start_line - 1; // convert to 0-indexed
+    let e = end_line.min(total).saturating_sub(1); // 0-indexed, clamped
+
+    if s > total {
+        return Ok(tool_err("RANGE_OUT_OF_BOUNDS",
+            format!("start_line={} 超出檔案總行數={}", start_line, total),
+            Some(rel_path),
+        ));
+    }
+
+    let mut result: Vec<&str> = Vec::with_capacity(total);
+    result.extend_from_slice(&lines[..s]);
+    // Insert new_text lines
+    let new_lines: Vec<&str> = new_text.split('\n').collect();
+    result.extend_from_slice(&new_lines);
+    if e + 1 < lines.len() {
+        result.extend_from_slice(&lines[e + 1..]);
+    }
+
+    // Re-join; preserve trailing newline if original had one
+    let mut patched = result.join("\n");
+    if original.ends_with('\n') { patched.push('\n'); }
+
+    tokio::fs::write(&full, &patched).await.map_err(|e| e.to_string())?;
+    sync_note_to_db(client, db, vault_id, rel_path, &patched).await;
+
+    Ok(json!({
+        "ok":            true,
+        "path":          rel_path,
+        "replaced_lines": format!("{}-{}", start_line, end_line.min(total)),
+        "lines_before":  total,
+        "lines_after":   patched.split('\n').count(),
     }))
 }
 
@@ -1402,9 +1519,15 @@ pub(crate) async fn vault_web_search(
         }).collect::<Vec<_>>(),
     }));
 
+    // Wrap each snippet individually — search result snippets come from arbitrary websites
+    // and may contain prompt injection attempts.
     let formatted = results.iter().enumerate()
         .map(|(i, (title, url, snippet))| {
-            format!("[{}] **{}**\n{}\n來源：{}", i + 1, title, snippet, url)
+            let safe_snippet = crate::service::harness::security::wrap_external_content(
+                &format!("Web:{}", url),
+                snippet,
+            );
+            format!("[{}] **{}**\n{}\n來源：{}", i + 1, title, safe_snippet, url)
         })
         .collect::<Vec<_>>()
         .join("\n\n");
@@ -1610,4 +1733,165 @@ pub(crate) fn extract_note_refs(tool_name: &str, args: &Value, result: &Value, _
         }
         _ => vec![],
     }
+}
+
+// ── fetch_url ─────────────────────────────────────────────────────────────────
+
+/// Fetch a URL and return its text content, stripped of HTML tags.
+/// Max 8000 chars to avoid blowing the context window.
+pub(crate) async fn vault_fetch_url(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<Value, String> {
+    const MAX_CHARS: usize = 8000;
+
+    let resp = client
+        .get(url)
+        .timeout(std::time::Duration::from_secs(15))
+        .header("User-Agent", "Mozilla/5.0 (compatible; NoteTreeLM/1.0)")
+        .send()
+        .await
+        .map_err(|e| format!("Fetch failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+
+    let content_type = resp.headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let body = resp.text().await.map_err(|e| format!("Read failed: {}", e))?;
+
+    // Strip HTML tags for HTML responses
+    let text = if content_type.contains("html") {
+        strip_html(&body)
+    } else {
+        body
+    };
+
+    let truncated: String = text.chars().take(MAX_CHARS).collect();
+    let was_truncated = text.chars().count() > MAX_CHARS;
+
+    Ok(json!({
+        "url": url,
+        "content": truncated,
+        "truncated": was_truncated,
+        "chars": truncated.len(),
+    }))
+}
+
+fn strip_html(html: &str) -> String {
+    // Remove <script> and <style> blocks entirely
+    let mut s = html.to_string();
+    for tag in &["script", "style"] {
+        while let Some(start) = s.to_lowercase().find(&format!("<{}", tag)) {
+            let end_tag = format!("</{}>", tag);
+            if let Some(end) = s.to_lowercase()[start..].find(&end_tag) {
+                s.drain(start..start + end + end_tag.len());
+            } else {
+                break;
+            }
+        }
+    }
+    // Strip remaining tags
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    // Collapse whitespace
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+// ── grep_vault ────────────────────────────────────────────────────────────────
+
+/// Full-text string search across all markdown files in the vault.
+/// Returns matching file paths + the line containing the match (first match per file).
+/// Case-insensitive. Max 50 results.
+pub(crate) fn vault_grep_notes(vault_path: &str, pattern: &str) -> Result<Value, String> {
+    if vault_path.is_empty() { return Err("Vault 未設定".to_string()); }
+    if pattern.is_empty() { return Err("pattern 不可為空".to_string()); }
+
+    const MAX_RESULTS: usize = 50;
+    let pattern_lower = pattern.to_lowercase();
+    let base = std::path::Path::new(vault_path);
+    let mut results: Vec<Value> = Vec::new();
+
+    fn walk(
+        dir: &std::path::Path,
+        base: &std::path::Path,
+        pattern: &str,
+        results: &mut Vec<Value>,
+        max: usize,
+    ) {
+        if results.len() >= max { return; }
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            if results.len() >= max { return; }
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !name.starts_with('.') { walk(&path, base, pattern, results, max); }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                let Ok(content) = std::fs::read_to_string(&path) else { continue };
+                for (i, line) in content.lines().enumerate() {
+                    if line.to_lowercase().contains(pattern) {
+                        let rel = path.strip_prefix(base).unwrap_or(&path);
+                        let snippet: String = line.trim().chars().take(120).collect();
+                        results.push(json!({
+                            "path": rel.to_string_lossy(),
+                            "line": i + 1,
+                            "snippet": snippet,
+                        }));
+                        break; // one match per file
+                    }
+                }
+            }
+        }
+    }
+
+    walk(base, base, &pattern_lower, &mut results, MAX_RESULTS);
+
+    Ok(json!({
+        "pattern": pattern,
+        "count": results.len(),
+        "results": results,
+    }))
+}
+
+// ── batch_read_notes ──────────────────────────────────────────────────────────
+
+/// Read multiple notes in one call. Each path is vault-relative.
+/// Returns array of { path, content, error? }. Max 10 notes per call.
+pub(crate) fn vault_batch_read_notes(vault_path: &str, paths: &[String]) -> Value {
+    const MAX_NOTES: usize = 10;
+    const MAX_CHARS_PER_NOTE: usize = 4000;
+
+    let base = std::path::Path::new(vault_path);
+    let results: Vec<Value> = paths.iter().take(MAX_NOTES).map(|rel_path| {
+        if let Err(e) = validate_rel_path(rel_path) {
+            return json!({ "path": rel_path, "error": e });
+        }
+        let full = base.join(rel_path);
+        match std::fs::read_to_string(&full) {
+            Ok(content) => {
+                let truncated: String = content.chars().take(MAX_CHARS_PER_NOTE).collect();
+                let was_truncated = content.chars().count() > MAX_CHARS_PER_NOTE;
+                json!({ "path": rel_path, "content": truncated, "truncated": was_truncated })
+            }
+            Err(e) => json!({ "path": rel_path, "error": e.to_string() }),
+        }
+    }).collect();
+
+    json!({ "notes": results, "count": results.len() })
 }

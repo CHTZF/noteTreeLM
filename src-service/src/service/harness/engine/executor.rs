@@ -220,9 +220,22 @@ impl Executor {
                                 }));
                             }
                         }
-                        // `recall` is never recorded — it reads working_memory and must
-                        // not appear in its own search results (prevents recall loops).
-                        if node.call.name != "recall" {
+                        // Internal / orchestration tools are never recorded in WorkingMemory.
+                        // They are reasoning aids or control-flow tools, not data sources,
+                        // so they must not produce valid cite IDs. Recording them would let
+                        // the LLM cite a `think "✅"` or `checkpoint` result to bypass cite
+                        // enforcement instead of citing an actual tool result (e.g. list_emails).
+                        const NON_CITABLE: &[&str] = &[
+                            "recall", "think",
+                            "checkpoint", "clear_checkpoint",
+                            "compress_context", "finish",
+                            "progress", "ask_user",
+                            "get_session_state", "batch_apply",
+                            "save_agent_knowledge", "get_agent_knowledge",
+                            "get_vault_changes", "create_agent_skill",
+                            "call_agents_parallel",
+                        ];
+                        if !NON_CITABLE.contains(&node.call.name.as_str()) {
                             self.working_memory.record(
                                 node.call.id.clone(),
                                 node.call.name.clone(),

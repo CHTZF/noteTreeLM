@@ -8,6 +8,8 @@ use serde_json::Value;
 use crate::service::harness::runtime::HarnessRequestRuntime;
 use crate::service::harness::governance::guard::ToolGuardSpec;
 use crate::service::harness::engine::transaction::{Transaction, AnswerChannel};
+use crate::service::harness::tools::skill_tools::SkillPassResult;
+use crate::service::harness::memory::working::WorkingMemory;
 
 /// Lightweight event for SSE broadcast (shared between daemon broadcast and service emit).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -24,6 +26,13 @@ pub struct AgentSession {
     pub cancel:         Arc<AtomicBool>,
     pub transaction:    Option<Arc<Transaction>>,
     pub answer_channel: Arc<AnswerChannel>,
+    /// Persistent evidence store shared across messages in the same conversation.
+    /// `inner` (tool call records) carries over; `current_run_ids` / `recall_count`
+    /// are reset at the start of each new run via `start_new_run()`.
+    pub working_memory: WorkingMemory,
+    /// Skills activated in the last completed run — carried forward so Gmail/Calendar
+    /// tools stay active in follow-up messages without re-running semantic search.
+    pub active_skills:  Option<SkillPassResult>,
 }
 
 pub type ToolFuture =

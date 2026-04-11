@@ -11,6 +11,8 @@ struct EmitterState {
     round_count:       u32,
     skill_activations: Vec<String>,
     llm_latency_ms:    Vec<u64>,
+    /// Set when agent:cite_status is emitted. None means no cite validation occurred.
+    cite_passed:       Option<bool>,
 }
 
 /// Wraps [`EmitEventFn`] to intercept SSE events and accumulate a [`SessionTrace`].
@@ -49,6 +51,7 @@ impl ObservabilityEmitter {
                 round_count:       0,
                 skill_activations: Vec::new(),
                 llm_latency_ms:    Vec::new(),
+                cite_passed:       None,
             })),
         }
     }
@@ -77,7 +80,20 @@ impl ObservabilityEmitter {
                 }
             }
         }
+        if event == "agent:cite_status" {
+            if let Some(passed) = payload["passed"].as_bool() {
+                if let Ok(mut s) = self.state.lock() {
+                    s.cite_passed = Some(passed);
+                }
+            }
+        }
         (self.inner)(event, payload);
+    }
+
+    /// Return the cite validation result recorded during this session.
+    /// `None` means no cite validation occurred (no tools ran).
+    pub(crate) fn cite_passed(&self) -> Option<bool> {
+        self.state.lock().ok().and_then(|s| s.cite_passed)
     }
 
     /// Increment the LLM round counter. Call once at the top of each ReAct iteration

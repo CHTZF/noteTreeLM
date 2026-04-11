@@ -85,7 +85,7 @@ async fn register_vault(
         .db
         .query("INSERT INTO vaults (vault_id, path, account_id, created_at) VALUES ($vid, $path, $aid, $now)")
         .bind(("vid", vault_id.clone()))
-        .bind(("path", path))
+        .bind(("path", path.clone()))
         .bind(("aid", account_id.clone()))
         .bind(("now", now))
         .await
@@ -93,6 +93,9 @@ async fn register_vault(
 
     // Ensure periodic memory_agent schedule exists for this vault+account
     crate::db::seeds::ensure_memory_schedule(&state.db, &vault_id, &account_id).await;
+
+    // Seed templates/ folder with starter notes (idempotent — skips if folder already exists)
+    crate::db::seeds::seed_vault_templates(&path).await;
 
     Ok(Json(json!({ "vault_id": vault_id })))
 }

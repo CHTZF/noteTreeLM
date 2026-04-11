@@ -297,6 +297,288 @@ pub async fn start_google_oauth(app: tauri::AppHandle, state: tauri::State<'_, A
     Ok(SessionInfo { token: resp.token, username: resp.username, expires_at: resp.expires_at, auth_provider: "google".to_string() })
 }
 
+// ── Google Calendar OAuth ──────────────────────────────────────────────────
+
+/// Launch browser OAuth flow with calendar scope, exchange for refresh_token,
+/// and store it in the daemon via POST /calendar/connect.
+#[tauri::command]
+pub async fn connect_google_calendar(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    use tauri_plugin_shell::ShellExt;
+
+    let (client_id, client_secret) = google_credentials();
+    let (code_verifier, code_challenge) = generate_pkce();
+    let oauth_state = uuid::Uuid::new_v4().to_string();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await.map_err(|e| e.to_string())?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let redirect_uri = format!("http://127.0.0.1:{}/callback", port);
+
+    let mut auth_url = url::Url::parse("https://accounts.google.com/o/oauth2/v2/auth")
+        .map_err(|e| e.to_string())?;
+    auth_url.query_pairs_mut()
+        .append_pair("client_id", &client_id)
+        .append_pair("redirect_uri", &redirect_uri)
+        .append_pair("response_type", "code")
+        .append_pair("scope", "openid email profile https://www.googleapis.com/auth/calendar")
+        .append_pair("code_challenge", &code_challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", &oauth_state)
+        .append_pair("access_type", "offline")
+        .append_pair("prompt", "consent"); // force refresh_token even for returning users
+
+    app.shell().open(auth_url.as_str(), None)
+        .map_err(|e| format!("無法開啟瀏覽器: {e}"))?;
+
+    let (mut stream, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        listener.accept(),
+    ).await
+    .map_err(|_| "Google 授權逾時（2 分鐘）".to_string())?
+    .map_err(|e| e.to_string())?;
+
+    let mut buf = vec![0u8; 8192];
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stream.read(&mut buf),
+    ).await
+    .map_err(|_| "讀取 callback 逾時".to_string())?
+    .map_err(|e| e.to_string())?;
+
+    let request_str = String::from_utf8_lossy(&buf[..n]);
+    let request_line = request_str.lines().next().unwrap_or("");
+    let raw_path = request_line.split_whitespace().nth(1).unwrap_or("");
+    let dummy = format!("http://dummy{}", raw_path);
+    let parsed_url = url::Url::parse(&dummy).map_err(|_| "解析 callback URL 失敗".to_string())?;
+
+    let mut auth_code: Option<String> = None;
+    let mut returned_state: Option<String> = None;
+    for (k, v) in parsed_url.query_pairs() {
+        match k.as_ref() {
+            "code"  => auth_code = Some(v.into_owned()),
+            "state" => returned_state = Some(v.into_owned()),
+            "error" => {
+                let _ = send_html_response(&mut stream, false).await;
+                return Err(format!("Google 授權被拒絕: {v}"));
+            }
+            _ => {}
+        }
+    }
+
+    let _ = send_html_response(&mut stream, true).await;
+    drop(stream);
+
+    if returned_state.as_deref() != Some(oauth_state.as_str()) {
+        return Err("OAuth state 不符，請重試".to_string());
+    }
+    let code = auth_code.ok_or("未收到授權碼")?;
+
+    let client = reqwest::Client::new();
+    let token_resp = client
+        .post("https://oauth2.googleapis.com/token")
+        .form(&[
+            ("code",          code.as_str()),
+            ("client_id",     client_id.as_str()),
+            ("client_secret", client_secret.as_str()),
+            ("redirect_uri",  redirect_uri.as_str()),
+            ("grant_type",    "authorization_code"),
+            ("code_verifier", code_verifier.as_str()),
+        ])
+        .send().await.map_err(|e| format!("Token 交換失敗: {e}"))?
+        .json::<serde_json::Value>().await.map_err(|e| format!("Token 解析失敗: {e}"))?;
+
+    let refresh_token = token_resp["refresh_token"].as_str()
+        .ok_or_else(|| {
+            let err = token_resp["error_description"].as_str().unwrap_or("未收到 refresh_token");
+            format!("取得 refresh_token 失敗: {err}")
+        })?
+        .to_string();
+
+    // Store refresh_token in daemon
+    let token = state.get_auth_token().await;
+    let body = serde_json::json!({
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+        "client_secret": client_secret,
+    });
+    crate::api_client::daemon_post::<_, serde_json::Value>(
+        &state.http_client,
+        "/calendar/connect",
+        &body,
+        Some(&token),
+    ).await.map_err(|e| format!("儲存行事曆 Token 失敗: {e}"))?;
+
+    Ok(())
+}
+
+/// Returns true if the current user has Google Calendar connected.
+#[tauri::command]
+pub async fn get_calendar_status(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let token = state.get_auth_token().await;
+    #[derive(serde::Deserialize)]
+    struct Resp { connected: bool }
+    let resp = crate::api_client::daemon_get::<Resp>(
+        &state.http_client,
+        "/calendar/status",
+        Some(&token),
+    ).await.map_err(|e| format!("查詢行事曆狀態失敗: {e}"))?;
+    Ok(resp.connected)
+}
+
+/// Removes the stored Google Calendar refresh_token for the current user.
+#[tauri::command]
+pub async fn disconnect_google_calendar(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let token = state.get_auth_token().await;
+    crate::api_client::daemon_post::<_, serde_json::Value>(
+        &state.http_client,
+        "/calendar/disconnect",
+        &serde_json::json!({}),
+        Some(&token),
+    ).await.map_err(|e| format!("中斷行事曆連線失敗: {e}"))?;
+    Ok(())
+}
+
+// ── Google Gmail OAuth ────────────────────────────────────────────────────────
+
+/// Launch browser OAuth flow with Gmail readonly scope, exchange for refresh_token,
+/// and store it in the daemon via POST /gmail/connect.
+#[tauri::command]
+pub async fn connect_gmail(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    use tauri_plugin_shell::ShellExt;
+
+    let (client_id, client_secret) = google_credentials();
+    let (code_verifier, code_challenge) = generate_pkce();
+    let oauth_state = uuid::Uuid::new_v4().to_string();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await.map_err(|e| e.to_string())?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let redirect_uri = format!("http://127.0.0.1:{}/callback", port);
+
+    let mut auth_url = url::Url::parse("https://accounts.google.com/o/oauth2/v2/auth")
+        .map_err(|e| e.to_string())?;
+    auth_url.query_pairs_mut()
+        .append_pair("client_id", &client_id)
+        .append_pair("redirect_uri", &redirect_uri)
+        .append_pair("response_type", "code")
+        .append_pair("scope", "https://www.googleapis.com/auth/gmail.readonly")
+        .append_pair("code_challenge", &code_challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", &oauth_state)
+        .append_pair("access_type", "offline")
+        .append_pair("prompt", "consent");
+
+    app.shell().open(auth_url.as_str(), None)
+        .map_err(|e| format!("無法開啟瀏覽器: {e}"))?;
+
+    let (mut stream, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        listener.accept(),
+    ).await
+    .map_err(|_| "Gmail 授權逾時（2 分鐘）".to_string())?
+    .map_err(|e| e.to_string())?;
+
+    let mut buf = vec![0u8; 8192];
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stream.read(&mut buf),
+    ).await
+    .map_err(|_| "讀取 callback 逾時".to_string())?
+    .map_err(|e| e.to_string())?;
+
+    let request_str = String::from_utf8_lossy(&buf[..n]);
+    let request_line = request_str.lines().next().unwrap_or("");
+    let raw_path = request_line.split_whitespace().nth(1).unwrap_or("");
+    let dummy = format!("http://dummy{}", raw_path);
+    let parsed_url = url::Url::parse(&dummy).map_err(|_| "解析 callback URL 失敗".to_string())?;
+
+    let mut auth_code: Option<String> = None;
+    let mut returned_state: Option<String> = None;
+    for (k, v) in parsed_url.query_pairs() {
+        match k.as_ref() {
+            "code"  => auth_code = Some(v.into_owned()),
+            "state" => returned_state = Some(v.into_owned()),
+            "error" => {
+                let _ = send_html_response(&mut stream, false).await;
+                return Err(format!("Gmail 授權被拒絕: {v}"));
+            }
+            _ => {}
+        }
+    }
+
+    let _ = send_html_response(&mut stream, true).await;
+    drop(stream);
+
+    if returned_state.as_deref() != Some(oauth_state.as_str()) {
+        return Err("OAuth state 不符，請重試".to_string());
+    }
+    let code = auth_code.ok_or("未收到授權碼")?;
+
+    let client = reqwest::Client::new();
+    let token_resp = client
+        .post("https://oauth2.googleapis.com/token")
+        .form(&[
+            ("code",          code.as_str()),
+            ("client_id",     client_id.as_str()),
+            ("client_secret", client_secret.as_str()),
+            ("redirect_uri",  redirect_uri.as_str()),
+            ("grant_type",    "authorization_code"),
+            ("code_verifier", code_verifier.as_str()),
+        ])
+        .send().await.map_err(|e| format!("Token 交換失敗: {e}"))?
+        .json::<serde_json::Value>().await.map_err(|e| format!("Token 解析失敗: {e}"))?;
+
+    let refresh_token = token_resp["refresh_token"].as_str()
+        .ok_or_else(|| {
+            let err = token_resp["error_description"].as_str().unwrap_or("未收到 refresh_token");
+            format!("取得 refresh_token 失敗: {err}")
+        })?
+        .to_string();
+
+    let token = state.get_auth_token().await;
+    crate::api_client::daemon_post::<_, serde_json::Value>(
+        &state.http_client,
+        "/gmail/connect",
+        &serde_json::json!({ "refresh_token": refresh_token, "client_id": client_id, "client_secret": client_secret }),
+        Some(&token),
+    ).await.map_err(|e| format!("儲存 Gmail Token 失敗: {e}"))?;
+
+    Ok(())
+}
+
+/// Returns true if the current user has Gmail connected.
+#[tauri::command]
+pub async fn get_gmail_status(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let token = state.get_auth_token().await;
+    #[derive(serde::Deserialize)]
+    struct Resp { connected: bool }
+    let resp = crate::api_client::daemon_get::<Resp>(
+        &state.http_client,
+        "/gmail/status",
+        Some(&token),
+    ).await.map_err(|e| format!("查詢 Gmail 狀態失敗: {e}"))?;
+    Ok(resp.connected)
+}
+
+/// Removes the stored Gmail refresh_token for the current user.
+#[tauri::command]
+pub async fn disconnect_gmail(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let token = state.get_auth_token().await;
+    crate::api_client::daemon_post::<_, serde_json::Value>(
+        &state.http_client,
+        "/gmail/disconnect",
+        &serde_json::json!({}),
+        Some(&token),
+    ).await.map_err(|e| format!("中斷 Gmail 連線失敗: {e}"))?;
+    Ok(())
+}
+
 async fn send_html_response(stream: &mut tokio::net::TcpStream, success: bool) -> std::io::Result<()> {
     let (title, msg) = if success { ("登入成功", "請返回 noteTreeLM 應用程式") } else { ("登入失敗", "請關閉此視窗並重試") };
     let icon = if success { "✅" } else { "❌" };

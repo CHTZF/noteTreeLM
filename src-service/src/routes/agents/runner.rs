@@ -31,6 +31,8 @@ pub async fn run(
     let now = chrono::Utc::now().timestamp();
     let activity_context = body["activity_context"].as_str().map(String::from);
     let ui_language = body["ui_language"].as_str().map(String::from);
+    let active_note = body["active_note"].as_str().map(String::from);
+    let selection   = body["selection"].as_str().map(String::from);
     let conversation_id = body["conversation_id"].as_str()
         .map(String::from)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -60,7 +62,7 @@ pub async fn run(
         }
     }
 
-    let runtime = match crate::service::build_agent_runtime(&state,
+    let mut runtime = match crate::service::build_agent_runtime(&state,
         &vault_id, &account_id,
         Some(session_id.clone()),
         conversation_id.clone(),
@@ -76,13 +78,28 @@ pub async fn run(
             return Ok(Json(json!({ "session_id": session_id, "conversation_id": conversation_id })));
         }
     };
+    runtime.active_note = active_note;
+    runtime.selection   = selection;
+    // Capture the emitter before moving runtime into run_agent.
+    // The emitter is Arc-backed so it reflects state written during run_agent.
+    let emitter = runtime.emitter.clone();
     crate::service::run_agent(
         runtime,
         input,
         activity_context,
     ).await;
 
-    Ok(Json(json!({ "session_id": session_id, "conversation_id": conversation_id })))
+    // Include cite_passed in the HTTP response so the frontend can read it synchronously
+    // from the invoke() return value, avoiding the race condition where agent:cite_status
+    // (SSE channel) may arrive after invoke() resolves (HTTP channel).
+    let cite_passed = emitter.cite_passed();
+    let mut resp = json!({ "session_id": session_id, "conversation_id": conversation_id });
+    resp["cite_passed"] = match cite_passed {
+        Some(true)  => json!(true),
+        Some(false) => json!(false),
+        None        => json!(null),
+    };
+    Ok(Json(resp))
 }
 
 /// POST /vaults/:vid/agent/cancel
@@ -152,6 +169,8 @@ pub async fn live_chat(
     let ui_language     = body["ui_language"].as_str().map(String::from);
     let note_context    = body["note_context"].as_str().map(String::from);
     let activity_context = body["activity_context"].as_str().map(String::from);
+    let active_note = body["active_note"].as_str().map(String::from);
+    let selection   = body["selection"].as_str().map(String::from);
     let conversation_id = body["conversation_id"].as_str().unwrap_or("").to_string();
 
     // Load live_chat agent_def; fall back to empty def (skill pre-pass will fill tool_names).
@@ -164,7 +183,7 @@ pub async fn live_chat(
 
     // Phase 1: run_agent (streaming:false) — tool execution (think + skill tools).
     // live_respond is intentionally excluded; it's called separately below.
-    let runtime = match crate::service::build_agent_runtime(&state,
+    let mut runtime = match crate::service::build_agent_runtime(&state,
         &vault_id, &account_id,
         Some(session_id.clone()),
         conversation_id.clone(),
@@ -176,6 +195,8 @@ pub async fn live_chat(
         Some(r) => r,
         None => return Ok(Json(json!({ "error": "LLM not configured" }))),
     };
+    runtime.active_note = active_note;
+    runtime.selection   = selection;
     let agent_response = crate::service::run_agent(
         runtime,
         input.clone(),

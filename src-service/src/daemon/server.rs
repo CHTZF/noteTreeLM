@@ -55,6 +55,8 @@ pub fn build_api_router(app_state: ApiState) -> Router {
         .merge(crate::routes::kb::router())
         .merge(crate::routes::agents::router())
         .merge(crate::routes::memory::router())
+        .merge(crate::routes::calendar::router())
+        .merge(crate::routes::gmail::router())
         .merge(crate::routes::scheduled::router())
         .merge(crate::routes::events::router())
         .merge(crate::routes::whisper::router())

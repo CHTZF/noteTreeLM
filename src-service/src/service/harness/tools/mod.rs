@@ -3,3 +3,5 @@ pub mod memory_tools;
 pub mod skill_tools;
 pub(crate) mod trace_tools;
 pub(crate) mod llm;
+pub(crate) mod calendar_tools;
+pub(crate) mod gmail_tools;

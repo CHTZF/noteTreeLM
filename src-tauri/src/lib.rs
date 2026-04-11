@@ -7,7 +7,9 @@ pub mod runtime;
 mod state;
 mod vault;
 
-use commands::auth::{login, logout, get_session, restore_session, change_password, start_google_oauth};
+use commands::auth::{login, logout, get_session, restore_session, change_password, start_google_oauth,
+                     connect_google_calendar, get_calendar_status, disconnect_google_calendar,
+                     connect_gmail, get_gmail_status, disconnect_gmail};
 use commands::{
     agent::{process_with_llm, stop_llama_server, warmup_llama_server,
          get_llama_server_status, start_llama_server, restart_llama_server,
@@ -340,6 +342,12 @@ pub fn run() {
             restore_session,
             change_password,
             start_google_oauth,
+            connect_google_calendar,
+            get_calendar_status,
+            disconnect_google_calendar,
+            connect_gmail,
+            get_gmail_status,
+            disconnect_gmail,
             // Settings
             get_settings,
             save_personal_settings,

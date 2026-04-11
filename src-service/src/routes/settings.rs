@@ -20,6 +20,7 @@ pub fn router() -> Router<ApiState> {
         .route("/settings/user/key/:key", get(get_user_setting_by_key))
         .route("/settings/api-key/:provider", get(get_api_key).post(set_api_key))
         .route("/settings/brave-key-id", post(set_brave_key_id))
+        .route("/settings/user-image", get(get_user_image).post(save_user_image))
 }
 
 async fn get_settings(
@@ -349,6 +350,82 @@ async fn set_api_key(
     }
     upsert_setting(&state, db_key, encrypted, now).await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ── User image (onboarding) endpoints ────────────────────────────────────────
+
+/// GET /settings/user-image
+/// Returns user_image parsed into a field map, plus the list of known profile fields.
+async fn get_user_image(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    use crate::service::harness::memory::user_image::{load_user_image, PROFILE_FIELDS};
+
+    let username = get_username_from_token(&state, &headers).await?;
+    let text = load_user_image(&state.db, &username).await;
+
+    // Parse into field map
+    let fields: std::collections::HashMap<String, String> = text.lines()
+        .filter_map(|line| {
+            let pos = line.find('：')?;
+            let key = line[..pos].trim().to_string();
+            let val = line[pos + '：'.len_utf8()..].trim().to_string();
+            if key.is_empty() || val.is_empty() { return None; }
+            Some((key, val))
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "fields": fields,
+        "profile_fields": PROFILE_FIELDS,
+        "raw_text": text,
+    })))
+}
+
+/// POST /settings/user-image
+/// Body: `{ "fields": { "所在地": "台北市", "語言": "繁體中文", ... } }`
+/// Writes directly to user_image (bypasses LLM — onboarding user-provided data).
+async fn save_user_image(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    use crate::service::harness::memory::user_image::PROFILE_FIELDS;
+
+    let username = get_username_from_token(&state, &headers).await?;
+    let fields_obj = body.get("fields")
+        .and_then(|v| v.as_object())
+        .ok_or((StatusCode::BAD_REQUEST, "Missing fields object".to_string()))?;
+
+    // Build ordered text: priority fields first, then others
+    let mut lines: Vec<String> = Vec::new();
+    for &pf in PROFILE_FIELDS {
+        if let Some(val) = fields_obj.get(pf).and_then(|v| v.as_str()) {
+            let val = val.trim();
+            if !val.is_empty() { lines.push(format!("{}：{}", pf, val)); }
+        }
+    }
+    for (key, val) in fields_obj {
+        if !PROFILE_FIELDS.contains(&key.as_str()) {
+            if let Some(v) = val.as_str() {
+                let v = v.trim();
+                if !v.is_empty() { lines.push(format!("{}：{}", key, v)); }
+            }
+        }
+    }
+    let text = lines.join("\n");
+
+    let now = Utc::now().timestamp();
+    let _ = state.db
+        .query("UPSERT user_settings SET username = $u, `key` = $k, `value` = $v, updated_at = $now WHERE username = $u AND `key` = $k")
+        .bind(("u", username))
+        .bind(("k", "user_image".to_string()))
+        .bind(("v", text))
+        .bind(("now", now))
+        .await;
+
     Ok(Json(json!({ "ok": true })))
 }
 

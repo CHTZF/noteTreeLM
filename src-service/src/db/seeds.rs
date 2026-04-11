@@ -71,17 +71,17 @@ const SKILLS: &[BuiltinSkill] = &[
         id: "builtin_search_note",
         title: "搜尋/查詢筆記",
         trigger: "搜尋、找、查、搜尋筆記、找資料、查某個主題、有沒有寫過、幫我找、找找看、查詢相關筆記、search notes、find note、look up、我有沒有寫、我有記過嗎、筆記裡有沒有、幫我查一下、找找有沒有、知識庫裡有",
-        behavior: "步驟1：呼叫 @[search_vault]，query 填入使用者問題中的關鍵字，取得相關筆記清單與摘要。步驟2：根據搜尋結果回覆使用者找到哪些筆記。步驟3（可選）：若使用者需要看完整內容，用搜尋結果中的路徑呼叫 read_note；若使用者要打開筆記，呼叫 open_note。",
+        behavior: "步驟1：判斷搜尋類型——若使用者問的是語意/主題（如「有什麼關於 X 的筆記」），呼叫 @[search_vault]；若使用者要找特定文字/程式碼/精確詞組（如「哪裡有寫到 function foo」），呼叫 @[grep_vault]。步驟2：根據搜尋結果回覆使用者找到哪些筆記。步驟3（可選）：若使用者需要看完整內容，用搜尋結果中的路徑呼叫 read_note；若使用者要打開筆記，呼叫 open_note。",
         injection_mode: "passive",
-        seed_version: 1,
+        seed_version: 2,
     },
     BuiltinSkill {
         id: "builtin_summarize_notes",
         title: "整理/摘要多篇筆記",
         trigger: "整理筆記、摘要多篇、幫我歸納、整合資料、總結所有、彙整、整理一份、summarize notes、consolidate、幫我做個總結、把這些筆記整理、歸納重點、統整一下、彙整成一篇、做個摘要",
-        behavior: "步驟1：呼叫 @[search_vault] 取得相關筆記清單。步驟2：對清單中每篇筆記呼叫 @[read_note] 讀取完整內容。步驟3：彙整所有內容後輸出摘要。步驟4（可選）：若使用者要存成新筆記，呼叫 @[plan_announce] 確認後再 @[create_note] 建立。",
+        behavior: "步驟1：呼叫 @[search_vault] 取得相關筆記清單（取得 path 列表）。步驟2：呼叫 @[batch_read_notes]（paths 填步驟1的路徑陣列，一次讀取所有筆記內容）。步驟3：彙整所有內容後輸出摘要。步驟4（可選）：若使用者要存成新筆記，呼叫 @[plan_announce] 確認後再 @[create_note] 建立。",
         injection_mode: "passive",
-        seed_version: 1,
+        seed_version: 2,
     },
     BuiltinSkill {
         id: "builtin_browse_structure",
@@ -127,9 +127,9 @@ const SKILLS: &[BuiltinSkill] = &[
         id: "builtin_web_search",
         title: "網路搜尋/外部資訊",
         trigger: "搜尋網路、查最新資訊、Google 一下、查新聞、找外部資料、搜網路、最新消息、web search、search the web、look it up online、查天氣、今天天氣、現在幾度、股價、最新匯率、即時資訊、查一下網路、幫我搜尋、去網路上找、外部資訊、最新動態、新聞、時事、最近發生什麼",
-        behavior: "步驟1：呼叫 @[web_search]（query 填具體搜尋關鍵字），取得最新網路資訊。步驟2：根據搜尋結果摘要回答使用者。",
+        behavior: "步驟1：呼叫 @[web_search]（query 填具體搜尋關鍵字），取得最新網路資訊與結果連結。步驟2（可選）：若搜尋結果摘要不夠完整、或使用者需要完整內容，從結果中選取最相關的 URL，呼叫 @[fetch_url] 取得頁面完整文字內容。步驟3：根據收集到的資訊回答使用者。",
         injection_mode: "passive",
-        seed_version: 1,
+        seed_version: 2,
     },
     BuiltinSkill {
         id: "builtin_create_skill",
@@ -167,9 +167,9 @@ const SKILLS: &[BuiltinSkill] = &[
         id: "builtin_deep_research",
         title: "深度研究整合（多篇筆記）",
         trigger: "深度研究、整合多篇筆記、綜合分析、跨筆記整理、找出關聯、知識整合、comprehensive research、deep dive、幫我深入研究、把相關筆記都找出來整合、綜合所有相關資料、跨文件分析、全面整理、多篇整合摘要、相關筆記分析",
-        behavior: "步驟1：呼叫 @[search_vault]（query 填研究主題）找出相關筆記清單。步驟2：對清單中每篇筆記呼叫 @[read_note] 讀取完整內容。步驟3：彙整後輸出整合摘要，並列出來源筆記路徑。",
+        behavior: "步驟1：呼叫 @[search_vault]（query 填研究主題）找出相關筆記清單。步驟1b（可選）：若需要找特定詞彙或程式碼出現位置，同時呼叫 @[grep_vault]（pattern 填精確關鍵字）補充語意搜尋的不足。步驟2：呼叫 @[batch_read_notes]（paths 填步驟1/1b 取得的路徑陣列，一次讀取全部）取得完整內容。步驟3：彙整後輸出整合摘要，並列出來源筆記路徑。",
         injection_mode: "passive",
-        seed_version: 1,
+        seed_version: 2,
     },
     BuiltinSkill {
         id: "builtin_personal_insight",
@@ -266,6 +266,39 @@ const SKILLS: &[BuiltinSkill] = &[
         behavior: "步驟1：呼叫 get_unprocessed_conversations 取得尚未分析記憶的對話列表。步驟2：對每個對話呼叫 get_conversation_content 取得完整訊息內容。步驟3：判斷是否有長期記憶價值，有 → 呼叫 save_memory_facts；無論如何每個對話都呼叫 mark_conversation_processed。步驟4：全部完成後呼叫 condense_memory_facts。步驟5：回覆整理摘要。",
         injection_mode: "passive",
         seed_version: 1,
+    },
+    BuiltinSkill {
+        id: "builtin_calendar",
+        title: "Google Calendar 行程查詢/建立",
+        trigger: "我今天有什麼行程、查行程、看行程、今天的行程、明天行程、這週有什麼、幫我加個行程、建立行程、新增行程、安排會議、calendar、schedule event、check calendar、what's on my calendar、幫我排一個、加到行事曆、建一個會議、設定行程",
+        behavior: "步驟1：若使用者要查詢行程，呼叫 @[get_calendar_events]（date 填使用者指定日期或今天，days 填查詢天數）。步驟2：若使用者要建立行程，先確認標題、時間（從【當前時間】推算，含時區），再呼叫 @[create_calendar_event]（title、start、end 使用 RFC 3339 格式含時區）。若 Google Calendar 尚未連接，告知使用者前往設定頁面連接。",
+        injection_mode: "passive",
+        seed_version: 1,
+    },
+    BuiltinSkill {
+        id: "builtin_use_template",
+        title: "套用筆記模板",
+        trigger: "套用模板、用模板建立、從模板新增、用範本、套模板、use template、apply template、create from template、從範本建立、幫我用模板、用模板寫、我有模板嗎、有什麼模板、查看模板、列出模板",
+        behavior: "步驟1：呼叫 @[list_structure]（path 填 \"templates\"）列出可用的模板清單。若資料夾不存在，改呼叫 @[search_vault]（query 填 \"template\"）搜尋模板筆記。步驟2：根據使用者需求選出最符合的模板，呼叫 @[read_note] 讀取模板內容。步驟3：將模板中的佔位符（如 {{日期}}、{{標題}}）替換為使用者提供的資訊（日期從系統時間取得）。步驟4：呼叫 @[plan_announce] 告知將建立的路徑與填入後的內容摘要。步驟5：使用者確認後呼叫 @[create_note] 建立筆記。",
+        injection_mode: "passive",
+        seed_version: 1,
+    },
+    BuiltinSkill {
+        id: "builtin_email_summary",
+        title: "Gmail 郵件整理/摘要",
+        trigger: "整理郵件、看今天的郵件、新郵件、未讀郵件、幫我看信、幫我整理信、查信、有什麼信、email summary、check email、today's email、unread emails、read my email、what emails did I get、郵件摘要、有哪些信、最新郵件",
+        behavior: "【鐵則，不可違反】\
+⚠ 當使用者想查看某封郵件的詳細內容（不論給的是主旨、寄件者或任何描述），你必須從 list_emails 結果的 messages 陣列中找到對應的 id 欄位，立即呼叫 @[read_email]。禁止直接用 snippet 回答——snippet 只是預覽。\
+⚠ 禁止捏造郵件正文、金額、日期、連結或任何數字。\
+⚠ 禁止要求使用者提供郵件 ID——使用者不知道郵件 ID。你必須自行從 list_emails 結果中提取 id 欄位。若不確定是哪封，選最相符的一封直接呼叫，不要詢問。\
+---\
+工具呼叫順序：\
+步驟1：若對話歷史中尚無 list_emails 工具結果，呼叫 @[list_emails]（query=`is:inbox newer_than:1d`，max_results=20）。若對話歷史已有 list_emails 結果，絕對不可再次呼叫——直接從歷史結果進行步驟2。\
+步驟2：在 list_emails 結果的 messages 陣列中比對 subject/from，取出對應的 id 欄位（16 位十六進位），立即呼叫 @[read_email]（message_id 填該 id）。\
+步驟3：根據 read_email 的真實回傳內容回答，不得自行補充或改寫郵件內容。\
+若 Gmail 未連接，告知前往設定連接。",
+        injection_mode: "passive",
+        seed_version: 8,
     },
 ];
 
@@ -574,6 +607,144 @@ pub async fn ensure_memory_schedule(db: &SurrealDb, vault_id: &str, account_id: 
         .await;
 
     tracing::info!("[seeds] created memory_agent schedule for vault={} account={}", vault_id, account_id);
+}
+
+/// Seed the `templates/` folder and starter template notes inside a vault.
+///
+/// Idempotent: only runs if the `templates/` directory does not yet exist in
+/// the vault root.  This lets users who already have a templates folder keep
+/// their customisations untouched.
+pub async fn seed_vault_templates(vault_path: &str) {
+    if vault_path.is_empty() { return; }
+    let templates_dir = std::path::Path::new(vault_path).join("templates");
+    if templates_dir.exists() { return; }
+
+    if let Err(e) = std::fs::create_dir_all(&templates_dir) {
+        tracing::warn!("[seeds] failed to create templates/ dir in {}: {}", vault_path, e);
+        return;
+    }
+
+    // ── Starter templates ────────────────────────────────────────────────────
+    let templates: &[(&str, &str)] = &[
+        ("會議紀錄.md", "\
+# 會議紀錄：{{標題}}
+
+**日期：** {{日期}}
+**與會人員：** {{人員}}
+**主持人：** {{主持人}}
+
+---
+
+## 議程
+
+1.
+
+## 討論紀錄
+
+### 主題一：
+
+### 主題二：
+
+## 決議事項
+
+- [ ]
+
+## 下次會議
+
+**時間：**
+**預計議題：**
+"),
+        ("每日日記.md", "\
+# {{日期}} 日記
+
+## 今天完成了什麼
+
+-
+
+## 遇到的問題
+
+-
+
+## 明天的計劃
+
+- [ ]
+
+## 隨筆
+
+"),
+        ("專案計劃.md", "\
+# 專案：{{專案名稱}}
+
+**開始日期：** {{日期}}
+**預計完成：**
+**負責人：**
+
+---
+
+## 目標
+
+> 一句話說明這個專案要達成什麼。
+
+## 範圍
+
+### In Scope
+-
+
+### Out of Scope
+-
+
+## 里程碑
+
+| 里程碑 | 預計日期 | 狀態 |
+|--------|----------|------|
+|        |          | 待開始 |
+
+## 任務清單
+
+- [ ]
+
+## 備注
+
+"),
+        ("讀書筆記.md", "\
+# 讀書筆記：{{書名}}
+
+**作者：** {{作者}}
+**閱讀日期：** {{日期}}
+**評分：** ⭐⭐⭐⭐⭐
+
+---
+
+## 核心主題
+
+## 重點摘要
+
+1.
+
+## 印象深刻的段落
+
+>
+
+## 個人反思
+
+## 行動項目
+
+- [ ]
+
+## 相關筆記
+
+-
+"),
+    ];
+
+    for (filename, content) in templates {
+        let file_path = templates_dir.join(filename);
+        if let Err(e) = std::fs::write(&file_path, content.as_bytes()) {
+            tracing::warn!("[seeds] failed to write template {}: {}", filename, e);
+        }
+    }
+
+    tracing::info!("[seeds] seeded {} templates in {}", templates.len(), vault_path);
 }
 
 /// Embed all skills for an account that have no embedding yet.

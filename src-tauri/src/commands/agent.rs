@@ -113,9 +113,14 @@ pub async fn invoke_agent(
         .collect();
 
     // 5. 委派給 service（pending plan、skill pre-pass、tool loop、DB 存取全在 service 處理）
+    // agent/run 是阻塞式請求（等 run_agent 跑完才回傳），可能因外部 API（Gmail/Calendar）
+    // 而花費數十秒，故使用無 timeout 的 client，避免 state.http_client 的 15s 限制觸發。
+    let agent_client = reqwest::Client::builder()
+        .build()
+        .unwrap_or_default();
     let vault_id_str = vault_id_opt.as_deref().unwrap_or("");
     let resp = crate::api_client::daemon_post::<_, serde_json::Value>(
-        &state.http_client,
+        &agent_client,
         &format!("/vaults/{}/agent/run", urlencoding::encode(vault_id_str)),
         &serde_json::json!({
             "session_id": session_id,
@@ -131,10 +136,11 @@ pub async fn invoke_agent(
         tok,
     ).await.map_err(|e| AppError::AI(e.to_string()))?;
 
-    // Tokens/events 透過 SSE passthrough 抵達前端；回傳 session_id + conversation_id
+    // Tokens/events 透過 SSE passthrough 抵達前端；回傳 session_id + conversation_id + cite_passed
     Ok(serde_json::json!({
         "session_id": session_id,
         "conversation_id": resp["conversation_id"],
+        "cite_passed": resp["cite_passed"],
     }))
 }
 

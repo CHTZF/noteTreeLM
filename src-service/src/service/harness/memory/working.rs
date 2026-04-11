@@ -46,21 +46,44 @@ const MAX_RECALL_CALLS: usize = 5;
 
 #[derive(Clone)]
 pub(crate) struct WorkingMemory {
-    inner:          Arc<Mutex<HashMap<String, ToolCallRecord>>>,
-    recall_count:   Arc<AtomicUsize>,
+    /// Persistent evidence store — carries over across messages in the same conversation.
+    /// Keyed by tool_call_id; used for cite validation, guard evaluation, and recall.
+    inner:           Arc<Mutex<HashMap<String, ToolCallRecord>>>,
+    /// IDs recorded in the CURRENT run only (cleared by `start_new_run`).
+    /// Used to restrict stall detection to within a single user message so that
+    /// calling `list_emails` in message 1 does not block it in message 2.
+    current_run_ids: Arc<Mutex<std::collections::HashSet<String>>>,
+    recall_count:    Arc<AtomicUsize>,
     /// Active skills carried across ReAct rounds.
     /// Set when skill pass fires; cleared when a round produces a final answer (no tool calls).
-    active_skills:  Arc<Mutex<Option<SkillPassResult>>>,
+    active_skills:   Arc<Mutex<Option<SkillPassResult>>>,
 }
 
 impl WorkingMemory {
     /// Create a new, empty `WorkingMemory` for the session.
     pub(crate) fn new() -> Self {
         Self {
-            inner:         Arc::new(Mutex::new(HashMap::new())),
-            recall_count:  Arc::new(AtomicUsize::new(0)),
-            active_skills: Arc::new(Mutex::new(None)),
+            inner:           Arc::new(Mutex::new(HashMap::new())),
+            current_run_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            recall_count:    Arc::new(AtomicUsize::new(0)),
+            active_skills:   Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Called at the start of each new user-message run.
+    /// Resets per-run state (stall detection, recall cap) while preserving the
+    /// persistent evidence store (`inner`) so previous tool results remain citable.
+    pub(crate) async fn start_new_run(&self) {
+        self.current_run_ids.lock().await.clear();
+        self.recall_count.store(0, Ordering::Relaxed);
+    }
+
+    /// Returns true if at least one tool call was recorded in the current run.
+    /// Used by cite enforcement: only require cite tags when tools have actually
+    /// returned results — if no tools ran (e.g. all failed), the LLM is free to
+    /// respond without a cite tag.
+    pub(crate) async fn current_run_has_results(&self) -> bool {
+        !self.current_run_ids.lock().await.is_empty()
     }
 
     /// Persist activated skills so subsequent rounds can re-inject them without
@@ -108,8 +131,10 @@ impl WorkingMemory {
         duration_ms:   u64,
         guard_outcome: GuardOutcome,
     ) {
+        let id = id.into();
+        self.current_run_ids.lock().await.insert(id.clone());
         self.inner.lock().await.insert(
-            id.into(),
+            id,
             ToolCallRecord { name: name.into(), args, result, started_at, duration_ms, guard_outcome },
         );
     }
@@ -145,10 +170,13 @@ impl WorkingMemory {
     /// (same tool name + identical `path` or `query` arg).
     /// Used by the round loop to inject a stall-detection warning.
     pub(crate) async fn repeated_calls(&self) -> Vec<(String, String)> {
+        let run_ids = self.current_run_ids.lock().await;
         let map = self.inner.lock().await;
         let mut counts: std::collections::HashMap<(String, String), usize> =
             std::collections::HashMap::new();
-        for rec in map.values() {
+        // Only count calls from the current run to avoid cross-message false stalls.
+        for (id, rec) in map.iter() {
+            if !run_ids.contains(id) { continue; }
             let key_arg = rec.args["path"]
                 .as_str()
                 .or_else(|| rec.args["query"].as_str())
@@ -186,13 +214,13 @@ impl WorkingMemory {
         let results: Vec<Value> = records.iter().filter_map(|r| {
             let args_str  = r.args.to_string().to_lowercase();
             let result_preview = r.result.to_string();
-            let result_str = result_preview[..result_preview.len().min(500)].to_lowercase();
+            let result_str = result_preview[..result_preview.floor_char_boundary(500)].to_lowercase();
             let name_str  = r.name.to_lowercase();
             if name_str.contains(&q) || args_str.contains(&q) || result_str.contains(&q) {
                 Some(serde_json::json!({
                     "tool":     r.name,
                     "args":     r.args,
-                    "result":   &result_preview[..result_preview.len().min(800)],
+                    "result":   &result_preview[..result_preview.floor_char_boundary(800)],
                 }))
             } else {
                 None
@@ -217,6 +245,44 @@ impl WorkingMemory {
             collect_cite_ids_from_value(&rec.result, &mut ids);
         }
         ids
+    }
+
+    /// Look up a single cite ID and return `(tool_name, result_preview)` if found.
+    /// `result_preview` is the first 300 chars of the result JSON string.
+    /// Returns `None` if the ID is not a top-level tool_call_id key.
+    pub(crate) async fn cite_detail(&self, id: &str) -> Option<(String, String)> {
+        let map = self.inner.lock().await;
+        map.get(id).map(|rec| {
+            let preview = rec.result.to_string();
+            let preview = preview[..preview.floor_char_boundary(300)].to_string();
+            (rec.name.clone(), preview)
+        })
+    }
+
+    /// Return top-level tool call records sorted by `started_at`, as `(id, tool_name)` pairs.
+    /// Only includes the direct `tool_call_id` keys (not nested `__cite_id__` values inside
+    /// results), so the LLM can see exactly which tool produced each citable result.
+    pub(crate) async fn cite_id_tool_pairs(&self) -> Vec<(String, String)> {
+        let map = self.inner.lock().await;
+        let mut pairs: Vec<_> = map.iter()
+            .map(|(id, rec)| (rec.started_at, id.clone(), rec.name.clone()))
+            .collect();
+        pairs.sort_by_key(|(ts, _, _)| *ts);
+        pairs.into_iter().map(|(_, id, name)| (id, name)).collect()
+    }
+
+    /// Same as `cite_id_tool_pairs` but restricted to the CURRENT RUN only.
+    /// Used by `cite_reminder` so the LLM is only prompted to cite tools it called
+    /// in this round, not carry-over results from previous messages.
+    pub(crate) async fn current_run_cite_pairs(&self) -> Vec<(String, String)> {
+        let run_ids = self.current_run_ids.lock().await;
+        let map     = self.inner.lock().await;
+        let mut pairs: Vec<_> = map.iter()
+            .filter(|(id, _)| run_ids.contains(*id))
+            .map(|(id, rec)| (rec.started_at, id.clone(), rec.name.clone()))
+            .collect();
+        pairs.sort_by_key(|(ts, _, _)| *ts);
+        pairs.into_iter().map(|(_, id, name)| (id, name)).collect()
     }
 
     /// Snapshot all records as a JSON-serialisable summary for `get_session_state`.

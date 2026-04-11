@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { Message } from './types'
 
 export default function MessageBubble({
@@ -21,6 +22,13 @@ export default function MessageBubble({
   const isTool = message.role === 'tool'
   const isNotice = message.role === 'notice'
   const isThink = message.role === 'think'
+  const citeFailed = message.citeFailed
+  const citeDetails = message.citeDetails
+  // citeFailed === undefined → no cite_status received (pure text, no tools ran) → hide badge
+  // citeFailed === false    → cite_status passed → show ✓
+  // citeFailed === true     → cite_status failed → show ⚠
+  const hasCiteInfo = citeFailed !== undefined
+  const [citeExpanded, setCiteExpanded] = useState(false)
 
   if (isThink) {
     return (
@@ -102,6 +110,57 @@ export default function MessageBubble({
             <style>{`@keyframes blink { 0%, 100% { opacity: 1 } 50% { opacity: 0 } }`}</style>
           )}
         </div>
+        {!isUser && !isTool && !isNotice && hasCiteInfo && (
+          <div style={{ marginTop: '4px' }}>
+            <button
+              onClick={() => setCiteExpanded(v => !v)}
+              title={citeFailed ? '此回覆未通過引用驗證，內容可能包含未經確認的資料' : '點選展開引用來源'}
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: '4px',
+                fontSize: '11px', padding: '2px 7px', borderRadius: '10px',
+                background: citeFailed ? 'rgba(255,159,10,0.12)' : 'rgba(48,209,88,0.10)',
+                border: `1px solid ${citeFailed ? 'rgba(255,159,10,0.35)' : 'rgba(48,209,88,0.35)'}`,
+                color: citeFailed ? '#ff9f0a' : '#30d158',
+                cursor: 'pointer', userSelect: 'none',
+              }}
+            >
+              {citeFailed ? '⚠ 引用未驗證' : '✓ 引用已驗證'}
+              {!citeFailed && citeDetails && citeDetails.length > 0 && (
+                <span style={{ opacity: 0.7 }}>{citeExpanded ? '▲' : '▼'}</span>
+              )}
+            </button>
+            {citeExpanded && !citeFailed && citeDetails && citeDetails.length > 0 && (
+              <div style={{
+                marginTop: '6px',
+                display: 'flex', flexDirection: 'column', gap: '6px',
+              }}>
+                {citeDetails.map(d => (
+                  <div key={d.id} style={{
+                    padding: '6px 10px', borderRadius: '6px',
+                    background: 'var(--color-bg-overlay)',
+                    border: '1px solid var(--color-border)',
+                    fontSize: '11px', lineHeight: 1.5,
+                  }}>
+                    <div style={{
+                      fontFamily: 'var(--font-mono, monospace)',
+                      color: 'var(--color-text-muted)',
+                      marginBottom: '2px',
+                    }}>
+                      📎 {d.tool}
+                    </div>
+                    <div style={{
+                      color: 'var(--color-text-secondary)',
+                      whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                      maxHeight: '120px', overflowY: 'auto',
+                    }}>
+                      {d.preview}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
         {!isUser && !isTool && !isNotice && (onSaveWeb || onExtractSkill || onRate) && (
           <div style={{ display: 'flex', gap: '4px', marginTop: '2px', alignItems: 'center' }}>
             {onSaveWeb && (

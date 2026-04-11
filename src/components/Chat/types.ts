@@ -3,6 +3,8 @@ export interface Message {
   content: string
   webRefs?: Array<{ path: string; title: string; excerpt: string }>
   savedWeb?: boolean
+  citeFailed?: boolean
+  citeDetails?: Array<{ id: string; tool: string; preview: string }>
 }
 
 export type SkillPreview = {

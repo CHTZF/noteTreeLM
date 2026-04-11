@@ -92,6 +92,19 @@ pub(crate) async fn run(
                         .unwrap_or_default()
                 } else { aid };
 
+                // Mark orphaned tasks (unresolvable account_id) as done so they stop firing.
+                if account_id.is_empty() {
+                    tracing::info!(
+                        "[scheduler] marking task {} as done — could not resolve account_id (orphaned vault)",
+                        tid
+                    );
+                    let _ = state_c.db
+                        .query("UPDATE scheduled_tasks SET status = 'done' WHERE task_id = $tid")
+                        .bind(("tid", tid))
+                        .await;
+                    return;
+                }
+
                 let agent_def = match crate::service::helpers::load_agent_def(
                     &state_c.db, &agent_name, &account_id,
                 ).await {

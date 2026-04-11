@@ -11,3 +11,5 @@ pub mod search;
 pub mod memory;
 pub mod scheduled;
 pub mod events;
+pub mod calendar;
+pub mod gmail;
