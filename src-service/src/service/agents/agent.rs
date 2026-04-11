@@ -97,7 +97,7 @@ pub async fn run_agent(
     let full_response = run_tool_loop(
         &runtime, &tool_names,
         enable_think, runtime.native_think, max_rounds, skills_are_cached,
-        Arc::clone(&tx),
+        Arc::clone(&tx), &input,
     ).await;
 
     // ── Step 8: Post-processing ───────────────────────────────────────────────
@@ -202,9 +202,13 @@ async fn run_tool_loop(
     max_rounds:       usize,
     skills_are_cached: bool,
     tx:               Arc<Transaction>,
+    input:            &str,
 ) -> String {
     let emitter = &runtime.emitter;
     let mut full_response = String::new();
+    // Transient corrections: appended to each round's snapshot but never written to the
+    // context buffer (and therefore never stored in DB or seen by memory agent).
+    let mut pending_corrections: Vec<Value> = Vec::new();
 
     if !tool_names.is_empty() {
         let tools_schema = build_tools_schema(tool_names);
@@ -261,6 +265,8 @@ async fn run_tool_loop(
             };
 
             let mut msgs_snapshot = runtime.get_context_msgs(true).await;
+            // Append transient corrections from previous rounds (not in context buffer).
+            msgs_snapshot.extend(pending_corrections.clone());
             // On the first content round when skills are active (whether freshly activated
             // or cached), inject a transient directive. For freshly-activated skills just say
             // "call immediately". For cached skills, also list already-executed tools from WM
@@ -341,16 +347,21 @@ async fn run_tool_loop(
             // Limit retries to avoid looping forever.
             if force_tool_use && tool_chunks.is_empty() && !text.trim().is_empty() {
                 tracing::warn!("[agent] LLM ignored tool_choice:required — injecting tool-call correction");
-                runtime.push_msg(json!({ "role": "assistant", "content": text })).await;
                 let msg = match runtime.locale {
-                    super::super::harness::prompt::Locale::En =>
-                        "[System] You must call a tool now. Do not output any text. \
-                         Call the required tool immediately using the tool call format.",
-                    _ =>
-                        "[系統] 你必須立即呼叫工具，不要輸出任何文字。\
-                         請直接使用工具呼叫格式呼叫所需的工具。",
+                    super::super::harness::prompt::Locale::En => format!(
+                        "[System] You must call a tool now to fulfil the user's request: \"{}\". \
+                         Do not output any text. Call the required tool immediately.",
+                        input
+                    ),
+                    _ => format!(
+                        "[系統] 你必須立即呼叫工具來完成使用者的請求：「{}」。\
+                         不要輸出任何文字，直接使用工具呼叫格式。",
+                        input
+                    ),
                 };
-                runtime.push_msg(json!({ "role": "user", "content": msg })).await;
+                pending_corrections.clear();
+                pending_corrections.push(json!({ "role": "assistant", "content": text }));
+                pending_corrections.push(json!({ "role": "user", "content": msg }));
                 emitter.emit("agent:clear_stream".to_string(), json!({}));
                 // continue to next round — force_tool_use will be false (not first content round)
                 // but skills are still active and tool_choice will be "auto"; the correction
@@ -416,9 +427,6 @@ async fn run_tool_loop(
                 // Push its reply as assistant message and inject a correction that
                 // explains *what* a cite ID is and lists available IDs with their
                 // corresponding tool names, so the LLM can connect ID → result.
-                if !text.is_empty() {
-                    runtime.push_msg(json!({ "role": "assistant", "content": text })).await;
-                }
                 let current_run_has_results = runtime.working_memory.current_run_has_results().await;
                 let all_pairs = runtime.working_memory.cite_id_tool_pairs().await;
                 let current_pairs = runtime.working_memory.current_run_cite_pairs().await;
@@ -486,13 +494,19 @@ async fn run_tool_loop(
                         ),
                     }
                 };
-                // Use role:system so the correction is treated as an instruction rather
-                // than a user message. This prevents the LLM from learning to mimic
-                // [系統] bracket-prefixed formatting in its own responses, which was the
-                // root cause of fabricated [外部資料] and similar markers appearing in
-                // answers. System messages are also excluded from post_process DB persistence,
-                // so they won't appear in conversation history on reload.
-                runtime.push_msg(json!({ "role": "user", "content": correction })).await;
+                // Correction is transient: appended to the next round's snapshot but never
+                // written to context buffer or DB, so memory agent stays clean.
+                let correction_with_input = match runtime.locale {
+                    super::super::harness::prompt::Locale::En =>
+                        format!("{}\n\n(User's original request: \"{}\")", correction, input),
+                    _ =>
+                        format!("{}\n\n（使用者原始請求：「{}」）", correction, input),
+                };
+                pending_corrections.clear();
+                if !text.is_empty() {
+                    pending_corrections.push(json!({ "role": "assistant", "content": text }));
+                }
+                pending_corrections.push(json!({ "role": "user", "content": correction_with_input }));
                 // Signal frontend to clear the streaming buffer before correction round
                 emitter.emit("agent:cite_correction_start".to_string(), json!({}));
                 // continue to next round for correction
@@ -520,6 +534,7 @@ async fn run_tool_loop(
                 }
                 // Clear sticky skills so build_agent_context starts fresh next round.
                 runtime.working_memory.clear_active_skills().await;
+                pending_corrections.clear();
                 break;
             }
         }
