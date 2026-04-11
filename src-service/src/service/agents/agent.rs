@@ -296,7 +296,9 @@ async fn run_tool_loop(
                             "立即呼叫工具。不要在工具呼叫之前輸出任何說明、確認或過渡語句。".to_string(),
                     }
                 };
-                msgs_snapshot.push(json!({ "role": "system", "content": hint }));
+                // Use role:user for mid-conversation directives — some models (e.g. Qwen3.5)
+                // only allow system messages at the very beginning of the conversation.
+                msgs_snapshot.push(json!({ "role": "user", "content": hint }));
             }
 
             let llm_t0 = std::time::Instant::now();
@@ -348,7 +350,7 @@ async fn run_tool_loop(
                         "[系統] 你必須立即呼叫工具，不要輸出任何文字。\
                          請直接使用工具呼叫格式呼叫所需的工具。",
                 };
-                runtime.push_msg(json!({ "role": "system", "content": msg })).await;
+                runtime.push_msg(json!({ "role": "user", "content": msg })).await;
                 emitter.emit("agent:clear_stream".to_string(), json!({}));
                 // continue to next round — force_tool_use will be false (not first content round)
                 // but skills are still active and tool_choice will be "auto"; the correction
@@ -490,7 +492,7 @@ async fn run_tool_loop(
                 // root cause of fabricated [外部資料] and similar markers appearing in
                 // answers. System messages are also excluded from post_process DB persistence,
                 // so they won't appear in conversation history on reload.
-                runtime.push_msg(json!({ "role": "system", "content": correction })).await;
+                runtime.push_msg(json!({ "role": "user", "content": correction })).await;
                 // Signal frontend to clear the streaming buffer before correction round
                 emitter.emit("agent:cite_correction_start".to_string(), json!({}));
                 // continue to next round for correction
