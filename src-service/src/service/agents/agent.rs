@@ -185,6 +185,7 @@ async fn run_one_llm_round(
         let tnames: &[String] = if has_tools { tool_names } else { &[] };
         llm::stream_llm_round(
             &runtime.client, &runtime.llm_url, body, emitter, &runtime.cancel, wm, tnames,
+            runtime.native_think,
         ).await.map(|(t, _, chunks, ci)| (t, chunks, ci))
     } else {
         llm::call_llm_once(
@@ -309,16 +310,10 @@ async fn run_tool_loop(
 
             if !text.is_empty() {
                 if native_think && text.contains("<think>") {
-                    // Model produced native <think>...</think> blocks: strip them for the
-                    // user-facing response but keep the original in context so the LLM
-                    // retains its chain-of-thought across tool rounds.
-                    let clean = strip_think_blocks(&text);
-                    if runtime.streaming && !clean.is_empty() {
-                        // Replace what was already streamed with the clean version.
-                        emitter.emit("agent:clear_stream".to_string(), json!({}));
-                        emitter.emit("llm:token".to_string(), json!(clean));
-                    }
-                    full_response = clean;
+                    // Streaming already routed think tokens to llm:think_token and answer
+                    // tokens to llm:token. Strip think blocks here only for DB storage so
+                    // the LLM's context window doesn't accumulate chain-of-thought noise.
+                    full_response = strip_think_blocks(&text);
                 } else {
                     full_response = text.clone();
                 }
@@ -533,12 +528,8 @@ async fn run_tool_loop(
         match run_one_llm_round(runtime, &msgs_snapshot, None, json!("auto"), &[], emitter).await {
             Ok((text, _, _)) => {
                 if native_think && text.contains("<think>") {
-                    let clean = strip_think_blocks(&text);
-                    if runtime.streaming && !clean.is_empty() {
-                        emitter.emit("agent:clear_stream".to_string(), json!({}));
-                        emitter.emit("llm:token".to_string(), json!(clean));
-                    }
-                    full_response = clean;
+                    // Streaming already routed think tokens to llm:think_token; strip for DB storage.
+                    full_response = strip_think_blocks(&text);
                 } else {
                     full_response = text;
                 }

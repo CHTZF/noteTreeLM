@@ -60,6 +60,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const streamingRef = useRef('')
+  const thinkStreamingRef = useRef('')  // accumulated native-think block content
+  const [thinkStreamingText, setThinkStreamingText] = useState('')
   const llmDoneContentRef = useRef('')  // authoritative final content from llm:done (citation-stripped)
   const citeFailedRef = useRef<boolean | undefined>(undefined)  // undefined=no event, false=passed, true=failed
   const citeDetailsRef = useRef<Array<{ id: string; tool: string; preview: string }>>([])  // details from agent:citation
@@ -419,8 +421,10 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     setInput('')
     setIsStreaming(true)
     setStreamingText('')
+    setThinkStreamingText('')
     setError('')
     streamingRef.current = ''
+    thinkStreamingRef.current = ''
     tokenCountRef.current = 0
 
     // 只把 user/assistant 訊息送給 LLM（tool/notice 只做 UI 顯示，不進入 context）
@@ -444,6 +448,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     let unlistenSkillFound: (() => void) = () => {}
     let unlistenSkillNotFound: (() => void) = () => {}
     let unlistenThink: (() => void) = () => {}
+    let unlistenThinkToken: (() => void) = () => {}
     let unlistenPlanAnnounce: (() => void) = () => {}
     let unlistenCitationMissing: (() => void) = () => {}
     let unlistenCitation: (() => void) = () => {}
@@ -496,6 +501,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         unlistenSkillFound,
         unlistenSkillNotFound,
         unlistenThink,
+        unlistenThinkToken,
         unlistenWriteTimeout,
         unlistenPlanAnnounce,
         unlistenCitationMissing,
@@ -624,6 +630,12 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         listen<{ thought: string }>('agent:think', (e) => {
           setMessages(prev => [...prev, { role: 'think' as const, content: e.payload.thought }])
         }),
+        // llm:think_token — native-think model (e.g. Qwen3.5) emits chain-of-thought tokens
+        // separately from answer tokens. Accumulate here; finalize as a think message on llm:done.
+        listen<string>('llm:think_token', (e) => {
+          thinkStreamingRef.current += e.payload
+          setThinkStreamingText(thinkStreamingRef.current)
+        }),
         listen<{ display: string }>('agent:write_timeout', () => {
           setPendingWriteDisplay(null)
           setMessages(prev => [...prev, { role: 'notice' as const, content: '⏱ 確認逾時，操作已取消' }])
@@ -708,13 +720,23 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       const webRefs = pendingWebRefsRef.current.length > 0
         ? pendingWebRefsRef.current
         : undefined
-      setMessages(prev => [...prev, {
-        role: 'assistant' as const,
-        content: finalContent,
-        webRefs,
-        citeFailed: citeFailedRef.current,
-        citeDetails: citeDetailsRef.current.length > 0 ? citeDetailsRef.current : undefined,
-      }])
+      // Finalize native-think block: if the model emitted <think> tokens, push them as a
+      // collapsible think message before the assistant answer.
+      const thinkContent = thinkStreamingRef.current
+      thinkStreamingRef.current = ''
+      setThinkStreamingText('')
+      setMessages(prev => {
+        const next = thinkContent
+          ? [...prev, { role: 'think' as const, content: thinkContent }]
+          : [...prev]
+        return [...next, {
+          role: 'assistant' as const,
+          content: finalContent,
+          webRefs,
+          citeFailed: citeFailedRef.current,
+          citeDetails: citeDetailsRef.current.length > 0 ? citeDetailsRef.current : undefined,
+        }]
+      })
 
       if (hasSkillIntent(text) && finalContent.length > 0) {
         doExtractSkill(text, finalContent)
@@ -748,6 +770,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       unlistenSkillFound()
       unlistenSkillNotFound()
       unlistenThink()
+      unlistenThinkToken()
       unlistenWriteTimeout()
       unlistenPlanAnnounce()
       unlistenCitationMissing()
@@ -1175,6 +1198,14 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
               )
             })
           })()}
+
+          {/* 原生 think 串流中：顯示模型思考內容（收合式） */}
+          {isStreaming && thinkStreamingText && (
+            <MessageBubble
+              message={{ role: 'think', content: thinkStreamingText }}
+              streaming
+            />
+          )}
 
           {/* 串流中 / agent 思考中的 assistant 泡泡 */}
           {isStreaming && (

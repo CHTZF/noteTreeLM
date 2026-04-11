@@ -424,6 +424,7 @@ pub(crate) async fn stream_llm_round(
     cancel: &Arc<AtomicBool>,
     working_memory: Option<&WorkingMemory>,
     tool_names: &[String],
+    native_think: bool,
 ) -> Result<(String, String, Vec<(String, String, String)>, bool), String> {
     let resp = client
         .post(format!("{}/v1/chat/completions", llm_url))
@@ -468,6 +469,11 @@ pub(crate) async fn stream_llm_round(
     // text accumulated before the JSON object started (preamble to discard)
     let mut pre_json_buf = String::new();
     let mut tc_text_idx = 0usize;
+    // Native-think block tracking: Qwen3.5-style models emit <think>...</think> before answering.
+    // Tokens inside <think> are routed to llm:think_token; tokens outside to llm:token.
+    let mut in_think_block = false;
+    // Small buffer to detect <think>/<think> tags that span SSE chunk boundaries.
+    let mut think_detect_buf = String::new();
 
     // Emit text through the cite-stripping pipeline and HOLD_BACK buffer.
     macro_rules! emit_text {
@@ -514,12 +520,40 @@ pub(crate) async fn stream_llm_round(
                         if let Some(content) = delta["content"].as_str() {
                             if !content.is_empty() {
                                 full_text.push_str(content);
+                                // ── Native think-block routing ────────────────────────────────────
+                                // Split content on <think>/<think> boundaries. Think-block tokens go
+                                // to llm:think_token; only answer tokens flow into the json-depth tracker.
+                                // Tag detection buffers handle tags that span SSE chunk boundaries.
+                                let owned_content: String;
+                                let content_to_track: &str = if native_think {
+                                    think_detect_buf.push_str(content);
+                                    let combined = std::mem::take(&mut think_detect_buf);
+                                    let (segs, leftover) = split_think_content(&combined, &mut in_think_block);
+                                    think_detect_buf = leftover;
+                                    owned_content = {
+                                        let mut non_think = String::new();
+                                        for (is_think, seg) in segs {
+                                            if is_think {
+                                                if !seg.is_empty() {
+                                                    emitter.emit("llm:think_token".to_string(), json!(seg));
+                                                }
+                                            } else {
+                                                non_think.push_str(&seg);
+                                            }
+                                        }
+                                        non_think
+                                    };
+                                    &owned_content
+                                } else {
+                                    owned_content = String::new();
+                                    content
+                                };
                                 // ── JSON depth tracker ───────────────────────
                                 // Walk the incoming chunk character by character.
                                 // Once we see '{' we enter JSON-buffering mode and
                                 // stop emitting. Strings inside JSON are handled by
                                 // tracking whether we're inside a quoted string.
-                                let mut chunk_rest = content;
+                                let mut chunk_rest = content_to_track;
                                 while !chunk_rest.is_empty() {
                                     if json_depth == 0 {
                                         // Not yet inside a JSON object.
@@ -666,6 +700,19 @@ pub(crate) async fn stream_llm_round(
                     }
                 }
             }
+        }
+    }
+
+    // ── Native think: flush remaining detection buffer ────────────────────────
+    // If the stream ended while we still had a partial tag buffered, emit it
+    // as the appropriate type (think or normal).
+    if native_think && !think_detect_buf.is_empty() {
+        let leftover = std::mem::take(&mut think_detect_buf);
+        if in_think_block {
+            emitter.emit("llm:think_token".to_string(), json!(leftover));
+        } else {
+            // Partial non-think tag that never completed — emit as normal text.
+            emit_text!(&leftover);
         }
     }
 
@@ -876,6 +923,51 @@ pub(crate) async fn call_llm_once(
         }
     }
     Ok((content, tool_chunks))
+}
+
+/// Split `text` on `<think>`/`</think>` boundaries.
+/// `in_think` tracks whether we start inside a think block and is updated as tags are found.
+/// Returns `(segments, leftover)` where `leftover` is a partial tag suffix that might
+/// complete in the next SSE chunk — prepend it to the next call's input.
+fn split_think_content(text: &str, in_think: &mut bool) -> (Vec<(bool, String)>, String) {
+    let mut segments: Vec<(bool, String)> = Vec::new();
+    let mut pos = 0;
+
+    loop {
+        let tag = if *in_think { "</think>" } else { "<think>" };
+        if let Some(rel) = text[pos..].find(tag) {
+            let seg_end = pos + rel;
+            if seg_end > pos {
+                segments.push((*in_think, text[pos..seg_end].to_string()));
+            }
+            pos = seg_end + tag.len();
+            *in_think = !*in_think;
+        } else {
+            // No complete tag found. Hold back any suffix that could be a partial tag.
+            let remaining = &text[pos..];
+            let hold = partial_tag_prefix_len(remaining, tag);
+            let safe_end = remaining.len().saturating_sub(hold);
+            if safe_end > 0 {
+                segments.push((*in_think, remaining[..safe_end].to_string()));
+            }
+            return (segments, remaining[safe_end..].to_string());
+        }
+    }
+}
+
+/// Returns the length of the longest suffix of `text` that is a prefix of `tag`.
+/// Allows detecting `<think>` / `</think>` tags that span SSE chunk boundaries.
+fn partial_tag_prefix_len(text: &str, tag: &str) -> usize {
+    let tag_bytes = tag.as_bytes();
+    let text_bytes = text.as_bytes();
+    for prefix_len in (1..tag_bytes.len()).rev() {
+        if let Some(start) = text_bytes.len().checked_sub(prefix_len) {
+            if text_bytes[start..] == tag_bytes[..prefix_len] {
+                return prefix_len;
+            }
+        }
+    }
+    0
 }
 
 /// Detect whether a response contains a reusable structured framework.
