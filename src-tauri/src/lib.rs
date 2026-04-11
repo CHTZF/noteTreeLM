@@ -122,12 +122,14 @@ async fn subscribe_service_events(app_handle: tauri::AppHandle) {
                     // Passthrough events re-emitted without "service:" prefix so
                     // the frontend receives the same event names as the Tauri-native flow.
                     const PASSTHROUGH: &[&str] = &[
-                        "llm:token", "llm:done",
+                        "llm:token", "llm:done", "llm:think_token",
                         "agent:tool_call", "agent:write_request", "agent:note_refs",
                         "agent:refs", "agent:web_refs",
                         "agent:think", "agent:skills_activated", "agent:plan_announce",
                         "agent:open_note", "agent:skill_suggestion",
                         "agent:citation", "agent:citation_missing", "agent:cite_correction_start",
+                        "agent:clear_stream", "agent:cite_status", "agent:skill_found",
+                        "agent:skill_not_found", "agent:write_timeout",
                         "memory:prefetched",
                         "whisper:stderr",
                         "llm:stderr",
