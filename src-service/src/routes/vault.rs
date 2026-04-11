@@ -52,12 +52,19 @@ async fn register_vault(
         .ok_or((StatusCode::BAD_REQUEST, "Missing path".to_string()))?
         .to_string();
 
-    // account_id: from body (legacy) or resolved from Bearer token
-    let account_id = if let Some(aid) = body.get("account_id").and_then(|v| v.as_str()) {
+    // account_id resolution priority:
+    // 1. body["account_id"] (explicit)
+    // 2. Bearer token → sessions table lookup
+    // 3. body["account"] (legacy key)
+    // 4. empty string (unauthenticated)
+    let account_id = if let Some(aid) = body.get("account_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
         aid.to_string()
     } else if let Some(tok) = crate::routes::auth::extract_bearer(&headers) {
         resolve_account_id_from_token(&state, &tok).await
-            .unwrap_or_else(|| body.get("account").and_then(|v| v.as_str()).unwrap_or("").to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| body.get("account_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from))
+            .or_else(|| body.get("account").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from))
+            .unwrap_or_default()
     } else {
         body.get("account").and_then(|v| v.as_str()).unwrap_or("").to_string()
     };

@@ -517,34 +517,21 @@ pub(crate) async fn stream_llm_round(
                             if !fr.is_empty() { finish_reason = fr.to_string(); }
                         }
                         let delta = &choice["delta"];
+                        // reasoning_content: llama.cpp emits Qwen3 chain-of-thought here,
+                        // separate from content. Route directly to llm:think_token.
+                        if native_think {
+                            if let Some(rc) = delta["reasoning_content"].as_str() {
+                                if !rc.is_empty() {
+                                    emitter.emit("llm:think_token".to_string(), json!(rc));
+                                }
+                            }
+                        }
                         if let Some(content) = delta["content"].as_str() {
                             if !content.is_empty() {
                                 full_text.push_str(content);
-                                // ── Native think-block routing ────────────────────────────────────
-                                // Split content on <think>/<think> boundaries. Think-block tokens go
-                                // to llm:think_token; only answer tokens flow into the json-depth tracker.
-                                // Tag detection buffers handle tags that span SSE chunk boundaries.
+                                // ── JSON depth tracker ───────────────────────
                                 let owned_content: String;
-                                let content_to_track: &str = if native_think {
-                                    think_detect_buf.push_str(content);
-                                    let combined = std::mem::take(&mut think_detect_buf);
-                                    let (segs, leftover) = split_think_content(&combined, &mut in_think_block);
-                                    think_detect_buf = leftover;
-                                    owned_content = {
-                                        let mut non_think = String::new();
-                                        for (is_think, seg) in segs {
-                                            if is_think {
-                                                if !seg.is_empty() {
-                                                    emitter.emit("llm:think_token".to_string(), json!(seg));
-                                                }
-                                            } else {
-                                                non_think.push_str(&seg);
-                                            }
-                                        }
-                                        non_think
-                                    };
-                                    &owned_content
-                                } else {
+                                let content_to_track: &str = {
                                     owned_content = String::new();
                                     content
                                 };

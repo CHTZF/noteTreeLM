@@ -53,7 +53,7 @@ pub async fn login(
         if let Ok(v) = daemon_post::<_, serde_json::Value>(
             &state.http_client,
             "/vaults",
-            &serde_json::json!({"path": vp, "account": resp.username}),
+            &serde_json::json!({"path": vp, "account_id": resp.username}),
             Some(&resp.token),
         ).await {
             if let Some(uuid) = v["vault_id"].as_str() {
@@ -285,7 +285,7 @@ pub async fn start_google_oauth(app: tauri::AppHandle, state: tauri::State<'_, A
         if let Ok(v) = daemon_post::<_, serde_json::Value>(
             &state.http_client,
             "/vaults",
-            &serde_json::json!({"path": vp, "account": username}),
+            &serde_json::json!({"path": vp, "account_id": username}),
             Some(&resp.token),
         ).await {
             if let Some(uuid) = v["vault_id"].as_str() {
