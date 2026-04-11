@@ -1,5 +1,51 @@
 use serde_json::{json, Value};
 use crate::db::SurrealDb;
+use reqwest::Client;
+
+/// Extract CJK bigrams from a string for regex-fallback memory search.
+///
+/// When the embedding server is unavailable, keyword regex search is used.
+/// For CJK text that contains no spaces, the whole phrase is treated as one
+/// keyword which may not substring-match stored facts.  Breaking it into
+/// sliding 2-character windows (bigrams) substantially improves recall.
+///
+/// Example: "今天天氣如何" → ["今天", "天天", "天氣", "氣如", "如何"]
+pub(crate) fn extract_cjk_bigrams(text: &str) -> Vec<String> {
+    let cjk_chars: Vec<char> = text.chars()
+        .filter(|c| {
+            let cp = *c as u32;
+            // CJK Unified Ideographs + Common CJK Extension blocks
+            (0x4E00..=0x9FFF).contains(&cp)
+                || (0x3400..=0x4DBF).contains(&cp)
+                || (0x20000..=0x2A6DF).contains(&cp)
+                || (0x2A700..=0x2B73F).contains(&cp)
+                || (0xF900..=0xFAFF).contains(&cp)
+        })
+        .collect();
+    if cjk_chars.len() < 2 { return vec![]; }
+    cjk_chars.windows(2)
+        .map(|w| w.iter().collect::<String>())
+        .collect()
+}
+
+/// Build search keywords for the regex fallback path:
+/// - For ASCII/mixed text: use the keywords as-is.
+/// - For CJK-heavy text (no spaces): supplement with bigrams so short
+///   sub-phrases can still match stored facts.
+pub(crate) fn enrich_keywords_for_fallback(keywords: &[String]) -> Vec<String> {
+    let mut enriched = keywords.to_vec();
+    for kw in keywords {
+        if !kw.contains(' ') && kw.chars().any(|c| (0x4E00..=0x9FFF).contains(&(c as u32))) {
+            let bigrams = extract_cjk_bigrams(kw);
+            for bg in bigrams {
+                if !enriched.contains(&bg) {
+                    enriched.push(bg);
+                }
+            }
+        }
+    }
+    enriched
+}
 
 /// Vault-scoped, embedding-indexed memory facts stored in `memory_facts` DB table.
 ///
@@ -183,6 +229,7 @@ pub(crate) async fn vault_query_memory_with_limit(
     }
 
     // Fallback: no embedding server, no keywords, or no facts with embeddings — use recency / keyword regex.
+    // For CJK keywords, enrich with bigrams to improve substring-match recall.
     let rows: Vec<Row> = if keywords.is_empty() {
         db.query("SELECT fact_id, content, category FROM memory_facts WHERE vault_id = $vid AND account_id = $aid AND expires_at > $now ORDER BY created_at DESC LIMIT $lim")
             .bind(("vid", vault_id.to_string()))
@@ -194,8 +241,9 @@ pub(crate) async fn vault_query_memory_with_limit(
             .and_then(|mut r| r.take(0).ok())
             .unwrap_or_default()
     } else {
+        let enriched = enrich_keywords_for_fallback(keywords);
         let mut collected: Vec<Row> = Vec::new();
-        for kw in keywords.iter().take(3) {
+        for kw in enriched.iter().take(8) {
             let mut rows: Vec<Row> = db
                 .query("SELECT fact_id, content, category FROM memory_facts WHERE vault_id = $vid AND account_id = $aid AND content ~ $kw AND expires_at > $now LIMIT $lim")
                 .bind(("vid", vault_id.to_string()))
@@ -209,6 +257,14 @@ pub(crate) async fn vault_query_memory_with_limit(
                 .unwrap_or_default();
             collected.append(&mut rows);
         }
+        // Deduplicate by fact_id to avoid returning the same fact multiple times.
+        let mut seen = std::collections::HashSet::new();
+        collected.retain(|r| {
+            let fid = r.fact_id.clone().unwrap_or_default();
+            if fid.is_empty() { return true; }
+            seen.insert(fid)
+        });
+        collected.truncate(limit as usize);
         collected
     };
     rows.into_iter().map(|r| json!({
@@ -217,3 +273,27 @@ pub(crate) async fn vault_query_memory_with_limit(
         "category": r.category,
     })).collect()
 }
+
+/// Fetch memory facts relevant to `keywords` and return them alongside their
+/// prefixed node IDs for frontend highlighting.
+///
+/// Returns `(facts, fact_ids)` where `fact_ids` are formatted as
+/// `"memory:{vault_id}:{fact_id}"` for use in `memory:prefetched` SSE events.
+pub(crate) async fn prefetch_memory_facts(
+    client:        &Client,
+    embedding_url: &Option<String>,
+    db:            &SurrealDb,
+    vault_id:      &str,
+    account_id:    &str,
+    keywords:      &[String],
+) -> (Vec<Value>, Vec<String>) {
+    let facts = vault_query_memory_with_limit(
+        client, embedding_url, db, vault_id, account_id, keywords, 6,
+    ).await;
+    let fact_ids: Vec<String> = facts.iter()
+        .filter_map(|f| f["fact_id"].as_str().filter(|s| !s.is_empty()))
+        .map(|fid| format!("memory:{}:{}", vault_id, fid))
+        .collect();
+    (facts, fact_ids)
+}
+

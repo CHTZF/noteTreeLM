@@ -39,10 +39,26 @@ pub(crate) struct ContextBudget {
 
 impl Default for ContextBudget {
     fn default() -> Self {
+        Self::from_context_size(8_192)
+    }
+}
+
+impl ContextBudget {
+    /// Compute a proportional budget from a model's context window (in tokens).
+    ///
+    /// Allocation (of usable 80% of the window):
+    ///   history  65 %  — conversation turns
+    ///   system   25 %  — system prompt + skill injection
+    ///   memory   10 %  — prefetched memory facts
+    ///
+    /// Char estimate: 1 token ≈ 3.5 chars (conservative average for mixed CJK/EN text).
+    pub fn from_context_size(ctx_tokens: usize) -> Self {
+        let usable = (ctx_tokens as f64 * 0.80) as usize;
+        let total_chars = (usable as f64 * 3.5) as usize;
         Self {
-            system_chars:  4_000,
-            memory_chars:  1_200,
-            history_chars: 12_000,
+            history_chars: (total_chars as f64 * 0.65) as usize,
+            system_chars:  (total_chars as f64 * 0.25) as usize,
+            memory_chars:  (total_chars as f64 * 0.10) as usize,
             keep_recent:   6,
         }
     }
@@ -68,6 +84,10 @@ pub(crate) struct ContextInput<'a> {
     pub is_chat:          bool,
     /// UI language for localised system messages.
     pub locale:           Locale,
+    /// True when the previous message had active skills (tool chain in progress).
+    /// When true, tool call/result pairs are included in history for cross-message chaining.
+    /// When false, only user and assistant text messages are loaded to keep context lean.
+    pub has_cached_skills: bool,
 }
 
 // ── Output ────────────────────────────────────────────────────────────────────
@@ -107,7 +127,38 @@ impl ContextPipeline {
         let system_chars_used = system_content.len();
 
         // ── Stage 2: History ───────────────────────────────────────────────
-        let mut history = EpisodicMemory::new(input.db.clone()).load(input.conv_id).await;
+        // When no skill chain is in progress, strip tool call/result pairs from history
+        // to keep context lean. When has_cached_skills=true the LLM needs prior tool
+        // outputs (e.g. list_emails IDs) to continue the chain — load them with
+        // JSON-aware compression so critical fields (IDs, subjects) are always preserved.
+        const TOOL_RESULT_LOAD_MAX: usize = 4000;
+        let raw_history = EpisodicMemory::new(input.db.clone()).load(input.conv_id).await;
+        let history_base: Vec<serde_json::Value> = if input.has_cached_skills {
+            raw_history.into_iter().filter_map(|m| {
+                match m["role"].as_str() {
+                    Some("tool") => {
+                        let content = m["content"].as_str().unwrap_or("");
+                        if content.len() > TOOL_RESULT_LOAD_MAX {
+                            let compressed = compress_tool_result(content, TOOL_RESULT_LOAD_MAX);
+                            let mut msg = m;
+                            msg["content"] = json!(compressed);
+                            Some(msg)
+                        } else {
+                            Some(m)
+                        }
+                    }
+                    Some("user") | Some("assistant") => Some(m),
+                    _ => None,
+                }
+            }).collect()
+        } else {
+            // No active skill chain — load only plain user/assistant turns.
+            raw_history.into_iter().filter(|m| {
+                matches!(m["role"].as_str(), Some("user") | Some("assistant"))
+                && m["tool_calls"].is_null()
+            }).collect()
+        };
+        let mut history = history_base;
         if history.last().and_then(|m| m["role"].as_str()) != Some("user") {
             history.push(json!({"role": "user", "content": input.user_input}));
         }
@@ -198,5 +249,87 @@ impl ContextPipeline {
             .collect::<Vec<_>>()
             .join("\n");
         templates::memory_block(&lines, locale).chars().take(self.budget.memory_chars).collect()
+    }
+}
+
+// ── Tool result compression ───────────────────────────────────────────────────
+
+/// Compress a tool result string to fit within `budget` bytes using a two-stage strategy:
+///
+/// **Stage 1 — JSON-aware field-value compression**
+/// Parse as JSON and recursively truncate long string values (> `FIELD_VALUE_MAX` chars).
+/// This preserves the complete JSON structure and all short values (IDs, dates, subjects),
+/// while compressing only the verbose fields (email bodies, HTML snippets, note content).
+/// If the result after field compression is still over budget, and it is a JSON array,
+/// trim trailing items and append `{"__more__": N}` so the LLM knows data was cut.
+///
+/// **Stage 2 — Char fallback**
+/// If the input is not valid JSON or field compression is insufficient, fall back to
+/// character-level truncation with a `…[truncated]` marker.
+fn compress_tool_result(content: &str, budget: usize) -> String {
+    const FIELD_VALUE_MAX: usize = 300;
+    const MAX_ARRAY_ITEMS: usize = 50;
+
+    // Stage 1: try JSON-aware compression.
+    if let Ok(parsed) = serde_json::from_str::<Value>(content) {
+        let compressed = compress_json_value(parsed, FIELD_VALUE_MAX);
+        let serialized = compressed.to_string();
+
+        if serialized.len() <= budget {
+            return serialized;
+        }
+
+        // Still over budget — if it's an array, trim items.
+        if let Ok(Value::Array(mut items)) = serde_json::from_str::<Value>(&serialized) {
+            let total = items.len();
+            // Binary-search for how many items fit within budget.
+            let mut keep = 0usize;
+            for i in 1..=items.len().min(MAX_ARRAY_ITEMS) {
+                let candidate = serde_json::to_string(&items[..i]).unwrap_or_default();
+                // Reserve ~30 chars for the __more__ sentinel.
+                if candidate.len() + 30 > budget { break; }
+                keep = i;
+            }
+            let remaining = total.saturating_sub(keep);
+            items.truncate(keep);
+            if remaining > 0 {
+                items.push(json!({ "__more__": remaining }));
+            }
+            return serde_json::to_string(&Value::Array(items)).unwrap_or_else(|_| serialized);
+        }
+    }
+
+    // Stage 2: char-level fallback.
+    if content.len() <= budget {
+        content.to_string()
+    } else {
+        format!("{}…[truncated]", &content[..budget])
+    }
+}
+
+/// Recursively traverse a JSON value and truncate any string value longer than
+/// `field_max` chars to `field_max` chars followed by `…`.
+/// Object keys and non-string values are never modified.
+fn compress_json_value(v: Value, field_max: usize) -> Value {
+    match v {
+        Value::String(s) => {
+            if s.chars().count() > field_max {
+                let truncated: String = s.chars().take(field_max).collect();
+                Value::String(format!("{}…", truncated))
+            } else {
+                Value::String(s)
+            }
+        }
+        Value::Array(arr) => {
+            Value::Array(arr.into_iter().map(|item| compress_json_value(item, field_max)).collect())
+        }
+        Value::Object(map) => {
+            Value::Object(
+                map.into_iter()
+                    .map(|(k, val)| (k, compress_json_value(val, field_max)))
+                    .collect()
+            )
+        }
+        other => other,
     }
 }

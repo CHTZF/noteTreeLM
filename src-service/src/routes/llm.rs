@@ -113,12 +113,15 @@ pub(crate) async fn ensure_llama_running(state: &ApiState) -> Result<String, Str
         config.bin.display(), config.model_path, port
     )));
 
+    let ctx_size = crate::service::ctx_size_for_model(&config.model_path) as u32;
+    let ctx_size_str = ctx_size.to_string();
+
     let mut cmd = tokio::process::Command::new(&config.bin);
     cmd.args([
         "--model",        &config.model_path,
         "--port",         &port.to_string(),
         "--host",         "127.0.0.1",
-        "--ctx-size",     "8192",
+        "--ctx-size",     &ctx_size_str,
         "--parallel",     "1",
         "--n-gpu-layers", "99",
         "--embedding",

@@ -21,7 +21,14 @@ pub(super) async fn trim_history(
         return (hist, false);
     }
 
-    let keep_from = hist.len().saturating_sub(keep_recent);
+    let mut keep_from = hist.len().saturating_sub(keep_recent);
+    // Ensure we don't split a tool call/result group: if the kept slice starts with
+    // a `role:tool` message, walk keep_from backward until the preceding
+    // `role:assistant` with tool_calls is included (or we reach index 0).
+    while keep_from > 0 && hist[keep_from]["role"].as_str() == Some("tool") {
+        keep_from -= 1;
+    }
+
     let old_text: String = hist[..keep_from].iter().map(|m| {
         let role    = m["role"].as_str().unwrap_or("user");
         let content = m["content"].as_str().unwrap_or("");

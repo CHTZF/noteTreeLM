@@ -31,6 +31,12 @@ export interface ModelItem {
   desc: string
   url: string
   recommended?: boolean
+  /** True when the model has built-in chain-of-thought (e.g. Qwen3.5).
+   *  When selected, the think tool injection (enable_think) is skipped. */
+  nativeThink?: boolean
+  /** Model's native context window in tokens. Used to set --ctx-size on llama-server
+   *  and to scale the system's ContextBudget proportionally. */
+  contextSize?: number
 }
 
 // Represents a model ready for use (complete + in models dir)
@@ -105,6 +111,7 @@ export const LLM_MODELS: ModelItem[] = [
     displaySize: '~1 GB',
     desc: '最快速，適合低記憶體環境（4 GB RAM）',
     url: 'https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf',
+    contextSize: 32768,
   },
   {
     id: 'Qwen2.5-3B-Instruct-Q4_K_M',
@@ -113,6 +120,7 @@ export const LLM_MODELS: ModelItem[] = [
     displaySize: '~2 GB',
     desc: '平衡速度與品質，適合 8 GB RAM',
     url: 'https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf',
+    contextSize: 32768,
   },
   {
     id: 'Qwen2.5-7B-Instruct-Q4_K_M',
@@ -122,6 +130,7 @@ export const LLM_MODELS: ModelItem[] = [
     desc: '推薦：高品質輸出，適合 16 GB RAM',
     url: 'https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf',
     recommended: true,
+    contextSize: 32768,
   },
   {
     id: 'Qwen2.5-14B-Instruct-Q4_K_M',
@@ -130,6 +139,18 @@ export const LLM_MODELS: ModelItem[] = [
     displaySize: '~9 GB',
     desc: '最高品質，需要 16 GB+ RAM 或獨立顯卡',
     url: 'https://huggingface.co/bartowski/Qwen2.5-14B-Instruct-GGUF/resolve/main/Qwen2.5-14B-Instruct-Q4_K_M.gguf',
+    contextSize: 32768,
+  },
+  {
+    id: 'Qwen3.5-9B-Q6_K',
+    filename: 'Qwen3.5-9B-Q6_K.gguf',
+    name: 'Qwen3.5-9B (Q6)',
+    displaySize: '~7.5 GB',
+    desc: '新世代旗艦：原生思考模式、工具呼叫、201 語言，Q6 近乎無損，建議 24 GB RAM',
+    url: 'https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q6_K.gguf',
+    recommended: true,
+    nativeThink: true,
+    contextSize: 32768,
   },
 ]
 

@@ -76,6 +76,20 @@ pub struct HarnessRequestRuntime {
     /// Used by write conflict detection.
     pub(crate) write_mtimes:    Arc<Mutex<HashMap<String, u64>>>,
 
+    // ── Per-request UI context ────────────────────────────────────────────────
+    /// Context window budget derived from the model's ctx-size setting.
+    /// Determines how much history / system / memory can be sent per turn.
+    pub(crate) context_budget: ContextBudget,
+    /// True when the currently loaded LLM has built-in chain-of-thought (e.g. Qwen3.5).
+    /// When true, `enable_think` in agent_def is ignored so the think tool is not injected.
+    pub native_think: bool,
+    /// Vault-relative path of the note currently open in the editor.
+    /// Injected into system prompt so agent can answer "這篇" / "this note" references.
+    pub active_note: Option<String>,
+    /// Text currently selected by the user in the editor.
+    /// Injected into system prompt so agent can operate on "這段" / "selected text".
+    pub selection:   Option<String>,
+
     // ── Shared loop state (accessible from tool handlers) ────────────────────
     /// Message buffer + finish-signal for the current tool loop.
     /// All message management goes through this; working_memory lives separately
@@ -130,6 +144,10 @@ impl HarnessRequestRuntime {
             agent_def:        Value::Null,
             write_snapshots:  Arc::new(Mutex::new(Default::default())),
             write_mtimes:     Arc::new(Mutex::new(Default::default())),
+            context_budget: ContextBudget::default(),
+            native_think: false,
+            active_note: None,
+            selection:   None,
             emitter,
             dispatcher: None,
             context:    ContextBuffer::new(),
@@ -200,6 +218,10 @@ impl HarnessRequestRuntime {
             agent_def,
             write_snapshots: Arc::new(Mutex::new(HashMap::new())),
             write_mtimes:    Arc::new(Mutex::new(HashMap::new())),
+            context_budget: ContextBudget::default(),
+            native_think: false,
+            active_note: None,
+            selection:   None,
             emitter,
             dispatcher,
             context: ContextBuffer::new(),
@@ -323,6 +345,21 @@ impl HarnessRequestRuntime {
                     "content": templates::stall_warning(&names, self.locale),
                 }));
             }
+
+            // ── Cite reminder ────────────────────────────────────────────────
+            // Only inject when tools were actually called this round.
+            // If no tools ran this round, we do NOT fall back to carry-over IDs:
+            // the LLM would cite a stale result (e.g. list_emails) while fabricating
+            // the actual content. Instead, leave it without a reminder — the
+            // wm_has_any path in cite_required will fire on long responses and
+            // trigger a correction that tells the LLM to call the right tool first.
+            let current_pairs = self.working_memory.current_run_cite_pairs().await;
+            if !current_pairs.is_empty() {
+                snapshot.push(json!({
+                    "role": "system",
+                    "content": templates::cite_reminder(&current_pairs, self.locale),
+                }));
+            }
         }
         snapshot
     }
@@ -421,136 +458,59 @@ impl HarnessRequestRuntime {
         activity_context: Option<&str>,
         mut tool_names:   Vec<String>,
     ) -> AgentContextResult {
-        let base_prompt = self.agent_def["system_prompt"].as_str().unwrap_or("").to_string();
-        // Prepend user_image (free-text personal background) to the system prompt so the model
-        // has location/language/occupation context without going through semantic search.
-        let user_image = if !self.account_id.is_empty() {
-            crate::service::harness::memory::user_image::load_user_image(&self.db, &self.account_id).await
-        } else {
-            String::new()
-        };
-        let system_prompt = if user_image.is_empty() {
-            base_prompt
-        } else {
-            format!("【使用者背景】\n{}\n\n{}", user_image, base_prompt)
-        };
+        let base_prompt = self.agent_def["system_prompt"].as_str().unwrap_or("");
+        let system_prompt = super::prompt::system::build_system_prompt(
+            &self.db,
+            &self.account_id,
+            base_prompt,
+            self.active_note.as_deref(),
+            self.selection.as_deref(),
+        ).await;
 
-        let pinned_skill_ids: Vec<String> = self.agent_def["skill_ids"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str()).map(String::from).collect())
-            .unwrap_or_default();
-        let do_skill_pass = !self.vault_path.is_empty()
-            && self.agent_def["use_skill_pass"].as_bool().unwrap_or(false);
-        let do_memory_prefetch = self.needs_frontend() && !self.vault_id.is_empty() && !self.account_id.is_empty();
+        let do_memory_prefetch = self.needs_frontend()
+            && !self.vault_id.is_empty()
+            && !self.account_id.is_empty();
         let keywords: Vec<String> = input.split_whitespace()
             .filter(|w| w.chars().count() >= 2)
             .take(5)
             .map(String::from)
             .collect();
 
-        // use_pinned: agent has explicitly pinned skills AND skill_pass is disabled
-        let use_pinned = !self.agent_def["use_skill_pass"].as_bool().unwrap_or(false)
-            && !pinned_skill_ids.is_empty();
-
-        // Sticky skill: if a previous round already matched skills, re-use them without
-        // re-running semantic search. Skills stay active until a round with no tool calls.
-        let cached_skill = if do_skill_pass {
-            self.working_memory.clone_active_skills().await
-        } else {
-            None
-        };
-
-        let (skill_result, prefetched_memory) = tokio::join!(
-            async {
-                if use_pinned {
-                    Some(crate::service::harness::tools::skill_tools::load_skills_by_ids(
-                        &self.db, &pinned_skill_ids,
-                    ).await)
-                } else if do_skill_pass {
-                    let new_result = crate::service::helpers::run_skill_pass(
-                        &self.client, &self.embedding_url, &self.db,
-                        &self.vault_id, &self.account_id, input,
-                    ).await;
-                    if let Some(mut cached) = cached_skill {
-                        // Merge: carry forward sticky skills and append any newly matched ones.
-                        // This lets mid-conversation new requirements add skills without losing
-                        // skills that were matched in earlier rounds.
-                        for title in &new_result.skill_titles {
-                            if !cached.skill_titles.contains(title) {
-                                cached.skill_titles.push(title.clone());
-                            }
-                        }
-                        for tool in &new_result.skill_tool_names {
-                            if !cached.skill_tool_names.contains(tool) {
-                                cached.skill_tool_names.push(tool.clone());
-                            }
-                        }
-                        if !new_result.system_injection.is_empty() {
-                            cached.system_injection = if cached.system_injection.is_empty() {
-                                new_result.system_injection
-                            } else {
-                                format!("{}\n\n{}", cached.system_injection, new_result.system_injection)
-                                    .chars().take(2000).collect()
-                            };
-                        }
-                        Some(cached)
-                    } else {
-                        Some(new_result)
-                    }
-                } else {
-                    None
-                }
-            },
+        // Run skill pre-pass and memory prefetch in parallel.
+        let (skill_output, prefetched_memory) = tokio::join!(
+            super::context::skill_pass::run(
+                &self.db, &self.client, &self.embedding_url,
+                &self.vault_id, &self.account_id,
+                &self.agent_def, &self.working_memory, input, tool_names,
+            ),
             async {
                 if do_memory_prefetch {
-                    let facts = crate::service::helpers::vault_query_memory_with_limit(
+                    Some(super::memory::semantic::prefetch_memory_facts(
                         &self.client, &self.embedding_url, &self.db,
-                        &self.vault_id, &self.account_id, &keywords, 6,
-                    ).await;
-                    let fact_ids: Vec<String> = facts.iter()
-                        .filter_map(|f| f["fact_id"].as_str().filter(|s| !s.is_empty()))
-                        .map(|fid| format!("memory:{}:{}", self.vault_id, fid))
-                        .collect();
-                    Some((facts, fact_ids))
+                        &self.vault_id, &self.account_id, &keywords,
+                    ).await)
                 } else {
                     None
                 }
             }
         );
 
-        let mut activated_skill_titles: Vec<String> = Vec::new();
-        let system_injection = if let Some(skill) = skill_result {
-            if skill.skill_titles.is_empty() {
-                let discovery = super::tools::skill_tools::build_skill_discovery_injection(&self.db, &self.account_id).await;
-                if !tool_names.contains(&"create_agent_skill".to_string()) {
-                    tool_names.push("create_agent_skill".to_string());
-                }
-                discovery
-            } else {
-                tracing::info!("[skill_pass] activated {} skills: {:?}", skill.skill_titles.len(), skill.skill_titles);
-                if self.streaming {
-                    self.emit("agent:skills_activated", json!({
-                        "titles": skill.skill_titles,
-                        "source": "pre_pass",
-                    }));
-                }
-                activated_skill_titles = skill.skill_titles.clone();
-                // Persist skills in WorkingMemory so subsequent ReAct rounds can re-use them
-                // without re-running semantic search. Cleared when a round produces no tool calls.
-                if !self.working_memory.has_active_skills().await {
-                    self.working_memory.set_active_skills(skill.clone()).await;
-                }
-                for t in skill.skill_tool_names {
-                    if !tool_names.contains(&t) { tool_names.push(t); }
-                }
-                skill.system_injection
-            }
-        } else {
-            String::new()
-        };
+        let super::context::SkillPrePassOutput {
+            system_injection,
+            activated_skill_titles,
+            tool_names,
+            had_active_skills,
+        } = skill_output;
+
+        if !activated_skill_titles.is_empty() {
+            self.emit("agent:skills_activated", json!({
+                "titles": activated_skill_titles,
+                "source": "pre_pass",
+            }));
+        }
 
         let (mem_facts, mem_fact_ids) = prefetched_memory.unwrap_or_default();
-        let pipeline = ContextPipeline::new(ContextBudget::default());
+        let pipeline = ContextPipeline::new(self.context_budget);
         let built = pipeline.build(
             ContextInput {
                 db:               &self.db,
@@ -563,6 +523,7 @@ impl HarnessRequestRuntime {
                 memory_facts:     &mem_facts,
                 is_chat:          self.streaming,
                 locale:           self.locale,
+                has_cached_skills: had_active_skills,
             },
             &self.client,
             &self.llm_url,
@@ -574,7 +535,7 @@ impl HarnessRequestRuntime {
                 built.system_chars_used,
             );
         }
-        if self.streaming && !mem_fact_ids.is_empty() {
+        if !mem_fact_ids.is_empty() {
             self.emit("memory:prefetched", json!({
                 "node_ids": mem_fact_ids,
                 "source": "chat",
@@ -628,11 +589,26 @@ impl HarnessRequestRuntime {
         }
 
         {
+            // Persist the full conversation including tool call/result pairs so that
+            // subsequent messages can reference tool outputs (e.g. read_email after list_emails).
+            // Stored without truncation — context truncation is applied at load time in the pipeline.
             let mut to_save: Vec<Value> = msgs.iter()
-                .filter(|m| matches!(m["role"].as_str(), Some("user") | Some("assistant")))
-                .filter(|m| m["tool_calls"].is_null())
-                .filter(|m| !m["content"].as_str().unwrap_or("").is_empty())
-                .cloned()
+                .filter_map(|m| {
+                    match m["role"].as_str() {
+                        Some("user") => {
+                            if m["content"].as_str().unwrap_or("").is_empty() { None }
+                            else { Some(m.clone()) }
+                        }
+                        Some("assistant") => {
+                            let has_text = !m["content"].as_str().unwrap_or("").is_empty();
+                            let has_tool_calls = !m["tool_calls"].is_null();
+                            if !has_text && !has_tool_calls { None }
+                            else { Some(m.clone()) }
+                        }
+                        Some("tool") => Some(m.clone()),
+                        _ => None,
+                    }
+                })
                 .collect();
             if !full_response.is_empty() {
                 to_save.push(json!({ "role": "assistant", "content": full_response }));

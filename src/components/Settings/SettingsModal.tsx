@@ -148,6 +148,71 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
   const [confirmPassword, setConfirmPassword] = useState('')
   const [pwSaving, setPwSaving] = useState(false)
 
+  // Google Calendar state
+  const [calendarConnected, setCalendarConnected] = useState(false)
+  const [calendarLoading, setCalendarLoading] = useState(false)
+
+  const [gmailConnected, setGmailConnected] = useState(false)
+  const [gmailLoading, setGmailLoading] = useState(false)
+
+  useEffect(() => {
+    if (tab !== 'account') return
+    invoke<boolean>('get_calendar_status').then(setCalendarConnected).catch(() => {})
+    invoke<boolean>('get_gmail_status').then(setGmailConnected).catch(() => {})
+  }, [tab])
+
+  const handleConnectGmail = async () => {
+    setGmailLoading(true)
+    try {
+      await invoke('connect_gmail')
+      setGmailConnected(true)
+      toast.success('Gmail 已連線')
+    } catch (e: any) {
+      toast.error(String(e))
+    } finally {
+      setGmailLoading(false)
+    }
+  }
+
+  const handleDisconnectGmail = async () => {
+    setGmailLoading(true)
+    try {
+      await invoke('disconnect_gmail')
+      setGmailConnected(false)
+      toast.success('已中斷 Gmail 連線')
+    } catch (e: any) {
+      toast.error(String(e))
+    } finally {
+      setGmailLoading(false)
+    }
+  }
+
+  const handleConnectCalendar = async () => {
+    setCalendarLoading(true)
+    try {
+      await invoke('connect_google_calendar')
+      setCalendarConnected(true)
+      toast.success('Google 行事曆已連線')
+    } catch (e: any) {
+      toast.error(String(e))
+    } finally {
+      setCalendarLoading(false)
+    }
+  }
+
+  const handleDisconnectCalendar = async () => {
+    setCalendarLoading(true)
+    try {
+      await invoke('disconnect_google_calendar')
+      setCalendarConnected(false)
+      toast.success('已中斷 Google 行事曆連線')
+    } catch (e: any) {
+      toast.error(String(e))
+    } finally {
+      setCalendarLoading(false)
+    }
+  }
+
   const colorScheme = draft.theme === 'dark' ? 'dark' : 'light'
   const inputStyle: React.CSSProperties = {
     width: '100%', height: '32px', padding: '0 10px', boxSizing: 'border-box',
@@ -724,7 +789,54 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                   style={{ padding: '7px 20px', borderRadius: '6px', background: 'var(--color-accent)', color: '#fff', fontSize: '13px', fontWeight: 500, opacity: (pwSaving || (!!confirmPassword && newPassword !== confirmPassword)) ? 0.5 : 1, cursor: (pwSaving || (!!confirmPassword && newPassword !== confirmPassword)) ? 'not-allowed' : 'pointer' }}
                 >{pwSaving ? '儲存中…' : '更新密碼'}</button>
               </>}
+
+              <div style={{ height: '1px', background: 'var(--color-border)', margin: '20px 0' }} />
+              <div style={{ fontSize: '12px', fontWeight: 600, letterSpacing: '0.07em', color: 'var(--color-text-secondary)', textTransform: 'uppercase', marginBottom: '12px' }}>Google 行事曆</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '8px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', color: calendarConnected ? 'var(--color-success)' : 'var(--color-text-secondary)' }}>
+                  <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: calendarConnected ? 'var(--color-success)' : 'var(--color-border)', display: 'inline-block' }} />
+                  {calendarConnected ? '已連線' : '未連線'}
+                </div>
+                {calendarConnected ? (
+                  <button
+                    onClick={handleDisconnectCalendar}
+                    disabled={calendarLoading}
+                    style={{ padding: '5px 14px', borderRadius: '6px', background: 'transparent', border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)', fontSize: '12px', cursor: calendarLoading ? 'not-allowed' : 'pointer', opacity: calendarLoading ? 0.5 : 1 }}
+                  >{calendarLoading ? '處理中…' : '中斷連線'}</button>
+                ) : (
+                  <button
+                    onClick={handleConnectCalendar}
+                    disabled={calendarLoading}
+                    style={{ padding: '5px 14px', borderRadius: '6px', background: 'var(--color-accent)', color: '#fff', fontSize: '12px', fontWeight: 500, cursor: calendarLoading ? 'not-allowed' : 'pointer', opacity: calendarLoading ? 0.5 : 1 }}
+                  >{calendarLoading ? '連線中…' : '連接 Google 行事曆'}</button>
+                )}
+              </div>
+              <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)' }}>連線後 AI 助理可查詢及建立行事曆事件</div>
+
+              <div style={{ height: '1px', background: 'var(--color-border)', margin: '20px 0' }} />
+              <div style={{ fontSize: '12px', fontWeight: 600, letterSpacing: '0.07em', color: 'var(--color-text-secondary)', textTransform: 'uppercase', marginBottom: '12px' }}>Gmail</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '8px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', color: gmailConnected ? 'var(--color-success)' : 'var(--color-text-secondary)' }}>
+                  <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: gmailConnected ? 'var(--color-success)' : 'var(--color-border)', display: 'inline-block' }} />
+                  {gmailConnected ? '已連線' : '未連線'}
+                </div>
+                {gmailConnected ? (
+                  <button
+                    onClick={handleDisconnectGmail}
+                    disabled={gmailLoading}
+                    style={{ padding: '5px 14px', borderRadius: '6px', background: 'transparent', border: '1px solid var(--color-border)', color: 'var(--color-text-secondary)', fontSize: '12px', cursor: gmailLoading ? 'not-allowed' : 'pointer', opacity: gmailLoading ? 0.5 : 1 }}
+                  >{gmailLoading ? '處理中…' : '中斷連線'}</button>
+                ) : (
+                  <button
+                    onClick={handleConnectGmail}
+                    disabled={gmailLoading}
+                    style={{ padding: '5px 14px', borderRadius: '6px', background: 'var(--color-accent)', color: '#fff', fontSize: '12px', fontWeight: 500, cursor: gmailLoading ? 'not-allowed' : 'pointer', opacity: gmailLoading ? 0.5 : 1 }}
+                  >{gmailLoading ? '連線中…' : '連接 Gmail'}</button>
+                )}
+              </div>
+              <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)' }}>連線後 AI 助理可整理今日郵件摘要（唯讀）</div>
             </>}
+
 
             {tab === 'general' && <>
               <div style={fieldStyle}>

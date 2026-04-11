@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { mobileApi, getSavedVaultId, sseUrl } from './mobileApi'
+import { mobileApi, sseUrl } from './mobileApi'
 
 interface Message {
   role: 'user' | 'assistant' | 'notice'
