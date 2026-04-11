@@ -34,6 +34,7 @@ pub async fn run_agent(
     if runtime.try_resume(&input).await {
         return String::new();
     }
+    let session_t0 = std::time::Instant::now();
 
     // ── Step 1: Extract agent params ─────────────────────────────────────────
     let enable_think = runtime.agent_def["enable_think"].as_bool().unwrap_or(false);
@@ -101,7 +102,7 @@ pub async fn run_agent(
 
     // ── Step 8: Post-processing ───────────────────────────────────────────────
     let msgs_final = runtime.get_context_msgs(false).await;
-    runtime.post_process(&msgs_final, &full_response, &input, mem_facts_count).await;
+    runtime.post_process(&msgs_final, &full_response, &input, mem_facts_count, session_t0.elapsed()).await;
 
     // Persist WorkingMemory and active skills back into the session for the next message.
     if !runtime.is_background() {

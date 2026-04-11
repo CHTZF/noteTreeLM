@@ -1241,7 +1241,7 @@ pub struct KBAndSkillSuggestions {
 /// 根據已匯入頁面的內容，用 LLM 建議 2-4 個值得建立的知識卡片。
 #[tauri::command]
 pub async fn suggest_kb_cards(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, AppState>,
     session_id: String,
     page_id: String,
@@ -2475,7 +2475,7 @@ skill_candidates 可為空陣列。如有可重用行為規則才填入。"#;
 /// 前端可在偵測到「記住」等關鍵字或使用者點擊📌按鈕時呼叫。
 #[tauri::command]
 pub async fn extract_skill_from_exchange(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, AppState>,
     user_msg: String,
     assistant_msg: String,

@@ -1,5 +1,4 @@
 use crate::{error::AppError, state::AppState};
-use std::time::Duration;
 use tauri::{AppHandle, State};
 
 // ─── Internal helpers (used by other Tauri commands) ──────────────────────────
@@ -28,18 +27,6 @@ pub(crate) async fn ensure_server_running(
 }
 
 /// Get single embedding via service API.
-pub async fn get_embedding(_client: &reqwest::Client, _base_url: &str, text: &str) -> Vec<f32> {
-    // base_url is ignored — always calls service
-    // We need AppState but don't have it here; callers that have state should
-    // call get_embedding_via_service instead.
-    // This stub returns empty; real callers should be updated.
-    tracing_log(text);
-    vec![]
-}
-
-fn tracing_log(_text: &str) {}
-
-/// Get single embedding via service API (preferred, has access to state).
 pub async fn get_embedding_via_service(state: &AppState, text: &str) -> Vec<f32> {
     let tok_owned = state.get_auth_token().await;
     let tok = if tok_owned.is_empty() { None } else { Some(tok_owned.as_str()) };
@@ -166,56 +153,4 @@ pub async fn restart_embedding_server(state: State<'_, AppState>, _app: AppHandl
     Ok(())
 }
 
-// ─── get_embeddings_batch (legacy compat for knowledge_import) ────────────────
 
-pub async fn get_embeddings_batch(
-    _client: &reqwest::Client,
-    _base_url: &str,
-    texts: &[&str],
-) -> Vec<Vec<f32>> {
-    // Stub — callers should be updated to use get_embedding_via_service
-    let _ = texts;
-    vec![]
-}
-
-// ─── Embedding URL accessor (for legacy callers that need direct URL) ─────────
-
-pub(crate) async fn ensure_embedding_server_running(
-    state: &AppState,
-    _app: &AppHandle,
-) -> Result<String, AppError> {
-    let tok_owned = state.get_auth_token().await;
-    let tok = if tok_owned.is_empty() { None } else { Some(tok_owned.as_str()) };
-    let resp = crate::api_client::daemon_post::<_, serde_json::Value>(
-        &state.http_client,
-        "/embedding/start",
-        &serde_json::json!({}),
-        tok,
-    ).await.map_err(|e| AppError::AI(e.to_string()))?;
-    let url = resp["url"].as_str()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| AppError::AI("embedding-server 未啟動或未設定模型路徑".to_string()))?
-        .to_string();
-    Ok(url)
-}
-
-// ─── find_free_port (kept for potential downstream use) ───────────────────────
-
-pub fn find_free_port(preferred: u16) -> u16 {
-    use std::net::TcpListener;
-    for port in preferred..=65535 {
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-    preferred
-}
-
-// ─── Legacy re-exports for ai.rs ─────────────────────────────────────────────
-
-pub async fn get_embedding_val(state: &AppState, text: &str) -> Vec<f32> {
-    get_embedding_via_service(state, text).await
-}
-
-// Duration re-export removed — Duration is std and should be imported directly
-pub use std::time::Duration as _Duration;

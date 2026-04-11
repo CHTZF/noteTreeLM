@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -24,13 +24,6 @@ pub struct AppState {
     pub api_key_cache: Arc<Mutex<HashMap<String, String>>>,
     /// 共用 HTTP client（所有 LLM / embedding 呼叫共用，避免重複建立 connection pool）
     pub http_client: reqwest::Client,
-    /// Intent centroid 快取（confirm / cancel / interrupt 三組固定詞組的 embedding 平均值）
-    /// 首次計算後永久快取；詞組不變，無需失效機制
-    pub intent_centroids: Arc<Mutex<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>>>,
-    /// 已設置標題的對話 ID 集合（in-memory）：防止 maybe_set_title 每輪重複 DB query
-    pub titled_convs: Arc<Mutex<HashSet<String>>>,
-    /// Live chat 執行旗標：true 時 make_confirm_write 自動核准寫入（無需前端確認）
-    pub live_chat_active: Arc<AtomicBool>,
     /// 目前 Vault 的 UUID（DB 查詢使用，與 vault_path 分離）
     pub vault_uuid: Arc<RwLock<String>>,
     /// 目前登入的使用者名稱
@@ -57,9 +50,6 @@ impl AppState {
             tool_test_cancel: Arc::new(AtomicBool::new(false)),
             api_key_cache: Arc::new(Mutex::new(HashMap::new())),
             http_client,
-            intent_centroids: Arc::new(Mutex::new(None)),
-            titled_convs: Arc::new(Mutex::new(HashSet::new())),
-            live_chat_active: Arc::new(AtomicBool::new(false)),
             vault_uuid: Arc::new(RwLock::new(String::new())),
             username: Arc::new(RwLock::new(String::new())),
             app_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),

@@ -577,6 +577,7 @@ impl HarnessRequestRuntime {
         full_response:   &str,
         input:           &str,
         mem_facts_count: usize,
+        session_elapsed: std::time::Duration,
     ) {
         if self.streaming {
             self.emit("llm:done", json!(full_response));
@@ -619,9 +620,12 @@ impl HarnessRequestRuntime {
         }
 
         let trace = self.emitter.finish(&self.working_memory, &self.conv_id, mem_facts_count).await;
+        let total_ms = session_elapsed.as_millis() as u64;
+        let llm_ms: u64 = trace.llm_latency_ms.iter().sum();
         tracing::debug!(
-            "[session:trace] session={} rounds={} tools={} blocked={} tool_ms={}ms",
-            self.session_id, trace.round_count, trace.total_calls(), trace.blocked_calls(), trace.total_tool_ms(),
+            "[session:trace] session={} total={}ms llm={}ms tool={}ms rounds={} tools={} blocked={}",
+            self.session_id, total_ms, llm_ms, trace.total_tool_ms(),
+            trace.round_count, trace.total_calls(), trace.blocked_calls(),
         );
         super::observability::trace_store::save_session_trace(
             &self.db, &self.vault_id, &self.account_id, &trace,

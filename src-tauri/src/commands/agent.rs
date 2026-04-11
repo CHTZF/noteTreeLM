@@ -5,7 +5,7 @@ use tauri::{AppHandle, State};
 
 // ─── Re-exports from sub-modules ──────────────────────────────────────────────
 pub use super::server::{
-    get_embedding, warmup_llama_server,
+    warmup_llama_server,
     stop_llama_server, get_llama_server_status, start_llama_server, restart_llama_server,
     warmup_embedding_server, get_embedding_server_status, check_embedding_endpoint,
     start_embedding_server, stop_embedding_server, restart_embedding_server,
@@ -22,8 +22,6 @@ pub struct ChatMessage {
     pub role: String,
     pub content: String,
 }
-// LLM engine — see runtime/llm_engine.rs
-pub use crate::runtime::llm_engine::compute_centroid;
 
 /// 取消正在進行的 Agent 串流
 #[tauri::command]
@@ -197,17 +195,8 @@ pub async fn invoke_live_chat(
 }
 
 
-// tool_list_recent_conversations — see runtime/tool_dispatch.rs
-pub use crate::runtime::tool_dispatch::tool_list_recent_conversations;
-
 // Tool schemas — see runtime/tool_schema.rs
 pub use crate::runtime::tool_schema::vault_tools;
-
-// Tool dispatch — see runtime/tool_dispatch.rs
-pub(crate) use crate::runtime::tool_dispatch::{
-    resolve_vault_path, tool_list_structure, tool_read_note,
-    tool_create_note, tool_update_note, tool_create_folder,
-};
 
 
 // FTS helpers — see runtime/fts_helpers.rs

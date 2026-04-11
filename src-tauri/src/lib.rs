@@ -518,10 +518,8 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("noteTreeLM 構建失敗")
-        .run(|app_handle, event| {
-            // App 結束時自動 kill llama-server 與 whisper-server
+        .run(|_app_handle, _event| {
             // llama/embedding/whisper 均由 service daemon 管理，不在 Tauri 端 kill
-            let _ = event;
         });
 }
 
