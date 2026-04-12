@@ -48,6 +48,7 @@ async fn get_setting(db: &SurrealDb, key: &str) -> Option<String> {
 struct LlamaConfig {
     bin: PathBuf,
     model_path: String,
+    draft_model_path: Option<String>,
 }
 
 async fn resolve_llama_config(db: &SurrealDb) -> Result<LlamaConfig, String> {
@@ -77,7 +78,13 @@ async fn resolve_llama_config(db: &SurrealDb) -> Result<LlamaConfig, String> {
         return Err(format!("找不到 llama-server：{}，請到 Settings > AI 更新路徑。", bin.display()));
     }
 
-    Ok(LlamaConfig { bin, model_path })
+    let draft_model_path = {
+        let raw = get_setting(db, "llm_draft_model_path").await.unwrap_or_default();
+        let p = raw.trim().trim_matches('"').trim_matches('\'').to_string();
+        if p.is_empty() || !std::path::Path::new(&p).exists() { None } else { Some(p) }
+    };
+
+    Ok(LlamaConfig { bin, model_path, draft_model_path })
 }
 
 pub(crate) async fn ensure_llama_running(state: &ApiState) -> Result<String, String> {
@@ -128,6 +135,10 @@ pub(crate) async fn ensure_llama_running(state: &ApiState) -> Result<String, Str
         "--embedding",
         "--pooling",      "mean",
     ]);
+    if let Some(ref draft_path) = config.draft_model_path {
+        cmd.args(["--model-draft", draft_path, "--draft", "4", "--n-gpu-layers-draft", "99"]);
+        state.daemon.emit("llm:stderr", json!(format!("[server] Speculative Decoding 已啟用，draft model：{}", draft_path)));
+    }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());

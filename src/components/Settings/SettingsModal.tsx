@@ -1421,6 +1421,21 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                 disabled={llamaStatus === 'running'}
               />
 
+              {/* ── Draft Model (Speculative Decoding) ─────────────────────── */}
+              <SectionDivider />
+              <SectionHeader label="Speculative Decoding（加速推理）" locked={llamaStatus === 'running'} />
+              <p style={{ fontSize: '12px', color: 'var(--color-text-muted)', marginBottom: '12px', lineHeight: 1.6 }}>
+                選填。設定後 llama-server 啟動時自動開啟 Speculative Decoding，使用小模型預測 token 再由主模型批次驗證，可加速 2-2.5x。建議搭配 Qwen3.5-0.8B (Q4)。
+              </p>
+              <ModelDownloader
+                models={LLM_MODELS.filter(m => m.id === 'Qwen3.5-0.8B-Q4_K_M')}
+                title="Draft Model"
+                kind="llm"
+                value={draft.llm_draft_model_path ?? ''}
+                onChange={(v) => up({ llm_draft_model_path: v })}
+                disabled={llamaStatus === 'running'}
+              />
+
               {/* ── Embedding Server ───────────────────────────────────────── */}
               <SectionDivider />
               <ServerCard

@@ -14,6 +14,7 @@ export interface Settings {
   ai_enable_summary: boolean
   ai_enable_vision: boolean
   llm_model_path: string
+  llm_draft_model_path: string
   llama_cli_path: string
   embedding_model_path: string
   last_open_note: string
@@ -73,6 +74,7 @@ export const DEFAULT_SETTINGS: Settings = {
   ai_enable_summary: true,
   ai_enable_vision: true,
   llm_model_path: '',
+  llm_draft_model_path: '',
   llama_cli_path: '',
   embedding_model_path: '',
   last_open_note: '',

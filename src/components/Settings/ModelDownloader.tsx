@@ -142,6 +142,16 @@ export const LLM_MODELS: ModelItem[] = [
     contextSize: 32768,
   },
   {
+    id: 'Qwen3.5-0.8B-Q4_K_M',
+    filename: 'Qwen3.5-0.8B-Q4_K_M.gguf',
+    name: 'Qwen3.5-0.8B (Q4) — Draft',
+    displaySize: '~0.5 GB',
+    desc: 'Speculative Decoding 用 draft model，與 Qwen3.5-9B 搭配可加速 2-2.5x，建議一起下載',
+    url: 'https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf',
+    nativeThink: true,
+    contextSize: 32768,
+  },
+  {
     id: 'Qwen3.5-9B-Q4_K_M',
     filename: 'Qwen3.5-9B-Q4_K_M.gguf',
     name: 'Qwen3.5-9B (Q4)',
