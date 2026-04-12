@@ -51,6 +51,21 @@ struct LlamaConfig {
     draft_model_path: Option<String>,
 }
 
+/// Derive a coarse architecture family from a model filename so we can reject
+/// cross-family speculative decoding pairs before llama.cpp crashes.
+fn model_family(path: &str) -> &'static str {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if name.contains("gemma") { "gemma" }
+    else if name.contains("qwen") { "qwen" }
+    else if name.contains("llama") { "llama" }
+    else if name.contains("mistral") { "mistral" }
+    else { "unknown" }
+}
+
 async fn resolve_llama_config(db: &SurrealDb) -> Result<LlamaConfig, String> {
     let cli_path = get_setting(db, "llama_cli_path").await.unwrap_or_default();
     let cli_path = cli_path.trim().trim_matches('"').trim_matches('\'').to_string();
@@ -81,7 +96,24 @@ async fn resolve_llama_config(db: &SurrealDb) -> Result<LlamaConfig, String> {
     let draft_model_path = {
         let raw = get_setting(db, "llm_draft_model_path").await.unwrap_or_default();
         let p = raw.trim().trim_matches('"').trim_matches('\'').to_string();
-        if p.is_empty() || !std::path::Path::new(&p).exists() { None } else { Some(p) }
+        if p.is_empty() || !std::path::Path::new(&p).exists() {
+            None
+        } else {
+            // Guard: draft and main model must be from the same architecture family.
+            // Mismatched vocabularies (e.g. Qwen3.5 draft + Gemma4 main) cause a
+            // heap-corruption crash in llama.cpp's speculative decoding path.
+            let main_family = model_family(&model_path);
+            let draft_family = model_family(&p);
+            if main_family == draft_family {
+                Some(p)
+            } else {
+                tracing::warn!(
+                    "[llama_config] draft model skipped: family mismatch (main={}, draft={})",
+                    main_family, draft_family
+                );
+                None
+            }
+        }
     };
 
     Ok(LlamaConfig { bin, model_path, draft_model_path })
