@@ -164,8 +164,7 @@ pub(crate) async fn ensure_llama_running(state: &ApiState) -> Result<String, Str
         "--parallel",     "1",
         "--n-gpu-layers", "99",
         "--cache-type-k", "q8_0",
-        "--embedding",
-        "--pooling",      "mean",
+        "--ubatch-size",  "2048",
     ]);
     if let Some(ref draft_path) = config.draft_model_path {
         cmd.args(["--model-draft", draft_path, "--draft", "4", "--n-gpu-layers-draft", "99"]);
