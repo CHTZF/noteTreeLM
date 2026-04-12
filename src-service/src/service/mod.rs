@@ -126,6 +126,7 @@ pub(crate) fn model_meta(model_path: &str) -> ModelMeta {
         ("Qwen2.5-3B-Instruct-Q4_K_M.gguf",   32_768, false),
         ("Qwen2.5-7B-Instruct-Q4_K_M.gguf",   32_768, false),
         ("Qwen2.5-14B-Instruct-Q4_K_M.gguf",  32_768, false),
+        ("Qwen3.5-9B-Q4_K_M.gguf",            32_768, true),
         ("Qwen3.5-9B-Q6_K.gguf",              32_768, true),
     ];
     TABLE.iter()
