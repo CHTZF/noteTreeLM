@@ -281,12 +281,13 @@ impl HarnessRequestRuntime {
             if pending.state().await == TransactionState::Preparing {
                 let embed_fn: EmbedFn = {
                     let client = self.client.clone();
-                    let llm_url = self.llm_url.clone();
+                    let embed_url = self.embedding_url.clone()
+                        .unwrap_or_else(|| self.llm_url.clone());
                     Arc::new(move |text: String| {
                         let client = client.clone();
-                        let llm_url = llm_url.clone();
+                        let embed_url = embed_url.clone();
                         Box::pin(async move {
-                            crate::embedding::embedder::embed_text_llm(&client, &llm_url, &text).await
+                            crate::embedding::embedder::embed_text_llm(&client, &embed_url, &text).await
                         })
                     })
                 };
