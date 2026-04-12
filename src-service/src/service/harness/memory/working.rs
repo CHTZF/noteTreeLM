@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 use serde_json::Value;
 use crate::service::harness::governance::guard::{GuardOutcome, ToolCallRecord};
-use crate::service::harness::tools::skill_tools::SkillPassResult;
 
 /// Recursively collect all `__cite_id__` string values from a JSON value.
 /// Used to discover nested cite IDs (e.g. `kb_1`, `kb_2`) embedded inside tool results.
@@ -54,9 +53,6 @@ pub(crate) struct WorkingMemory {
     /// calling `list_emails` in message 1 does not block it in message 2.
     current_run_ids: Arc<Mutex<std::collections::HashSet<String>>>,
     recall_count:    Arc<AtomicUsize>,
-    /// Active skills carried across ReAct rounds.
-    /// Set when skill pass fires; cleared when a round produces a final answer (no tool calls).
-    active_skills:   Arc<Mutex<Option<SkillPassResult>>>,
 }
 
 impl WorkingMemory {
@@ -66,7 +62,6 @@ impl WorkingMemory {
             inner:           Arc::new(Mutex::new(HashMap::new())),
             current_run_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
             recall_count:    Arc::new(AtomicUsize::new(0)),
-            active_skills:   Arc::new(Mutex::new(None)),
         }
     }
 
@@ -84,32 +79,6 @@ impl WorkingMemory {
     /// respond without a cite tag.
     pub(crate) async fn current_run_has_results(&self) -> bool {
         !self.current_run_ids.lock().await.is_empty()
-    }
-
-    /// Persist activated skills so subsequent rounds can re-inject them without
-    /// re-running semantic search.
-    pub(crate) async fn set_active_skills(&self, result: SkillPassResult) {
-        *self.active_skills.lock().await = Some(result);
-    }
-
-    /// Return the currently active skill result, if any.
-    pub(crate) async fn take_active_skills(&self) -> Option<SkillPassResult> {
-        self.active_skills.lock().await.take()
-    }
-
-    /// Peek at the active skills without consuming them.
-    pub(crate) async fn has_active_skills(&self) -> bool {
-        self.active_skills.lock().await.is_some()
-    }
-
-    /// Clone the current active skills without consuming them (peek).
-    pub(crate) async fn clone_active_skills(&self) -> Option<SkillPassResult> {
-        self.active_skills.lock().await.clone()
-    }
-
-    /// Clear active skills — called when the agent produces a final answer (no tool calls).
-    pub(crate) async fn clear_active_skills(&self) {
-        *self.active_skills.lock().await = None;
     }
 
     /// Record a completed tool execution.

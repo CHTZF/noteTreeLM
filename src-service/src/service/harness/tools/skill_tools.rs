@@ -160,29 +160,10 @@ pub(crate) async fn run_skill_pass(
     for (_, title, behavior, mode) in &matched {
         if mode == "proactive" { continue; }
         let chain = extract_chain_from_behavior(behavior);
-        if chain.is_empty() {
-            // No tool markers — inject raw behavior text as guidance.
-            if !behavior.is_empty() {
-                let clean = strip_tool_markers(behavior);
-                injection_parts.push(format!("[技能：{}]\n{}", title, clean).chars().take(500).collect());
-            }
-        } else {
-            // Chain skill: inject as ordered operation hint for LLM, expose tools via skill_tool_names.
-            chain.iter().for_each(|t| { chain_tool_set.insert(t.clone()); });
-            let step_hint = chain.iter()
-                .filter(|t| t.as_str() != "plan_announce")
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" → ");
-            if !step_hint.is_empty() {
-                let clean_desc = strip_tool_markers(behavior);
-                injection_parts.push(
-                    format!(
-                        "[技能：{}]\n必須依序呼叫工具（在工具回傳結果前，不得直接回覆）：{}\n{}",
-                        title, step_hint, clean_desc
-                    ).chars().take(600).collect()
-                );
-            }
+        chain.iter().for_each(|t| { chain_tool_set.insert(t.clone()); });
+        if !behavior.is_empty() {
+            let clean = strip_tool_markers(behavior);
+            injection_parts.push(format!("[技能：{}]\n{}", title, clean).chars().take(1500).collect());
         }
     }
 
@@ -241,19 +222,9 @@ pub(crate) async fn load_skills_by_ids(db: &SurrealDb, skill_ids: &[String]) -> 
     for (_, title, behavior, _) in &rows {
         let chain = extract_chain_from_behavior(behavior);
         chain.iter().for_each(|t| { chain_tool_set.insert(t.clone()); });
-        let clean_desc = strip_tool_markers(behavior);
-        if !chain.is_empty() {
-            let step_hint = chain.iter()
-                .filter(|t| t.as_str() != "plan_announce")
-                .cloned().collect::<Vec<_>>().join(" → ");
-            injection_parts.push(
-                format!(
-                    "[技能：{}]\n必須依序呼叫工具（在工具回傳結果前，不得直接回覆）：{}\n{}",
-                    title, step_hint, clean_desc
-                ).chars().take(600).collect()
-            );
-        } else if !behavior.is_empty() {
-            injection_parts.push(format!("[技能：{}]\n{}", title, clean_desc).chars().take(500).collect());
+        if !behavior.is_empty() {
+            let clean = strip_tool_markers(behavior);
+            injection_parts.push(format!("[技能：{}]\n{}", title, clean).chars().take(1500).collect());
         }
     }
 

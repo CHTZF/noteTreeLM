@@ -229,7 +229,7 @@ impl Executor {
                             "recall", "think",
                             "checkpoint", "clear_checkpoint",
                             "compress_context", "finish",
-                            "progress", "ask_user",
+                            "progress",
                             "get_session_state", "batch_apply",
                             "save_agent_knowledge", "get_agent_knowledge",
                             "get_vault_changes", "create_agent_skill",

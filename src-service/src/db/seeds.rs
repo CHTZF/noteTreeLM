@@ -288,17 +288,17 @@ const SKILLS: &[BuiltinSkill] = &[
         title: "Gmail 郵件整理/摘要",
         trigger: "整理郵件、看今天的郵件、新郵件、未讀郵件、幫我看信、幫我整理信、查信、有什麼信、email summary、check email、today's email、unread emails、read my email、what emails did I get、郵件摘要、有哪些信、最新郵件",
         behavior: "【鐵則，不可違反】\
-⚠ 當使用者想查看某封郵件的詳細內容（不論給的是主旨、寄件者或任何描述），你必須從 list_emails 結果的 messages 陣列中找到對應的 id 欄位，立即呼叫 @[read_email]。禁止直接用 snippet 回答——snippet 只是預覽。\
 ⚠ 禁止捏造郵件正文、金額、日期、連結或任何數字。\
-⚠ 禁止要求使用者提供郵件 ID——使用者不知道郵件 ID。你必須自行從 list_emails 結果中提取 id 欄位。若不確定是哪封，選最相符的一封直接呼叫，不要詢問。\
+⚠ 禁止要求使用者提供郵件 ID——使用者不知道郵件 ID。你必須自行從 list_emails 結果中提取 id 欄位。\
 ---\
-工具呼叫順序：\
 步驟1：若對話歷史中尚無 list_emails 工具結果，呼叫 @[list_emails]（query=`is:inbox newer_than:1d`，max_results=20）。若對話歷史已有 list_emails 結果，絕對不可再次呼叫——直接從歷史結果進行步驟2。\
-步驟2：在 list_emails 結果的 messages 陣列中比對 subject/from，取出對應的 id 欄位（16 位十六進位），立即呼叫 @[read_email]（message_id 填該 id）。\
-步驟3：根據 read_email 的真實回傳內容回答，不得自行補充或改寫郵件內容。\
+步驟2（判斷意圖）：\
+• 若使用者是「整理/摘要今天的郵件」、「有什麼信」、「看今天的信」等未指定特定郵件的請求——直接用 list_emails 結果的 subject/from/date 整理成條列式摘要回答，不需要呼叫 @[read_email]。\
+• 若使用者明確指定要看某封郵件的內容（給了主旨、寄件者或任何描述）——從 list_emails 結果中比對，取出對應的 id 欄位（16 位十六進位），立即呼叫 @[read_email]（message_id 填該 id）。若不確定是哪封，選最相符的一封直接呼叫，不要詢問。\
+步驟3：若呼叫了 @[read_email]，根據其真實回傳內容回答，不得自行補充或改寫郵件內容。\
 若 Gmail 未連接，告知前往設定連接。",
         injection_mode: "passive",
-        seed_version: 8,
+        seed_version: 10,
     },
 ];
 

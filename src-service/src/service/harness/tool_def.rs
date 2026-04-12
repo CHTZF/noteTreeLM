@@ -112,7 +112,6 @@ pub(crate) static ALL_TOOL_DEFS: &[ToolDef] = &[
     ToolDef { name: "compress_context",    schema_fn: schema_compress_context,    is_write: false, guard: None, handler: handle_compress_context,    rollback: None },
     ToolDef { name: "recall",              schema_fn: schema_recall,              is_write: false, guard: None, handler: handle_recall,              rollback: None },
     ToolDef { name: "finish",              schema_fn: schema_finish,              is_write: false, guard: None, handler: handle_finish,              rollback: None },
-    ToolDef { name: "ask_user",            schema_fn: schema_ask_user,            is_write: false, guard: None, handler: handle_ask_user,            rollback: None },
     ToolDef { name: "checkpoint",          schema_fn: schema_checkpoint,          is_write: false, guard: None, handler: handle_checkpoint,          rollback: None },
     ToolDef { name: "clear_checkpoint",    schema_fn: schema_clear_checkpoint,    is_write: false, guard: None, handler: handle_clear_checkpoint,    rollback: None },
     ToolDef { name: "progress",            schema_fn: schema_progress,            is_write: false, guard: None, handler: handle_progress,            rollback: None },
@@ -564,13 +563,6 @@ fn schema_clear_checkpoint() -> Value { json!({ "type": "function", "function": 
     "parameters": { "type": "object", "properties": {} }
 }})}
 
-fn schema_ask_user() -> Value { json!({ "type": "function", "function": {
-    "name": "ask_user",
-    "description": "向使用者提問，暫停執行等待補充資訊，收到回覆後自動繼續。當你需要更多資訊才能安全或正確地繼續任務時使用（例如：不確定目標路徑、操作範圍有歧義）。",
-    "parameters": { "type": "object", "properties": {
-        "question": { "type": "string", "description": "要問使用者的問題，具體說明你需要什麼資訊以及為什麼" }
-    }, "required": ["question"] }
-}})}
 
 fn schema_plan_announce() -> Value { json!({ "type": "function", "function": {
     "name": "plan_announce",
@@ -1285,59 +1277,30 @@ fn handle_search_skills(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFut
     Box::pin(async move {
         let query = args["query"].as_str().unwrap_or("").to_string();
 
-        #[derive(serde::Deserialize)]
-        struct Row {
-            title:      String,
-            behavior:   String,
-            tool_calls: Option<Value>,
-            embedding:  Option<Value>,
+        // Run the full skill pass with the query as input.
+        // This is the same logic as the pre-pass, giving reactive mid-conversation
+        // activation through the same path as the initial pre-pass.
+        use crate::service::harness::tools::skill_tools;
+        let result = skill_tools::run_skill_pass(
+            &env.client, &env.embedding_url, &env.db,
+            &env.vault_id, &env.account_id, &query,
+        ).await;
+
+        if result.skill_titles.is_empty() {
+            // No match — return available skill list so LLM can inform the user.
+            let discovery = skill_tools::build_skill_discovery_injection(&env.db, &env.account_id).await;
+            env.merge_active_skills(vec![], vec!["create_agent_skill".to_string()], discovery.clone()).await;
+            return Ok(json!({ "found": false, "message": discovery }));
         }
 
-        let mut resp = env.db
-            .query("SELECT title, behavior, tool_calls, embedding \
-                    FROM agent_skills WHERE account_id = $aid AND is_active = true LIMIT 30")
-            .bind(("aid", env.account_id.clone()))
-            .await
-            .map_err(|e| e.to_string())?;
-        let rows: Vec<Row> = resp.take(0).map_err(|e| e.to_string())?;
+        let titles = result.skill_titles.clone();
+        env.merge_active_skills(result.skill_titles, result.skill_tool_names, result.system_injection).await;
 
-        // Semantic search when we have a non-empty query and an embedding server.
-        let q_vec = if !query.is_empty() {
-            crate::embedding::embedder::embed_text(&env.client, &env.embedding_url, &query).await
-        } else {
-            None
-        };
-
-        let results: Vec<Value> = if let Some(ref qv) = q_vec {
-            let mut scored: Vec<(f32, &Row)> = rows.iter().filter_map(|r| {
-                let emb: Vec<f32> = r.embedding.as_ref()?.as_array()?
-                    .iter().filter_map(|v| v.as_f64().map(|f| f as f32))
-                    .collect();
-                if emb.is_empty() { return None; }
-                let score = crate::embedding::embedder::cosine_sim(qv, &emb);
-                if score >= 0.60 { Some((score, r)) } else { None }
-            }).collect();
-            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            scored.into_iter().take(10).map(|(_, r)| json!({
-                "title": r.title,
-                "behavior": r.behavior,
-                "required_tools": r.tool_calls,
-            })).collect()
-        } else {
-            let q_lower = query.to_lowercase();
-            rows.iter()
-                .filter(|r| q_lower.is_empty()
-                    || r.title.to_lowercase().contains(&q_lower)
-                    || r.behavior.to_lowercase().contains(&q_lower))
-                .take(10)
-                .map(|r| json!({
-                    "title": r.title,
-                    "behavior": r.behavior,
-                    "required_tools": r.tool_calls,
-                }))
-                .collect()
-        };
-        Ok(json!(results))
+        Ok(json!({
+            "found": true,
+            "activated_skills": titles,
+            "message": "技能已激活，請立即按照技能指示呼叫所需工具，不要再輸出任何文字。",
+        }))
     })
 }
 
@@ -1576,45 +1539,6 @@ fn handle_get_agent_knowledge(env: Arc<HarnessRequestRuntime>, args: Value) -> T
     })
 }
 
-/// ask_user: suspend the agent and wait for the user to reply via the chat box.
-///
-/// The question is emitted as `llm:done` so the frontend renders it as an assistant
-/// message and exits loading state (allowing the user to type).  The tool then
-/// blocks on a oneshot channel; `run_agent` detects `waiting_for_answer` on the
-/// next user message and forwards it to this channel to resume execution.
-fn handle_ask_user(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
-    Box::pin(async move {
-        use std::sync::atomic::Ordering;
-
-        let question = args["question"].as_str().unwrap_or("").to_string();
-        if question.is_empty() {
-            return Ok(json!("問題不能為空"));
-        }
-
-        // Register via AnswerChannel — no &mut session needed.
-        let rx = env.answer_channel.wait().await;
-
-        // Emit the question as a regular assistant message so the frontend
-        // exits loading state and lets the user type their reply.
-        env.emit("llm:done", serde_json::json!(question));
-
-        // Wait for the answer or cancellation.
-        let cancel = Arc::clone(&env.cancel);
-        tokio::select! {
-            result = rx => {
-                Ok(json!(result.unwrap_or_default()))
-            }
-            _ = async {
-                loop {
-                    if cancel.load(Ordering::Relaxed) { break; }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                }
-            } => {
-                Ok(json!("（使用者取消）"))
-            }
-        }
-    })
-}
 
 /// plan_announce: emit SSE only — no filesystem/DB side effects.
 fn handle_plan_announce(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {

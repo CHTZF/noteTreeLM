@@ -554,7 +554,7 @@ pub(crate) async fn vault_update_note_with_conflict_check(
                 "path":       rel_path,
                 "message":    format!(
                     "檔案 {} 在你讀取後已被修改（讀取時 mtime={}, 現在={}）。\
-                     請用 read_note 重新讀取最新內容，或用 ask_user 詢問使用者要如何合併。",
+                     請用 read_note 重新讀取最新內容，或直接在回覆中詢問使用者要如何合併。",
                     rel_path, mtime_at_read, current_mtime
                 ),
             }));

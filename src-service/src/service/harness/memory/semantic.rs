@@ -290,10 +290,26 @@ pub(crate) async fn prefetch_memory_facts(
     let facts = vault_query_memory_with_limit(
         client, embedding_url, db, vault_id, account_id, keywords, 6,
     ).await;
-    let fact_ids: Vec<String> = facts.iter()
+    let raw_ids: Vec<String> = facts.iter()
         .filter_map(|f| f["fact_id"].as_str().filter(|s| !s.is_empty()))
+        .map(String::from)
+        .collect();
+    let fact_ids: Vec<String> = raw_ids.iter()
         .map(|fid| format!("memory:{}:{}", vault_id, fid))
         .collect();
+
+    // Increment inject_count for each returned fact so DMN animation reflects
+    // actual usage frequency (same as the HTTP /memory/query route does).
+    for fid in raw_ids {
+        let db2 = db.clone();
+        tokio::spawn(async move {
+            let _ = db2
+                .query("UPDATE memory_facts SET inject_count = (inject_count ?? 0) + 1 WHERE fact_id = $fid")
+                .bind(("fid", fid))
+                .await;
+        });
+    }
+
     (facts, fact_ids)
 }
 

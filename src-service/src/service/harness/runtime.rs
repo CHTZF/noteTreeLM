@@ -10,6 +10,7 @@ use super::prompt::{templates, Locale};
 use crate::db::SurrealDb;
 use crate::service::types::{EmitEventFn, EmbedFn, AgentSession};
 use crate::service::harness::engine::transaction::{TransactionState, AnswerChannel};
+use crate::service::harness::tools::skill_tools::SkillPassResult;
 use crate::service::harness::engine::intent_classifier::{Intent, IntentClassifier};
 use super::memory::working::WorkingMemory;
 use super::engine::dispatcher::Dispatcher;
@@ -89,13 +90,16 @@ pub struct HarnessRequestRuntime {
     /// Text currently selected by the user in the editor.
     /// Injected into system prompt so agent can operate on "這段" / "selected text".
     pub selection:   Option<String>,
+    /// Active skills for the current turn. Seeded from `agent_sessions` at turn start,
+    /// written back at turn end. All in-turn reads/writes use this local Arc<Mutex>
+    /// to avoid contention on the global `agent_sessions` map.
+    pub(crate) active_skills: Arc<tokio::sync::RwLock<Option<SkillPassResult>>>,
 
     // ── Shared loop state (accessible from tool handlers) ────────────────────
     /// Message buffer + finish-signal for the current tool loop.
     /// All message management goes through this; working_memory lives separately
     /// because it is used by executor, emitter, and tool handlers as well.
     pub(crate) context: ContextBuffer,
-
     // ── Eagerly-built execution helpers ──────────────────────────────────────
     /// Session-stamped SSE emitter (built at construction time).
     pub(crate) emitter:    ObservabilityEmitter,
@@ -105,9 +109,7 @@ pub struct HarnessRequestRuntime {
 
 /// Output of the skill pre-pass + context pipeline step.
 pub(crate) struct AgentContextResult {
-    pub mem_facts_count:        usize,
-    pub activated_skill_titles: Vec<String>,
-    pub tool_names:             Vec<String>,
+    pub mem_facts_count: usize,
 }
 
 impl HarnessRequestRuntime {
@@ -146,8 +148,9 @@ impl HarnessRequestRuntime {
             write_mtimes:     Arc::new(Mutex::new(Default::default())),
             context_budget: ContextBudget::default(),
             native_think: false,
-            active_note: None,
-            selection:   None,
+            active_note:   None,
+            selection:     None,
+            active_skills: Arc::new(tokio::sync::RwLock::new(None)),
             emitter,
             dispatcher: None,
             context:    ContextBuffer::new(),
@@ -220,8 +223,9 @@ impl HarnessRequestRuntime {
             write_mtimes:    Arc::new(Mutex::new(HashMap::new())),
             context_budget: ContextBudget::default(),
             native_think: false,
-            active_note: None,
-            selection:   None,
+            active_note:   None,
+            selection:     None,
+            active_skills: Arc::new(tokio::sync::RwLock::new(None)),
             emitter,
             dispatcher,
             context: ContextBuffer::new(),
@@ -426,6 +430,35 @@ impl HarnessRequestRuntime {
         self.write_snapshots.lock().await.get(path).cloned()
     }
 
+    /// Merge new skill result into `self.active_skills` (distinct).
+    /// Called by both the pre-pass (`build_agent_context`) and `handle_search_skills`.
+    /// Writes to the local per-turn Arc<Mutex> — no global agent_sessions lock needed.
+    pub(crate) async fn merge_active_skills(
+        &self,
+        titles:    Vec<String>,
+        tools:     Vec<String>,
+        injection: String,
+    ) {
+        let mut guard = self.active_skills.write().await;
+        if let Some(ref mut existing) = *guard {
+            for t in &titles {
+                if !existing.skill_titles.contains(t) { existing.skill_titles.push(t.clone()); }
+            }
+            for t in &tools {
+                if !existing.skill_tool_names.contains(t) { existing.skill_tool_names.push(t.clone()); }
+            }
+            if !injection.is_empty() {
+                existing.system_injection = injection;
+            }
+        } else {
+            *guard = Some(SkillPassResult {
+                system_injection: injection,
+                skill_titles:     titles,
+                skill_tool_names: tools,
+            });
+        }
+    }
+
     /// Compress the buffer — delegates to `ContextBuffer::compress`.
     pub(crate) async fn compress_msgs(&self, summary: &str, tail: usize, keep_ids: &[String]) -> usize {
         self.context.compress(summary, tail, keep_ids, self.locale).await
@@ -454,12 +487,14 @@ impl HarnessRequestRuntime {
 
     /// Run the skill pre-pass + memory prefetch (Step 5) and context pipeline (Step 6) together.
     /// `system_prompt` is read from `self.agent_def["system_prompt"]`.
+    /// Skill activation results are written to `pending_skill_injection` for consumption
+    /// by `run_tool_loop` — NOT injected directly into the system message.
     pub(crate) async fn build_agent_context(
         &self,
         input:            &str,
         activity_context: Option<&str>,
-        mut tool_names:   Vec<String>,
     ) -> AgentContextResult {
+        let ctx_t0 = std::time::Instant::now();
         let base_prompt = self.agent_def["system_prompt"].as_str().unwrap_or("");
         let system_prompt = super::prompt::system::build_system_prompt(
             &self.db,
@@ -468,6 +503,7 @@ impl HarnessRequestRuntime {
             self.active_note.as_deref(),
             self.selection.as_deref(),
         ).await;
+        let t_sys_prompt = ctx_t0.elapsed();
 
         let do_memory_prefetch = self.needs_frontend()
             && !self.vault_id.is_empty()
@@ -478,12 +514,15 @@ impl HarnessRequestRuntime {
             .map(String::from)
             .collect();
 
+        // Capture carry-over state BEFORE skill pass fires.
+        let had_active_skills = self.active_skills.read().await.is_some();
+
         // Run skill pre-pass and memory prefetch in parallel.
         let (skill_output, prefetched_memory) = tokio::join!(
             super::context::skill_pass::run(
                 &self.db, &self.client, &self.embedding_url,
                 &self.vault_id, &self.account_id,
-                &self.agent_def, &self.working_memory, input, tool_names,
+                &self.agent_def, input,
             ),
             async {
                 if do_memory_prefetch {
@@ -497,18 +536,16 @@ impl HarnessRequestRuntime {
             }
         );
 
+        let t_parallel = ctx_t0.elapsed();
         let super::context::SkillPrePassOutput {
             system_injection,
             activated_skill_titles,
-            tool_names,
-            had_active_skills,
+            skill_tool_names,
         } = skill_output;
 
-        if !activated_skill_titles.is_empty() {
-            self.emit("agent:skills_activated", json!({
-                "titles": activated_skill_titles,
-                "source": "pre_pass",
-            }));
+        // Merge skill activation into runtime.active_skills (local, no global lock).
+        if !system_injection.is_empty() || !skill_tool_names.is_empty() || !activated_skill_titles.is_empty() {
+            self.merge_active_skills(activated_skill_titles, skill_tool_names, system_injection).await;
         }
 
         let (mem_facts, mem_fact_ids) = prefetched_memory.unwrap_or_default();
@@ -520,7 +557,6 @@ impl HarnessRequestRuntime {
                 vault_id:         &self.vault_id,
                 user_input:       input,
                 system_prompt:    &system_prompt,
-                skill_injection:  &system_injection,
                 activity_context,
                 memory_facts:     &mem_facts,
                 is_chat:          self.streaming,
@@ -537,18 +573,24 @@ impl HarnessRequestRuntime {
                 built.system_chars_used,
             );
         }
-        if !mem_fact_ids.is_empty() {
+        if do_memory_prefetch {
             self.emit("memory:prefetched", json!({
                 "node_ids": mem_fact_ids,
                 "source": "chat",
             }));
         }
 
+        let t_pipeline = ctx_t0.elapsed();
+        tracing::info!(
+            "[build_agent_context] sys_prompt={}ms parallel(skill+mem)={}ms pipeline={}ms total={}ms",
+            t_sys_prompt.as_millis(),
+            (t_parallel - t_sys_prompt).as_millis(),
+            (t_pipeline - t_parallel).as_millis(),
+            t_pipeline.as_millis(),
+        );
         self.init_msgs(built.messages).await;
         AgentContextResult {
             mem_facts_count: mem_facts.len(),
-            activated_skill_titles,
-            tool_names,
         }
     }
 

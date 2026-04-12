@@ -41,7 +41,7 @@ export default function MessageBubble({
             opacity: 0.6,
           }}>
             <span style={{ fontSize: 9 }}>▶</span>
-            <span style={{ fontStyle: 'italic' }}>💭 {message.content.slice(0, 40)}{message.content.length > 40 ? '…' : ''}</span>
+            <span style={{ fontStyle: 'italic' }}>💭 思考過程</span>
           </summary>
           <div style={{
             marginTop: 4, padding: '4px 10px',

@@ -116,6 +116,17 @@ pub(crate) async fn ensure_llama_running(state: &ApiState) -> Result<String, Str
     let ctx_size = crate::service::ctx_size_for_model(&config.model_path) as u32;
     let ctx_size_str = ctx_size.to_string();
 
+    // Probe whether this binary was compiled with flash-attention support.
+    let supports_flash_attn = std::process::Command::new(&config.bin)
+        .arg("--help")
+        .output()
+        .map(|o| {
+            let out = String::from_utf8_lossy(&o.stdout).to_string()
+                + &String::from_utf8_lossy(&o.stderr);
+            out.contains("flash") || out.contains("flash-attn")
+        })
+        .unwrap_or(false);
+
     let mut cmd = tokio::process::Command::new(&config.bin);
     cmd.args([
         "--model",        &config.model_path,
@@ -124,12 +135,17 @@ pub(crate) async fn ensure_llama_running(state: &ApiState) -> Result<String, Str
         "--ctx-size",     &ctx_size_str,
         "--parallel",     "1",
         "--n-gpu-layers", "99",
+        "--cache-type-k", "q8_0",
+        "--cache-type-v", "q8_0",
         "--embedding",
         "--pooling",      "mean",
-    ])
-    .stdin(std::process::Stdio::null())
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::piped());
+    ]);
+    if supports_flash_attn {
+        cmd.arg("--flash-attn");
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
     #[cfg(target_os = "windows")]
     { use std::os::windows::process::CommandExt; cmd.creation_flags(0x08000000); }
 

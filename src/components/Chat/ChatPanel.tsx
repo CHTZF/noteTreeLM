@@ -14,8 +14,16 @@ import { useVoiceRecorder } from '../../hooks/useVoiceRecorder'
 import VoiceOverlay from '../common/VoiceOverlay'
 import ConversationList from './ConversationList'
 import MessageBubble from './MessageBubble'
-import { Message, SkillPreview, DraftState, ORCHESTRATOR_SYSTEM } from './types'
+import { Message, SkillPreview, DraftState, TransientMessages, ORCHESTRATOR_SYSTEM } from './types'
 import type { AgentSkill } from '../../types/models'
+
+/// Merge transient messages (think/tool/notice) back into loaded history.
+/// Inserts each transient message after the last assistant message whose index
+/// is closest to it in the original sequence — approximated by appending at end.
+function mergeTransientIntoHistory(history: Message[], transient: Message[]): Message[] {
+  if (transient.length === 0) return history
+  return [...history, ...transient]
+}
 
 export default function ChatPanel({ liveChatActive = false, onActiveChange, onOpenNote }: { liveChatActive?: boolean; onActiveChange?: (active: boolean) => void; onOpenNote?: (path: string) => void }) {
   const { t, i18n } = useTranslation()
@@ -62,6 +70,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const streamingRef = useRef('')
   const thinkStreamingRef = useRef('')  // accumulated native-think block content
   const [thinkStreamingText, setThinkStreamingText] = useState('')
+  const thinkFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const tokenFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const llmDoneContentRef = useRef('')  // authoritative final content from llm:done (citation-stripped)
   const citeFailedRef = useRef<boolean | undefined>(undefined)  // undefined=no event, false=passed, true=failed
   const citeDetailsRef = useRef<Array<{ id: string; tool: string; preview: string }>>([])  // details from agent:citation
@@ -77,6 +87,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
 
   // Per-conversation draft state (input + chips), keyed by conversationId
   const conversationDraftsRef = useRef<Record<string, DraftState>>({})
+  const conversationTransientRef = useRef<Record<string, TransientMessages>>({})
   const inputRef2 = useRef('')  // mirrors `input` state for save-on-switch (avoids stale closure)
   useEffect(() => { inputRef2.current = input }, [input])
 
@@ -129,7 +140,9 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         // Strip internal system correction messages injected by the cite validation loop
         .filter(m => !m.content.startsWith('[系統]') && !m.content.startsWith('[System]'))
       const loadedMsgs = filtered.map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }))
-      setMessages(loadedMsgs)
+      // Restore transient messages (think/tool/notice) cached from previous visit
+      const transient = conversationTransientRef.current[id]?.msgs ?? []
+      setMessages(mergeTransientIntoHistory(loadedMsgs, transient))
 
       // 從 DB 恢復每則 assistant 回覆的評分狀態（依 content_hash 對位訊息 index）
       const ratingMap: Record<number, 'good' | 'bad'> = {}
@@ -154,12 +167,20 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
 
   // Save draft for the outgoing conversation, then restore (or clear) for the incoming one
   const switchConversation = useCallback((outgoingId: string | null, incomingId: string | null) => {
-    // Save current draft
+    // Save current draft + transient messages
     if (outgoingId) {
       conversationDraftsRef.current[outgoingId] = {
         input: inputRef2.current,
         noteSuggestions: noteSuggestionsRef.current,
       }
+      // Capture current transient messages (think/tool/notice) for this conversation
+      setMessages(prev => {
+        const transient = prev.filter(m => m.role === 'think' || m.role === 'tool' || m.role === 'notice')
+        if (transient.length > 0) {
+          conversationTransientRef.current[outgoingId] = { msgs: transient }
+        }
+        return prev
+      })
     }
     // Restore draft for the new conversation (or start fresh)
     const draft = incomingId ? conversationDraftsRef.current[incomingId] : undefined
@@ -426,6 +447,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     streamingRef.current = ''
     thinkStreamingRef.current = ''
     tokenCountRef.current = 0
+    if (thinkFlushTimerRef.current) { clearTimeout(thinkFlushTimerRef.current); thinkFlushTimerRef.current = null }
+    if (tokenFlushTimerRef.current) { clearTimeout(tokenFlushTimerRef.current); tokenFlushTimerRef.current = null }
 
     // 只把 user/assistant 訊息送給 LLM（tool/notice 只做 UI 顯示，不進入 context）
     const llmMessages = allMessages
@@ -559,9 +582,14 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         listen<string>('llm:token', (event) => {
           streamingRef.current += event.payload
           tokenCountRef.current += event.payload.length
-          setStreamingText(streamingRef.current)
           if (tokenCountRef.current === event.payload.length) {
             log('✓ 開始收到 llm:token 串流')
+          }
+          if (!tokenFlushTimerRef.current) {
+            tokenFlushTimerRef.current = setTimeout(() => {
+              setStreamingText(streamingRef.current)
+              tokenFlushTimerRef.current = null
+            }, 50)
           }
         }),
         listen<string>('llm:done', (e) => {
@@ -634,7 +662,12 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         // separately from answer tokens. Accumulate here; finalize as a think message on llm:done.
         listen<string>('llm:think_token', (e) => {
           thinkStreamingRef.current += e.payload
-          setThinkStreamingText(thinkStreamingRef.current)
+          if (!thinkFlushTimerRef.current) {
+            thinkFlushTimerRef.current = setTimeout(() => {
+              setThinkStreamingText(thinkStreamingRef.current)
+              thinkFlushTimerRef.current = null
+            }, 150)
+          }
         }),
         listen<{ display: string }>('agent:write_timeout', () => {
           setPendingWriteDisplay(null)

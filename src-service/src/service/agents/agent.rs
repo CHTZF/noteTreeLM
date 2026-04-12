@@ -35,9 +35,13 @@ pub async fn run_agent(
         return String::new();
     }
     let session_t0 = std::time::Instant::now();
+    let pre_llm_t0 = std::time::Instant::now();
 
     // ── Step 1: Extract agent params ─────────────────────────────────────────
-    let enable_think = runtime.agent_def["enable_think"].as_bool().unwrap_or(false);
+    // native_think models (e.g. Qwen3.5) produce <think> blocks natively —
+    // the think tool is redundant and wastes a full round when the LLM ignores it.
+    let enable_think = runtime.agent_def["enable_think"].as_bool().unwrap_or(false)
+        && !runtime.native_think;
     let max_rounds   = runtime.agent_def["max_rounds"].as_u64().unwrap_or(super::super::MAX_ROUNDS as u64) as usize;
 
     // ── Step 2: Resolve tool list ─────────────────────────────────────────────
@@ -45,8 +49,12 @@ pub async fn run_agent(
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
+    // Always strip think tool; native_think models handle reasoning internally.
     tool_names.retain(|t| t != "think");
-    tool_names = inject_required_tools(tool_names, runtime.needs_frontend());
+    let use_skill_pass = runtime.agent_def["use_skill_pass"].as_bool().unwrap_or(false);
+    tool_names = inject_required_tools(tool_names, runtime.needs_frontend(), use_skill_pass);
+
+    let t_params = pre_llm_t0.elapsed();
 
     // ── Step 3: Session registration ─────────────────────────────────────────
     // Carry forward WorkingMemory and active skills from the previous run so that:
@@ -63,9 +71,10 @@ pub async fn run_agent(
             // Replace runtime's fresh WM with the carried-over one, then reset per-run state.
             runtime.working_memory = old.working_memory.clone();
             runtime.working_memory.start_new_run().await;
-            // Re-seed active skills so build_agent_context picks them up as cached_skill.
+            // Seed runtime.active_skills from previous turn so build_agent_context
+            // can detect carry-over before the skill pass fires.
             if let Some(ref skills) = old.active_skills {
-                runtime.working_memory.set_active_skills(skills.clone()).await;
+                *runtime.active_skills.write().await = Some(skills.clone());
             }
         }
         sessions.insert((*runtime.conv_id).clone(), AgentSession {
@@ -79,25 +88,25 @@ pub async fn run_agent(
         });
     }
 
+    let t_session = pre_llm_t0.elapsed();
+
     // ── Step 4: Emitter is pre-built in runtime ───────────────────────────────
     let emitter = &runtime.emitter;
 
     // ── Step 5+6: Pre-pass + context ─────────────────────────────────────────
-    // Check BEFORE build_agent_context whether skills are already active (carry-over
-    // from the previous message). When they are, we treat it as a "cached" activation
-    // and do NOT force tool_choice="required" — the LLM can decide which step to run
-    // based on the conversation context (e.g. user provided an email ID → skip list_emails).
-    let skills_are_cached = runtime.working_memory.has_active_skills().await;
-
-    let AgentContextResult { mem_facts_count, activated_skill_titles, tool_names } =
-        runtime.build_agent_context(&input, activity_context.as_deref(), tool_names).await;
-    emitter.record_skill_activations(&activated_skill_titles);
+    // Capture carry-over state BEFORE build_agent_context fires the skill pass.
+    // had_active_skills = true → LLM already knows its next step, don't force tool use.
+    let skills_are_cached = runtime.active_skills.read().await.is_some();
+    let AgentContextResult { mem_facts_count } =
+        runtime.build_agent_context(&input, activity_context.as_deref()).await;
+    let t_context = pre_llm_t0.elapsed();
 
     // ── Step 7: Tool loop ─────────────────────────────────────────────────────
     let full_response = run_tool_loop(
         &runtime, &tool_names,
         enable_think, runtime.native_think, max_rounds, skills_are_cached,
         Arc::clone(&tx), &input,
+        pre_llm_t0, t_params, t_session, t_context,
     ).await;
 
     // ── Step 8: Post-processing ───────────────────────────────────────────────
@@ -106,10 +115,9 @@ pub async fn run_agent(
 
     // Persist WorkingMemory and active skills back into the session for the next message.
     if !runtime.is_background() {
-        let skills_snapshot = runtime.working_memory.clone_active_skills().await;
+        let skills_snapshot = runtime.active_skills.read().await.clone();
         let mut sessions = runtime.agent_sessions.lock().await;
         if let Some(sess) = sessions.get_mut(runtime.conv_id.as_str()) {
-            // working_memory is already the same Arc — this is a no-op but kept for clarity.
             sess.working_memory = runtime.working_memory.clone();
             if skills_snapshot.is_some() {
                 sess.active_skills = skills_snapshot;
@@ -131,26 +139,28 @@ const VAULT_TOOL_MARKERS: &[&str] = &[
     "read_then_write", "update_note_frontmatter",
 ];
 
-fn inject_required_tools(mut tool_names: Vec<String>, needs_frontend: bool) -> Vec<String> {
-    if tool_names.is_empty() { return tool_names; }
-
-    for name in [
+fn inject_required_tools(mut tool_names: Vec<String>, needs_frontend: bool, use_skill_pass: bool) -> Vec<String> {
+    let mut required: Vec<&str> = vec![
         "get_session_state",
         "compress_context", "finish",
         "checkpoint", "clear_checkpoint",
         "save_agent_knowledge", "get_agent_knowledge",
         "batch_apply",
-    ] {
+    ];
+    // search_skills only when use_skill_pass=true: allows reactive mid-conversation
+    // skill activation (e.g. multi-turn "好" after LLM asks "要整理為筆記嗎？").
+    if use_skill_pass {
+        required.push("search_skills");
+    }
+    for name in required {
         if !tool_names.contains(&name.to_string()) {
             tool_names.push(name.to_string());
         }
     }
 
     if needs_frontend {
-        for name in ["ask_user", "progress"] {
-            if !tool_names.contains(&name.to_string()) {
-                tool_names.push(name.to_string());
-            }
+        if !tool_names.contains(&"progress".to_string()) {
+            tool_names.push("progress".to_string());
         }
     }
 
@@ -178,8 +188,10 @@ async fn run_one_llm_round(
     if runtime.streaming {
         let body = match tools {
             Some(tv) => json!({ "messages": msgs, "tools": tv, "tool_choice": tool_choice,
-                               "stream": true, "temperature": 0.7, "max_tokens": 4096 }),
-            None     => json!({ "messages": msgs, "stream": true, "temperature": 0.7, "max_tokens": 4096 }),
+                               "stream": true, "temperature": 0.7, "max_tokens": 4096,
+                               "cache_prompt": true }),
+            None     => json!({ "messages": msgs, "stream": true, "temperature": 0.7, "max_tokens": 4096,
+                               "cache_prompt": true }),
         };
         let wm = if has_tools { Some(&runtime.working_memory) } else { None };
         let tnames: &[String] = if has_tools { tool_names } else { &[] };
@@ -203,6 +215,10 @@ async fn run_tool_loop(
     skills_are_cached: bool,
     tx:               Arc<Transaction>,
     input:            &str,
+    pre_llm_t0:       std::time::Instant,
+    t_params:         std::time::Duration,
+    t_session:        std::time::Duration,
+    t_context:        std::time::Duration,
 ) -> String {
     let emitter = &runtime.emitter;
     let mut full_response = String::new();
@@ -210,9 +226,13 @@ async fn run_tool_loop(
     // context buffer (and therefore never stored in DB or seen by memory agent).
     let mut pending_corrections: Vec<Value> = Vec::new();
 
+    // inject_required_tools always returns non-empty (search_skills etc. are always added),
+    // so tool_names is guaranteed non-empty here and the else branch is never taken.
+    let mut tool_names: Vec<String> = tool_names.to_vec();
+
     if !tool_names.is_empty() {
-        let tools_schema = build_tools_schema(tool_names);
-        let tools_value  = if tools_schema.is_empty() { None } else { Some(json!(tools_schema)) };
+        let mut tools_schema = build_tools_schema(&tool_names);
+        let mut tools_value  = if tools_schema.is_empty() { None } else { Some(json!(tools_schema)) };
         // When native_think=true the model produces <think>...</think> blocks on its own;
         // skip injecting the think tool regardless of the agent's enable_think setting.
         let think_schema = if enable_think && !native_think {
@@ -220,6 +240,66 @@ async fn run_tool_loop(
         } else {
             None
         };
+
+        // ── Sync active skills from session → tool schema ────────────────────
+        // Read agent_sessions[conv_id].active_skills and:
+        //   1. Add any skill tools not yet in the live schema.
+        //   2. Push system_injection to pending_corrections (once, deduped).
+        //   3. Emit agent:skills_activated with ALL currently active titles so the
+        //      frontend can replace its display with the current state.
+        // Called before round 0 (pre-pass) and after each dispatch (reactive search_skills).
+        macro_rules! sync_active_skills {
+            () => {{
+                let (all_titles, all_tools, injection) = {
+                    runtime.active_skills.read().await
+                        .as_ref()
+                        .map(|s| (s.skill_titles.clone(), s.skill_tool_names.clone(), s.system_injection.clone()))
+                        .unwrap_or_default()
+                };
+                tracing::info!(
+                    "[sync_active_skills] titles={:?} tools={:?} injection_len={}",
+                    all_titles, all_tools, injection.len()
+                );
+                // Merge new tools into schema.
+                let mut added = false;
+                for t in &all_tools {
+                    if !tool_names.contains(t) {
+                        tool_names.push(t.clone());
+                        added = true;
+                    }
+                }
+                if added {
+                    tools_schema = build_tools_schema(&tool_names);
+                    tools_value  = if tools_schema.is_empty() { None } else { Some(json!(tools_schema)) };
+                }
+                // Push skill directive (deduplicated by content).
+                if !injection.is_empty() {
+                    let already = pending_corrections.iter()
+                        .any(|m| m["content"].as_str() == Some(injection.as_str()));
+                    if !already {
+                        pending_corrections.push(json!({ "role": "user", "content": injection }));
+                    }
+                }
+                // Always emit current active titles so frontend replaces its display.
+                // record_skill_activations handles both state recording and SSE emit.
+                if !all_titles.is_empty() {
+                    emitter.record_skill_activations(&all_titles);
+                }
+            }};
+        }
+
+        // Sync before round 0 (pre-pass results already written to agent_sessions).
+        sync_active_skills!();
+        let skills_are_cached = skills_are_cached;
+        let t_sync = pre_llm_t0.elapsed();
+        tracing::info!(
+            "[pre_llm] params={}ms session={}ms context={}ms sync={}ms total={}ms",
+            t_params.as_millis(),
+            (t_session - t_params).as_millis(),
+            (t_context - t_session).as_millis(),
+            (t_sync - t_context).as_millis(),
+            t_sync.as_millis(),
+        );
 
         // Limit cite-correction retries to avoid infinite loops when the LLM
         // cannot learn the format within a few attempts.
@@ -234,19 +314,19 @@ async fn run_tool_loop(
             // force tool_choice="required" when chain skills are active so the model
             // cannot skip tool calls and fabricate an answer.
             let is_first_content_round = if enable_think { round == 1 } else { round == 0 };
-            // Only force tool use on the first content round when skills were freshly
-            // activated (not carried over from a previous message). Carry-over skills
             // Only force tool use when skills are freshly activated (not carry-over from
             // a previous message). Forcing on cached-skill turns causes the LLM to restart
             // the skill chain from step 1 (e.g. re-calling list_emails) even when step 1
-            // was already done. With force_tool_use=false the LLM decides which step to
-            // run next based on context; cite validation + wm_has_any catches cases where
-            // it tries to answer from stale data without calling the right tool.
-            let has_active = runtime.working_memory.has_active_skills().await;
+            // was already done.
+            let (has_active, skill_has_tools) = {
+                let guard = runtime.active_skills.read().await;
+                (guard.is_some(), guard.as_ref().map(|s| !s.skill_tool_names.is_empty()).unwrap_or(false))
+            };
             let force_tool_use = is_first_content_round
                 && !tool_names.is_empty()
                 && !skills_are_cached
-                && has_active;
+                && has_active
+                && skill_has_tools;
             tracing::debug!(
                 "[agent] round={} is_first_content={} skills_cached={} has_active={} force_tool_use={}",
                 round, is_first_content_round, skills_are_cached, has_active, force_tool_use
@@ -271,45 +351,33 @@ async fn run_tool_loop(
             // or cached), inject a transient directive. For freshly-activated skills just say
             // "call immediately". For cached skills, also list already-executed tools from WM
             // so the LLM knows which steps are done and doesn't re-run them from step 1.
-            let has_skills = runtime.working_memory.has_active_skills().await;
-            if is_first_content_round && has_skills {
-                let hint: String = if skills_are_cached && !runtime.working_memory.is_empty().await {
-                    let pairs = runtime.working_memory.cite_id_tool_pairs().await;
-                    // Deduplicate by tool name (same tool may have been called multiple times).
-                    let mut seen = std::collections::HashSet::new();
-                    let names: Vec<&str> = pairs.iter()
-                        .filter_map(|(_, n)| seen.insert(n.as_str()).then_some(n.as_str()))
-                        .collect();
-                    match runtime.locale {
-                        super::super::harness::prompt::Locale::En => format!(
-                            "Tools already completed this session: {}. \
-                             Do NOT re-run them. Call the NEXT required tool directly \
-                             without any text before the tool call.",
-                            names.join(", ")
-                        ),
-                        _ => format!(
-                            "本 session 已完成的工具：{}。\
-                             禁止重複呼叫這些工具。直接呼叫下一個所需工具，\
-                             呼叫前不要輸出任何文字。",
-                            names.join("、")
-                        ),
-                    }
-                } else {
-                    match runtime.locale {
-                        super::super::harness::prompt::Locale::En =>
-                            "Call the required tool immediately. Do not output any text before the tool call.".to_string(),
-                        _ =>
-                            "立即呼叫工具。不要在工具呼叫之前輸出任何說明、確認或過渡語句。".to_string(),
-                    }
+            // When skills are cached (carry-over from previous message) and tools have
+            // already run this session, inject a hint listing completed tools so the LLM
+            // knows which step to continue from rather than restarting from step 1.
+            let has_skills = runtime.active_skills.read().await.is_some();
+            if is_first_content_round && has_skills && skills_are_cached && !runtime.working_memory.is_empty().await {
+                let pairs = runtime.working_memory.cite_id_tool_pairs().await;
+                let mut seen = std::collections::HashSet::new();
+                let names: Vec<&str> = pairs.iter()
+                    .filter_map(|(_, n)| seen.insert(n.as_str()).then_some(n.as_str()))
+                    .collect();
+                let hint = match runtime.locale {
+                    super::super::harness::prompt::Locale::En => format!(
+                        "Tools already completed this session: {}. \
+                         Do NOT re-run them. Call the NEXT required tool directly.",
+                        names.join(", ")
+                    ),
+                    _ => format!(
+                        "本 session 已完成的工具：{}。禁止重複呼叫這些工具。直接呼叫下一個所需工具。",
+                        names.join("、")
+                    ),
                 };
-                // Use role:user for mid-conversation directives — some models (e.g. Qwen3.5)
-                // only allow system messages at the very beginning of the conversation.
                 msgs_snapshot.push(json!({ "role": "user", "content": hint }));
             }
 
             let llm_t0 = std::time::Instant::now();
             let (text, tool_chunks, cite_invalid) = match run_one_llm_round(
-                runtime, &msgs_snapshot, round_tools, round_choice, tool_names, emitter,
+                runtime, &msgs_snapshot, round_tools, round_choice, &tool_names, emitter,
             ).await {
                 Ok(r) => r,
                 Err(e) => { tracing::warn!("[agent/tools] llm error: {}", e); break; }
@@ -421,6 +489,10 @@ async fn run_tool_loop(
                 runtime.extend_msgs_guarded(Planner::results_to_messages(&tool_chunks, results)).await;
 
                 if runtime.cancel.load(Ordering::Relaxed) { break; }
+
+                // Re-sync after dispatch: picks up any new skills written by
+                // handle_search_skills during this round (reactive activation).
+                sync_active_skills!();
             } else if cite_invalid && cite_correction_count < MAX_CITE_CORRECTIONS {
                 cite_correction_count += 1;
                 // LLM fabricated a citation ID or produced no cite tag at all.
@@ -524,16 +596,8 @@ async fn run_tool_loop(
                 if cite_applicable {
                     emitter.emit("agent:cite_status".to_string(), json!({ "passed": !cite_invalid }));
                 }
-                // Save skills to session BEFORE clearing so the next message can re-use them.
-                let skills_to_save = runtime.working_memory.clone_active_skills().await;
-                if skills_to_save.is_some() {
-                    let mut sessions = runtime.agent_sessions.lock().await;
-                    if let Some(sess) = sessions.get_mut(runtime.conv_id.as_str()) {
-                        sess.active_skills = skills_to_save;
-                    }
-                }
-                // Clear sticky skills so build_agent_context starts fresh next round.
-                runtime.working_memory.clear_active_skills().await;
+                // runtime.active_skills persists until turn end where it is written
+                // back to agent_sessions — no early save/clear needed here.
                 pending_corrections.clear();
                 break;
             }

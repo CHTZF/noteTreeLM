@@ -351,7 +351,6 @@ fn parse_batch_response(body: &str, ids: &[&String]) -> Vec<Value> {
                         "subject": get_header("Subject"),
                         "from":    get_header("From"),
                         "date":    get_header("Date"),
-                        "snippet": msg["snippet"].as_str().unwrap_or(""),
                     }));
                 }
             }

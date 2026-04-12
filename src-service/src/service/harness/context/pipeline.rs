@@ -74,8 +74,6 @@ pub(crate) struct ContextInput<'a> {
     pub user_input:       &'a str,
     /// Base system prompt from agent_def.
     pub system_prompt:    &'a str,
-    /// Optional free-text injected below the base prompt (from skill pass).
-    pub skill_injection:  &'a str,
     /// Optional user activity context (recent UI events).
     pub activity_context: Option<&'a str>,
     /// Memory facts pre-fetched by the parallel pre-pass.
@@ -176,20 +174,27 @@ impl ContextPipeline {
             input.locale,
         ).await;
 
-        // ── Stage 4: Injected system messages ─────────────────────────────
+        // ── Stage 4: Supplemental context ────────────────────────────────
+        // Merge into the single system message rather than adding extra messages.
+        // This satisfies models (e.g. Qwen3.5) that only allow system at position 0,
+        // and prevents these strings from being saved to DB as fake user messages.
         let locale = input.locale;
         let (exec_history, checkpoint, agent_knowledge) = tokio::join!(
             load_exec_history(input.db, input.conv_id),
             load_checkpoint(input.db, input.conv_id, locale),
             load_agent_knowledge(input.db, input.vault_id, locale),
         );
+        let system_content = {
+            let mut parts = vec![system_content];
+            if let Some(c) = exec_history    { parts.push(c); }
+            if let Some(c) = checkpoint      { parts.push(c); }
+            if let Some(c) = agent_knowledge { parts.push(c); }
+            parts.join("\n\n")
+        };
 
-        // Assemble: system → exec history → checkpoint → agent knowledge → history
-        let mut messages = Vec::with_capacity(4 + history.len());
+        // Assemble: single system message → history
+        let mut messages = Vec::with_capacity(1 + history.len());
         messages.push(json!({"role": "system", "content": system_content}));
-        if let Some(c) = exec_history  { messages.push(json!({"role": "system", "content": c})); }
-        if let Some(c) = checkpoint    { messages.push(json!({"role": "system", "content": c})); }
-        if let Some(c) = agent_knowledge { messages.push(json!({"role": "system", "content": c})); }
         messages.extend(history);
 
         BuiltContext { messages, system_chars_used, history_chars_before_trim, was_trimmed }
@@ -216,26 +221,6 @@ impl ContextPipeline {
             parts.push(self.build_memory_block(input.memory_facts, input.locale));
         }
 
-        if !input.skill_injection.is_empty() {
-            let so_far: usize = parts.iter().map(|s| s.len()).sum();
-            let remaining = self.budget.system_chars.saturating_sub(so_far);
-            if remaining > 50 {
-                let full_len = input.skill_injection.chars().count();
-                let capped: String = input.skill_injection.chars().take(remaining).collect();
-                if capped.len() < full_len {
-                    tracing::warn!(
-                        "[context] skill injection truncated: {}/{} chars kept (budget={})",
-                        capped.len(), full_len, self.budget.system_chars
-                    );
-                }
-                parts.push(capped);
-            } else {
-                tracing::warn!(
-                    "[context] skill injection dropped: no budget (so_far={} budget={})",
-                    so_far, self.budget.system_chars
-                );
-            }
-        }
 
         parts.join("\n\n")
     }

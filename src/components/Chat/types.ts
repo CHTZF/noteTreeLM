@@ -20,6 +20,10 @@ export type SkillPreview = {
 
 export type DraftState = { input: string; noteSuggestions: { absPath: string; label: string; isUrl: boolean; excerpt?: string; toolName?: string }[] }
 
+// Transient UI messages (think/tool/notice) cached in memory per conversation.
+// Not persisted to DB — survives tab/pane switches within the same app session.
+export type TransientMessages = { msgs: Message[] }
+
 export const ORCHESTRATOR_SYSTEM =
   `你是一個筆記助理，可以直接使用工具完成使用者的請求。\n` +
   `可用工具：\n` +
