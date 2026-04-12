@@ -172,6 +172,16 @@ export const LLM_MODELS: ModelItem[] = [
     nativeThink: true,
     contextSize: 32768,
   },
+  {
+    id: 'gemma-4-E4B-Q4_K_M',
+    filename: 'google_gemma-4-E4B-it-Q4_K_M.gguf',
+    name: 'Gemma 4 E4B (Q4)',
+    displaySize: '~5.4 GB',
+    desc: 'Google 新世代：4.5B 有效參數、256K context、原生思考模式，工具呼叫品質優於 Qwen 系列，建議 16 GB+ RAM',
+    url: 'https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF/resolve/main/google_gemma-4-E4B-it-Q4_K_M.gguf',
+    nativeThink: true,
+    contextSize: 131072,
+  },
 ]
 
 export const EMBEDDING_MODELS: ModelItem[] = [

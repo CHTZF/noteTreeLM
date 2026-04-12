@@ -129,6 +129,7 @@ pub(crate) fn model_meta(model_path: &str) -> ModelMeta {
         ("Qwen3.5-0.8B-Q4_K_M.gguf",          32_768, true),
         ("Qwen3.5-9B-Q4_K_M.gguf",            32_768, true),
         ("Qwen3.5-9B-Q6_K.gguf",              32_768, true),
+        ("google_gemma-4-E4B-it-Q4_K_M.gguf", 131_072, true),
     ];
     TABLE.iter()
         .find(|(name, _, _)| filename.eq_ignore_ascii_case(name))
