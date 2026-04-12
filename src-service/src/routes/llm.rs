@@ -125,7 +125,6 @@ pub(crate) async fn ensure_llama_running(state: &ApiState) -> Result<String, Str
         "--parallel",     "1",
         "--n-gpu-layers", "99",
         "--cache-type-k", "q8_0",
-        "--cache-type-v", "q8_0",
         "--embedding",
         "--pooling",      "mean",
     ]);
