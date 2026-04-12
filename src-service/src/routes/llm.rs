@@ -81,6 +81,7 @@ async fn resolve_llama_config(db: &SurrealDb) -> Result<LlamaConfig, String> {
     let draft_model_path = {
         let raw = get_setting(db, "llm_draft_model_path").await.unwrap_or_default();
         let p = raw.trim().trim_matches('"').trim_matches('\'').to_string();
+        tracing::info!("[llama_config] draft_model_path raw={:?} trimmed={:?} exists={}", raw, p, std::path::Path::new(&p).exists());
         if p.is_empty() || !std::path::Path::new(&p).exists() { None } else { Some(p) }
     };
 
