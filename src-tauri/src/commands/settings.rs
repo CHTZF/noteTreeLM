@@ -126,6 +126,7 @@ pub struct SystemSettings {
     pub whisper_threads: u32,
     pub whisper_auto_insert: bool,
     pub llm_model_path: String,
+    pub llm_draft_model_path: String,
     pub llama_cli_path: String,
     pub embedding_model_path: String,
 }
@@ -146,6 +147,7 @@ pub async fn get_system_settings(state: State<'_, AppState>) -> Result<SystemSet
         whisper_threads: u(&sys, "whisper_threads", 4),
         whisper_auto_insert: b(&sys, "whisper_auto_insert", true),
         llm_model_path: s(&sys, "llm_model_path", ""),
+        llm_draft_model_path: s(&sys, "llm_draft_model_path", ""),
         llama_cli_path: s(&sys, "llama_cli_path", ""),
         embedding_model_path: s(&sys, "embedding_model_path", ""),
     })
@@ -170,6 +172,7 @@ pub async fn save_system_settings(
     map.insert("whisper_threads", settings.whisper_threads.to_string());
     map.insert("whisper_auto_insert", settings.whisper_auto_insert.to_string());
     map.insert("llm_model_path", settings.llm_model_path.trim().to_string());
+    map.insert("llm_draft_model_path", settings.llm_draft_model_path.trim().to_string());
     map.insert("llama_cli_path", settings.llama_cli_path.trim().to_string());
     map.insert("embedding_model_path", settings.embedding_model_path.trim().to_string());
 
