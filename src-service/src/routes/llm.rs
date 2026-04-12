@@ -138,7 +138,10 @@ pub(crate) async fn ensure_llama_running(state: &ApiState) -> Result<String, Str
     ]);
     if let Some(ref draft_path) = config.draft_model_path {
         cmd.args(["--model-draft", draft_path, "--draft", "4", "--n-gpu-layers-draft", "99"]);
+        tracing::info!("[llama_config] speculative decoding enabled, draft={}", draft_path);
         state.daemon.emit("llm:stderr", json!(format!("[server] Speculative Decoding 已啟用，draft model：{}", draft_path)));
+    } else {
+        tracing::info!("[llama_config] speculative decoding disabled (no draft model configured)");
     }
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
