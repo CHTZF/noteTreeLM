@@ -35,7 +35,6 @@ pub async fn run_agent(
         return String::new();
     }
     let session_t0 = std::time::Instant::now();
-    let pre_llm_t0 = std::time::Instant::now();
 
     // ── Step 1: Extract agent params ─────────────────────────────────────────
     // native_think models (e.g. Qwen3.5) produce <think> blocks natively —
@@ -53,8 +52,6 @@ pub async fn run_agent(
     tool_names.retain(|t| t != "think");
     let use_skill_pass = runtime.agent_def["use_skill_pass"].as_bool().unwrap_or(false);
     tool_names = inject_required_tools(tool_names, runtime.needs_frontend(), use_skill_pass);
-
-    let t_params = pre_llm_t0.elapsed();
 
     // ── Step 3: Session registration ─────────────────────────────────────────
     // Carry forward WorkingMemory and active skills from the previous run so that:
@@ -88,8 +85,6 @@ pub async fn run_agent(
         });
     }
 
-    let t_session = pre_llm_t0.elapsed();
-
     // ── Step 4: Emitter is pre-built in runtime ───────────────────────────────
     let emitter = &runtime.emitter;
 
@@ -99,14 +94,12 @@ pub async fn run_agent(
     let skills_are_cached = runtime.active_skills.read().await.is_some();
     let AgentContextResult { mem_facts_count } =
         runtime.build_agent_context(&input, activity_context.as_deref()).await;
-    let t_context = pre_llm_t0.elapsed();
 
     // ── Step 7: Tool loop ─────────────────────────────────────────────────────
     let full_response = run_tool_loop(
         &runtime, &tool_names,
         enable_think, runtime.native_think, max_rounds, skills_are_cached,
         Arc::clone(&tx), &input,
-        pre_llm_t0, t_params, t_session, t_context,
     ).await;
 
     // ── Step 8: Post-processing ───────────────────────────────────────────────
@@ -215,10 +208,6 @@ async fn run_tool_loop(
     skills_are_cached: bool,
     tx:               Arc<Transaction>,
     input:            &str,
-    pre_llm_t0:       std::time::Instant,
-    t_params:         std::time::Duration,
-    t_session:        std::time::Duration,
-    t_context:        std::time::Duration,
 ) -> String {
     let emitter = &runtime.emitter;
     let mut full_response = String::new();
@@ -256,10 +245,6 @@ async fn run_tool_loop(
                         .map(|s| (s.skill_titles.clone(), s.skill_tool_names.clone(), s.system_injection.clone()))
                         .unwrap_or_default()
                 };
-                tracing::info!(
-                    "[sync_active_skills] titles={:?} tools={:?} injection_len={}",
-                    all_titles, all_tools, injection.len()
-                );
                 // Merge new tools into schema.
                 let mut added = false;
                 for t in &all_tools {
@@ -290,16 +275,6 @@ async fn run_tool_loop(
 
         // Sync before round 0 (pre-pass results already written to agent_sessions).
         sync_active_skills!();
-        let skills_are_cached = skills_are_cached;
-        let t_sync = pre_llm_t0.elapsed();
-        tracing::info!(
-            "[pre_llm] params={}ms session={}ms context={}ms sync={}ms total={}ms",
-            t_params.as_millis(),
-            (t_session - t_params).as_millis(),
-            (t_context - t_session).as_millis(),
-            (t_sync - t_context).as_millis(),
-            t_sync.as_millis(),
-        );
 
         // Limit cite-correction retries to avoid infinite loops when the LLM
         // cannot learn the format within a few attempts.
