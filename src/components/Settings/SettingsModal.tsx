@@ -120,6 +120,9 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
 
   const [memoryAgentRunning, setMemoryAgentRunning] = useState(false)
   const [memoryAgentMsg, setMemoryAgentMsg] = useState('')
+  const [diarizeReloading, setDiarizeReloading] = useState(false)
+  const [diarizeStatus, setDiarizeStatus] = useState<'idle' | 'ok' | 'error'>('idle')
+  const [diarizeError, setDiarizeError] = useState('')
 
   // Mobile tab state
   const [mobileTunnelUrl, setMobileTunnelUrl] = useState<string | null>(null)
@@ -1304,6 +1307,52 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                   </div>
                 </>
               )}
+
+              {/* ── Speaker Diarization ─────────────────────────────────────── */}
+              <SectionDivider />
+              <SectionHeader label="說話者識別（Speaker Diarization）" />
+              <div style={fieldStyle}>
+                <label style={labelStyle}>3D-Speaker CAM++ 模型路徑（.onnx）</label>
+                <PathPicker
+                  value={draft.diarize_model_path ?? ''}
+                  onChange={(v) => up({ diarize_model_path: v })}
+                />
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '6px 0 8px', lineHeight: 1.5 }}>
+                  從 ModelScope 下載 <code>speech_campplus_sv_zh-cn_16k-common</code> 的 ONNX 檔案並填入路徑。
+                  支援中英混合語音，可識別會議中多位說話者。留空則停用。
+                </p>
+                <button
+                  onClick={async () => {
+                    setDiarizeReloading(true)
+                    setDiarizeStatus('idle')
+                    setDiarizeError('')
+                    try {
+                      const res = await api.reloadDiarizeModel()
+                      if (res.ok) {
+                        setDiarizeStatus('ok')
+                      } else {
+                        setDiarizeStatus('error')
+                        setDiarizeError(res.error ?? '載入失敗')
+                      }
+                    } catch (e: any) {
+                      setDiarizeStatus('error')
+                      setDiarizeError(String(e?.message ?? e))
+                    } finally {
+                      setDiarizeReloading(false)
+                    }
+                  }}
+                  disabled={diarizeReloading || !draft.diarize_model_path}
+                  style={{ ...inputStyle, cursor: (diarizeReloading || !draft.diarize_model_path) ? 'not-allowed' : 'pointer', opacity: (diarizeReloading || !draft.diarize_model_path) ? 0.6 : 1 }}
+                >
+                  {diarizeReloading ? '載入中…' : '套用並載入模型'}
+                </button>
+                {diarizeStatus === 'ok' && (
+                  <p style={{ fontSize: '12px', color: 'var(--color-success, #22c55e)', margin: '6px 0 0' }}>✓ 模型已載入</p>
+                )}
+                {diarizeStatus === 'error' && (
+                  <p style={{ fontSize: '12px', color: 'var(--color-error, #ef4444)', margin: '6px 0 0' }}>✗ {diarizeError}</p>
+                )}
+              </div>
             </>}
 
             {tab === 'local' && <>

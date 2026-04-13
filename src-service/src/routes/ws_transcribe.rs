@@ -81,7 +81,11 @@ fn spawn_transcribe(
 /// Extract speaker embedding synchronously (CPU, <20ms) and identify speaker.
 /// Returns None if no diarize model is loaded.
 fn identify_speaker(state: &ApiState, tracker: &mut SpeakerTracker, samples: &[i16]) -> Option<String> {
-    let model = state.daemon.diarize_model.as_ref()?;
+    // Clone the Arc while holding the lock briefly, then release before inference
+    let model = {
+        let guard = state.daemon.diarize_model.read().ok()?;
+        guard.clone()?
+    };
     match model.extract(samples) {
         Ok(embedding) => Some(tracker.identify(&embedding)),
         Err(_) => None,

@@ -56,6 +56,7 @@ export const api = {
   saveSettings: (data: Record<string, unknown>) => request<{ ok: boolean }>('POST', '/settings', data),
   getUserSettings: () => request<Record<string, string>>('GET', '/settings/user'),
   saveUserSettings: (data: Record<string, unknown>) => request<{ ok: boolean }>('POST', '/settings/user', data),
+  reloadDiarizeModel: () => request<{ ok: boolean; loaded?: boolean; error?: string }>('POST', '/settings/diarize/reload', {}),
 
   // Conversations
   listConversations: (vaultId?: string, mode?: string, accountId?: string) => {

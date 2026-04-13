@@ -29,8 +29,9 @@ pub struct DaemonState {
     pub http_client: reqwest::Client,
 
     /// 3D-Speaker CAM++ ONNX embedding model for speaker diarization.
+    /// Wrapped in RwLock so it can be hot-reloaded when the user changes the path.
     /// None if no model path is configured in settings.
-    pub diarize_model: Option<Arc<EmbedModel>>,
+    pub diarize_model: Arc<std::sync::RwLock<Option<Arc<EmbedModel>>>>,
 
     // ── 固定 URL（從 config 計算，runtime 不變）─────────────────────────────
     pub llm_url: String,
@@ -64,7 +65,7 @@ impl DaemonState {
             intent_centroids: Arc::new(Mutex::new(None)),
             vault_path_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             http_client: reqwest::Client::new(),
-            diarize_model: None,
+            diarize_model: Arc::new(std::sync::RwLock::new(None)),
             llm_url: config.llm_url(),
             embedding_url: config.embedding_url(),
             whisper_url: config.whisper_url(),

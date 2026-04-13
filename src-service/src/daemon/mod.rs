@@ -25,6 +25,19 @@ pub async fn run(data_dir: PathBuf, config: Config) -> Result<(), Box<dyn std::e
 
     let auth_store = AuthStore::new();
     let daemon_state = DaemonState::new(&data_dir, &config);
+
+    // Load diarize model if path is configured in settings
+    match crate::diarize::load_from_db(&db).await {
+        Ok(Some(model)) => {
+            tracing::info!("Diarize model loaded successfully");
+            if let Ok(mut guard) = daemon_state.diarize_model.write() {
+                *guard = Some(model);
+            }
+        }
+        Ok(None) => tracing::info!("Diarize model path not configured — speaker diarization disabled"),
+        Err(e)   => tracing::warn!("Diarize model failed to load: {}", e),
+    }
+
     let http_port = config.service.port;
     let https_port = config.service.https_port;
 

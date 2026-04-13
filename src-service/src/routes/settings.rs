@@ -21,6 +21,7 @@ pub fn router() -> Router<ApiState> {
         .route("/settings/api-key/:provider", get(get_api_key).post(set_api_key))
         .route("/settings/brave-key-id", post(set_brave_key_id))
         .route("/settings/user-image", get(get_user_image).post(save_user_image))
+        .route("/settings/diarize/reload", post(reload_diarize_model))
 }
 
 async fn get_settings(
@@ -427,6 +428,32 @@ async fn save_user_image(
         .await;
 
     Ok(Json(json!({ "ok": true })))
+}
+
+/// POST /settings/diarize/reload
+/// Re-reads `diarize_model_path` from settings and hot-reloads the ONNX model.
+async fn reload_diarize_model(
+    State(state): State<ApiState>,
+) -> Json<Value> {
+    match crate::diarize::load_from_db(&state.db).await {
+        Ok(model_opt) => {
+            let loaded = model_opt.is_some();
+            if let Ok(mut guard) = state.daemon.diarize_model.write() {
+                *guard = model_opt;
+            }
+            if loaded {
+                tracing::info!("Diarize model reloaded successfully");
+                Json(json!({ "ok": true, "loaded": true }))
+            } else {
+                tracing::info!("Diarize model path cleared — diarization disabled");
+                Json(json!({ "ok": true, "loaded": false }))
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Diarize model reload failed: {}", e);
+            Json(json!({ "ok": false, "error": e }))
+        }
+    }
 }
 
 #[derive(Deserialize)]

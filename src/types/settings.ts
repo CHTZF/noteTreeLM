@@ -7,6 +7,7 @@ export interface Settings {
   whisper_cli_path: string
   whisper_model_path: string
   whisper_threads: number
+  diarize_model_path: string
   whisper_auto_insert: boolean
   import_max_depth: number
   import_max_pages: number
@@ -66,6 +67,7 @@ export const DEFAULT_SETTINGS: Settings = {
   auto_save_delay: 1000,
   whisper_cli_path: '',
   whisper_model_path: '',
+  diarize_model_path: '',
   whisper_threads: 4,
   whisper_auto_insert: true,
   import_max_depth: 3,
