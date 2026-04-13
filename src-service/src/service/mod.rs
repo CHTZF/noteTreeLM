@@ -58,7 +58,12 @@ pub async fn build_agent_runtime(
             .map(|r| r.value)
             .unwrap_or_default();
         let meta = model_meta(&model_path);
-        (meta.native_think, harness::context::ContextBudget::from_context_size(meta.ctx_size))
+        // We always start llama-server with --reasoning off for native_think models,
+        // so the model will NOT produce think blocks natively. Treat native_think as
+        // false so that the agent injects the think tool and forces a think round instead.
+        let effective_native_think = false;
+        let _ = meta.native_think; // suppress unused warning
+        (effective_native_think, harness::context::ContextBudget::from_context_size(meta.ctx_size))
     };
     let session_id = Arc::new(session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
     let emitter    = HarnessRequestRuntime::build_emitter(&emit_fn, &session_id);
