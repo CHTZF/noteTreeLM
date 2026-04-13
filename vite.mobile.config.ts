@@ -7,6 +7,7 @@ import path from 'path'
 export default defineConfig({
   plugins: [react()],
   root: '.',
+  base: '/mobile/',
   // Use mobile.html as the entry
   build: {
     outDir: 'src-service/mobile-dist',
