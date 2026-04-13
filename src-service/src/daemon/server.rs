@@ -61,6 +61,7 @@ pub fn build_api_router(app_state: ApiState) -> Router {
         .merge(crate::routes::events::router())
         .merge(crate::routes::ws::router())
         .merge(crate::routes::ws_transcribe::router())
+        .merge(crate::routes::meetings::router())
         .merge(crate::routes::whisper::router())
         .merge(crate::routes::llm::router())
         .route("/pairing-info", get(pairing_info_handler))

@@ -13,5 +13,6 @@ pub mod scheduled;
 pub mod events;
 pub mod ws;
 pub mod ws_transcribe;
+pub mod meetings;
 pub mod calendar;
 pub mod gmail;

@@ -11,6 +11,7 @@ export const SPECIAL_NAMES: Record<string, string> = {
   '__help__': '說明',
   '__trash__': '垃圾桶',
   '__import__': '知識匯入',
+  '__meeting__': '會議錄音',
 }
 
 interface TabBarProps {

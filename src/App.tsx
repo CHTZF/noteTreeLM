@@ -40,6 +40,7 @@ import ImportPanel from './components/ImportCenter/ImportPanel'
 import SkillsPage from './components/Skills/SkillsPage'
 import AgentsPage from './components/Agents/AgentsPage'
 import EvalPage from './components/Eval/EvalPage'
+import MeetingPanel from './components/Meeting/MeetingPanel'
 import KnowledgeAssistant from './components/KnowledgeAssistant/KnowledgeAssistant'
 import HelpPanel from './components/Help/HelpPanel'
 import Editor from './components/Editor/Editor'
@@ -68,7 +69,8 @@ const IMPORT_TAB = '__import__'
 const KB_ASSIST_TAB = '__kb_assist__'
 const SKILLS_TAB = '__skills__'
 const AGENTS_TAB = '__agents__'
-const EVAL_TAB   = '__eval__'
+const EVAL_TAB     = '__eval__'
+const MEETING_TAB  = '__meeting__'
 const DEBUG_TAB = '__debug__'
 
 // ─── Pane tree types ───────────────────────────────────────────────────────
@@ -568,7 +570,7 @@ function AppMain() {
 
   // ─── Open a note in the focused pane ──────────────────────────────────
   // Chat/LiveChat tabs should never be replaced by content navigation
-  const isChatTab = (p: string) => p === CHAT_TAB || p === LIVE_CHAT_TAB || p === IMPORT_TAB || p === KB_ASSIST_TAB || p === SKILLS_TAB || p === AGENTS_TAB || p === EVAL_TAB
+  const isChatTab = (p: string) => p === CHAT_TAB || p === LIVE_CHAT_TAB || p === IMPORT_TAB || p === KB_ASSIST_TAB || p === SKILLS_TAB || p === AGENTS_TAB || p === EVAL_TAB || p === MEETING_TAB
 
   // Find a pane that is NOT showing a Chat/LiveChat tab as its active tab,
   // excluding the given leafId. Returns undefined if none exists.
@@ -810,7 +812,8 @@ function AppMain() {
     { id: 'graph', label: '知識圖譜', icon: '🕸️', action: () => openNote(GRAPH_TAB) },
     { id: 'agents', label: 'Agent 管理', icon: '⚡', action: () => openNote(AGENTS_TAB) },
     { id: 'skills', label: '技能規範', icon: '🎚️', action: () => openNote(SKILLS_TAB) },
-    { id: 'eval',   label: 'Eval Suite', icon: '🧪', action: () => openNote(EVAL_TAB) },
+    { id: 'eval',    label: 'Eval Suite', icon: '🧪', action: () => openNote(EVAL_TAB) },
+    { id: 'meeting', label: '會議錄音',    icon: '🎙', action: () => openNote(MEETING_TAB) },
     { id: 'kb_assist', label: '知識助理', icon: '🛡️', action: () => openNote(KB_ASSIST_TAB) },
     { id: 'import', label: '匯入中心', icon: '📥', action: () => openNote(IMPORT_TAB) },
     { id: 'chat', label: 'Chat 對話', icon: '💬', action: () => openNote(CHAT_TAB) },
@@ -1174,6 +1177,9 @@ function AppMain() {
               {t.path === EVAL_TAB && (
                 <EvalPage />
               )}
+              {t.path === MEETING_TAB && (
+                <MeetingPanel />
+              )}
               {t.path === KB_ASSIST_TAB && (
                 <KnowledgeAssistant onOpenNote={openNoteFromChat} />
               )}
@@ -1183,7 +1189,7 @@ function AppMain() {
             </div>
           ))}
           {/* Regular content — only when active tab is not Chat/LiveChat/Import */}
-          {(!activeTab || (activeTab.path !== CHAT_TAB && activeTab.path !== LIVE_CHAT_TAB && activeTab.path !== IMPORT_TAB && activeTab.path !== KB_ASSIST_TAB && activeTab.path !== SKILLS_TAB && activeTab.path !== AGENTS_TAB && activeTab.path !== EVAL_TAB && activeTab.path !== MEMORY_LINKS_TAB)) && (
+          {(!activeTab || (activeTab.path !== CHAT_TAB && activeTab.path !== LIVE_CHAT_TAB && activeTab.path !== IMPORT_TAB && activeTab.path !== KB_ASSIST_TAB && activeTab.path !== SKILLS_TAB && activeTab.path !== AGENTS_TAB && activeTab.path !== EVAL_TAB && activeTab.path !== MEETING_TAB && activeTab.path !== MEMORY_LINKS_TAB)) && (
             renderPaneContent(leaf, isFocused, activePath)
           )}
           {isDraggingTab && dropZoneInfo?.paneId === leaf.id && (

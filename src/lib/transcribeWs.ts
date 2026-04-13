@@ -2,11 +2,13 @@
  * Shared transcription WebSocket client with auto-reconnect.
  *
  * Protocol:
- *   client → text:   {"type":"start","language":"zh-TW"}
+ *   client → text:   {"type":"start","language":"zh-TW","vault_id":"..."}
  *   client → binary: Int16Array (16 kHz, mono, little-endian) — continuous frames
  *   client → text:   {"type":"stop"}
+ *   client → text:   {"type":"rename_speaker","speaker":"SPEAKER_00","name":"Alice"}
  *
- *   server → text:   {"event":"whisper:done","data":{"text":"...","index":N}}
+ *   server → text:   {"event":"meeting:started","data":{"meeting_id":"..."}}
+ *   server → text:   {"event":"whisper:done","data":{"text":"...","index":N,"ts_ms":N,"speaker":"..."}}
  *   server → text:   {"event":"whisper:flush_done"}
  *   server → text:   {"event":"whisper:error","data":"..."}
  */
@@ -16,6 +18,8 @@ export interface TranscribeSession {
   sendPcm(buffer: ArrayBuffer): void
   /** Tell server to flush remaining buffer; waits for flush_done internally. */
   stop(): void
+  /** Rename a speaker label to a real name (sent to server). */
+  renameSpeaker(speaker: string, name: string): void
   /** Permanently close the session (no reconnect). */
   close(): void
 }
@@ -43,14 +47,46 @@ const MAX_RECONNECT_ATTEMPTS = 5
  */
 export function createTranscribeSession(
   language: string,
-  onResult: (text: string, index: number, speaker?: string) => void,
+  onResult: (text: string, index: number, speaker?: string, tsMs?: number) => void,
   onFlushDone: () => void,
   onError: (msg: string) => void,
+  options?: {
+    vaultId?: string
+    onMeetingStarted?: (meetingId: string) => void
+  },
 ): Promise<TranscribeSession> {
+  const vaultId = options?.vaultId ?? ''
+  const onMeetingStarted = options?.onMeetingStarted
+
+  function handleMessage(e: MessageEvent, onMsg: (msg: { event: string; data?: unknown }) => void) {
+    if (typeof e.data !== 'string') return
+    try {
+      onMsg(JSON.parse(e.data as string) as { event: string; data?: unknown })
+    } catch { /* ignore parse errors */ }
+  }
+
+  function dispatch(msg: { event: string; data?: unknown }) {
+    if (msg.event === 'whisper:done') {
+      const d = msg.data as { text: string; index: number; speaker?: string; ts_ms?: number }
+      onResult(d.text ?? '', d.index ?? 0, d.speaker, d.ts_ms)
+    } else if (msg.event === 'whisper:flush_done') {
+      stopping = false
+      onFlushDone()
+    } else if (msg.event === 'whisper:error') {
+      onError(String(msg.data ?? '轉錄失敗'))
+    } else if (msg.event === 'meeting:started') {
+      const d = msg.data as { meeting_id: string }
+      onMeetingStarted?.(d.meeting_id)
+    }
+  }
+
+  // These are captured by dispatch / closures below
+  let stopping = false
+
   return new Promise((resolve, reject) => {
     let ws: WebSocket | null = null
     let closed = false          // set by close() — no further reconnects
-    let stopping = false        // set by stop() — waiting for flush_done
+    stopping = false
     let reconnectAttempts = 0
     // PCM frames buffered while reconnecting
     const pendingPcm: ArrayBuffer[] = []
@@ -62,7 +98,7 @@ export function createTranscribeSession(
 
       ws.onopen = () => {
         reconnectAttempts = 0
-        ws!.send(JSON.stringify({ type: 'start', language }))
+        ws!.send(JSON.stringify({ type: 'start', language, vault_id: vaultId }))
         // Flush any frames buffered during reconnect
         for (const buf of pendingPcm) {
           ws!.send(buf)
@@ -70,41 +106,16 @@ export function createTranscribeSession(
         pendingPcm.length = 0
       }
 
-      ws.onmessage = (e) => {
-        if (typeof e.data !== 'string') return
-        try {
-          const msg = JSON.parse(e.data as string) as { event: string; data?: unknown }
-          if (msg.event === 'whisper:done') {
-            const d = msg.data as { text: string; index: number; speaker?: string }
-            onResult(d.text ?? '', d.index ?? 0, d.speaker)
-          } else if (msg.event === 'whisper:flush_done') {
-            stopping = false
-            onFlushDone()
-          } else if (msg.event === 'whisper:error') {
-            onError(String(msg.data ?? '轉錄失敗'))
-          }
-        } catch { /* ignore parse errors */ }
-      }
-
-      ws.onerror = () => {
-        // onerror always followed by onclose — handle retry there
-      }
+      ws.onmessage = (e) => handleMessage(e, dispatch)
+      ws.onerror = () => {}
 
       ws.onclose = (e) => {
-        if (closed) return  // intentional close, no reconnect
-
-        if (e.wasClean) {
-          // Server sent a proper Close frame (e.g. server shutdown signal)
-          onError('轉錄連線已關閉')
-          return
-        }
-
-        // Unexpected disconnect — retry with backoff
+        if (closed) return
+        if (e.wasClean) { onError('轉錄連線已關閉'); return }
         if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
           onError(`轉錄連線中斷，已重試 ${MAX_RECONNECT_ATTEMPTS} 次`)
           return
         }
-
         const delay = RECONNECT_DELAYS_MS[Math.min(reconnectAttempts, RECONNECT_DELAYS_MS.length - 1)]
         reconnectAttempts++
         setTimeout(connect, delay)
@@ -119,24 +130,8 @@ export function createTranscribeSession(
     firstWs.onopen = () => {
       ws = firstWs
       reconnectAttempts = 0
-      ws.send(JSON.stringify({ type: 'start', language }))
-
-      ws.onmessage = (e) => {
-        if (typeof e.data !== 'string') return
-        try {
-          const msg = JSON.parse(e.data as string) as { event: string; data?: unknown }
-          if (msg.event === 'whisper:done') {
-            const d = msg.data as { text: string; index: number; speaker?: string }
-            onResult(d.text ?? '', d.index ?? 0, d.speaker)
-          } else if (msg.event === 'whisper:flush_done') {
-            stopping = false
-            onFlushDone()
-          } else if (msg.event === 'whisper:error') {
-            onError(String(msg.data ?? '轉錄失敗'))
-          }
-        } catch { /* ignore */ }
-      }
-
+      ws.send(JSON.stringify({ type: 'start', language, vault_id: vaultId }))
+      ws.onmessage = (e) => handleMessage(e, dispatch)
       ws.onerror = () => {}
 
       ws.onclose = (e) => {
@@ -157,7 +152,6 @@ export function createTranscribeSession(
           if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(buffer)
           } else {
-            // Buffer frames while reconnecting (cap at 5s worth ≈ 160 frames × 480 samples)
             if (pendingPcm.length < 160) pendingPcm.push(buffer)
           }
         },
@@ -167,9 +161,14 @@ export function createTranscribeSession(
           if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'stop' }))
           } else {
-            // Not connected — flush_done will never come; resolve immediately
             stopping = false
             onFlushDone()
+          }
+        },
+        renameSpeaker(speaker: string, name: string) {
+          if (closed) return
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'rename_speaker', speaker, name }))
           }
         },
         close() {

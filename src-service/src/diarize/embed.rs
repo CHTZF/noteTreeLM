@@ -42,8 +42,10 @@ impl EmbedModel {
         let num_mel = features.ncols(); // 80
 
         // ── 3. Flatten to Vec and build shape [1, num_frames, num_mel] ────────
-        // into_raw_vec() gives row-major contiguous data
-        let flat: Vec<f32> = features.into_raw_vec_and_offset().0;
+        // into_iter() iterates in logical (row-major) order regardless of
+        // underlying memory layout — safer than into_raw_vec_and_offset()
+        // which depends on the array having zero offset and standard strides.
+        let flat: Vec<f32> = features.into_iter().collect();
         let shape = [1usize, num_frames, num_mel];
 
         // ── 4. ONNX inference (no ndarray feature needed — use raw shape+vec) ─

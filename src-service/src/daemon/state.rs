@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -24,6 +24,10 @@ pub struct DaemonState {
     pub intent_centroids: Arc<Mutex<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>>>,
     /// vault_id → vault_path in-process cache (avoids a DB round-trip on every note read).
     pub vault_path_cache: Arc<std::sync::RwLock<HashMap<String, String>>>,
+
+    /// Application data directory (e.g. ~/Library/Application Support/com.notetreelm.app).
+    /// Used for storing meeting WAV files under {data_dir}/meetings/.
+    pub data_dir: PathBuf,
 
     /// Shared HTTP client — connection-pool reuse across all whisper / LLM requests.
     pub http_client: reqwest::Client,
@@ -64,6 +68,7 @@ impl DaemonState {
             agent_sessions: Arc::new(Mutex::new(HashMap::new())),
             intent_centroids: Arc::new(Mutex::new(None)),
             vault_path_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            data_dir: data_dir.to_path_buf(),
             http_client: reqwest::Client::new(),
             diarize_model: Arc::new(std::sync::RwLock::new(None)),
             llm_url: config.llm_url(),

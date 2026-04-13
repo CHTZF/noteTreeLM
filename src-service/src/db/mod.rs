@@ -375,6 +375,31 @@ async fn run_migrations(db: &SurrealDb) -> Result<(), surrealdb::Error> {
         "DEFINE FIELD IF NOT EXISTS created_at       ON response_ratings TYPE int DEFAULT 0;",
         "DEFINE INDEX IF NOT EXISTS idx_response_ratings_id ON response_ratings FIELDS rating_id UNIQUE;",
 
+        // ── meetings ─────────────────────────────────────────────────────────
+        "DEFINE TABLE IF NOT EXISTS meetings SCHEMALESS;",
+        "DEFINE FIELD IF NOT EXISTS meeting_id        ON meetings TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS vault_id          ON meetings TYPE option<string>;",
+        "DEFINE FIELD IF NOT EXISTS account_id        ON meetings TYPE string DEFAULT '';",
+        "DEFINE FIELD IF NOT EXISTS language          ON meetings TYPE string DEFAULT 'auto';",
+        "DEFINE FIELD IF NOT EXISTS started_at        ON meetings TYPE int DEFAULT 0;",
+        "DEFINE FIELD IF NOT EXISTS ended_at          ON meetings TYPE option<int>;",
+        "DEFINE FIELD IF NOT EXISTS wav_path          ON meetings TYPE option<string>;",
+        "DEFINE FIELD IF NOT EXISTS note_path         ON meetings TYPE option<string>;",
+        "DEFINE FIELD IF NOT EXISTS status            ON meetings TYPE string DEFAULT 'recording';",
+        "DEFINE FIELD IF NOT EXISTS speaker_names_json ON meetings TYPE string DEFAULT '{}';",
+        "DEFINE INDEX IF NOT EXISTS idx_meetings_id        ON meetings FIELDS meeting_id UNIQUE;",
+        "DEFINE INDEX IF NOT EXISTS idx_meetings_vault_ts  ON meetings FIELDS vault_id, started_at;",
+
+        "DEFINE TABLE IF NOT EXISTS meeting_segments SCHEMALESS;",
+        "DEFINE FIELD IF NOT EXISTS seg_id     ON meeting_segments TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS meeting_id ON meeting_segments TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS seg_index  ON meeting_segments TYPE int DEFAULT 0;",
+        "DEFINE FIELD IF NOT EXISTS speaker    ON meeting_segments TYPE option<string>;",
+        "DEFINE FIELD IF NOT EXISTS text       ON meeting_segments TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS ts_ms      ON meeting_segments TYPE int DEFAULT 0;",
+        "DEFINE INDEX IF NOT EXISTS idx_meeting_segs_id  ON meeting_segments FIELDS seg_id UNIQUE;",
+        "DEFINE INDEX IF NOT EXISTS idx_meeting_segs_mid ON meeting_segments FIELDS meeting_id, seg_index;",
+
         // ── graph nodes & edges ──────────────────────────────────────────────
         "DEFINE TABLE IF NOT EXISTS graph_nodes SCHEMALESS;",
         "DEFINE FIELD IF NOT EXISTS vault_id   ON graph_nodes TYPE string;",

@@ -350,6 +350,39 @@ export const api = {
     const vaultId = await getVaultId()
     return request<{ case_id: string; deleted: boolean }>('DELETE', `/vaults/${encodeURIComponent(vaultId)}/eval/cases/${encodeURIComponent(caseId)}`)
   },
+
+  // Meetings
+  listMeetings: (vaultId?: string, limit = 50, offset = 0) => {
+    const params = new URLSearchParams({ limit: String(limit), offset: String(offset) })
+    if (vaultId) params.set('vault_id', vaultId)
+    return request<{ meetings: MeetingSummary[] }>('GET', `/meetings?${params}`)
+  },
+  getMeeting: (id: string) =>
+    request<{ meeting: MeetingSummary; segments: MeetingSegment[] }>('GET', `/meetings/${encodeURIComponent(id)}`),
+  renameMeetingSpeaker: (id: string, speaker: string, name: string) =>
+    request<{ ok: boolean; speaker_names_json: string }>('POST', `/meetings/${encodeURIComponent(id)}/rename-speaker`, { speaker, name }),
+  deleteMeeting: (id: string) =>
+    request<{ ok: boolean }>('DELETE', `/meetings/${encodeURIComponent(id)}`),
+}
+
+export interface MeetingSummary {
+  meeting_id: string
+  vault_id?: string
+  account_id?: string
+  language?: string
+  started_at?: number
+  ended_at?: number
+  status?: string
+  note_path?: string
+  wav_path?: string
+  speaker_names_json?: string
+}
+
+export interface MeetingSegment {
+  seg_index: number
+  speaker?: string
+  text: string
+  ts_ms: number
 }
 
 export interface EvalCaseSummary {

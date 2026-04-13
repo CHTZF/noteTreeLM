@@ -312,14 +312,27 @@ pub fn build_wav_from_i16(samples: &[i16], sample_rate: u32) -> Vec<u8> {
 
 /// Transcribe raw PCM16 (16-bit signed LE, 16 kHz mono) via whisper-server.
 /// Returns the recognized text (empty string if hallucination/silence), or an error.
+/// `context`: optional preceding transcript text fed as initial_prompt.
+/// Whisper uses this to bias vocabulary and improve cross-segment accuracy.
+/// If both `context` and the language-specific prompt exist, they are concatenated.
 pub async fn transcribe_pcm16(
     state: &ApiState,
     samples: &[i16],
     language: &str,
+    context: Option<&str>,
 ) -> Result<String, String> {
     let wav = build_wav_from_i16(samples, 16000);
     let base_url = ensure_running(state).await?;
-    let (whisper_lang, initial_prompt) = map_language(language);
+    let (whisper_lang, lang_prompt) = map_language(language);
+
+    // Merge language hint with cross-segment context.
+    // Order: lang_prompt first (sets vocabulary bias), then context (recent speech).
+    let merged_prompt: Option<String> = match (lang_prompt, context.filter(|s| !s.is_empty())) {
+        (Some(lp), Some(ctx)) => Some(format!("{} {}", lp, ctx)),
+        (Some(lp), None)      => Some(lp.to_string()),
+        (None,     Some(ctx)) => Some(ctx.to_string()),
+        (None,     None)      => None,
+    };
 
     let client = &state.daemon.http_client;
     let part = reqwest::multipart::Part::bytes(wav)
@@ -336,8 +349,8 @@ pub async fn transcribe_pcm16(
         .text("no_speech_thold", "0.6")
         .text("suppress_blank", "true");
 
-    if let Some(prompt) = initial_prompt {
-        form = form.text("initial_prompt", prompt.to_string());
+    if let Some(prompt) = merged_prompt {
+        form = form.text("initial_prompt", prompt);
     }
 
     let resp = client
