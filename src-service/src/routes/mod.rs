@@ -12,5 +12,6 @@ pub mod memory;
 pub mod scheduled;
 pub mod events;
 pub mod ws;
+pub mod ws_transcribe;
 pub mod calendar;
 pub mod gmail;

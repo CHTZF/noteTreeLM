@@ -24,6 +24,9 @@ pub struct DaemonState {
     /// vault_id → vault_path in-process cache (avoids a DB round-trip on every note read).
     pub vault_path_cache: Arc<std::sync::RwLock<HashMap<String, String>>>,
 
+    /// Shared HTTP client — connection-pool reuse across all whisper / LLM requests.
+    pub http_client: reqwest::Client,
+
     // ── 固定 URL（從 config 計算，runtime 不變）─────────────────────────────
     pub llm_url: String,
     pub embedding_url: String,
@@ -55,6 +58,7 @@ impl DaemonState {
             agent_sessions: Arc::new(Mutex::new(HashMap::new())),
             intent_centroids: Arc::new(Mutex::new(None)),
             vault_path_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            http_client: reqwest::Client::new(),
             llm_url: config.llm_url(),
             embedding_url: config.embedding_url(),
             whisper_url: config.whisper_url(),

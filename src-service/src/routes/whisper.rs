@@ -99,7 +99,7 @@ async fn ensure_running(state: &ApiState) -> Result<String, String> {
     let config = resolve_config(&state.db).await?;
 
     let base_url = state.daemon.whisper_url.clone();
-    let client = reqwest::Client::new();
+    let client = &state.daemon.http_client;
 
     enum Action { Spawn, WaitExisting, Ready }
 
@@ -280,6 +280,88 @@ fn is_hallucination(text: &str) -> bool {
 
 // ─── WAV helpers ──────────────────────────────────────────────────────────────
 
+/// Build a WAV file from raw i16 PCM samples (mono, little-endian).
+pub fn build_wav_from_i16(samples: &[i16], sample_rate: u32) -> Vec<u8> {
+    let channels: u16 = 1;
+    let bits_per_sample: u16 = 16;
+    let n_samples = samples.len() as u32;
+    let byte_rate = sample_rate * channels as u32 * bits_per_sample as u32 / 8;
+    let block_align = channels * bits_per_sample / 8;
+    let data_size = n_samples * 2;
+    let file_size = 36 + data_size;
+
+    let mut buf = Vec::with_capacity(44 + data_size as usize);
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&file_size.to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(&channels.to_le_bytes());
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    buf.extend_from_slice(&byte_rate.to_le_bytes());
+    buf.extend_from_slice(&block_align.to_le_bytes());
+    buf.extend_from_slice(&bits_per_sample.to_le_bytes());
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_size.to_le_bytes());
+    for &s in samples {
+        buf.extend_from_slice(&s.to_le_bytes());
+    }
+    buf
+}
+
+/// Transcribe raw PCM16 (16-bit signed LE, 16 kHz mono) via whisper-server.
+/// Returns the recognized text (empty string if hallucination/silence), or an error.
+pub async fn transcribe_pcm16(
+    state: &ApiState,
+    samples: &[i16],
+    language: &str,
+) -> Result<String, String> {
+    let wav = build_wav_from_i16(samples, 16000);
+    let base_url = ensure_running(state).await?;
+    let (whisper_lang, initial_prompt) = map_language(language);
+
+    let client = &state.daemon.http_client;
+    let part = reqwest::multipart::Part::bytes(wav)
+        .file_name("audio.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| e.to_string())?;
+
+    let mut form = reqwest::multipart::Form::new()
+        .part("file", part)
+        .text("response_format", "json")
+        .text("language", whisper_lang.to_string())
+        .text("temperature", "0.0")
+        .text("beam_size", "3")
+        .text("no_speech_thold", "0.6")
+        .text("suppress_blank", "true");
+
+    if let Some(prompt) = initial_prompt {
+        form = form.text("initial_prompt", prompt.to_string());
+    }
+
+    let resp = client
+        .post(format!("{}/inference", base_url))
+        .multipart(form)
+        .timeout(Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| format!("whisper-server 請求失敗：{}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("whisper-server 回傳錯誤 {}：{}", status, body));
+    }
+
+    let json: serde_json::Value = resp.json().await
+        .map_err(|e| format!("解析回應失敗：{}", e))?;
+
+    let text = json["text"].as_str().unwrap_or("").trim().to_string();
+    let text = if is_hallucination(&text) { String::new() } else { text };
+    Ok(text)
+}
+
 pub fn build_silent_wav(duration_secs: f32, sample_rate: u32) -> Vec<u8> {
     let n_samples = (duration_secs * sample_rate as f32) as u32;
     let channels: u16 = 1;
@@ -307,9 +389,8 @@ pub fn build_silent_wav(duration_secs: f32, sample_rate: u32) -> Vec<u8> {
     buf
 }
 
-async fn warmup_inference(base_url: &str) {
+async fn warmup_inference(base_url: &str, client: &reqwest::Client) {
     let wav = build_silent_wav(1.0, 16000);
-    let client = reqwest::Client::new();
     let Ok(part) = reqwest::multipart::Part::bytes(wav)
         .file_name("warmup.wav")
         .mime_str("audio/wav")
@@ -367,7 +448,7 @@ async fn transcribe_handler(
         (StatusCode::SERVICE_UNAVAILABLE, e)
     })?;
 
-    let client = reqwest::Client::new();
+    let client = &state.daemon.http_client;
     let part = reqwest::multipart::Part::bytes(wav)
         .file_name("audio.wav")
         .mime_str("audio/wav")
@@ -412,8 +493,7 @@ async fn transcribe_handler(
 async fn status_handler(
     State(state): State<ApiState>,
 ) -> Json<Value> {
-    let client = reqwest::Client::new();
-    let healthy = client
+    let healthy = state.daemon.http_client
         .get(format!("{}/health", state.daemon.whisper_url))
         .timeout(Duration::from_secs(2))
         .send()
@@ -453,7 +533,7 @@ async fn start_handler(
         state.daemon.emit("whisper:stderr", json!(format!("[server:error] {}", e)));
         (StatusCode::INTERNAL_SERVER_ERROR, e)
     })?;
-    warmup_inference(&base_url).await;
+    warmup_inference(&base_url, &state.daemon.http_client).await;
     state.daemon.emit("whisper:stderr", json!("[server] 推論引擎預熱完成"));
 
     Ok(Json(json!({ "ok": true })))
@@ -489,7 +569,7 @@ async fn restart_handler(
     let base_url = ensure_running(&state).await.map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, e)
     })?;
-    warmup_inference(&base_url).await;
+    warmup_inference(&base_url, &state.daemon.http_client).await;
 
     Ok(Json(json!({ "ok": true })))
 }
