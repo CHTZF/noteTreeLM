@@ -10,6 +10,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::app_state::ApiState;
+use crate::diarize::SpeakerTracker;
 
 #[derive(Deserialize)]
 pub struct WsQuery {
@@ -47,22 +48,22 @@ fn rms_i16(samples: &[i16]) -> f32 {
 }
 
 // Maximum chars kept as rolling context passed to next whisper call.
-// Whisper initial_prompt is capped at ~224 tokens ≈ ~200 CJK chars / ~400 Latin chars.
 const MAX_CONTEXT_CHARS: usize = 200;
 
 /// Result of one transcription job, forwarded back to the sender loop.
 struct TranscribeResult {
     index: u32,
+    speaker: Option<String>,
     outcome: Result<String, String>,
 }
 
 /// Spawn a transcription task. Results are sent through `result_tx`.
-/// `context` is the recent transcript text used as initial_prompt for this segment.
 fn spawn_transcribe(
     state: ApiState,
     samples: Vec<i16>,
     language: String,
     context: String,
+    speaker: Option<String>,
     index: u32,
     result_tx: mpsc::Sender<TranscribeResult>,
 ) {
@@ -73,8 +74,18 @@ fn spawn_transcribe(
             r = crate::routes::whisper::transcribe_pcm16(&state, &samples, &language, ctx) => r,
             _ = shutdown_rx.recv() => Err("server shutdown".to_string()),
         };
-        let _ = result_tx.send(TranscribeResult { index, outcome }).await;
+        let _ = result_tx.send(TranscribeResult { index, speaker, outcome }).await;
     });
+}
+
+/// Extract speaker embedding synchronously (CPU, <20ms) and identify speaker.
+/// Returns None if no diarize model is loaded.
+fn identify_speaker(state: &ApiState, tracker: &mut SpeakerTracker, samples: &[i16]) -> Option<String> {
+    let model = state.daemon.diarize_model.as_ref()?;
+    match model.extract(samples) {
+        Ok(embedding) => Some(tracker.identify(&embedding)),
+        Err(_) => None,
+    }
 }
 
 async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<String>) {
@@ -94,16 +105,11 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
     let mut shutdown_rx = state.daemon.ws_shutdown_tx.subscribe();
 
     // Channel for transcription results from background tasks
-    // Capacity 16: allows up to 16 in-flight segments before back-pressure
     let (result_tx, mut result_rx) = mpsc::channel::<TranscribeResult>(16);
 
-    // Track pending tasks so stop() can wait for them all
     let mut pending_tasks: u32 = 0;
-    // next_send_index: the segment index we're waiting to forward next (for ordered output)
     let mut next_send_index: u32 = 0;
-    // Out-of-order result buffer: index → outcome
-    let mut result_buf: std::collections::HashMap<u32, Result<String, String>> = std::collections::HashMap::new();
-    // Rolling context: last N chars of recognised text, passed as initial_prompt
+    let mut result_buf: std::collections::HashMap<u32, TranscribeResult> = std::collections::HashMap::new();
     let mut context_buf = String::new();
 
     // ─── Per-connection state ──────────────────────────────────────────────────
@@ -114,8 +120,9 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
     let mut chunk_start     : usize = 0;
     let mut segment_index   : u32   = 0;
     let mut active          = false;
-    // When true, we've sent "stop" and are draining pending tasks
     let mut stopping        = false;
+    // Per-connection speaker tracker (reset on each "start")
+    let mut speaker_tracker = SpeakerTracker::new();
 
     loop {
         tokio::select! {
@@ -124,8 +131,6 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
                 let msg = match msg_opt {
                     Some(Ok(m)) => m,
                     _ => {
-                        // Client disconnected — clear buffer, background tasks will
-                        // drain naturally (result_tx dropped when result_rx drops)
                         pcm.clear();
                         break;
                     }
@@ -152,18 +157,19 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
                                 context_buf.clear();
                                 active          = true;
                                 stopping        = false;
+                                speaker_tracker = SpeakerTracker::new();
                             }
 
                             Some("stop") => {
                                 if active {
-                                    // Flush remaining buffer as final segment
                                     let remaining = pcm[chunk_start..].to_vec();
                                     if remaining.len() >= MIN_SEGMENT_SAMPLES
                                         && rms_i16(&remaining) >= MIN_CHUNK_RMS
                                     {
+                                        let speaker = identify_speaker(&state, &mut speaker_tracker, &remaining);
                                         spawn_transcribe(
                                             state.clone(), remaining, language.clone(),
-                                            context_buf.clone(), segment_index, result_tx.clone(),
+                                            context_buf.clone(), speaker, segment_index, result_tx.clone(),
                                         );
                                         segment_index += 1;
                                         pending_tasks += 1;
@@ -175,7 +181,6 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
                                     speech_active   = false;
                                     silence_samples = 0;
 
-                                    // If nothing pending, flush_done immediately
                                     if pending_tasks == 0 {
                                         let _ = tx.send(Message::Text(
                                             json!({"event":"whisper:flush_done"}).to_string()
@@ -192,7 +197,6 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
                                 chunk_start     = 0;
                                 speech_active   = false;
                                 silence_samples = 0;
-                                // Drain any pending results silently
                                 result_buf.clear();
                                 pending_tasks = 0;
                                 next_send_index = segment_index;
@@ -225,9 +229,10 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
                             if segment_len >= MAX_SEGMENT_SAMPLES {
                                 let chunk = pcm[chunk_start..].to_vec();
                                 if rms_i16(&chunk) >= MIN_CHUNK_RMS {
+                                    let speaker = identify_speaker(&state, &mut speaker_tracker, &chunk);
                                     spawn_transcribe(
                                         state.clone(), chunk, language.clone(),
-                                        context_buf.clone(), segment_index, result_tx.clone(),
+                                        context_buf.clone(), speaker, segment_index, result_tx.clone(),
                                     );
                                     segment_index += 1;
                                     pending_tasks += 1;
@@ -236,7 +241,6 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
                                 speech_active = false;
                                 silence_samples = 0;
 
-                                // Compact
                                 pcm.drain(0..chunk_start);
                                 chunk_start = 0;
                             }
@@ -254,9 +258,11 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
                                 if chunk.len() >= MIN_SEGMENT_SAMPLES
                                     && rms_i16(chunk) >= MIN_CHUNK_RMS
                                 {
+                                    let chunk_owned = chunk.to_vec();
+                                    let speaker = identify_speaker(&state, &mut speaker_tracker, &chunk_owned);
                                     spawn_transcribe(
-                                        state.clone(), chunk.to_vec(), language.clone(),
-                                        context_buf.clone(), segment_index, result_tx.clone(),
+                                        state.clone(), chunk_owned, language.clone(),
+                                        context_buf.clone(), speaker, segment_index, result_tx.clone(),
                                     );
                                     segment_index += 1;
                                     pending_tasks += 1;
@@ -264,7 +270,6 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
 
                                 chunk_start = end_idx;
 
-                                // Compact processed audio (keep at most 60s of raw)
                                 if chunk_start > SAMPLE_RATE * 60 {
                                     pcm.drain(0..chunk_start);
                                     chunk_start = 0;
@@ -272,7 +277,6 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
                             } else if !speech_active
                                 && (pcm.len() - chunk_start) > AMBIENT_DRAIN_SAMPLES
                             {
-                                // Long ambient silence — discard to prevent unbounded growth
                                 chunk_start = pcm.len();
                                 pcm.drain(0..chunk_start);
                                 chunk_start = 0;
@@ -290,11 +294,11 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
                 if pending_tasks > 0 { pending_tasks -= 1; }
 
                 // Buffer out-of-order results; forward in-order
-                result_buf.insert(res.index, res.outcome);
-                while let Some(outcome) = result_buf.remove(&next_send_index) {
-                    match outcome {
+                result_buf.insert(res.index, res);
+                while let Some(res) = result_buf.remove(&next_send_index) {
+                    match res.outcome {
                         Ok(text) if !text.is_empty() => {
-                            // Update rolling context for next segment's initial_prompt
+                            // Update rolling context
                             context_buf.push_str(&text);
                             if context_buf.chars().count() > MAX_CONTEXT_CHARS {
                                 let skip = context_buf.char_indices()
@@ -304,9 +308,16 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
                                 context_buf.drain(0..skip);
                             }
 
+                            let mut data = json!({
+                                "text": text,
+                                "index": next_send_index,
+                            });
+                            if let Some(spk) = res.speaker {
+                                data["speaker"] = json!(spk);
+                            }
                             let out = json!({
                                 "event": "whisper:done",
-                                "data": { "text": text, "index": next_send_index }
+                                "data": data,
                             }).to_string();
                             if tx.send(Message::Text(out)).await.is_err() {
                                 pcm.clear();
@@ -325,7 +336,6 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
                     next_send_index += 1;
                 }
 
-                // If we were waiting to stop and all tasks are done → flush_done
                 if stopping && pending_tasks == 0 {
                     let _ = tx.send(Message::Text(
                         json!({"event":"whisper:flush_done"}).to_string()

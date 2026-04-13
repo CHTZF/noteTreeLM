@@ -63,3 +63,7 @@ futures-util = "0.3"
 
 # Config file
 toml = "0.8"
+
+# Speaker diarization (CAM++ embedding model via ONNX)
+ort = "2.0.0-rc.12"
+knf-rs = "0.3"

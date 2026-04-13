@@ -43,7 +43,7 @@ const MAX_RECONNECT_ATTEMPTS = 5
  */
 export function createTranscribeSession(
   language: string,
-  onResult: (text: string, index: number) => void,
+  onResult: (text: string, index: number, speaker?: string) => void,
   onFlushDone: () => void,
   onError: (msg: string) => void,
 ): Promise<TranscribeSession> {
@@ -75,8 +75,8 @@ export function createTranscribeSession(
         try {
           const msg = JSON.parse(e.data as string) as { event: string; data?: unknown }
           if (msg.event === 'whisper:done') {
-            const d = msg.data as { text: string; index: number }
-            onResult(d.text ?? '', d.index ?? 0)
+            const d = msg.data as { text: string; index: number; speaker?: string }
+            onResult(d.text ?? '', d.index ?? 0, d.speaker)
           } else if (msg.event === 'whisper:flush_done') {
             stopping = false
             onFlushDone()
@@ -126,8 +126,8 @@ export function createTranscribeSession(
         try {
           const msg = JSON.parse(e.data as string) as { event: string; data?: unknown }
           if (msg.event === 'whisper:done') {
-            const d = msg.data as { text: string; index: number }
-            onResult(d.text ?? '', d.index ?? 0)
+            const d = msg.data as { text: string; index: number; speaker?: string }
+            onResult(d.text ?? '', d.index ?? 0, d.speaker)
           } else if (msg.event === 'whisper:flush_done') {
             stopping = false
             onFlushDone()
