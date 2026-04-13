@@ -1747,7 +1747,7 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px' }}>
                   <div style={{ padding: '16px', background: '#ffffff', borderRadius: '12px', display: 'inline-block' }}>
                     <QRCodeSVG
-                      value={JSON.stringify({ url: mobileTunnelUrl, pairing_code: mobilePairingCode })}
+                      value={`${mobileTunnelUrl}/mobile?pairing_code=${mobilePairingCode}`}
                       size={200}
                       level="M"
                     />
@@ -1758,7 +1758,7 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                   <button
                     onClick={() => {
                       navigator.clipboard.writeText(
-                        JSON.stringify({ url: mobileTunnelUrl, pairing_code: mobilePairingCode })
+                        `${mobileTunnelUrl}/mobile?pairing_code=${mobilePairingCode}`
                       ).catch(() => {})
                     }}
                     style={{ padding: '5px 14px', borderRadius: '6px', fontSize: '12px', border: '1px solid var(--color-border)', background: 'transparent', color: 'var(--color-text-secondary)', cursor: 'pointer' }}

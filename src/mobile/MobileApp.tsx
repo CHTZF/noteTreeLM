@@ -6,6 +6,7 @@ import {
   getBaseUrl,
   getSavedVaultId,
   saveVaultId,
+  saveAuth,
   clearAuth,
   mobileApi,
 } from './mobileApi'
@@ -19,6 +20,32 @@ export default function MobileApp() {
   const [vaultError, setVaultError] = useState('')
 
   useEffect(() => {
+    // Auto-pair if pairing_code is in URL params (scanned from QR code)
+    const params = new URLSearchParams(window.location.search)
+    const qrCode = params.get('pairing_code')
+    if (qrCode) {
+      const baseUrl = window.location.origin
+      window.history.replaceState({}, '', window.location.pathname)
+      mobileApi.mobilePair(baseUrl, qrCode, 'Mobile')
+        .then(resp => {
+          saveAuth(baseUrl, resp.token, resp.username)
+          // Fetch vaults after auto-pair
+          return mobileApi.listVaults()
+        })
+        .then(list => {
+          if (list.length === 1) {
+            saveVaultId(list[0].vault_id)
+            setVaultId(list[0].vault_id)
+            setScreen('chat')
+          } else {
+            setVaults(list)
+            setScreen('vault_select')
+          }
+        })
+        .catch(() => setScreen('pair'))
+      return
+    }
+
     const token = getToken()
     const base = getBaseUrl()
     if (!token || !base) {
