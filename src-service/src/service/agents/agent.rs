@@ -376,7 +376,7 @@ async fn run_tool_loop(
             // Treating this text as a final answer would bypass the content round entirely.
             let is_think_round = enable_think && round == 0;
             if is_think_round && tool_chunks.is_empty() && !text.trim().is_empty() {
-                tracing::warn!("[agent] think round: LLM output text instead of think tool — skipping to content round");
+                tracing::warn!("[agent] think round: LLM output text instead of think tool — skipping to content round\n  output: {:?}", &text[..text.len().min(300)]);
                 // Push as assistant context so the content round sees what the model said.
                 runtime.push_msg(json!({ "role": "assistant", "content": text })).await;
                 emitter.emit("agent:clear_stream".to_string(), json!({}));
