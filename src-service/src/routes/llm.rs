@@ -152,8 +152,8 @@ pub(crate) async fn ensure_llama_running(state: &ApiState) -> Result<String, Str
         config.bin.display(), config.model_path, port
     )));
 
-    let ctx_size = crate::service::ctx_size_for_model(&config.model_path) as u32;
-    let ctx_size_str = ctx_size.to_string();
+    let meta = crate::service::model_meta(&config.model_path);
+    let ctx_size_str = meta.ctx_size.to_string();
 
     let mut cmd = tokio::process::Command::new(&config.bin);
     cmd.args([
@@ -166,6 +166,9 @@ pub(crate) async fn ensure_llama_running(state: &ApiState) -> Result<String, Str
         "--cache-type-k", "q8_0",
         "--ubatch-size",  "2048",
     ]);
+    if meta.native_think {
+        cmd.args(["--reasoning", "off"]);
+    }
     if let Some(ref draft_path) = config.draft_model_path {
         cmd.args(["--model-draft", draft_path, "--draft", "4", "--n-gpu-layers-draft", "99"]);
         state.daemon.emit("llm:stderr", json!(format!("[server] Speculative Decoding 已啟用，draft model：{}", draft_path)));
