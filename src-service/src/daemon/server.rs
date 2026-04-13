@@ -71,10 +71,10 @@ pub fn build_api_router(app_state: ApiState) -> Router {
 
     // Mobile PWA static files — served at /mobile/*
     // Built by `npm run build:mobile` into src-service/mobile-dist/
-    // SPA fallback: unknown paths under /mobile/ serve index.html
+    // Vite outputs the entry as mobile.html (from the input filename); use that as SPA fallback.
     let mobile_dist = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mobile-dist");
     let mobile_service = ServeDir::new(&mobile_dist)
-        .fallback(ServeFile::new(mobile_dist.join("index.html")));
+        .fallback(ServeFile::new(mobile_dist.join("mobile.html")));
 
     Router::new()
         .nest("/api/v1", api_v1)
