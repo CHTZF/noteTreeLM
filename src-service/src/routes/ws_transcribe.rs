@@ -46,6 +46,10 @@ fn rms_i16(samples: &[i16]) -> f32 {
     (sum_sq / samples.len() as f64).sqrt() as f32
 }
 
+// Maximum chars kept as rolling context passed to next whisper call.
+// Whisper initial_prompt is capped at ~224 tokens ≈ ~200 CJK chars / ~400 Latin chars.
+const MAX_CONTEXT_CHARS: usize = 200;
+
 /// Result of one transcription job, forwarded back to the sender loop.
 struct TranscribeResult {
     index: u32,
@@ -53,21 +57,22 @@ struct TranscribeResult {
 }
 
 /// Spawn a transcription task. Results are sent through `result_tx`.
-/// `shutdown_tx` is subscribed to cancel the task if server shuts down.
+/// `context` is the recent transcript text used as initial_prompt for this segment.
 fn spawn_transcribe(
     state: ApiState,
     samples: Vec<i16>,
     language: String,
+    context: String,
     index: u32,
     result_tx: mpsc::Sender<TranscribeResult>,
 ) {
     let mut shutdown_rx = state.daemon.ws_shutdown_tx.subscribe();
     tokio::spawn(async move {
+        let ctx = if context.is_empty() { None } else { Some(context.as_str()) };
         let outcome = tokio::select! {
-            r = crate::routes::whisper::transcribe_pcm16(&state, &samples, &language) => r,
+            r = crate::routes::whisper::transcribe_pcm16(&state, &samples, &language, ctx) => r,
             _ = shutdown_rx.recv() => Err("server shutdown".to_string()),
         };
-        // Ignore send error — WS handler may have already exited
         let _ = result_tx.send(TranscribeResult { index, outcome }).await;
     });
 }
@@ -96,8 +101,10 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
     let mut pending_tasks: u32 = 0;
     // next_send_index: the segment index we're waiting to forward next (for ordered output)
     let mut next_send_index: u32 = 0;
-    // Out-of-order result buffer: index → text
+    // Out-of-order result buffer: index → outcome
     let mut result_buf: std::collections::HashMap<u32, Result<String, String>> = std::collections::HashMap::new();
+    // Rolling context: last N chars of recognised text, passed as initial_prompt
+    let mut context_buf = String::new();
 
     // ─── Per-connection state ──────────────────────────────────────────────────
     let mut language        = "auto".to_string();
@@ -142,6 +149,7 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
                                 next_send_index = 0;
                                 result_buf.clear();
                                 pending_tasks   = 0;
+                                context_buf.clear();
                                 active          = true;
                                 stopping        = false;
                             }
@@ -155,7 +163,7 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
                                     {
                                         spawn_transcribe(
                                             state.clone(), remaining, language.clone(),
-                                            segment_index, result_tx.clone(),
+                                            context_buf.clone(), segment_index, result_tx.clone(),
                                         );
                                         segment_index += 1;
                                         pending_tasks += 1;
@@ -219,7 +227,7 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
                                 if rms_i16(&chunk) >= MIN_CHUNK_RMS {
                                     spawn_transcribe(
                                         state.clone(), chunk, language.clone(),
-                                        segment_index, result_tx.clone(),
+                                        context_buf.clone(), segment_index, result_tx.clone(),
                                     );
                                     segment_index += 1;
                                     pending_tasks += 1;
@@ -248,7 +256,7 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
                                 {
                                     spawn_transcribe(
                                         state.clone(), chunk.to_vec(), language.clone(),
-                                        segment_index, result_tx.clone(),
+                                        context_buf.clone(), segment_index, result_tx.clone(),
                                     );
                                     segment_index += 1;
                                     pending_tasks += 1;
@@ -286,6 +294,16 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
                 while let Some(outcome) = result_buf.remove(&next_send_index) {
                     match outcome {
                         Ok(text) if !text.is_empty() => {
+                            // Update rolling context for next segment's initial_prompt
+                            context_buf.push_str(&text);
+                            if context_buf.chars().count() > MAX_CONTEXT_CHARS {
+                                let skip = context_buf.char_indices()
+                                    .nth(context_buf.chars().count() - MAX_CONTEXT_CHARS)
+                                    .map(|(i, _)| i)
+                                    .unwrap_or(0);
+                                context_buf.drain(0..skip);
+                            }
+
                             let out = json!({
                                 "event": "whisper:done",
                                 "data": { "text": text, "index": next_send_index }
