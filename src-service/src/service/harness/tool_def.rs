@@ -223,9 +223,9 @@ const GUARD_GENERATE_MOC: ToolGuardSpec = ToolGuardSpec {
 
 fn schema_think() -> Value { json!({ "type": "function", "function": {
     "name": "think",
-    "description": "REQUIRED as first step. Before taking any action, output a short plan: what the user wants, which tools you will call, and in what order. Do NOT answer the user directly here.",
+    "description": "在回應前先進行推理思考（不直接輸出給使用者）",
     "parameters": { "type": "object", "properties": {
-        "thought": { "type": "string", "description": "Your step-by-step plan for how to respond" }
+        "thought": { "type": "string", "description": "推理過程" }
     }, "required": ["thought"] }
 }})}
 

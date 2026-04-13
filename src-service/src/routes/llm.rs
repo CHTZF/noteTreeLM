@@ -166,9 +166,6 @@ pub(crate) async fn ensure_llama_running(state: &ApiState) -> Result<String, Str
         "--cache-type-k", "q8_0",
         "--ubatch-size",  "2048",
     ]);
-    if meta.native_think {
-        cmd.args(["--reasoning", "off"]);
-    }
     if let Some(ref draft_path) = config.draft_model_path {
         cmd.args(["--model-draft", draft_path, "--draft", "4", "--n-gpu-layers-draft", "99"]);
         state.daemon.emit("llm:stderr", json!(format!("[server] Speculative Decoding 已啟用，draft model：{}", draft_path)));
