@@ -22,6 +22,7 @@ pub(crate) async fn build_system_prompt(
     base_prompt: &str,
     active_note: Option<&str>,
     selection:   Option<&str>,
+    platform:    Option<&str>,
 ) -> String {
     let now_dt = chrono::Local::now();
     let datetime_str = now_dt.format("%Y-%m-%d %A %H:%M %Z").to_string();
@@ -68,6 +69,14 @@ pub(crate) async fn build_system_prompt(
                 preview
             ));
         }
+    }
+
+    if platform == Some("mobile") {
+        header.push_str(
+            "\n【執行環境：手機】\
+            \n使用者透過手機與你互動。請勿建議「開啟筆記」「在編輯器中查看」等桌面操作。\
+            \n若需要呈現筆記內容，請直接在回覆中引用或摘要，而非指示使用者打開檔案。\n"
+        );
     }
 
     format!("{}\n{}", header, base_prompt)

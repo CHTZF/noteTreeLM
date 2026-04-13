@@ -90,7 +90,7 @@ export const mobileApi = {
     conversation_id?: string
     messages?: unknown[]
     vault_path?: string
-  }) => request<{ session_id: string; conversation_id: string }>(
+  }) => request<{ session_id: string; conversation_id: string; response_text?: string }>(
     'POST',
     `/vaults/${encodeURIComponent(vaultId)}/agent/run`,
     body,
@@ -103,11 +103,11 @@ export const mobileApi = {
   getSettings: () => request<Record<string, string>>('GET', '/settings'),
 }
 
-/** Build the SSE URL for the events stream. Returned as a string so the
- *  caller can construct an EventSource with it. */
-export function sseUrl(): string {
+/** Build the WebSocket URL for the agent stream. */
+export function wsUrl(): string {
   const base = getBaseUrl()
   const token = getToken()
-  // EventSource cannot set headers; pass token as query param
-  return `${base}/api/v1/events${token ? `?token=${encodeURIComponent(token)}` : ''}`
+  // Convert https:// → wss://, http:// → ws://
+  const wsBase = base.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:')
+  return `${wsBase}/api/v1/ws${token ? `?token=${encodeURIComponent(token)}` : ''}`
 }

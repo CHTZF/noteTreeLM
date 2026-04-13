@@ -97,6 +97,7 @@ pub async fn build_agent_runtime(
         native_think,
         active_note:   None,
         selection:     None,
+            platform:    None,
         active_skills: Arc::new(tokio::sync::RwLock::new(None)),
         emitter,
         dispatcher,

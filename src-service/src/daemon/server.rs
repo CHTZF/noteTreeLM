@@ -59,6 +59,7 @@ pub fn build_api_router(app_state: ApiState) -> Router {
         .merge(crate::routes::gmail::router())
         .merge(crate::routes::scheduled::router())
         .merge(crate::routes::events::router())
+        .merge(crate::routes::ws::router())
         .merge(crate::routes::whisper::router())
         .merge(crate::routes::llm::router())
         .route("/pairing-info", get(pairing_info_handler))
@@ -104,6 +105,7 @@ pub async fn run_http_server(
     app_state: ApiState,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let ws_shutdown_tx = app_state.daemon.ws_shutdown_tx.clone();
     let app = build_api_router(app_state);
 
     // Bind only to loopback — security: not accessible from outside
@@ -112,7 +114,10 @@ pub async fn run_http_server(
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app.into_make_service())
-        .with_graceful_shutdown(async move { let _ = shutdown_rx.recv().await; })
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.recv().await;
+            let _ = ws_shutdown_tx.send(());
+        })
         .await?;
 
     Ok(())

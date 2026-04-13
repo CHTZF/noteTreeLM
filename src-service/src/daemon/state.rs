@@ -14,6 +14,9 @@ pub struct DaemonState {
     pub tunnel_url: Arc<RwLock<Option<String>>>,
     /// Broadcast channel for server-sent events (capacity 64).
     pub event_tx: tokio::sync::broadcast::Sender<ServiceEvent>,
+    /// Shutdown signal — sent once when the server is stopping.
+    /// WebSocket handlers subscribe and close their connections on receipt.
+    pub ws_shutdown_tx: tokio::sync::broadcast::Sender<()>,
     /// Active interactive agent sessions keyed by session_id.
     pub agent_sessions: Arc<Mutex<HashMap<String, AgentSession>>>,
     /// Intent centroid cache (confirm / cancel / interrupt embeddings).
@@ -43,10 +46,12 @@ impl DaemonState {
         let sqlite = crate::db::sqlite::init_sqlite(&data_dir.join("search.db"))
             .expect("SQLite FTS5 init failed");
         let (event_tx, _) = tokio::sync::broadcast::channel(64);
+        let (ws_shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         Self {
             sqlite,
             tunnel_url: Arc::new(RwLock::new(None)),
             event_tx,
+            ws_shutdown_tx,
             agent_sessions: Arc::new(Mutex::new(HashMap::new())),
             intent_centroids: Arc::new(Mutex::new(None)),
             vault_path_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),

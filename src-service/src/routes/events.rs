@@ -1,6 +1,6 @@
 use axum::{
     extract::State,
-    response::{sse::Event, Sse},
+    response::{sse::Event, IntoResponse, Sse},
 };
 use futures_util::stream::StreamExt;
 use std::convert::Infallible;
@@ -16,22 +16,33 @@ pub fn router() -> axum::Router<ApiState> {
 /// Each message has `event: <name>` and `data: <json-payload>`.
 async fn sse_handler(
     State(state): State<ApiState>,
-) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+) -> impl IntoResponse {
     let rx = state.daemon.event_tx.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|result| async move {
         match result {
             Ok(ev) => {
                 let data = ev.payload.to_string();
-                Some(Ok(Event::default().event(ev.event).data(data)))
+                Some(Ok::<Event, Infallible>(Event::default().event(ev.event).data(data)))
             }
             // Lagged — skip and continue
             Err(_) => None,
         }
     });
 
-    Sse::new(stream).keep_alive(
+    let sse = Sse::new(stream).keep_alive(
         axum::response::sse::KeepAlive::new()
             .interval(std::time::Duration::from_secs(15))
             .text("ping"),
+    );
+
+    // Disable Cloudflare / nginx response buffering so SSE tokens
+    // reach the mobile client in real-time instead of being held
+    // until the stream ends.
+    (
+        [
+            ("X-Accel-Buffering", "no"),
+            ("Cache-Control", "no-cache"),
+        ],
+        sse,
     )
 }

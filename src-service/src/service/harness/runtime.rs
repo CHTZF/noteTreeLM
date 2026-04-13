@@ -90,6 +90,9 @@ pub struct HarnessRequestRuntime {
     /// Text currently selected by the user in the editor.
     /// Injected into system prompt so agent can operate on "這段" / "selected text".
     pub selection:   Option<String>,
+    /// Client platform: "desktop" | "mobile". Injected into system prompt
+    /// so the agent adjusts behaviour (e.g. no open_note on mobile).
+    pub platform:    Option<String>,
     /// Active skills for the current turn. Seeded from `agent_sessions` at turn start,
     /// written back at turn end. All in-turn reads/writes use this local Arc<Mutex>
     /// to avoid contention on the global `agent_sessions` map.
@@ -150,6 +153,7 @@ impl HarnessRequestRuntime {
             native_think: false,
             active_note:   None,
             selection:     None,
+            platform:    None,
             active_skills: Arc::new(tokio::sync::RwLock::new(None)),
             emitter,
             dispatcher: None,
@@ -225,6 +229,7 @@ impl HarnessRequestRuntime {
             native_think: false,
             active_note:   None,
             selection:     None,
+            platform:    None,
             active_skills: Arc::new(tokio::sync::RwLock::new(None)),
             emitter,
             dispatcher,
@@ -503,6 +508,7 @@ impl HarnessRequestRuntime {
             base_prompt,
             self.active_note.as_deref(),
             self.selection.as_deref(),
+            self.platform.as_deref(),
         ).await;
         let t_sys_prompt = ctx_t0.elapsed();
 

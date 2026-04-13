@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { mobileApi, sseUrl } from './mobileApi'
+import { wsUrl } from './mobileApi'
 
 interface Message {
   role: 'user' | 'assistant' | 'notice'
@@ -20,114 +20,114 @@ export default function MobileChatPage({ vaultId, onUnpair }: Props) {
 
   const streamingRef = useRef('')
   const sessionIdRef = useRef<string | null>(null)
-  const sseRef = useRef<EventSource | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
+  const conversationIdRef = useRef<string | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+
+  // Keep ref in sync with state so callbacks always see latest value
+  useEffect(() => { conversationIdRef.current = conversationId }, [conversationId])
 
   // Auto-scroll
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, isStreaming])
 
-  // Connect SSE on mount
+  // Connect WebSocket once on mount, keep alive for the page lifetime
   useEffect(() => {
-    const url = sseUrl()
-    const es = new EventSource(url)
-    sseRef.current = es
+    const url = wsUrl()
+    const ws = new WebSocket(url)
+    wsRef.current = ws
 
-    es.addEventListener('llm:token', (e: MessageEvent) => {
-      const token = typeof e.data === 'string' ? e.data : ''
-      // Strip surrounding quotes if the server JSON-encodes a plain string
-      const text = (() => {
-        try { const v = JSON.parse(token); return typeof v === 'string' ? v : token } catch { return token }
-      })()
-      streamingRef.current += text
-      setMessages(prev => {
-        const last = prev[prev.length - 1]
-        if (last?.role === 'assistant' && last.content === '__streaming__') {
-          return [...prev.slice(0, -1), { role: 'assistant', content: streamingRef.current }]
-        }
-        return prev
-      })
-    })
-
-    es.addEventListener('llm:done', () => {
-      const final = streamingRef.current
-      streamingRef.current = ''
-      setIsStreaming(false)
-      setToolDisplay(null)
-      setMessages(prev => {
-        const last = prev[prev.length - 1]
-        if (last?.role === 'assistant') {
-          return [...prev.slice(0, -1), { role: 'assistant', content: final || last.content }]
-        }
-        return prev
-      })
-    })
-
-    es.addEventListener('agent:tool_call', (e: MessageEvent) => {
+    ws.onmessage = (e) => {
       try {
-        const payload = JSON.parse(e.data)
-        // Filter by session_id when available
-        if (sessionIdRef.current && payload.session_id && payload.session_id !== sessionIdRef.current) return
-        setToolDisplay(payload.display ?? null)
-      } catch { /* ignore */ }
-    })
+        const msg = JSON.parse(e.data)
+        if (msg.type === 'token') {
+          streamingRef.current += msg.data
+          setMessages(prev => {
+            const last = prev[prev.length - 1]
+            if (last?.role === 'assistant') {
+              return [...prev.slice(0, -1), { role: 'assistant', content: streamingRef.current }]
+            }
+            return prev
+          })
+        } else if (msg.type === 'done') {
+          const final = streamingRef.current || msg.data || ''
+          streamingRef.current = ''
+          if (!conversationIdRef.current && msg.conversation_id) {
+            setConversationId(msg.conversation_id)
+          }
+          setIsStreaming(false)
+          setToolDisplay(null)
+          setMessages(prev => {
+            const last = prev[prev.length - 1]
+            if (last?.role === 'assistant') {
+              return [...prev.slice(0, -1), { role: 'assistant', content: final }]
+            }
+            return prev
+          })
+        } else if (msg.type === 'tool') {
+          setToolDisplay(msg.data?.display ?? null)
+        } else if (msg.type === 'cancelled') {
+          streamingRef.current = ''
+          setIsStreaming(false)
+          setToolDisplay(null)
+          setMessages(prev => prev.filter(m => m.content !== '__streaming__'))
+        } else if (msg.type === 'error') {
+          streamingRef.current = ''
+          setIsStreaming(false)
+          setToolDisplay(null)
+          setMessages(prev => {
+            const filtered = prev.filter(m => m.content !== '__streaming__')
+            return [...filtered, { role: 'notice', content: `錯誤：${msg.message}` }]
+          })
+        }
+      } catch { /* ignore parse errors */ }
+    }
 
-    es.addEventListener('agent:cancelled', () => {
-      if (!isStreaming) return
+    ws.onerror = () => {
       streamingRef.current = ''
       setIsStreaming(false)
       setToolDisplay(null)
       setMessages(prev => {
-        const last = prev[prev.length - 1]
-        if (last?.role === 'assistant' && last.content === '__streaming__') {
-          return [...prev.slice(0, -1)]
-        }
-        return prev
+        const filtered = prev.filter(m => m.content !== '__streaming__')
+        return [...filtered, { role: 'notice', content: '連線錯誤，請重新整理頁面' }]
       })
-    })
+    }
 
-    return () => { es.close() }
+    return () => { ws.close() }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const sendMessage = useCallback(async () => {
+  const sendMessage = useCallback(() => {
+    const ws = wsRef.current
     const text = input.trim()
-    if (!text || isStreaming) return
+    if (!text || isStreaming || !ws || ws.readyState !== WebSocket.OPEN) return
+
     setInput('')
     setMessages(prev => [...prev, { role: 'user', content: text }])
     setIsStreaming(true)
     streamingRef.current = ''
-    // Placeholder while streaming
     setMessages(prev => [...prev, { role: 'assistant', content: '__streaming__' }])
 
     const sessionId = crypto.randomUUID()
     sessionIdRef.current = sessionId
 
-    try {
-      const resp = await mobileApi.runAgent(vaultId, {
-        session_id: sessionId,
-        input: text,
-        conversation_id: conversationId ?? undefined,
-      })
-      if (!conversationId) setConversationId(resp.conversation_id)
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e)
-      setIsStreaming(false)
-      setToolDisplay(null)
-      streamingRef.current = ''
-      setMessages(prev => {
-        const filtered = prev.filter(m => m.content !== '__streaming__')
-        return [...filtered, { role: 'notice', content: `錯誤：${msg}` }]
-      })
-    }
-  }, [input, isStreaming, vaultId, conversationId])
+    ws.send(JSON.stringify({
+      type: 'run',
+      vault_id: vaultId,
+      session_id: sessionId,
+      input: text,
+      conversation_id: conversationIdRef.current ?? undefined,
+    }))
+  }, [input, isStreaming, vaultId])
 
-  const cancel = useCallback(async () => {
-    if (!sessionIdRef.current) return
-    try { await mobileApi.cancelAgent(vaultId, sessionIdRef.current) } catch { /* ignore */ }
-  }, [vaultId])
+  const cancel = useCallback(() => {
+    const ws = wsRef.current
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'cancel' }))
+    }
+  }, [])
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === 'Enter' && !e.shiftKey) {

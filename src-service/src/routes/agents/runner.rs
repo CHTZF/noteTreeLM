@@ -83,7 +83,7 @@ pub async fn run(
     // Capture the emitter before moving runtime into run_agent.
     // The emitter is Arc-backed so it reflects state written during run_agent.
     let emitter = runtime.emitter.clone();
-    crate::service::run_agent(
+    let response_text = crate::service::run_agent(
         runtime,
         input,
         activity_context,
@@ -99,6 +99,11 @@ pub async fn run(
         Some(false) => json!(false),
         None        => json!(null),
     };
+    // Include the final response text so mobile clients can display it
+    // without relying on SSE (which may be buffered by proxies like Cloudflare).
+    if !response_text.is_empty() {
+        resp["response_text"] = json!(response_text);
+    }
     Ok(Json(resp))
 }
 

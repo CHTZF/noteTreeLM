@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { useAgentWs } from '../../lib/useAgentWs'
 import { open as openUrl } from '@tauri-apps/plugin-shell'
 import { api } from '../../lib/api'
 import { useTranslation } from 'react-i18next'
@@ -8,7 +8,6 @@ import { useSettingsStore } from '../../stores/settingsStore'
 import { useAuthStore } from '../../stores/authStore'
 import { useEditorStore } from '../../stores/editorStore'
 import { useDebugStore } from '../../stores/debugStore'
-import { useActivityStore } from '../../stores/activityStore'
 import { toast } from '../common/Toast'
 import { useVoiceRecorder } from '../../hooks/useVoiceRecorder'
 import VoiceOverlay from '../common/VoiceOverlay'
@@ -100,6 +99,8 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
 
   // Track web refs from agent:web_refs (call_external_ai / web_search) for "儲存為知識"
   const pendingWebRefsRef = useRef<Array<{ path: string; title: string; excerpt: string }>>([])
+
+  const { on, run: wsRun, cancel: wsCancel, confirm: wsConfirm } = useAgentWs()
 
   const log = useCallback((msg: string) => addLog('chat', 'info', msg), [addLog])
   const err = useCallback((msg: string) => addLog('chat', 'error', msg), [addLog])
@@ -341,66 +342,30 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     t.scrollTop = t.scrollHeight
   }, [input])
 
-  // 持續監聽 llm:stderr → 寫入 debug
-  // 使用 cancelled flag 解決 React StrictMode 下 async listen() 的 race condition
-  // （cleanup 可能在 Promise resolve 前執行，導致舊 listener 未被移除而重複觸發）
+  // 持續監聽 llm:stderr / sub_agent:* 事件 → 寫入 debug
   useEffect(() => {
-    let cancelled = false
-    let unlisten: (() => void) | undefined
-    listen<string>('llm:stderr', (event) => {
-      useDebugStore.getState().addLog('llm', 'warn', event.payload.trimEnd())
-    }).then((fn) => {
-      if (cancelled) fn() // 已 cleanup，立即取消這個 listener
-      else unlisten = fn
-    })
-    return () => {
-      cancelled = true
-      unlisten?.()
-    }
-  }, []) // addLog 是 Zustand stable reference，不需要作為 dep
-
-  // 持續監聽 sub_agent:* 事件 → 寫入 debug
-  useEffect(() => {
-    let cancelled = false
-    const unlistens: (() => void)[] = []
-
-    const setup = async () => {
-      const { addLog: dbgLog } = useDebugStore.getState()
-
-      const fn1 = await listen<{ sub_session_id: string; kind: string; task: string }>(
-        'sub_agent:start', (e) => {
-          if (cancelled) return
-          dbgLog('sub-agent', 'info', `🤖 [${e.payload.kind}] 開始：${e.payload.task.slice(0, 80)}`)
-        }
-      )
-      const fn2 = await listen<{ sub_session_id: string; kind: string; display: string }>(
-        'sub_agent:tool_call', (e) => {
-          if (cancelled) return
-          dbgLog('sub-agent', 'info', e.payload.display)
-        }
-      )
-      const fn3 = await listen<{ sub_session_id: string; kind: string; result_preview: string }>(
-        'sub_agent:done', (e) => {
-          if (cancelled) return
-          dbgLog('sub-agent', 'info', `✅ [${e.payload.kind}] 完成`)
-        }
-      )
-      const fn4 = await listen<{ sub_session_id: string; error: string }>(
-        'sub_agent:error', (e) => {
-          if (cancelled) return
-          dbgLog('sub-agent', 'error', `❌ sub-agent 錯誤：${e.payload.error}`)
-        }
-      )
-      if (cancelled) { fn1(); fn2(); fn3(); fn4(); return }
-      unlistens.push(fn1, fn2, fn3, fn4)
-    }
-
-    setup()
-    return () => {
-      cancelled = true
-      unlistens.forEach(fn => fn())
-    }
-  }, [])
+    const { addLog: dbgLog } = useDebugStore.getState()
+    const offs = [
+      on('llm:stderr', (data) => dbgLog('llm', 'warn', (data as string).trimEnd())),
+      on('sub_agent:start', (data) => {
+        const p = data as { sub_session_id: string; kind: string; task: string }
+        dbgLog('sub-agent', 'info', `🤖 [${p.kind}] 開始：${p.task.slice(0, 80)}`)
+      }),
+      on('sub_agent:tool_call', (data) => {
+        const p = data as { sub_session_id: string; kind: string; display: string }
+        dbgLog('sub-agent', 'info', p.display)
+      }),
+      on('sub_agent:done', (data) => {
+        const p = data as { sub_session_id: string; kind: string; result_preview: string }
+        dbgLog('sub-agent', 'info', `✅ [${p.kind}] 完成`)
+      }),
+      on('sub_agent:error', (data) => {
+        const p = data as { sub_session_id: string; error: string }
+        dbgLog('sub-agent', 'error', `❌ sub-agent 錯誤：${p.error}`)
+      }),
+    ]
+    return () => offs.forEach(off => off())
+  }, [on])
 
   // 自動捲動到底部
   useEffect(() => {
@@ -422,7 +387,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       sessionWriteApprovedRef.current = true
     }
     setPendingWriteDisplay(null)
-    await invoke('confirm_write_tool', { approved })
+    wsConfirm(approved)
   }, [writeConfirmMode])
 
   const send = useCallback(async () => {
@@ -433,7 +398,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
 
     // 若反思 agent 正在執行中，先取消它再繼續
     if (isReflectingRef.current) {
-      invoke('cancel_agent').catch(() => {})
+      wsCancel()
     }
 
     const userMsg: Message = { role: 'user', content: text }
@@ -450,33 +415,9 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
     if (thinkFlushTimerRef.current) { clearTimeout(thinkFlushTimerRef.current); thinkFlushTimerRef.current = null }
     if (tokenFlushTimerRef.current) { clearTimeout(tokenFlushTimerRef.current); tokenFlushTimerRef.current = null }
 
-    // 只把 user/assistant 訊息送給 LLM（tool/notice 只做 UI 顯示，不進入 context）
-    const llmMessages = allMessages
-      .filter((m) => m.role === 'user' || m.role === 'assistant')
-      .map((m) => ({ role: m.role, content: m.content }))
-
     log(`▶ 傳送訊息（${text.length} 字）`)
 
-    let unlistenToken: (() => void) = () => {}
-    let unlistenDone: (() => void) = () => {}
-    let unlistenToolCall: (() => void) = () => {}
-    let unlistenWriteReq: (() => void) = () => {}
-    let unlistenWriteTimeout: (() => void) = () => {}
-    let unlistenNoteRefs: (() => void) = () => {}
-    let unlistenOpenNote: (() => void) = () => {}
-    let unlistenWebRefs: (() => void) = () => {}
-    let unlistenSkillsActivated: (() => void) = () => {}
-    let unlistenSkillSuggestion: (() => void) = () => {}
-    let unlistenPreRouteDebug: (() => void) = () => {}
-    let unlistenSkillFound: (() => void) = () => {}
-    let unlistenSkillNotFound: (() => void) = () => {}
-    let unlistenThink: (() => void) = () => {}
-    let unlistenThinkToken: (() => void) = () => {}
-    let unlistenPlanAnnounce: (() => void) = () => {}
-    let unlistenCitationMissing: (() => void) = () => {}
-    let unlistenCitation: (() => void) = () => {}
-    let unlistenCiteCorrectionStart: (() => void) = () => {}
-    let unlistenCiteStatus: (() => void) = () => {}
+    const eventOffs: Array<() => void> = []
 
     // Clear previous suggestions at the start of each send
     setNoteSuggestions([])
@@ -509,240 +450,178 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
         : ORCHESTRATOR_SYSTEM
       if (system) log(`  帶入 system 上下文（${system.length} 字元）`)
 
-      // 所有監聽器並行建立，再呼叫 invoke_agent
-      ;[
-        unlistenToolCall,
-        unlistenNoteRefs,
-        unlistenOpenNote,
-        unlistenWriteReq,
-        unlistenToken,
-        unlistenDone,
-        unlistenWebRefs,
-        unlistenSkillsActivated,
-        unlistenSkillSuggestion,
-        unlistenPreRouteDebug,
-        unlistenSkillFound,
-        unlistenSkillNotFound,
-        unlistenThink,
-        unlistenThinkToken,
-        unlistenWriteTimeout,
-        unlistenPlanAnnounce,
-        unlistenCitationMissing,
-        unlistenCitation,
-        unlistenCiteCorrectionStart,
-        unlistenCiteStatus,
-      ] = await Promise.all([
-        listen<{ session_id?: string; display?: string } | string>('agent:tool_call', (event) => {
-          const display = typeof event.payload === 'string'
-            ? event.payload
-            : (event.payload as any)?.display ?? JSON.stringify(event.payload)
-          if (display === 'think') return  // think is visualized in MemoryLinksView, not chat
-          setMessages((prev) => [...prev, { role: 'tool', content: display }])
-        }),
-        listen<{ session_id: string; refs: { path: string; title?: string; excerpt?: string; tool_name?: string }[] }>('agent:refs', (e) => {
-          const suggestions = e.payload.refs.map(ref => {
-            const absPath = ref.path
-            const isUrl = absPath.startsWith('http')
-            let label: string
-            if (isUrl) {
-              label = ref.title ?? (() => { try { return new URL(absPath).hostname } catch { return absPath } })()
-            } else {
-              const hashIdx = absPath.indexOf('#')
-              const filePart = hashIdx >= 0 ? absPath.slice(0, hashIdx) : absPath
-              const section = hashIdx >= 0 ? absPath.slice(hashIdx + 1) : ''
-              const filename = filePart.split('/').pop()?.replace(/\.md$/, '') ?? filePart
-              label = ref.title ?? (section ? `${filename} § ${section}` : filename)
-              // Accumulate for graph edge creation on memory extraction
-              referencedNotePathsRef.current.add(filePart)
-            }
-            return { absPath, label, isUrl, excerpt: ref.excerpt, toolName: ref.tool_name }
-          })
-          setNoteSuggestions(suggestions)
-          noteSuggestionsRef.current = suggestions
-        }),
-        // 後端 pending_plan 確認後開啟筆記（embedding-based intent classify）
-        listen<string[]>('agent:open_note', (e) => {
-          if (onOpenNote && e.payload.length > 0) {
-            onOpenNote(e.payload[0])
+      // 註冊所有事件監聽器（WebSocket on()，同步，回傳 off fn）
+      let offSkillsActivated: (() => void) = () => {}
+      let offSkillSuggestion: (() => void) = () => {}
+      offSkillsActivated = on('agent:tool_call', (data) => {
+        const display = typeof data === 'string'
+          ? data
+          : (data as any)?.display ?? JSON.stringify(data)
+        if (display === 'think') return
+        setMessages((prev) => [...prev, { role: 'tool', content: display }])
+      })
+      eventOffs.push(offSkillsActivated)
+      eventOffs.push(on('agent:refs', (data) => {
+        const payload = data as { session_id: string; refs: { path: string; title?: string; excerpt?: string; tool_name?: string }[] }
+        const suggestions = payload.refs.map(ref => {
+          const absPath = ref.path
+          const isUrl = absPath.startsWith('http')
+          let label: string
+          if (isUrl) {
+            label = ref.title ?? (() => { try { return new URL(absPath).hostname } catch { return absPath } })()
+          } else {
+            const hashIdx = absPath.indexOf('#')
+            const filePart = hashIdx >= 0 ? absPath.slice(0, hashIdx) : absPath
+            const section = hashIdx >= 0 ? absPath.slice(hashIdx + 1) : ''
+            const filename = filePart.split('/').pop()?.replace(/\.md$/, '') ?? filePart
+            label = ref.title ?? (section ? `${filename} § ${section}` : filename)
+            referencedNotePathsRef.current.add(filePart)
           }
-        }),
-        // 監聽寫入確認請求
-        listen<string>('agent:write_request', async (event) => {
-          const display = event.payload
-          if (writeConfirmMode === 'never') {
-            await invoke('confirm_write_tool', { approved: true })
-            return
-          }
-          if (writeConfirmMode === 'once' && sessionWriteApprovedRef.current) {
-            await invoke('confirm_write_tool', { approved: true })
-            return
-          }
-          setPendingWriteDisplay(display)
-        }),
-        listen<string>('llm:token', (event) => {
-          streamingRef.current += event.payload
-          tokenCountRef.current += event.payload.length
-          if (tokenCountRef.current === event.payload.length) {
-            log('✓ 開始收到 llm:token 串流')
-          }
-          if (!tokenFlushTimerRef.current) {
-            tokenFlushTimerRef.current = setTimeout(() => {
-              setStreamingText(streamingRef.current)
-              tokenFlushTimerRef.current = null
-            }, 50)
-          }
-        }),
-        listen<string>('llm:done', (e) => {
-          // Backend sends citation-stripped full response — use as authoritative final content.
-          llmDoneContentRef.current = e.payload || ''
-          log(`⏹ llm:done 事件收到，共 ${llmDoneContentRef.current.length} 字元`)
-        }),
-        listen<Array<{ path: string; title: string; excerpt: string }>>('agent:web_refs', (e) => {
-          pendingWebRefsRef.current = [...pendingWebRefsRef.current, ...e.payload]
-        }),
-        // 透明度：skill pre-pass 觸發時，顯示哪些技能正在作用
-        listen<{ titles: string[] }>('agent:skills_activated', (e) => {
-          console.log('[skills_activated] payload:', JSON.stringify(e.payload))
-          const titles = e.payload?.titles
-          if (!Array.isArray(titles) || titles.length === 0) return
-          const names = titles.join('、')
-          setMessages(prev => [...prev, {
-            role: 'tool' as const,
-            content: `⚡ 套用技能：${names}`,
-          }])
-          unlistenSkillsActivated()
-        }),
-        // Bottom-up skill 歸納：agent 偵測到結構化回答框架時，提示使用者存為技能規範
-        listen<{ query: string; response_preview: string }>('agent:skill_suggestion', (_e) => {
-          setMessages(prev => [...prev, {
-            role: 'notice' as const,
-            content: `💡 這個回答包含可重用的框架，是否前往「知識中心 → 我的技能規範」將此偏好設定為技能？`,
-          }])
-          unlistenSkillSuggestion()
-        }),
-        // Pre-routing debug trace
-        listen<{ step: string; reason?: string; best_match?: string; dim?: number; found?: number; repaired?: number }>(
-          'agent:pre_route_debug',
-          (e) => {
-            const p = e.payload
-            const msg = p.step === 'skip'
-              ? `⚠ pre-routing skip: ${p.reason}`
-              : p.step === 'miss'
-              ? `⚠ pre-routing miss: ${p.reason}${p.best_match ? ` (best: ${p.best_match})` : ''}`
-              : p.step === 'repair_done'
-              ? `✓ pre-routing repair_done found=${p.found} repaired=${p.repaired}`
-              : p.step === 'create_agent_called'
-              ? `🔨 create_agent called: name=${(p as any).name} trigger=${(p as any).trigger} emb=${(p as any).emb_url}`
-              : p.step === 'db_dump'
-              ? `🗄 db_dump vid=${(p as any).query_vid} | ${(p as any).agents?.map((a: any) => `${a.name}[t=${a.trigger},emb=${a.has_emb},st=${a.status},vid=${a.vid_match?'✓':'✗'},builtin=${a.builtin}]`).join(' | ') || '(no agents)'}`
-              : `✓ pre-routing ${p.step}${p.dim ? ` dim=${p.dim}` : ''}`
-            addLog('llm', 'info', msg)
-          }
-        ),
-        // search_skills 工具找到技能：對話框顯示搜尋提示 + 詢問是否加入觸發條件
-        listen<{ skill_id: string; skill_title: string; use_ask: string }>('agent:skill_found', (e) => {
-          setMessages(prev => [...prev, {
-            role: 'tool' as const,
-            content: `🔍 搜尋到技能：${e.payload.skill_title}（意圖：${e.payload.use_ask}）`,
-          }])
-          setPendingSkillFound(e.payload)
-        }),
-        // search_skills 找不到技能：讓使用者選擇要加入哪個 skill 的觸發條件
-        listen<{ use_ask: string }>('agent:skill_not_found', (e) => {
-          setMessages(prev => [...prev, {
-            role: 'tool' as const,
-            content: `❓ 找不到適合的技能（意圖：${e.payload.use_ask}）`,
-          }])
-          setPendingSkillNotFound(e.payload)
-        }),
-        listen<{ thought: string }>('agent:think', (e) => {
-          setMessages(prev => [...prev, { role: 'think' as const, content: e.payload.thought }])
-        }),
-        // llm:think_token — native-think model (e.g. Qwen3.5) emits chain-of-thought tokens
-        // separately from answer tokens. Accumulate here; finalize as a think message on llm:done.
-        listen<string>('llm:think_token', (e) => {
-          thinkStreamingRef.current += e.payload
-          if (!thinkFlushTimerRef.current) {
-            thinkFlushTimerRef.current = setTimeout(() => {
-              setThinkStreamingText(thinkStreamingRef.current)
-              thinkFlushTimerRef.current = null
-            }, 150)
-          }
-        }),
-        listen<{ display: string }>('agent:write_timeout', () => {
-          setPendingWriteDisplay(null)
-          setMessages(prev => [...prev, { role: 'notice' as const, content: '⏱ 確認逾時，操作已取消' }])
-        }),
-        listen<{ session_id: string; plan: string }>('agent:plan_announce', (e) => {
-          setMessages(prev => [...prev, { role: 'notice' as const, content: `📋 計畫：${e.payload.plan}` }])
-        }),
-        listen<Record<string, never>>('agent:citation_missing', () => {
-          console.warn('[citation] LLM response missing or invalid [cite:...] tag')
-        }),
-        listen<{ ids: string[]; details?: Array<{ id: string; tool: string; preview: string }> }>('agent:citation', (e) => {
-          // Valid citation IDs confirmed by backend — show as source chips
-          const ids = e.payload?.ids ?? []
-          if (ids.length === 0) return
-          // Accumulate cite details for the expandable badge in MessageBubble
-          if (e.payload?.details?.length) {
-            citeDetailsRef.current = [...citeDetailsRef.current, ...e.payload.details]
-          }
-          const chips = ids
-            .filter(id => id !== 'none')
-            .map(id => ({
-              absPath: id,
-              label: id,
-              isUrl: false,
-              toolName: 'citation' as const,
-            }))
-          if (chips.length > 0) {
-            setNoteSuggestions(prev => [...prev, ...chips])
-            noteSuggestionsRef.current = [...noteSuggestionsRef.current, ...chips]
-          }
-        }),
-        listen<Record<string, never>>('agent:cite_correction_start', () => {
-          // LLM produced a fabricated citation; backend is retrying with correction.
-          // Reset streaming buffer so the corrected response displays cleanly.
-          streamingRef.current = ''
-          tokenCountRef.current = 0
-          setStreamingText('')
-          setNoteSuggestions([])
-          noteSuggestionsRef.current = []
-        }),
-        listen<Record<string, never>>('agent:clear_stream', () => {
-          // LLM output a <tool_call> tag mid-stream — backend is suppressing the rest.
-          // Clear whatever preamble text was already streamed to the user.
-          streamingRef.current = ''
-          tokenCountRef.current = 0
-          setStreamingText('')
-        }),
-        listen<{ passed: boolean }>('agent:cite_status', (e) => {
-          citeFailedRef.current = !e.payload.passed
-        }),
-      ])
+          return { absPath, label, isUrl, excerpt: ref.excerpt, toolName: ref.tool_name }
+        })
+        setNoteSuggestions(suggestions)
+        noteSuggestionsRef.current = suggestions
+      }))
+      eventOffs.push(on('agent:open_note', (data) => {
+        const paths = data as string[]
+        if (onOpenNote && paths.length > 0) onOpenNote(paths[0])
+      }))
+      eventOffs.push(on('agent:write_request', (data) => {
+        const display = data as string
+        if (writeConfirmMode === 'never') { wsConfirm(true); return }
+        if (writeConfirmMode === 'once' && sessionWriteApprovedRef.current) { wsConfirm(true); return }
+        setPendingWriteDisplay(display)
+      }))
+      eventOffs.push(on('llm:token', (data) => {
+        const token = data as string
+        streamingRef.current += token
+        tokenCountRef.current += token.length
+        if (tokenCountRef.current === token.length) log('✓ 開始收到 llm:token 串流')
+        if (!tokenFlushTimerRef.current) {
+          tokenFlushTimerRef.current = setTimeout(() => {
+            setStreamingText(streamingRef.current)
+            tokenFlushTimerRef.current = null
+          }, 50)
+        }
+      }))
+      eventOffs.push(on('llm:done', (data) => {
+        llmDoneContentRef.current = (data as string) || ''
+        log(`⏹ llm:done 事件收到，共 ${llmDoneContentRef.current.length} 字元`)
+      }))
+      eventOffs.push(on('agent:web_refs', (data) => {
+        pendingWebRefsRef.current = [...pendingWebRefsRef.current, ...(data as Array<{ path: string; title: string; excerpt: string }>)]
+      }))
+      offSkillsActivated = on('agent:skills_activated', (data) => {
+        const payload = data as { titles: string[] }
+        console.log('[skills_activated] payload:', JSON.stringify(payload))
+        const titles = payload?.titles
+        if (!Array.isArray(titles) || titles.length === 0) return
+        setMessages(prev => [...prev, { role: 'tool' as const, content: `⚡ 套用技能：${titles.join('、')}` }])
+        offSkillsActivated()
+      })
+      eventOffs.push(offSkillsActivated)
+      offSkillSuggestion = on('agent:skill_suggestion', () => {
+        setMessages(prev => [...prev, {
+          role: 'notice' as const,
+          content: `💡 這個回答包含可重用的框架，是否前往「知識中心 → 我的技能規範」將此偏好設定為技能？`,
+        }])
+        offSkillSuggestion()
+      })
+      eventOffs.push(offSkillSuggestion)
+      eventOffs.push(on('agent:pre_route_debug', (data) => {
+        const p = data as { step: string; reason?: string; best_match?: string; dim?: number; found?: number; repaired?: number }
+        const msg = p.step === 'skip'
+          ? `⚠ pre-routing skip: ${p.reason}`
+          : p.step === 'miss'
+          ? `⚠ pre-routing miss: ${p.reason}${p.best_match ? ` (best: ${p.best_match})` : ''}`
+          : p.step === 'repair_done'
+          ? `✓ pre-routing repair_done found=${p.found} repaired=${p.repaired}`
+          : p.step === 'create_agent_called'
+          ? `🔨 create_agent called: name=${(p as any).name} trigger=${(p as any).trigger} emb=${(p as any).emb_url}`
+          : p.step === 'db_dump'
+          ? `🗄 db_dump vid=${(p as any).query_vid} | ${(p as any).agents?.map((a: any) => `${a.name}[t=${a.trigger},emb=${a.has_emb},st=${a.status},vid=${a.vid_match?'✓':'✗'},builtin=${a.builtin}]`).join(' | ') || '(no agents)'}`
+          : `✓ pre-routing ${p.step}${p.dim ? ` dim=${p.dim}` : ''}`
+        addLog('llm', 'info', msg)
+      }))
+      eventOffs.push(on('agent:skill_found', (data) => {
+        const p = data as { skill_id: string; skill_title: string; use_ask: string }
+        setMessages(prev => [...prev, { role: 'tool' as const, content: `🔍 搜尋到技能：${p.skill_title}（意圖：${p.use_ask}）` }])
+        setPendingSkillFound(p)
+      }))
+      eventOffs.push(on('agent:skill_not_found', (data) => {
+        const p = data as { use_ask: string }
+        setMessages(prev => [...prev, { role: 'tool' as const, content: `❓ 找不到適合的技能（意圖：${p.use_ask}）` }])
+        setPendingSkillNotFound(p)
+      }))
+      eventOffs.push(on('agent:think', (data) => {
+        const p = data as { thought: string }
+        setMessages(prev => [...prev, { role: 'think' as const, content: p.thought }])
+      }))
+      eventOffs.push(on('llm:think_token', (data) => {
+        thinkStreamingRef.current += data as string
+        if (!thinkFlushTimerRef.current) {
+          thinkFlushTimerRef.current = setTimeout(() => {
+            setThinkStreamingText(thinkStreamingRef.current)
+            thinkFlushTimerRef.current = null
+          }, 150)
+        }
+      }))
+      eventOffs.push(on('agent:write_timeout', () => {
+        setPendingWriteDisplay(null)
+        setMessages(prev => [...prev, { role: 'notice' as const, content: '⏱ 確認逾時，操作已取消' }])
+      }))
+      eventOffs.push(on('agent:plan_announce', (data) => {
+        const p = data as { session_id: string; plan: string }
+        setMessages(prev => [...prev, { role: 'notice' as const, content: `📋 計畫：${p.plan}` }])
+      }))
+      eventOffs.push(on('agent:citation_missing', () => {
+        console.warn('[citation] LLM response missing or invalid [cite:...] tag')
+      }))
+      eventOffs.push(on('agent:citation', (data) => {
+        const p = data as { ids: string[]; details?: Array<{ id: string; tool: string; preview: string }> }
+        const ids = p?.ids ?? []
+        if (ids.length === 0) return
+        if (p?.details?.length) citeDetailsRef.current = [...citeDetailsRef.current, ...p.details]
+        const chips = ids
+          .filter(id => id !== 'none')
+          .map(id => ({ absPath: id, label: id, isUrl: false, toolName: 'citation' as const }))
+        if (chips.length > 0) {
+          setNoteSuggestions(prev => [...prev, ...chips])
+          noteSuggestionsRef.current = [...noteSuggestionsRef.current, ...chips]
+        }
+      }))
+      eventOffs.push(on('agent:cite_correction_start', () => {
+        streamingRef.current = ''
+        tokenCountRef.current = 0
+        setStreamingText('')
+        setNoteSuggestions([])
+        noteSuggestionsRef.current = []
+      }))
+      eventOffs.push(on('agent:clear_stream', () => {
+        streamingRef.current = ''
+        tokenCountRef.current = 0
+        setStreamingText('')
+      }))
+      eventOffs.push(on('agent:cite_status', (data) => {
+        const p = data as { passed: boolean }
+        citeFailedRef.current = !p.passed
+      }))
 
-      log('  呼叫 invoke("invoke_agent")')
-      const agentResp = await invoke<{ session_id: string; conversation_id: string; cite_passed?: boolean | null }>('invoke_agent', {
+      log('  呼叫 wsRun')
+      const agentResp = await wsRun({
+        vaultId: await invoke<string>('get_vault_uuid'),
         input: text,
-        messages: conversationId ? [] : llmMessages,
-        system,
         conversationId: conversationId ?? undefined,
-        activityContext: useActivityStore.getState().getContextString() || null,
+        platform: 'desktop',
+        activeNote: currentPath ?? undefined,
         uiLanguage: i18n.language,
       })
-      // cite_passed is included in the HTTP response to avoid the race condition
-      // where agent:cite_status (SSE) may arrive after invoke() resolves.
-      // If the SSE listener already set citeFailedRef (early delivery), keep it;
-      // otherwise use the HTTP response value.
-      if (citeFailedRef.current === undefined && agentResp.cite_passed !== undefined && agentResp.cite_passed !== null) {
-        citeFailedRef.current = !agentResp.cite_passed
-      }
 
-      if (!conversationId && agentResp.conversation_id) {
-        setConversationId(agentResp.conversation_id)
+      if (!conversationId && agentResp.conversationId) {
+        setConversationId(agentResp.conversationId)
         invoke<string>('get_vault_uuid').then(vaultId => {
           const username = useAuthStore.getState().session?.username ?? ''
-          api.setLastChatConversationId(`${username}_${vaultId}`, agentResp.conversation_id).catch(() => {})
+          api.setLastChatConversationId(`${username}_${vaultId}`, agentResp.conversationId).catch(() => {})
         }).catch(() => {})
       }
 
@@ -790,26 +669,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       err(`invoke 失敗：\n${msg}`)
       setError(msg)
     } finally {
-      unlistenToken()
-      unlistenDone()
-      unlistenToolCall()
-      unlistenWriteReq()
-      unlistenNoteRefs()
-      unlistenOpenNote()
-      unlistenWebRefs()
-      unlistenSkillsActivated()
-      unlistenSkillSuggestion()
-      unlistenPreRouteDebug()
-      unlistenSkillFound()
-      unlistenSkillNotFound()
-      unlistenThink()
-      unlistenThinkToken()
-      unlistenWriteTimeout()
-      unlistenPlanAnnounce()
-      unlistenCitationMissing()
-      unlistenCitation()
-      unlistenCiteCorrectionStart()
-      unlistenCiteStatus()
+      eventOffs.forEach(off => off())
       setPendingWriteDisplay(null)
       setIsStreaming(false)
       isStreamingRef.current = false
@@ -838,43 +698,33 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
 
   // ─── Reflection：每 6 則訊息後背景觀察對話模式，結果顯示在 Debug tab ──────
   const REFLECTION_INTERVAL = 6
-  const REFLECTION_SYSTEM = `你是一個自我改進系統，負責觀察使用者與 AI 的對話模式並自動固化知識。
-執行步驟：
-1. 呼叫 list_recent_conversations 讀取最近對話
-2. 分析重複需求、知識缺口、常用查詢模式
-3. 若發現可固化的行為模式，呼叫 create_agent_skill 建立技能規範
-4. 若有值得保存的知識，呼叫 create_note 建立筆記
-限制：技能規範預設未啟用，使用者可在「我的技能規範」頁面審核。不要產生冗餘或過度通泛的技能。`
-
   const triggerReflection = useCallback(async () => {
     if (isReflectingRef.current) return
     isReflectingRef.current = true
     const { addLog: dbgLog } = useDebugStore.getState()
     dbgLog('reflection', 'info', '🔄 開始觀察對話模式…')
 
-    let unlistenTool: (() => void) | null = null
+    const offTool = on('agent:tool_call', (data) => {
+      const display = typeof data === 'string' ? data : (data as any)?.display ?? ''
+      dbgLog('reflection', 'info', display)
+    })
 
     try {
-      unlistenTool = await listen<{ display: string }>('agent:tool_call', e => {
-        dbgLog('reflection', 'info', e.payload.display)
-      })
-
-      // invoke_agent 是 blocking — await 到 agent loop 完成才 resolve
-      const result = await invoke<string>('invoke_agent', {
+      const vaultId = await invoke<string>('get_vault_uuid')
+      await wsRun({
+        vaultId,
         input: '開始觀察',
-        messages: [],
-        system: REFLECTION_SYSTEM,
-        useTools: true,
+        platform: 'desktop',
+        uiLanguage: i18n.language,
       })
 
-      if (result) dbgLog('reflection', 'info', result)
       dbgLog('reflection', 'info', '✅ 觀察完成')
       window.dispatchEvent(new CustomEvent('skills-changed'))
     } catch (e) {
       dbgLog('reflection', 'error', `觸發失敗：${e}`)
     } finally {
       isReflectingRef.current = false
-      unlistenTool?.()
+      offTool()
     }
   }, [])
 
