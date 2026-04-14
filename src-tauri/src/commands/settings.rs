@@ -129,6 +129,7 @@ pub struct SystemSettings {
     pub llm_draft_model_path: String,
     pub llama_cli_path: String,
     pub embedding_model_path: String,
+    pub diarize_model_path: String,
 }
 
 #[tauri::command]
@@ -150,6 +151,7 @@ pub async fn get_system_settings(state: State<'_, AppState>) -> Result<SystemSet
         llm_draft_model_path: s(&sys, "llm_draft_model_path", ""),
         llama_cli_path: s(&sys, "llama_cli_path", ""),
         embedding_model_path: s(&sys, "embedding_model_path", ""),
+        diarize_model_path: s(&sys, "diarize_model_path", ""),
     })
 }
 
@@ -175,6 +177,7 @@ pub async fn save_system_settings(
     map.insert("llm_draft_model_path", settings.llm_draft_model_path.trim().to_string());
     map.insert("llama_cli_path", settings.llama_cli_path.trim().to_string());
     map.insert("embedding_model_path", settings.embedding_model_path.trim().to_string());
+    map.insert("diarize_model_path", settings.diarize_model_path.trim().to_string());
 
     daemon_post::<_, serde_json::Value>(&state.http_client, "/settings", &map, tok)
         .await.map_err(|e| AppError::Settings(e))?;

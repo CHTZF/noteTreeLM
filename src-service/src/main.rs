@@ -7,6 +7,8 @@ mod embedding;
 mod routes;
 mod app_state;
 pub mod diarize;
+pub mod audio_store;
+pub mod speaker_engine;
 
 fn get_data_dir() -> std::path::PathBuf {
     let base = dirs::data_dir().expect("Cannot find data directory");

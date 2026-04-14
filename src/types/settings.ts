@@ -52,6 +52,7 @@ export interface Settings {
   show_kb_assist: boolean
   show_import: boolean
   show_memory_links: boolean
+  show_meeting: boolean
   file_sort_type: 'none' | 'asc' | 'desc'
   hotkey_toggle_view: string
   hotkey_save: string
@@ -113,6 +114,7 @@ export const DEFAULT_SETTINGS: Settings = {
   show_kb_assist: false,
   show_import: false,
   show_memory_links: false,
+  show_meeting: false,
   file_sort_type: 'none',
   hotkey_toggle_view: 'mod+e',
   hotkey_save: 'mod+s',

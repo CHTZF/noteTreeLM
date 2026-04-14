@@ -6,7 +6,7 @@ import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
 import { open as openPath } from '@tauri-apps/plugin-shell'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
-import { faGear, faBolt, faChevronLeft, faChevronRight, faSitemap, faFolderTree, faMagnifyingGlass, faBug, faComments, faMicrophone, faArrowRightArrowLeft, faTrash, faArrowRightFromBracket, faCircleQuestion, faUser, faFileImport, faShieldHalved, faSliders, faBrain } from '@fortawesome/free-solid-svg-icons'
+import { faGear, faBolt, faChevronLeft, faChevronRight, faSitemap, faFolderTree, faMagnifyingGlass, faBug, faComments, faMicrophone, faArrowRightArrowLeft, faTrash, faArrowRightFromBracket, faCircleQuestion, faUser, faFileImport, faShieldHalved, faSliders, faBrain, faUsers } from '@fortawesome/free-solid-svg-icons'
 import { useSettingsStore } from './stores/settingsStore'
 import { api } from './lib/api'
 import { useVaultStore } from './stores/vaultStore'
@@ -1147,7 +1147,7 @@ function AppMain() {
           }}
         >
           {/* Always-mounted Chat / LiveChat / Import / KB Assistant / Skills / MemoryLinks panels — hidden with display:none when not active */}
-          {leaf.tabs.filter(t => t.path === CHAT_TAB || t.path === LIVE_CHAT_TAB || t.path === IMPORT_TAB || t.path === KB_ASSIST_TAB || t.path === SKILLS_TAB || t.path === AGENTS_TAB || t.path === MEMORY_LINKS_TAB).map(t => (
+          {leaf.tabs.filter(t => t.path === CHAT_TAB || t.path === LIVE_CHAT_TAB || t.path === IMPORT_TAB || t.path === KB_ASSIST_TAB || t.path === SKILLS_TAB || t.path === AGENTS_TAB || t.path === MEMORY_LINKS_TAB || t.path === MEETING_TAB || t.path === EVAL_TAB).map(t => (
             <div key={t.id} style={{
               display: t.id === leaf.activeTabId ? 'flex' : 'none',
               flex: 1, flexDirection: 'column', height: '100%', overflow: 'hidden',
@@ -1330,6 +1330,14 @@ function AppMain() {
               title={t('tabs.import')}
               onClick={() => openNote(IMPORT_TAB)}
             ><FontAwesomeIcon icon={faFileImport} /></button>
+          )}
+
+          {settings.show_meeting && (
+            <button
+              className={`icon-menubar-btn${currentPath === MEETING_TAB ? ' active' : ''}`}
+              title="會議錄音"
+              onClick={() => openNote(MEETING_TAB)}
+            ><FontAwesomeIcon icon={faUsers} /></button>
           )}
 
           {settings.show_agent_tools && (

@@ -53,6 +53,7 @@ export function createTranscribeSession(
   options?: {
     vaultId?: string
     onMeetingStarted?: (meetingId: string) => void
+    onMeetingDone?: (meetingId: string) => void
   },
 ): Promise<TranscribeSession> {
   const vaultId = options?.vaultId ?? ''
@@ -69,9 +70,15 @@ export function createTranscribeSession(
     if (msg.event === 'whisper:done') {
       const d = msg.data as { text: string; index: number; speaker?: string; ts_ms?: number }
       onResult(d.text ?? '', d.index ?? 0, d.speaker, d.ts_ms)
-    } else if (msg.event === 'whisper:flush_done') {
+    } else if (msg.event === 'whisper:flush_done' || msg.event === 'meeting:done') {
+      // meeting:done is sent after SpeakerEngine attribution completes (two-phase shutdown).
+      // whisper:flush_done kept for compatibility.
       stopping = false
       onFlushDone()
+      if (msg.event === 'meeting:done') {
+        const d = msg.data as { meeting_id: string }
+        options?.onMeetingDone?.(d.meeting_id)
+      }
     } else if (msg.event === 'whisper:error') {
       onError(String(msg.data ?? '轉錄失敗'))
     } else if (msg.event === 'meeting:started') {

@@ -391,14 +391,29 @@ async fn run_migrations(db: &SurrealDb) -> Result<(), surrealdb::Error> {
         "DEFINE INDEX IF NOT EXISTS idx_meetings_vault_ts  ON meetings FIELDS vault_id, started_at;",
 
         "DEFINE TABLE IF NOT EXISTS meeting_segments SCHEMALESS;",
-        "DEFINE FIELD IF NOT EXISTS seg_id     ON meeting_segments TYPE string;",
-        "DEFINE FIELD IF NOT EXISTS meeting_id ON meeting_segments TYPE string;",
-        "DEFINE FIELD IF NOT EXISTS seg_index  ON meeting_segments TYPE int DEFAULT 0;",
-        "DEFINE FIELD IF NOT EXISTS speaker    ON meeting_segments TYPE option<string>;",
-        "DEFINE FIELD IF NOT EXISTS text       ON meeting_segments TYPE string;",
-        "DEFINE FIELD IF NOT EXISTS ts_ms      ON meeting_segments TYPE int DEFAULT 0;",
+        "DEFINE FIELD IF NOT EXISTS seg_id         ON meeting_segments TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS meeting_id     ON meeting_segments TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS seg_index      ON meeting_segments TYPE int DEFAULT 0;",
+        "DEFINE FIELD IF NOT EXISTS speaker        ON meeting_segments TYPE option<string>;",
+        "DEFINE FIELD IF NOT EXISTS text           ON meeting_segments TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS ts_ms          ON meeting_segments TYPE int DEFAULT 0;",
+        // chunk_start_ms: absolute ms from meeting start, derived from total_samples_received
+        // Used by SpeakerEngine: absolute_word_ms = chunk_start_ms + word.start_s * 1000
+        "DEFINE FIELD IF NOT EXISTS chunk_start_ms ON meeting_segments TYPE int DEFAULT 0;",
+        // words_json: JSON array of {word, start_s, end_s} relative to chunk start (from Whisper verbose_json)
+        "DEFINE FIELD IF NOT EXISTS words_json     ON meeting_segments TYPE option<string>;",
         "DEFINE INDEX IF NOT EXISTS idx_meeting_segs_id  ON meeting_segments FIELDS seg_id UNIQUE;",
         "DEFINE INDEX IF NOT EXISTS idx_meeting_segs_mid ON meeting_segments FIELDS meeting_id, seg_index;",
+
+        // speaker_spans: SpeakerEngine is the sole writer; TranscriptionEngine never touches this table
+        "DEFINE TABLE IF NOT EXISTS speaker_spans SCHEMALESS;",
+        "DEFINE FIELD IF NOT EXISTS span_id    ON speaker_spans TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS meeting_id ON speaker_spans TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS speaker_id ON speaker_spans TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS start_ms   ON speaker_spans TYPE int DEFAULT 0;",
+        "DEFINE FIELD IF NOT EXISTS end_ms     ON speaker_spans TYPE int DEFAULT 0;",
+        "DEFINE INDEX IF NOT EXISTS idx_speaker_spans_id  ON speaker_spans FIELDS span_id UNIQUE;",
+        "DEFINE INDEX IF NOT EXISTS idx_speaker_spans_mid ON speaker_spans FIELDS meeting_id, start_ms;",
 
         // ── graph nodes & edges ──────────────────────────────────────────────
         "DEFINE TABLE IF NOT EXISTS graph_nodes SCHEMALESS;",

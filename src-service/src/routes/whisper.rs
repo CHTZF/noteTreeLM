@@ -17,6 +17,7 @@ pub fn router() -> Router<ApiState> {
         .route("/whisper/stop", post(stop_handler))
         .route("/whisper/restart", post(restart_handler))
         .route("/whisper/transcribe", post(transcribe_handler))
+        .route("/whisper/test-verbose", post(test_verbose_handler))
 }
 
 // ─── Settings ─────────────────────────────────────────────────────────────────
@@ -162,6 +163,7 @@ async fn ensure_running(state: &ApiState) -> Result<String, String> {
                 "--port", &port.to_string(),
                 "--host", "127.0.0.1",
                 "--threads", &config.threads.to_string(),
+                // --dtw not supported by Breeze-ASR-25 (MediaTek fine-tune, non-standard heads)
             ]);
             #[cfg(target_os = "macos")]
             cmd.arg("--flash-attn");
@@ -310,6 +312,24 @@ pub fn build_wav_from_i16(samples: &[i16], sample_rate: u32) -> Vec<u8> {
     buf
 }
 
+/// Word-level timestamp from Whisper verbose_json.
+/// `start_s` / `end_s` are seconds relative to the WAV chunk start (NOT absolute meeting time).
+/// To get absolute meeting time: `chunk_start_ms + start_s * 1000`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WordTimestamp {
+    pub word: String,
+    pub start_s: f32,
+    pub end_s: f32,
+}
+
+/// Full result from a verbose transcription call.
+#[derive(Debug, Clone)]
+pub struct TranscriptResult {
+    pub text: String,
+    /// May be empty if whisper-server returns no word-level data.
+    pub words: Vec<WordTimestamp>,
+}
+
 /// Transcribe raw PCM16 (16-bit signed LE, 16 kHz mono) via whisper-server.
 /// Returns the recognized text (empty string if hallucination/silence), or an error.
 /// `context`: optional preceding transcript text fed as initial_prompt.
@@ -321,12 +341,22 @@ pub async fn transcribe_pcm16(
     language: &str,
     context: Option<&str>,
 ) -> Result<String, String> {
+    Ok(transcribe_pcm16_verbose(state, samples, language, context).await?.text)
+}
+
+/// Like `transcribe_pcm16` but also returns word-level timestamps from verbose_json.
+/// `words[].start_s` / `end_s` are relative to the chunk start — convert to absolute with
+/// `chunk_start_ms + word.start_s * 1000`.
+pub async fn transcribe_pcm16_verbose(
+    state: &ApiState,
+    samples: &[i16],
+    language: &str,
+    context: Option<&str>,
+) -> Result<TranscriptResult, String> {
     let wav = build_wav_from_i16(samples, 16000);
     let base_url = ensure_running(state).await?;
     let (whisper_lang, lang_prompt) = map_language(language);
 
-    // Merge language hint with cross-segment context.
-    // Order: lang_prompt first (sets vocabulary bias), then context (recent speech).
     let merged_prompt: Option<String> = match (lang_prompt, context.filter(|s| !s.is_empty())) {
         (Some(lp), Some(ctx)) => Some(format!("{} {}", lp, ctx)),
         (Some(lp), None)      => Some(lp.to_string()),
@@ -342,12 +372,13 @@ pub async fn transcribe_pcm16(
 
     let mut form = reqwest::multipart::Form::new()
         .part("file", part)
-        .text("response_format", "json")
+        .text("response_format", "verbose_json")
         .text("language", whisper_lang.to_string())
         .text("temperature", "0.0")
         .text("beam_size", "3")
         .text("no_speech_thold", "0.6")
-        .text("suppress_blank", "true");
+        .text("suppress_blank", "true")
+        .text("word_timestamps", "true");
 
     if let Some(prompt) = merged_prompt {
         form = form.text("initial_prompt", prompt);
@@ -372,7 +403,26 @@ pub async fn transcribe_pcm16(
 
     let text = json["text"].as_str().unwrap_or("").trim().to_string();
     let text = if is_hallucination(&text) { String::new() } else { text };
-    Ok(text)
+
+    // Parse word-level timestamps from verbose_json segments[].words[]
+    // words[].start / end are WAV-relative seconds (confirmed by test).
+    let words: Vec<WordTimestamp> = json["segments"]
+        .as_array()
+        .map(|segs| {
+            segs.iter()
+                .filter_map(|seg| seg["words"].as_array())
+                .flatten()
+                .filter_map(|w| {
+                    let word = w["word"].as_str()?.to_string();
+                    let start_s = w["start"].as_f64()? as f32;
+                    let end_s = w["end"].as_f64()? as f32;
+                    Some(WordTimestamp { word, start_s, end_s })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(TranscriptResult { text, words })
 }
 
 pub fn build_silent_wav(duration_secs: f32, sample_rate: u32) -> Vec<u8> {
@@ -585,6 +635,107 @@ async fn restart_handler(
     warmup_inference(&base_url, &state.daemon.http_client).await;
 
     Ok(Json(json!({ "ok": true })))
+}
+
+// ─── verbose_json test endpoint ──────────────────────────────────────────────
+//
+// POST /whisper/test-verbose
+// Accepts a WAV file (multipart "file" field) + optional "language" field.
+// Returns the raw verbose_json from whisper.cpp so we can verify that
+// segment timestamps are 0-based relative to the WAV start, not some
+// internal offset.
+//
+// Expected response shape from whisper.cpp verbose_json:
+//   {
+//     "text": "...",
+//     "segments": [
+//       { "id": 0, "start": 0.0, "end": 1.2, "text": "..." },
+//       { "id": 1, "start": 1.2, "end": 2.8, "text": "..." }
+//     ]
+//   }
+//
+// Validation: send a WAV with known content, e.g.:
+//   0.0s – 1.0s  silence
+//   1.0s – 2.0s  speech ("你好")
+//   2.0s – 3.0s  silence
+//   3.0s – 4.0s  speech ("再見")
+// Then confirm segment[0].start ≈ 1.0 and segment[1].start ≈ 3.0.
+// If they're correct, absolute_ms = chunk_start_ms + segment.start * 1000.
+async fn test_verbose_handler(
+    State(state): State<ApiState>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let mut wav_bytes: Option<Vec<u8>> = None;
+    let mut language = "auto".to_string();
+
+    while let Some(field) = multipart.next_field().await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+    {
+        match field.name().unwrap_or("") {
+            "file" => {
+                wav_bytes = Some(field.bytes().await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?.to_vec());
+            }
+            "language" => {
+                language = String::from_utf8_lossy(
+                    &field.bytes().await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+                ).into_owned();
+            }
+            _ => { let _ = field.bytes().await; }
+        }
+    }
+
+    let wav = wav_bytes.ok_or((StatusCode::BAD_REQUEST, "missing file".to_string()))?;
+    let base_url = ensure_running(&state).await
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let (whisper_lang, _) = map_language(&language);
+
+    let part = reqwest::multipart::Part::bytes(wav)
+        .file_name("test.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let form = reqwest::multipart::Form::new()
+        .part("file", part)
+        .text("response_format", "verbose_json")
+        .text("language", whisper_lang.to_string())
+        .text("temperature", "0.0");
+
+    let resp = state.daemon.http_client
+        .post(format!("{}/inference", base_url))
+        .multipart(form)
+        .timeout(Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err((StatusCode::BAD_GATEWAY, format!("whisper error {}: {}", status, body)));
+    }
+
+    // Return raw verbose_json so caller can inspect segment timestamps
+    let raw: Value = resp.json().await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Also extract segments in a normalised form for easy inspection
+    let segments: Vec<Value> = raw["segments"].as_array()
+        .map(|arr| arr.iter().map(|s| json!({
+            "id":    s["id"],
+            "start": s["start"],   // seconds, relative to WAV start
+            "end":   s["end"],
+            "text":  s["text"],
+        })).collect())
+        .unwrap_or_default();
+
+    Ok(Json(json!({
+        "text": raw["text"],
+        "segments": segments,
+        "raw": raw,          // full response for debugging
+        "_note": "start/end are seconds relative to the WAV start (0-based). \
+                  absolute_ms = chunk_start_ms + start * 1000"
+    })))
 }
 
 /// Called on service shutdown — kill whisper process gracefully.

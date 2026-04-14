@@ -84,9 +84,16 @@ async fn get_meeting(
     #[derive(serde::Deserialize, serde::Serialize)]
     struct SegRow {
         seg_index: i64,
-        speaker: Option<String>,
         text: String,
         ts_ms: i64,
+        chunk_start_ms: Option<i64>,
+    }
+
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct SpanRow {
+        speaker_id: String,
+        start_ms: i64,
+        end_ms: i64,
     }
 
     let mut mr = state.db
@@ -102,14 +109,45 @@ async fn get_meeting(
         .ok_or_else(|| (StatusCode::NOT_FOUND, "meeting not found".to_string()))?;
 
     let mut sr = state.db
-        .query("SELECT seg_index, speaker, text, ts_ms FROM meeting_segments WHERE meeting_id = $mid ORDER BY seg_index")
+        .query("SELECT seg_index, text, ts_ms, chunk_start_ms FROM meeting_segments WHERE meeting_id = $mid ORDER BY seg_index")
+        .bind(("mid", id.clone()))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let segments: Vec<SegRow> = sr.take(0).unwrap_or_default();
+
+    // Fetch speaker_spans for attribution (SpeakerEngine writes these asynchronously)
+    let mut span_r = state.db
+        .query("SELECT speaker_id, start_ms, end_ms FROM speaker_spans WHERE meeting_id = $mid ORDER BY start_ms")
         .bind(("mid", id))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let spans: Vec<SpanRow> = span_r.take(0).unwrap_or_default();
 
-    let segments: Vec<SegRow> = sr.take(0).unwrap_or_default();
+    // Join: for each segment, find the span with most overlap to get the speaker
+    let name_map: std::collections::HashMap<String, String> =
+        serde_json::from_str(meeting.speaker_names_json.as_deref().unwrap_or("{}")).unwrap_or_default();
 
-    Ok(Json(json!({ "meeting": meeting, "segments": segments })))
+    let segments_with_speaker: Vec<serde_json::Value> = segments.iter().map(|seg| {
+        let seg_start = seg.chunk_start_ms.unwrap_or(seg.ts_ms);
+        let seg_end   = seg_start + 8000; // rough 8s window
+        let speaker = spans.iter()
+            .filter(|s| s.start_ms < seg_end && s.end_ms > seg_start)
+            .map(|s| {
+                let overlap = (s.end_ms.min(seg_end) - s.start_ms.max(seg_start)).max(0);
+                (overlap, &s.speaker_id)
+            })
+            .max_by_key(|(o, _)| *o)
+            .map(|(_, spk)| name_map.get(spk.as_str()).cloned().unwrap_or_else(|| spk.clone()));
+
+        json!({
+            "seg_index": seg.seg_index,
+            "text": seg.text,
+            "ts_ms": seg.ts_ms,
+            "speaker": speaker,
+        })
+    }).collect();
+
+    Ok(Json(json!({ "meeting": meeting, "segments": segments_with_speaker, "speaker_spans": spans })))
 }
 
 #[derive(Deserialize)]
@@ -171,7 +209,7 @@ async fn delete_meeting(
     }
 
     state.db
-        .query("DELETE FROM meeting_segments WHERE meeting_id = $mid; DELETE FROM meetings WHERE meeting_id = $mid")
+        .query("DELETE FROM meeting_segments WHERE meeting_id = $mid; DELETE FROM speaker_spans WHERE meeting_id = $mid; DELETE FROM meetings WHERE meeting_id = $mid")
         .bind(("mid", id))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

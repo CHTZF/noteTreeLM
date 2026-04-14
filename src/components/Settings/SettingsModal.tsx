@@ -58,7 +58,7 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
   const [expandedLog, setExpandedLog] = useState<string | null>(null)
   const [draft, setDraft] = useState<Settings>(() =>
     mode === 'system'
-      ? { ...DEFAULT_SETTINGS, ...(systemSettings ?? {}) }
+      ? { ...DEFAULT_SETTINGS, ...settings, ...(systemSettings ?? {}) }
       : { ...settings }
   )
   const [braveApiKey, setBraveApiKey] = useState('')
@@ -123,6 +123,10 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
   const [diarizeReloading, setDiarizeReloading] = useState(false)
   const [diarizeStatus, setDiarizeStatus] = useState<'idle' | 'ok' | 'error'>('idle')
   const [diarizeError, setDiarizeError] = useState('')
+  const [diarizeDownloading, setDiarizeDownloading] = useState(false)
+  const [diarizeDownloadedBytes, setDiarizeDownloadedBytes] = useState(0)
+  const [diarizeDownloadTotalBytes, setDiarizeDownloadTotalBytes] = useState(0)
+  const [diarizeDownloadError, setDiarizeDownloadError] = useState('')
 
   // Mobile tab state
   const [mobileTunnelUrl, setMobileTunnelUrl] = useState<string | null>(null)
@@ -394,6 +398,36 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
     return () => { cancelled = true; try { unlisten?.(); unlisten = null } catch {} }
   }, [])
 
+  // 監聽 diarize 模型下載進度
+  useEffect(() => {
+    let unlisten: (() => void) | null = null
+    let cancelled = false
+    listen<any>('model-download-progress', (e) => {
+      if (e.payload.model_id !== '__diarize__') return
+      const p = e.payload
+      if (p.status === 'downloading') {
+        setDiarizeDownloading(true)
+        setDiarizeDownloadedBytes(p.downloaded_bytes ?? 0)
+        setDiarizeDownloadTotalBytes(p.total_bytes ?? 0)
+        setDiarizeDownloadError('')
+      } else if (p.status === 'completed') {
+        setDiarizeDownloading(false)
+        setDiarizeDownloadedBytes(0)
+        setDiarizeDownloadTotalBytes(0)
+        setDiarizeDownloadError('')
+        if (p.file_path) up({ diarize_model_path: p.file_path })
+        setDiarizeStatus('ok')
+        toast.success('CAM++ 模型下載完成，已自動載入')
+      } else if (p.status === 'error') {
+        setDiarizeDownloading(false)
+        setDiarizeDownloadedBytes(0)
+        setDiarizeDownloadTotalBytes(0)
+        setDiarizeDownloadError(p.error ?? '下載失敗')
+      }
+    }).then(fn => { if (cancelled) { try { fn() } catch {} } else unlisten = fn }).catch(() => {})
+    return () => { cancelled = true; try { unlisten?.(); unlisten = null } catch {} }
+  }, [])
+
   useEffect(() => {
     if (tab !== 'advanced') return
     invoke<RepairLog[]>('list_repair_logs')
@@ -587,7 +621,7 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
 
   const tabs: [Tab, string][] = mode === 'system'
     ? [['voice', t('settings.tab.voice')], ['local', t('settings.tab.local')], ['search', '網路搜尋'], ['advanced', t('settings.tab.advanced')], ['raw', t('settings.tab.raw')]]
-    : [['account', t('settings.tab.account')], ['general', t('settings.tab.general')], ['sidebar', '左側選單'], ['advanced', t('settings.tab.advanced')], ['memory', t('settings.tab.memory')], ['mobile', 'Mobile'], ['raw', t('settings.tab.raw')]]
+    : [['account', t('settings.tab.account')], ['general', t('settings.tab.general')], ['voice', t('settings.tab.voice')], ['sidebar', '左側選單'], ['advanced', t('settings.tab.advanced')], ['memory', t('settings.tab.memory')], ['mobile', 'Mobile'], ['raw', t('settings.tab.raw')]]
 
   const handleChangePassword = async () => {
     if (!newPassword || newPassword !== confirmPassword) {
@@ -1030,7 +1064,63 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
               </div>
             </>}
 
-            {tab === 'voice' && <>
+            {tab === 'voice' && mode === 'personal' && <>
+              <SectionHeader label="即時預覽" />
+              <ToggleRow
+                label="錄音時顯示即時預覽（定期送 Whisper 預測）"
+                value={draft.voice_preview_enabled ?? true}
+                onChange={(v) => up({ voice_preview_enabled: v })}
+              />
+              <div style={fieldStyle}>
+                <label style={labelStyle}>語音處理長度</label>
+                <select
+                  value={draft.voice_preview_interval ?? 5000}
+                  onChange={(e) => up({ voice_preview_interval: Number(e.target.value) })}
+                  style={inputStyle}
+                  disabled={!(draft.voice_preview_enabled ?? true)}
+                >
+                  {[1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000].map((ms) => (
+                    <option key={ms} value={ms}>{`${ms / 1000} 秒`}</option>
+                  ))}
+                </select>
+                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '4px 0 0', lineHeight: 1.5 }}>
+                  每隔此長度的音頻送一次 Whisper 預覽辨識。
+                </p>
+              </div>
+              <SectionDivider />
+              <SectionHeader label="音訊處理" />
+              <ToggleRow
+                label="RNNoise 雜訊抑制（關閉則使用瀏覽器內建抑制）"
+                value={draft.voice_noise_suppression ?? true}
+                onChange={(v) => up({ voice_noise_suppression: v })}
+              />
+              <div style={fieldStyle}>
+                <label style={labelStyle}>語音後處理模式</label>
+                <select
+                  value={draft.voice_process_mode}
+                  onChange={(e) => up({ voice_process_mode: e.target.value as any })}
+                  style={inputStyle}
+                >
+                  <option value="none">無（直接插入原始文字）</option>
+                  <option value="format">自動整理（llama 潤稿）</option>
+                  <option value="summary">標記 Wikilink（llama 分析關鍵詞）</option>
+                </select>
+                {draft.voice_process_mode !== 'none' && !draft.llama_cli_path && (
+                  <p style={{ fontSize: '11px', color: 'var(--color-warning, #f59e0b)', margin: '6px 0 0', lineHeight: 1.5 }}>
+                    ⚠ 請先到「系統設定 → Local LLM Server」頁面設定 llama 路徑與本地模型。
+                  </p>
+                )}
+                {draft.voice_process_mode !== 'none' && (
+                  <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '6px 0 0', lineHeight: 1.5 }}>
+                    {draft.voice_process_mode === 'format'
+                      ? '辨識完成後，llama 會將口語文字潤飾成書面語後再插入。'
+                      : '辨識完成後，llama 會分析口語文字中的關鍵主題，並將其替換為 [[wikilink]] 格式後插入。'}
+                  </p>
+                )}
+              </div>
+            </>}
+
+            {tab === 'voice' && mode === 'system' && <>
               {/* ── Server Status ──────────────────────────────────────────── */}
               <ServerCard
                 name="Whisper Server（語音辨識）"
@@ -1137,97 +1227,6 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                 </p>
               </div>
 
-              {/* ── Recognition Settings ───────────────────────────────────── */}
-              <SectionDivider />
-              <SectionHeader label="辨識設定" />
-              <ToggleRow
-                label="錄音時顯示即時預覽（定期送 Whisper 預測）"
-                value={draft.voice_preview_enabled ?? true}
-                onChange={(v) => up({ voice_preview_enabled: v })}
-              />
-              <div style={fieldStyle}>
-                <label style={labelStyle}>語音處理長度</label>
-                <select
-                  value={draft.voice_preview_interval ?? 5000}
-                  onChange={(e) => up({ voice_preview_interval: Number(e.target.value) })}
-                  style={inputStyle}
-                  disabled={!(draft.voice_preview_enabled ?? true)}
-                >
-                  {[1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000].map((ms) => (
-                    <option key={ms} value={ms}>{`${ms / 1000} 秒`}</option>
-                  ))}
-                </select>
-                <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '4px 0 0', lineHeight: 1.5 }}>
-                  每隔此長度的音頻送一次 Whisper 預覽辨識。
-                </p>
-              </div>
-              {/* 語音響應時間：唯讀顯示，根據選取長度 + 實測 Whisper 速度計算 */}
-              {(draft.voice_preview_enabled ?? true) && (
-                <div style={fieldStyle}>
-                  <label style={labelStyle}>語音響應時間</label>
-                  {whisperBenchmarking && (
-                    <p style={{ fontSize: '12px', color: 'var(--color-text-muted)', margin: 0, lineHeight: 1.5 }}>
-                      ⏱ 測試 Whisper 推論速度中…
-                    </p>
-                  )}
-                  {!whisperBenchmarking && whisperBenchmarkMs !== null && (() => {
-                    const intervalMs  = draft.voice_preview_interval ?? 5000
-                    const inferMs     = Math.round(whisperBenchmarkMs / 1000 * intervalMs)  // RTF × 段長
-                    const totalMs     = intervalMs + inferMs
-                    const rtf         = whisperBenchmarkMs / 1000
-                    const noteColor   = rtf < 0.3
-                      ? 'var(--color-success, #10b981)'
-                      : rtf < 0.7
-                        ? 'var(--color-warning, #f59e0b)'
-                        : 'var(--color-error, #ef4444)'
-                    return (
-                      <p style={{ fontSize: '12px', color: noteColor, margin: 0, lineHeight: 1.8 }}>
-                        約 {(totalMs / 1000).toFixed(1)} 秒
-                        <span style={{ fontSize: '11px', color: 'var(--color-text-muted)', marginLeft: 6 }}>
-                          （處理長度 {intervalMs / 1000}s + Whisper 推論 ~{inferMs}ms）
-                        </span>
-                      </p>
-                    )
-                  })()}
-                  {!whisperBenchmarking && whisperBenchmarkMs === null && (
-                    <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: 0, lineHeight: 1.5 }}>
-                      {whisperStatus === 'running'
-                        ? '測速中，請稍候…'
-                        : '啟動 Whisper 伺服器後自動測速並顯示估算值'}
-                    </p>
-                  )}
-                </div>
-              )}
-              <ToggleRow
-                label="RNNoise 雜訊抑制（關閉則使用瀏覽器內建抑制）"
-                value={draft.voice_noise_suppression ?? true}
-                onChange={(v) => up({ voice_noise_suppression: v })}
-              />
-              <div style={fieldStyle}>
-                <label style={labelStyle}>語音後處理模式</label>
-                <select
-                  value={draft.voice_process_mode}
-                  onChange={(e) => up({ voice_process_mode: e.target.value as any })}
-                  style={inputStyle}
-                >
-                  <option value="none">無（直接插入原始文字）</option>
-                  <option value="format">自動整理（llama 潤稿）</option>
-                  <option value="summary">標記 Wikilink（llama 分析關鍵詞）</option>
-                </select>
-                {draft.voice_process_mode !== 'none' && !draft.llama_cli_path && (
-                  <p style={{ fontSize: '11px', color: 'var(--color-warning, #f59e0b)', margin: '6px 0 0', lineHeight: 1.5 }}>
-                    ⚠ 請先到「Local LLM Server」頁面設定 llama 路徑與本地模型。
-                  </p>
-                )}
-                {draft.voice_process_mode !== 'none' && (
-                  <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '6px 0 0', lineHeight: 1.5 }}>
-                    {draft.voice_process_mode === 'format'
-                      ? '辨識完成後，llama 會將口語文字潤飾成書面語後再插入。'
-                      : '辨識完成後，llama 會分析口語文字中的關鍵主題，並將其替換為 [[wikilink]] 格式後插入。'}
-                  </p>
-                )}
-              </div>
-
               {/* ── Model Management ───────────────────────────────────────── */}
               <SectionDivider />
               <SectionHeader label="模型管理" locked={whisperStatus === 'running'} />
@@ -1318,34 +1317,81 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
                   onChange={(v) => up({ diarize_model_path: v })}
                 />
                 <p style={{ fontSize: '11px', color: 'var(--color-text-muted)', margin: '6px 0 8px', lineHeight: 1.5 }}>
-                  從 ModelScope 下載 <code>speech_campplus_sv_zh-cn_16k-common</code> 的 ONNX 檔案並填入路徑。
-                  支援中英混合語音，可識別會議中多位說話者。留空則停用。
+                  用於會議錄音中的多人說話者識別。支援中英混合語音，可自動標記 SPEAKER_00、SPEAKER_01 等。留空則停用。
                 </p>
-                <button
-                  onClick={async () => {
-                    setDiarizeReloading(true)
-                    setDiarizeStatus('idle')
-                    setDiarizeError('')
-                    try {
-                      const res = await api.reloadDiarizeModel()
-                      if (res.ok) {
-                        setDiarizeStatus('ok')
-                      } else {
+
+                {/* Auto-download button */}
+                {!draft.diarize_model_path && !diarizeDownloading && (
+                  <button
+                    onClick={() => {
+                      setDiarizeDownloadError('')
+                      invoke('download_diarize_model').catch((e: any) => {
+                        setDiarizeDownloadError(String(e?.message ?? e))
+                      })
+                    }}
+                    style={{ ...inputStyle, cursor: 'pointer', marginBottom: 6 }}
+                  >
+                    ↓ 自動下載 CAM++ 模型（~26 MB，來自 HuggingFace）
+                  </button>
+                )}
+
+                {/* Download progress */}
+                {diarizeDownloading && (
+                  <div style={{ margin: '6px 0' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: 'var(--color-text-muted)', marginBottom: 4 }}>
+                      <span>下載中…</span>
+                      <span>
+                        {diarizeDownloadTotalBytes > 0
+                          ? `${(diarizeDownloadedBytes / 1024 / 1024).toFixed(1)} / ${(diarizeDownloadTotalBytes / 1024 / 1024).toFixed(1)} MB`
+                          : `${(diarizeDownloadedBytes / 1024 / 1024).toFixed(1)} MB`}
+                      </span>
+                    </div>
+                    <div style={{ background: 'var(--color-border, #2d3748)', borderRadius: 4, height: 6, overflow: 'hidden' }}>
+                      <div style={{
+                        background: 'var(--color-accent, #3b82f6)',
+                        height: '100%',
+                        width: diarizeDownloadTotalBytes > 0
+                          ? `${Math.min(100, (diarizeDownloadedBytes / diarizeDownloadTotalBytes) * 100).toFixed(1)}%`
+                          : '30%',
+                        transition: 'width 0.3s',
+                      }} />
+                    </div>
+                  </div>
+                )}
+
+                {diarizeDownloadError && (
+                  <p style={{ fontSize: '12px', color: 'var(--color-error, #ef4444)', margin: '4px 0 6px' }}>✗ {diarizeDownloadError}</p>
+                )}
+
+                {/* Manual reload button (shown when path is set) */}
+                {draft.diarize_model_path && (
+                  <button
+                    onClick={async () => {
+                      setDiarizeReloading(true)
+                      setDiarizeStatus('idle')
+                      setDiarizeError('')
+                      try {
+                        const res = await api.reloadDiarizeModel()
+                        if (res.ok) {
+                          setDiarizeStatus('ok')
+                        } else {
+                          setDiarizeStatus('error')
+                          setDiarizeError(res.error ?? '載入失敗')
+                        }
+                      } catch (e: any) {
                         setDiarizeStatus('error')
-                        setDiarizeError(res.error ?? '載入失敗')
+                        setDiarizeError(String(e?.message ?? e))
+                      } finally {
+                        setDiarizeReloading(false)
                       }
-                    } catch (e: any) {
-                      setDiarizeStatus('error')
-                      setDiarizeError(String(e?.message ?? e))
-                    } finally {
-                      setDiarizeReloading(false)
-                    }
-                  }}
-                  disabled={diarizeReloading || !draft.diarize_model_path}
-                  style={{ ...inputStyle, cursor: (diarizeReloading || !draft.diarize_model_path) ? 'not-allowed' : 'pointer', opacity: (diarizeReloading || !draft.diarize_model_path) ? 0.6 : 1 }}
-                >
-                  {diarizeReloading ? '載入中…' : '套用並載入模型'}
-                </button>
+                    }}
+                    disabled={diarizeReloading}
+                    style={{ ...inputStyle, cursor: diarizeReloading ? 'not-allowed' : 'pointer', opacity: diarizeReloading ? 0.6 : 1 }}
+                  >
+                    {diarizeReloading ? '載入中…' : '套用並載入模型'}
+                  </button>
+                )}
+
                 {diarizeStatus === 'ok' && (
                   <p style={{ fontSize: '12px', color: 'var(--color-success, #22c55e)', margin: '6px 0 0' }}>✓ 模型已載入</p>
                 )}
@@ -1540,6 +1586,7 @@ export default function SettingsModal({ onClose, inline, mode = 'personal' }: Se
               <ToggleRow label="技能規範" value={draft.show_skills} onChange={(v) => up({ show_skills: v })} />
               <ToggleRow label="知識助理" value={draft.show_kb_assist} onChange={(v) => up({ show_kb_assist: v })} />
               <ToggleRow label="匯入中心" value={draft.show_import} onChange={(v) => up({ show_import: v })} />
+              <ToggleRow label="會議錄音" value={draft.show_meeting ?? false} onChange={(v) => up({ show_meeting: v })} />
               <SectionDivider />
               <SectionHeader label="開發工具" />
               <ToggleRow label="Agent tool 測試" value={draft.show_agent_tools ?? false} onChange={(v) => up({ show_agent_tools: v })} />

@@ -968,6 +968,99 @@ async fn run_llama_download(app: &AppHandle, model_id: &str) -> Result<String, A
     Ok(dest.to_string_lossy().into_owned())
 }
 
+/// Downloads the CAM++ ONNX diarization model from HuggingFace into models_dir.
+/// On success, auto-sets `diarize_model_path` in daemon settings and reloads the model.
+/// Progress is pushed via "model-download-progress" events with model_id = "__diarize__".
+#[tauri::command]
+pub async fn download_diarize_model(
+    app: AppHandle,
+    state: tauri::State<'_, crate::state::AppState>,
+    dl_state: tauri::State<'_, DownloadState>,
+) -> Result<(), AppError> {
+    const MODEL_ID: &str = "__diarize__";
+    const FILENAME: &str = "campplus_cn_common.onnx";
+    const URL: &str =
+        "https://huggingface.co/funasr/campplus/resolve/main/campplus_cn_common.onnx";
+
+    let dir = models_dir(&app)?;
+    let final_path = dir.join(FILENAME);
+
+    // Already downloaded — just auto-configure and report done
+    if final_path.exists() {
+        let path_str = final_path.to_string_lossy().to_string();
+        emit_progress(&app, DownloadProgress {
+            model_id: MODEL_ID.to_string(),
+            downloaded_bytes: 0, total_bytes: 0, speed_bps: 0,
+            status: "completed".to_string(),
+            file_path: Some(path_str),
+            error: None,
+        });
+        return Ok(());
+    }
+
+    // Prevent duplicate downloads
+    let cancel_flag = {
+        let mut active = dl_state.active.lock().await;
+        if active.contains_key(MODEL_ID) { return Ok(()); }
+        let flag = Arc::new(AtomicBool::new(false));
+        active.insert(MODEL_ID.to_string(), flag.clone());
+        flag
+    };
+
+    let part_path = dir.join(format!("{}.part", FILENAME));
+    let resume_from = if part_path.exists() {
+        std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let app2 = app.clone();
+    let client = state.http_client.clone();
+    let tok = { let t = state.get_auth_token().await; if t.is_empty() { None } else { Some(t) } };
+
+    tokio::spawn(async move {
+        let result = run_download(
+            &app2, MODEL_ID, URL, &part_path, &final_path, resume_from, cancel_flag,
+        ).await;
+
+        if let Some(ds) = app2.try_state::<DownloadState>() {
+            ds.active.lock().await.remove(MODEL_ID);
+        }
+
+        match result {
+            Ok(()) => {
+                let path_str = final_path.to_string_lossy().to_string();
+                // Auto-configure diarize_model_path in daemon settings
+                crate::api_client::daemon_set_setting(
+                    &client, tok.as_deref(), "diarize_model_path", &path_str,
+                ).await;
+                // Hot-reload model in daemon (best-effort; user can also click "套用並載入模型")
+                let _ = crate::api_client::daemon_post::<_, serde_json::Value>(
+                    &client, "/settings/diarize/reload", &serde_json::json!({}), tok.as_deref(),
+                ).await;
+                emit_progress(&app2, DownloadProgress {
+                    model_id: MODEL_ID.to_string(),
+                    downloaded_bytes: 0, total_bytes: 0, speed_bps: 0,
+                    status: "completed".to_string(),
+                    file_path: Some(path_str),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                emit_progress(&app2, DownloadProgress {
+                    model_id: MODEL_ID.to_string(),
+                    downloaded_bytes: 0, total_bytes: 0, speed_bps: 0,
+                    status: "error".to_string(),
+                    file_path: None,
+                    error: Some(e.to_string()),
+                });
+            }
+        }
+    });
+
+    Ok(())
+}
+
 // ── Core download logic ───────────────────────────────────────────────────────
 
 async fn run_download(

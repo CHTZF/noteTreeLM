@@ -503,6 +503,7 @@ pub fn run() {
             download_llama_server,
             get_coreml_model_path,
             download_coreml_model,
+            download_diarize_model,
             // Activity Pattern Learning
             save_pattern,
             update_pattern_score,

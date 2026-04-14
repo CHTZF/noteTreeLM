@@ -2,6 +2,7 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import { createTranscribeSession, TranscribeSession } from '../../lib/transcribeWs'
 import { api } from '../../lib/api'
 import type { MeetingSummary, MeetingSegment } from '../../lib/api'
+import { useSettingsStore } from '../../stores/settingsStore'
 
 // ─── Audio constants (same as useVoiceRecorder) ──────────────────────────────
 const WHISPER_SAMPLE_RATE = 16_000
@@ -36,6 +37,10 @@ function formatTs(tsMs: number): string {
 export default function MeetingPanel() {
   const [language, setLanguage] = useState('auto')
   const vaultId = useRef<string>('')
+  const { settings, loadSystem } = useSettingsStore()
+  const diarizePath = settings.diarize_model_path ?? ''
+
+  useEffect(() => { loadSystem() }, [loadSystem])
 
   // resolve vault id on mount
   useEffect(() => {
@@ -105,13 +110,15 @@ export default function MeetingPanel() {
     try {
       const session = await createTranscribeSession(
         language,
-        (text, index, speaker, tsMs) => {
+        (text, index, _speaker, tsMs) => {
+          // speaker is omitted here — SpeakerEngine assigns speakers asynchronously.
+          // We display text immediately without a label; labels are filled in on meeting:done.
           if (!text.trim()) return
-          setSegments(prev => [...prev, { index, speaker, text, tsMs: tsMs ?? 0 }])
+          setSegments(prev => [...prev, { index, text, tsMs: tsMs ?? 0 }])
         },
         () => {
-          // flush_done — audio flushed; server will now post-process
-          setMode('done')
+          // whisper:flush_done (legacy) — Whisper tasks flushed
+          setMode('processing')
         },
         (msg) => {
           setError(msg)
@@ -121,6 +128,19 @@ export default function MeetingPanel() {
           vaultId: vaultId.current,
           onMeetingStarted: (mid) => {
             setMeetingId(mid)
+          },
+          onMeetingDone: async (mid) => {
+            // SpeakerEngine has completed — reload segments with speaker attribution
+            try {
+              const result = await api.getMeeting(mid)
+              setSegments(result.segments.map((s: MeetingSegment) => ({
+                index: s.seg_index,
+                speaker: s.speaker ?? undefined,
+                text: s.text,
+                tsMs: s.ts_ms,
+              })))
+            } catch { /* ignore — segments already displayed without speakers */ }
+            setMode('done')
           },
         },
       )
@@ -182,8 +202,10 @@ export default function MeetingPanel() {
     streamRef.current = null
     audioCtxRef.current = null
 
-    // Tell server to flush
+    // Tell server to flush; show 'processing' immediately so the user knows
+    // the meeting stopped (SpeakerEngine drain may take up to 30s before 'done').
     sessionRef.current?.stop()
+    setMode('processing')
   }, [])
 
   // ─── Rename speaker ──────────────────────────────────────────────────────────
@@ -301,7 +323,17 @@ export default function MeetingPanel() {
 
       {/* Transcript */}
       <div ref={scrollRef} style={{ flex: 1, overflowY: 'auto', padding: '12px 16px' }}>
-        {groups.length === 0 && mode === 'idle' && (
+        {groups.length === 0 && mode === 'idle' && !diarizePath && (
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', marginTop: 48, gap: 12 }}>
+            <span style={{ fontSize: 32 }}>🎤</span>
+            <div style={{ color: '#f59e0b', fontSize: 14, fontWeight: 600 }}>需要設定說話者識別模型</div>
+            <div style={{ color: '#64748b', fontSize: 13, textAlign: 'center', lineHeight: 1.7, maxWidth: 320 }}>
+              會議錄音需要 CAM++ ONNX 模型來區分不同說話者。<br />
+              請至<strong style={{ color: '#94a3b8' }}>系統設定 → 語音辨識 → 說話者識別</strong>下載並設定模型路徑。
+            </div>
+          </div>
+        )}
+        {groups.length === 0 && mode === 'idle' && diarizePath && (
           <div style={{ color: '#4a5568', textAlign: 'center', marginTop: 48, fontSize: 14 }}>
             按下開始錄音以記錄會議
           </div>
@@ -373,10 +405,16 @@ export default function MeetingPanel() {
         {mode === 'idle' || mode === 'done' || mode === 'error' ? (
           <button
             onClick={startRecording}
+            disabled={!diarizePath}
+            title={!diarizePath ? '請先至系統設定設定 CAM++ 模型路徑' : undefined}
             style={{
-              background: '#dc2626', border: 'none', borderRadius: 24, color: '#fff',
-              cursor: 'pointer', fontSize: 14, fontWeight: 600, padding: '10px 28px',
+              background: diarizePath ? '#dc2626' : '#374151',
+              border: 'none', borderRadius: 24,
+              color: diarizePath ? '#fff' : '#6b7280',
+              cursor: diarizePath ? 'pointer' : 'not-allowed',
+              fontSize: 14, fontWeight: 600, padding: '10px 28px',
               display: 'flex', alignItems: 'center', gap: 8,
+              opacity: diarizePath ? 1 : 0.6,
             }}
           >
             <span style={{ fontSize: 16 }}>●</span> 開始錄音
