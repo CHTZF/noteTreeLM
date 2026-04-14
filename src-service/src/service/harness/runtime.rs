@@ -34,6 +34,10 @@ pub struct HarnessRequestRuntime {
     pub db:               SurrealDb,
     /// Already-resolved LLM base URL (e.g. "http://127.0.0.1:8080").
     pub llm_url:          String,
+    /// Optional standalone draft-model server URL.
+    /// Used for simple queries and context-compression summarisation.
+    /// Falls back to `llm_url` when None.
+    pub draft_llm_url:    Option<String>,
     pub embedding_url:    Option<String>,
     pub vault_id:         String,
     pub account_id:       String,
@@ -128,6 +132,7 @@ impl HarnessRequestRuntime {
         HarnessRequestRuntime {
             db:               surrealdb::Surreal::init(),
             llm_url:          String::new(),
+            draft_llm_url:    None,
             embedding_url:    None,
             vault_id:         String::new(),
             account_id:       String::new(),
@@ -198,6 +203,7 @@ impl HarnessRequestRuntime {
         HarnessRequestRuntime {
             db:               self.db.clone(),
             llm_url:          self.llm_url.clone(),
+            draft_llm_url:    self.draft_llm_url.clone(),
             embedding_url:    self.embedding_url.clone(),
             vault_id:         self.vault_id.clone(),
             account_id:       self.account_id.clone(),
@@ -572,6 +578,7 @@ impl HarnessRequestRuntime {
             },
             &self.client,
             &self.llm_url,
+            self.draft_llm_url.as_deref(),
         ).await;
         if built.was_trimmed {
             tracing::debug!(

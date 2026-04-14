@@ -18,6 +18,11 @@ pub struct ServiceConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServersConfig {
     pub llama_port: u16,
+    /// Optional standalone draft-model server port.
+    /// When set, simple queries and context-compression summarisation are routed here
+    /// instead of the main llama_port, leaving the main model free for complex tasks.
+    #[serde(default)]
+    pub llama_draft_port: Option<u16>,
     pub embedding_port: u16,
     pub whisper_port: u16,
 }
@@ -30,7 +35,7 @@ impl Default for ServiceConfig {
 
 impl Default for ServersConfig {
     fn default() -> Self {
-        Self { llama_port: 18080, embedding_port: 18081, whisper_port: 18082 }
+        Self { llama_port: 18080, llama_draft_port: None, embedding_port: 18081, whisper_port: 18082 }
     }
 }
 
@@ -66,6 +71,13 @@ impl Config {
 
     pub fn llm_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.servers.llama_port)
+    }
+
+    /// Returns the draft model server URL if `llama_draft_port` is configured.
+    pub fn draft_llm_url(&self) -> Option<String> {
+        self.servers.llama_draft_port
+            .filter(|&p| p > 0)
+            .map(|p| format!("http://127.0.0.1:{}", p))
     }
 
     pub fn embedding_url(&self) -> String {

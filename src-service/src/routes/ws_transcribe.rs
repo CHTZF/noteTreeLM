@@ -123,127 +123,194 @@ async fn finalize_meeting(state: &ApiState, meeting_id: &str, wav_path: Option<&
         .await;
 }
 
-/// Spawn meeting post-process (LLM summary). Called after SpeakerEngine attribution
+const MEETING_AGENT_SYSTEM: &str = "\
+你是一個專業的會議記錄 Agent。你會收到一段已標注說話者的會議逐字稿。\n\
+\n\
+你的工作流程：\n\
+1. 先用 search_past_meetings 搜尋是否有與本次會議相關的歷史會議（依關鍵主題或參與者搜尋）。\n\
+   若找到相關歷史會議，用 get_meeting_context 取得其決策和行動項目，並在本次記錄中標注延續關係。\n\
+2. 用 search_vault 搜尋 vault 中是否有相關背景資料（專案說明、先前決策文件）。\n\
+3. 根據逐字稿產出完整的 Markdown 格式會議記錄，包含以下段落（全繁體中文）：\n\
+   - **會議摘要** — 3 到 5 句描述主要內容與結果\n\
+   - **參與者** — 條列識別到的說話者\n\
+   - **決策記錄** — 本次確定的決定，條列式\n\
+   - **行動項目** — 格式：`- [ ] 事項（負責人：XXX）`，無法確認負責人則標 TBD\n\
+   - **延續自上次**（若找到歷史會議）— 說明本次哪些決策或行動項目是延續上次的\n\
+   - **相關資料**（若有）— `[[筆記名稱]]` wiki-link 格式\n\
+4. 最後必須呼叫 save_meeting_extractions 把決策清單和行動項目寫入資料庫。\n\
+   decisions 是字串陣列，每條一個決策；actions 是物件陣列 {description, owner}。\n\
+\n\
+注意：只輸出筆記本文內容，不要加入逐字稿本身（逐字稿會另外附加）。";
+
+/// Build the formatted transcript string with speaker labels and timestamps.
+/// Shared between the WebSocket post-process and the REST summarize endpoint.
+pub(crate) async fn build_meeting_transcript(state: &ApiState, meeting_id: &str) -> Option<(String, String, i64, Option<String>, Option<String>)> {
+    #[derive(serde::Deserialize)]
+    struct SegRow { text: String, ts_ms: i64, chunk_start_ms: i64 }
+    #[derive(serde::Deserialize)]
+    struct SpanRow { speaker_id: String, start_ms: i64, end_ms: i64 }
+    #[derive(serde::Deserialize)]
+    struct MeetingRow { vault_id: Option<String>, account_id: Option<String>, started_at: i64, speaker_names_json: String }
+
+    let mut r = state.db
+        .query("SELECT text, ts_ms, chunk_start_ms FROM meeting_segments WHERE meeting_id = $mid ORDER BY seg_index")
+        .bind(("mid", meeting_id.to_string()))
+        .await.ok()?;
+    let segments: Vec<SegRow> = r.take(0).unwrap_or_default();
+    if segments.is_empty() { return None; }
+
+    let mut sr = state.db
+        .query("SELECT speaker_id, start_ms, end_ms FROM speaker_spans WHERE meeting_id = $mid ORDER BY start_ms")
+        .bind(("mid", meeting_id.to_string()))
+        .await.ok()?;
+    let spans: Vec<SpanRow> = sr.take(0).unwrap_or_default();
+
+    let mut mr = state.db
+        .query("SELECT vault_id, account_id, started_at, speaker_names_json FROM meetings WHERE meeting_id = $mid LIMIT 1")
+        .bind(("mid", meeting_id.to_string()))
+        .await.ok()?;
+    let meeting: MeetingRow = mr.take::<Vec<MeetingRow>>(0).unwrap_or_default().into_iter().next()?;
+
+    let name_map: std::collections::HashMap<String, String> =
+        serde_json::from_str(&meeting.speaker_names_json).unwrap_or_default();
+
+    let resolve_speaker = |seg_start_ms: i64, seg_end_ms: i64| -> Option<String> {
+        spans.iter()
+            .filter(|s| s.start_ms < seg_end_ms && s.end_ms > seg_start_ms)
+            .map(|s| {
+                let overlap = (s.end_ms.min(seg_end_ms) - s.start_ms.max(seg_start_ms)).max(0);
+                (overlap, &s.speaker_id)
+            })
+            .max_by_key(|(o, _)| *o)
+            .map(|(_, spk)| name_map.get(spk.as_str()).cloned().unwrap_or_else(|| spk.clone()))
+    };
+
+    let mut transcript = String::new();
+    let mut last_speaker = String::new();
+    for seg in &segments {
+        let seg_end_ms = seg.chunk_start_ms + 8000;
+        let speaker = resolve_speaker(seg.chunk_start_ms, seg_end_ms)
+            .unwrap_or_else(|| "unknown".to_string());
+        let mins = seg.ts_ms / 60_000;
+        let secs = (seg.ts_ms % 60_000) / 1000;
+        if speaker != last_speaker {
+            transcript.push_str(&format!("\n**{}** `{:02}:{:02}`\n", speaker, mins, secs));
+            last_speaker = speaker;
+        }
+        transcript.push_str(&seg.text);
+        transcript.push('\n');
+    }
+
+    let date = chrono::DateTime::from_timestamp(meeting.started_at / 1000, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| meeting.started_at.to_string());
+
+    Some((transcript, date, meeting.started_at, meeting.vault_id, meeting.account_id))
+}
+
+/// Run the meeting Agent and write the resulting note to vault/meetings/.
+/// Returns the relative note path on success.
+pub(crate) async fn run_meeting_agent(
+    state: &ApiState,
+    meeting_id: &str,
+    transcript: &str,
+    date: &str,
+    started_at: i64,
+    vault_id: &str,
+    account_id: &str,
+) -> Option<String> {
+    use serde_json::json;
+
+    let agent_def = json!({
+        "name": "meeting_summarizer",
+        "kind": "task",
+        "system_prompt": MEETING_AGENT_SYSTEM,
+        "tool_names": ["search_past_meetings", "get_meeting_context", "search_vault", "read_note", "save_meeting_extractions"],
+        "max_rounds": 12,
+        "enable_think": false,
+    });
+    let conv_id = format!("meeting-{}", &meeting_id[..meeting_id.len().min(8)]);
+
+    let llm_text = match crate::service::build_agent_runtime(
+        state, vault_id, account_id,
+        None, conv_id, agent_def,
+        false, Some("zh-TW"),
+        Some("meeting".to_string()),
+        Some(meeting_id.to_string()),
+    ).await {
+        Some(runtime) => {
+            let initial_msg = format!(
+                "請整理以下會議逐字稿，產出結構化會議記錄：\n\n{}",
+                transcript
+            );
+            tracing::info!("meeting {}: running Agent summarizer", meeting_id);
+            crate::service::run_agent(runtime, initial_msg, None).await
+        }
+        None => {
+            // LLM not configured — fall back to simple oneshot
+            tracing::warn!("meeting {}: LLM not configured, falling back to oneshot", meeting_id);
+            let system = "你是一個會議記錄助理。根據以下逐字稿，產出：\n1. 會議摘要（3–5 句）\n2. 行動項目（Action Items，條列式，含負責人）\n3. 決策記錄（條列式）\n\n請用繁體中文回答，使用 Markdown 格式。";
+            match call_llm_oneshot(state, system, &format!("逐字稿：\n{}", transcript), 2048).await {
+                Ok(t) => t,
+                Err(e) => { tracing::warn!("meeting {}: oneshot failed: {}", meeting_id, e); return None; }
+            }
+        }
+    };
+
+    // Write note file
+    let vault_path = state.resolve_vault_path(vault_id).await;
+    if vault_path.is_empty() { return None; }
+
+    let meetings_dir = std::path::Path::new(&vault_path).join("meetings");
+    let _ = std::fs::create_dir_all(&meetings_dir);
+    let filename = format!("{}-{}.md",
+        chrono::DateTime::from_timestamp(started_at / 1000, 0)
+            .map(|dt| dt.format("%Y%m%d-%H%M").to_string())
+            .unwrap_or_else(|| "meeting".to_string()),
+        &meeting_id[..meeting_id.len().min(8)],
+    );
+    let full_path = meetings_dir.join(&filename);
+    let note_content = format!(
+        "---\ntags: [meeting]\ndate: {}\n---\n\n# 會議記錄 {}\n\n{}\n\n---\n\n## 逐字稿\n\n{}\n",
+        date, date, llm_text, transcript
+    );
+    if std::fs::write(&full_path, &note_content).is_err() {
+        tracing::warn!("meeting {}: failed to write note file", meeting_id);
+        return None;
+    }
+    tracing::info!("meeting {}: note written to {}", meeting_id, full_path.display());
+    Some(format!("meetings/{}", filename))
+}
+
+/// Spawn meeting post-process (Agent summary). Called after SpeakerEngine attribution
 /// is complete so all speaker_spans are already in DB.
 async fn spawn_meeting_postprocess(state: ApiState, meeting_id: String) {
     tokio::spawn(async move {
-        #[derive(serde::Deserialize)]
-        struct SegRow { seg_index: i64, text: String, ts_ms: i64, chunk_start_ms: i64 }
-        #[derive(serde::Deserialize)]
-        struct SpanRow { speaker_id: String, start_ms: i64, end_ms: i64 }
-        #[derive(serde::Deserialize)]
-        struct MeetingRow { vault_id: Option<String>, language: String, started_at: i64, speaker_names_json: String }
-
-        let mut r = match state.db
-            .query("SELECT seg_index, text, ts_ms, chunk_start_ms FROM meeting_segments WHERE meeting_id = $mid ORDER BY seg_index")
-            .bind(("mid", meeting_id.clone()))
-            .await {
-            Ok(r) => r,
-            Err(e) => { tracing::warn!("meeting post-process: fetch segments failed: {}", e); return; }
-        };
-        let segments: Vec<SegRow> = r.take(0).unwrap_or_default();
-        if segments.is_empty() {
+        let Some((transcript, date, started_at, vault_id_opt, account_id_opt)) =
+            build_meeting_transcript(&state, &meeting_id).await
+        else {
             tracing::info!("meeting {}: no segments, skipping post-process", meeting_id);
             return;
-        }
-
-        // Fetch speaker spans for attribution JOIN
-        let mut sr = match state.db
-            .query("SELECT speaker_id, start_ms, end_ms FROM speaker_spans WHERE meeting_id = $mid ORDER BY start_ms")
-            .bind(("mid", meeting_id.clone()))
-            .await {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-        let spans: Vec<SpanRow> = sr.take(0).unwrap_or_default();
-
-        let mut mr = match state.db
-            .query("SELECT vault_id, language, started_at, speaker_names_json FROM meetings WHERE meeting_id = $mid LIMIT 1")
-            .bind(("mid", meeting_id.clone()))
-            .await {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-        let meeting: MeetingRow = match mr.take::<Vec<MeetingRow>>(0).ok().and_then(|v| v.into_iter().next()) {
-            Some(m) => m,
-            None => return,
         };
 
-        let name_map: std::collections::HashMap<String, String> =
-            serde_json::from_str(&meeting.speaker_names_json).unwrap_or_default();
-
-        // Resolve speaker for a segment: find the speaker_span with most overlap
-        let resolve_speaker = |seg_start_ms: i64, seg_end_ms: i64| -> Option<String> {
-            spans.iter()
-                .filter(|s| s.start_ms < seg_end_ms && s.end_ms > seg_start_ms)
-                .map(|s| {
-                    let overlap = (s.end_ms.min(seg_end_ms) - s.start_ms.max(seg_start_ms)).max(0);
-                    (overlap, &s.speaker_id)
-                })
-                .max_by_key(|(o, _)| *o)
-                .map(|(_, spk)| name_map.get(spk.as_str()).cloned().unwrap_or_else(|| spk.clone()))
+        let vault_id = match vault_id_opt.as_deref() {
+            Some(v) if !v.is_empty() => v.to_string(),
+            _ => { tracing::warn!("meeting {}: no vault_id, skipping note write", meeting_id); return; }
         };
+        let account_id = account_id_opt.unwrap_or_default();
 
-        // Build transcript block
-        let mut transcript = String::new();
-        let mut last_speaker = String::new();
-        for seg in &segments {
-            let seg_end_ms = seg.chunk_start_ms + 8000; // rough end estimate
-            let speaker = resolve_speaker(seg.chunk_start_ms, seg_end_ms)
-                .unwrap_or_else(|| "unknown".to_string());
-            let mins = seg.ts_ms / 60_000;
-            let secs = (seg.ts_ms % 60_000) / 1000;
-            if speaker != last_speaker {
-                transcript.push_str(&format!("\n**{}** `{:02}:{:02}`\n", speaker, mins, secs));
-                last_speaker = speaker;
-            }
-            transcript.push_str(&seg.text);
-            transcript.push('\n');
-        }
-
-        let system = "你是一個會議記錄助理。根據以下逐字稿，產出：\n1. 會議摘要（3–5 句）\n2. 行動項目（Action Items，條列式，含負責人）\n3. 決策記錄（條列式）\n\n請用繁體中文回答，使用 Markdown 格式。";
-        let user_content = format!("逐字稿：\n{}", transcript);
-
-        let llm_result = call_llm_oneshot(&state, system, &user_content, 2048).await;
-        let llm_text = match llm_result {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("meeting {}: LLM call failed: {}", meeting_id, e);
-                format!("*LLM 摘要失敗：{}*\n", e)
-            }
-        };
-
-        let date = chrono::DateTime::from_timestamp(meeting.started_at / 1000, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-            .unwrap_or_else(|| meeting.started_at.to_string());
-
-        let note_content = format!(
-            "---\ntags: [meeting]\ndate: {}\n---\n\n# 會議記錄 {}\n\n{}\n\n---\n\n## 逐字稿\n\n{}\n",
-            date, date, llm_text, transcript
-        );
-
-        if let Some(vault_id) = &meeting.vault_id {
-            let vault_path = state.resolve_vault_path(vault_id).await;
-            if !vault_path.is_empty() {
-                let meetings_dir = std::path::Path::new(&vault_path).join("meetings");
-                let _ = std::fs::create_dir_all(&meetings_dir);
-                let filename = format!("{}-{}.md",
-                    chrono::DateTime::from_timestamp(meeting.started_at / 1000, 0)
-                        .map(|dt| dt.format("%Y%m%d-%H%M").to_string())
-                        .unwrap_or_else(|| "meeting".to_string()),
-                    &meeting_id[..8],
-                );
-                let full_path = meetings_dir.join(&filename);
-                if std::fs::write(&full_path, &note_content).is_ok() {
-                    let rel = format!("meetings/{}", filename);
-                    let _ = state.db
-                        .query("UPDATE meetings SET note_path = $path WHERE meeting_id = $mid")
-                        .bind(("path", rel.clone()))
-                        .bind(("mid", meeting_id.clone()))
-                        .await;
-                    tracing::info!("meeting {}: note written to {}", meeting_id, full_path.display());
-                }
-            }
+        if let Some(rel_path) = run_meeting_agent(
+            &state, &meeting_id, &transcript, &date, started_at, &vault_id, &account_id,
+        ).await {
+            let _ = state.db
+                .query("UPDATE meetings SET note_path = $path WHERE meeting_id = $mid")
+                .bind(("path", rel_path.clone()))
+                .bind(("mid", meeting_id.clone()))
+                .await;
+            state.daemon.emit("meeting:summarized", serde_json::json!({
+                "meeting_id": meeting_id,
+                "note_path":  rel_path,
+            }));
         }
     });
 }

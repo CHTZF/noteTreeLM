@@ -415,6 +415,29 @@ async fn run_migrations(db: &SurrealDb) -> Result<(), surrealdb::Error> {
         "DEFINE INDEX IF NOT EXISTS idx_speaker_spans_id  ON speaker_spans FIELDS span_id UNIQUE;",
         "DEFINE INDEX IF NOT EXISTS idx_speaker_spans_mid ON speaker_spans FIELDS meeting_id, start_ms;",
 
+        // ── meeting structured extractions ──────────────────────────────────
+        "DEFINE TABLE IF NOT EXISTS meeting_actions SCHEMALESS;",
+        "DEFINE FIELD IF NOT EXISTS action_id    ON meeting_actions TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS meeting_id   ON meeting_actions TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS vault_id     ON meeting_actions TYPE option<string>;",
+        "DEFINE FIELD IF NOT EXISTS description  ON meeting_actions TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS owner        ON meeting_actions TYPE option<string>;",
+        "DEFINE FIELD IF NOT EXISTS status       ON meeting_actions TYPE string DEFAULT 'open';",
+        "DEFINE FIELD IF NOT EXISTS created_at   ON meeting_actions TYPE int DEFAULT 0;",
+        "DEFINE INDEX IF NOT EXISTS idx_meeting_actions_id    ON meeting_actions FIELDS action_id UNIQUE;",
+        "DEFINE INDEX IF NOT EXISTS idx_meeting_actions_mid   ON meeting_actions FIELDS meeting_id;",
+        "DEFINE INDEX IF NOT EXISTS idx_meeting_actions_vault ON meeting_actions FIELDS vault_id, status;",
+
+        "DEFINE TABLE IF NOT EXISTS meeting_decisions SCHEMALESS;",
+        "DEFINE FIELD IF NOT EXISTS decision_id  ON meeting_decisions TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS meeting_id   ON meeting_decisions TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS vault_id     ON meeting_decisions TYPE option<string>;",
+        "DEFINE FIELD IF NOT EXISTS description  ON meeting_decisions TYPE string;",
+        "DEFINE FIELD IF NOT EXISTS created_at   ON meeting_decisions TYPE int DEFAULT 0;",
+        "DEFINE INDEX IF NOT EXISTS idx_meeting_decisions_id  ON meeting_decisions FIELDS decision_id UNIQUE;",
+        "DEFINE INDEX IF NOT EXISTS idx_meeting_decisions_mid ON meeting_decisions FIELDS meeting_id;",
+        "DEFINE INDEX IF NOT EXISTS idx_meeting_decisions_vault ON meeting_decisions FIELDS vault_id;",
+
         // ── graph nodes & edges ──────────────────────────────────────────────
         "DEFINE TABLE IF NOT EXISTS graph_nodes SCHEMALESS;",
         "DEFINE FIELD IF NOT EXISTS vault_id   ON graph_nodes TYPE string;",

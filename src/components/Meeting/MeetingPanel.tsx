@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
+import { listen } from '@tauri-apps/api/event'
 import { createTranscribeSession, TranscribeSession } from '../../lib/transcribeWs'
 import { api } from '../../lib/api'
 import type { MeetingSummary, MeetingSegment } from '../../lib/api'
@@ -58,6 +59,10 @@ export default function MeetingPanel() {
   const [segments, setSegments] = useState<LiveSegment[]>([])
   const [speakerNames, setSpeakerNames] = useState<Record<string, string>>({})
 
+  // Note path from Agent summarization
+  const [notePath, setNotePath] = useState<string | null>(null)
+  const [summarizing, setSummarizing] = useState(false)
+
   // Speaker rename UI
   const [editingSpeaker, setEditingSpeaker] = useState<string | null>(null)
   const [editName, setEditName] = useState('')
@@ -84,6 +89,20 @@ export default function MeetingPanel() {
     }
   }, [segments])
 
+  // Listen for Agent summarization complete
+  useEffect(() => {
+    let cancelled = false
+    let unlisten: (() => void) | null = null
+    listen<{ meeting_id: string; note_path: string }>('meeting:summarized', (event) => {
+      if (cancelled) return
+      if (meetingId && event.payload.meeting_id === meetingId) {
+        setNotePath(event.payload.note_path)
+        setSummarizing(false)
+      }
+    }).then(fn => { if (cancelled) fn(); else unlisten = fn })
+    return () => { cancelled = true; unlisten?.() }
+  }, [meetingId])
+
   // ─── Load history ────────────────────────────────────────────────────────────
   const loadHistory = useCallback(async () => {
     setHistoryLoading(true)
@@ -106,6 +125,8 @@ export default function MeetingPanel() {
     setSpeakerNames({})
     setMeetingId(null)
     setDuration(0)
+    setNotePath(null)
+    setSummarizing(false)
 
     try {
       const session = await createTranscribeSession(
@@ -139,6 +160,12 @@ export default function MeetingPanel() {
                 text: s.text,
                 tsMs: s.ts_ms,
               })))
+              // If the Agent already finished before we polled, grab the note_path
+              if (result.meeting?.note_path) {
+                setNotePath(result.meeting.note_path)
+              } else {
+                setSummarizing(true)
+              }
             } catch { /* ignore — segments already displayed without speakers */ }
             setMode('done')
           },
@@ -387,8 +414,31 @@ export default function MeetingPanel() {
           </div>
         )}
         {mode === 'done' && meetingId && (
-          <div style={{ background: '#14532d22', border: '1px solid #166534', borderRadius: 8, padding: '10px 14px', marginTop: 8, fontSize: 13, color: '#86efac' }}>
-            會議記錄已儲存，AI 摘要生成中（可在 vault/meetings/ 查看）
+          <div style={{ background: '#14532d22', border: '1px solid #166534', borderRadius: 8, padding: '10px 14px', marginTop: 8, fontSize: 13 }}>
+            {notePath ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <span style={{ color: '#86efac' }}>✓ 會議記錄已整理完成</span>
+                <span style={{ color: '#4ade80', fontFamily: 'monospace', fontSize: 12 }}>{notePath}</span>
+                <button
+                  onClick={async () => {
+                    if (!meetingId) return
+                    setNotePath(null)
+                    setSummarizing(true)
+                    try { await api.summarizeMeeting(meetingId) } catch { setSummarizing(false) }
+                  }}
+                  style={{ background: 'none', border: '1px solid #166534', borderRadius: 4, color: '#86efac', cursor: 'pointer', fontSize: 11, padding: '2px 8px', marginLeft: 'auto' }}
+                >
+                  重新整理
+                </button>
+              </div>
+            ) : summarizing ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: '#60a5fa' }}>
+                <span style={{ display: 'inline-block', animation: 'spin 1s linear infinite', fontSize: 14 }}>⟳</span>
+                Agent 正在整理會議記錄…
+              </div>
+            ) : (
+              <div style={{ color: '#64748b' }}>會議記錄已儲存（可在 vault/meetings/ 查看）</div>
+            )}
           </div>
         )}
       </div>
@@ -442,6 +492,10 @@ export default function MeetingPanel() {
           0%, 100% { opacity: 1; }
           50% { opacity: 0.3; }
         }
+        @keyframes spin {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
+        }
       `}</style>
     </div>
   )
@@ -452,6 +506,21 @@ function MeetingHistoryCard({ meeting, onDelete }: { meeting: MeetingSummary; on
   const [expanded, setExpanded] = useState(false)
   const [detail, setDetail] = useState<{ segments: MeetingSegment[]; names: Record<string, string> } | null>(null)
   const [loading, setLoading] = useState(false)
+  const [summarizing, setSummarizing] = useState(false)
+  const [notePath, setNotePath] = useState(meeting.note_path ?? null)
+
+  useEffect(() => {
+    let cancelled = false
+    let unlisten: (() => void) | null = null
+    listen<{ meeting_id: string; note_path: string }>('meeting:summarized', (event) => {
+      if (cancelled) return
+      if (event.payload.meeting_id === meeting.meeting_id) {
+        setNotePath(event.payload.note_path)
+        setSummarizing(false)
+      }
+    }).then(fn => { if (cancelled) fn(); else unlisten = fn })
+    return () => { cancelled = true; unlisten?.() }
+  }, [meeting.meeting_id])
 
   const load = async () => {
     if (detail || loading) return
@@ -492,7 +561,20 @@ function MeetingHistoryCard({ meeting, onDelete }: { meeting: MeetingSummary; on
             {meeting.language ?? 'auto'} · {meeting.status && (
               <span style={{ color: statusColor[meeting.status] ?? '#94a3b8' }}>{meeting.status}</span>
             )}
-            {meeting.note_path && <span style={{ color: '#6b7280' }}> · {meeting.note_path}</span>}
+            {notePath
+              ? <span style={{ color: '#4ade80' }}> · ✓ {notePath}</span>
+              : summarizing
+                ? <span style={{ color: '#60a5fa' }}> · ⟳ 整理中…</span>
+                : <span
+                    onClick={async (e) => {
+                      e.stopPropagation()
+                      setSummarizing(true)
+                      try { await api.summarizeMeeting(meeting.meeting_id) } catch { setSummarizing(false) }
+                    }}
+                    style={{ color: '#3b82f6', cursor: 'pointer', marginLeft: 4 }}
+                    title="觸發 Agent 整理"
+                  > · 整理摘要</span>
+            }
           </div>
         </div>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>

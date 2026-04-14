@@ -36,6 +36,7 @@ pub async fn build_agent_runtime(
     use harness::prompt::Locale;
 
     let llm_url       = state.daemon.llm_url.clone();
+    let draft_llm_url = state.daemon.draft_llm_url.clone();
     let embedding_url = Some(state.daemon.embedding_url.clone());
     let event_tx      = state.daemon.event_tx.clone();
     let emit_fn: EmitEventFn = Arc::new(move |event: String, payload: serde_json::Value| {
@@ -67,6 +68,7 @@ pub async fn build_agent_runtime(
     Some(HarnessRequestRuntime {
         db:               state.db.clone(),
         llm_url,
+        draft_llm_url,
         embedding_url,
         vault_id:         vault_id.to_string(),
         account_id:       account_id.to_string(),

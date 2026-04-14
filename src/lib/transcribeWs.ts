@@ -99,6 +99,7 @@ export function createTranscribeSession(
     const pendingPcm: ArrayBuffer[] = []
 
     function connect() {
+      if (closed) return
       const url = getTranscribeWsUrl()
       ws = new WebSocket(url)
       ws.binaryType = 'arraybuffer'
@@ -118,6 +119,8 @@ export function createTranscribeSession(
 
       ws.onclose = (e) => {
         if (closed) return
+        // During a normal stop flow the server closes cleanly — not an error.
+        if (stopping) return
         if (e.wasClean) { onError('轉錄連線已關閉'); return }
         if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
           onError(`轉錄連線中斷，已重試 ${MAX_RECONNECT_ATTEMPTS} 次`)
@@ -143,6 +146,7 @@ export function createTranscribeSession(
 
       ws.onclose = (e) => {
         if (closed) return
+        if (stopping) return
         if (e.wasClean) { onError('轉錄連線已關閉'); return }
         if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
           onError(`轉錄連線中斷，已重試 ${MAX_RECONNECT_ATTEMPTS} 次`)

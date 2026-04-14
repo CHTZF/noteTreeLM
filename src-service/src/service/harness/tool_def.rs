@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use super::runtime::HarnessRequestRuntime;
 use super::governance::guard::{GuardLevel, ToolGuardSpec, norm_path};
 use crate::service::types::ToolFuture;
-use super::tools::{memory_tools, vault_tools, trace_tools, gmail_tools};
+use super::tools::{memory_tools, vault_tools, trace_tools, gmail_tools, meeting_tools};
 use super::security::wrap_external_content;
 
 // ── ToolDef ───────────────────────────────────────────────────────────────────
@@ -132,6 +132,13 @@ pub(crate) static ALL_TOOL_DEFS: &[ToolDef] = &[
     ToolDef { name: "save_memory_facts",             schema_fn: schema_save_memory_facts,             is_write: true,  guard: None, handler: handle_save_memory_facts,             rollback: None },
     ToolDef { name: "mark_conversation_processed",   schema_fn: schema_mark_conversation_processed,   is_write: true,  guard: None, handler: handle_mark_conversation_processed,   rollback: None },
     ToolDef { name: "condense_memory_facts",         schema_fn: schema_condense_memory_facts,         is_write: true,  guard: None, handler: handle_condense_memory_facts,         rollback: None },
+
+    // ── Meeting intelligence tools ────────────────────────────────────────────
+    ToolDef { name: "search_past_meetings",     schema_fn: schema_search_past_meetings,     is_write: false, guard: None, handler: handle_search_past_meetings,     rollback: None },
+    ToolDef { name: "list_open_actions",        schema_fn: schema_list_open_actions,        is_write: false, guard: None, handler: handle_list_open_actions,        rollback: None },
+    ToolDef { name: "get_meeting_context",      schema_fn: schema_get_meeting_context,      is_write: false, guard: None, handler: handle_get_meeting_context,      rollback: None },
+    ToolDef { name: "save_meeting_extractions", schema_fn: schema_save_meeting_extractions, is_write: true,  guard: None, handler: handle_save_meeting_extractions, rollback: None },
+    ToolDef { name: "complete_action",          schema_fn: schema_complete_action,          is_write: true,  guard: None, handler: handle_complete_action,          rollback: None },
 
     // ── Trace analyst tools (trace_analyst agent only) ───────────────────────
     ToolDef { name: "list_session_traces",            schema_fn: trace_tools::schema_list_session_traces,            is_write: false, guard: None, handler: trace_tools::handle_list_session_traces,            rollback: None },
@@ -1861,6 +1868,116 @@ fn rollback_schedule_task(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolF
         let full = std::path::Path::new(&env.vault_path).join(format!("tasks/{}.md", safe));
         let _ = tokio::fs::remove_file(&full).await;
         Ok(json!(null))
+    })
+}
+
+// ── Meeting intelligence tools ────────────────────────────────────────────────
+
+fn schema_search_past_meetings() -> Value { json!({ "type": "function", "function": {
+    "name": "search_past_meetings",
+    "description": "在歷史會議記錄中搜尋。可依關鍵字、說話者姓名、時間範圍篩選。\
+                    返回匹配的會議列表，含日期、參與者、note 路徑和逐字稿摘錄。\
+                    適合回答「上次討論 X 是什麼時候」、「Alice 參與了哪些會議」等問題。",
+    "parameters": { "type": "object", "properties": {
+        "query":   { "type": "string",  "description": "搜尋關鍵字（可為空，配合 speaker 使用）" },
+        "speaker": { "type": "string",  "description": "說話者姓名（可選）" },
+        "days":    { "type": "number",  "description": "只看最近 N 天（可選，預設全部）" },
+        "limit":   { "type": "number",  "description": "最多回傳幾筆，預設 5" },
+    }, "required": ["query"] }
+}})}
+
+fn handle_search_past_meetings(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let query   = args["query"].as_str().unwrap_or("").to_string();
+        let speaker = args["speaker"].as_str().map(String::from);
+        let days    = args["days"].as_u64();
+        let limit   = args["limit"].as_u64().unwrap_or(5) as usize;
+        Ok(meeting_tools::search_past_meetings(
+            &env.db, &env.vault_id, &query,
+            speaker.as_deref(), days, limit,
+        ).await)
+    })
+}
+
+fn schema_list_open_actions() -> Value { json!({ "type": "function", "function": {
+    "name": "list_open_actions",
+    "description": "列出所有未完成的行動項目（Action Items）。可依負責人姓名篩選。\
+                    適合回答「Alice 還有哪些未完成的事項」、「本月所有待辦行動項目」等問題。",
+    "parameters": { "type": "object", "properties": {
+        "owner": { "type": "string", "description": "負責人姓名（可選）" },
+        "limit": { "type": "number", "description": "最多回傳幾筆，預設 20" },
+    }, "required": [] }
+}})}
+
+fn handle_list_open_actions(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let owner = args["owner"].as_str().map(String::from);
+        let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+        Ok(meeting_tools::list_open_actions(
+            &env.db, &env.vault_id, owner.as_deref(), limit,
+        ).await)
+    })
+}
+
+fn schema_get_meeting_context() -> Value { json!({ "type": "function", "function": {
+    "name": "get_meeting_context",
+    "description": "取得某場會議的完整結構化資訊：元資料、參與者、決策記錄、行動項目、逐字稿預覽。\
+                    適合在需要深入了解某場特定會議時使用（先用 search_past_meetings 找到 meeting_id）。",
+    "parameters": { "type": "object", "properties": {
+        "meeting_id": { "type": "string", "description": "會議 ID（從 search_past_meetings 結果取得）" },
+    }, "required": ["meeting_id"] }
+}})}
+
+fn handle_get_meeting_context(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let mid = args["meeting_id"].as_str().unwrap_or("");
+        if mid.is_empty() { return Ok(json!({ "error": "meeting_id 不能為空" })); }
+        Ok(meeting_tools::get_meeting_context(&env.db, mid).await)
+    })
+}
+
+fn schema_save_meeting_extractions() -> Value { json!({ "type": "function", "function": {
+    "name": "save_meeting_extractions",
+    "description": "將本次會議整理出的決策和行動項目儲存到結構化資料庫。\
+                    會議整理完成後必須呼叫此工具，使資料可被後續查詢。",
+    "parameters": { "type": "object", "properties": {
+        "meeting_id": { "type": "string",  "description": "會議 ID" },
+        "decisions":  { "type": "array",   "items": { "type": "string" },
+                        "description": "決策清單，每條一個字串" },
+        "actions": { "type": "array", "description": "行動項目清單",
+            "items": { "type": "object", "properties": {
+                "description": { "type": "string" },
+                "owner":       { "type": "string", "description": "負責人（不確定填 TBD）" },
+            }, "required": ["description"] }
+        },
+    }, "required": ["meeting_id", "decisions", "actions"] }
+}})}
+
+fn handle_save_meeting_extractions(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let mid       = args["meeting_id"].as_str().unwrap_or("");
+        let decisions = args["decisions"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        let actions   = args["actions"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        if mid.is_empty() { return Ok(json!({ "error": "meeting_id 不能為空" })); }
+        Ok(meeting_tools::save_meeting_extractions(
+            &env.db, &env.vault_id, mid, decisions, actions,
+        ).await)
+    })
+}
+
+fn schema_complete_action() -> Value { json!({ "type": "function", "function": {
+    "name": "complete_action",
+    "description": "將一個行動項目標記為已完成。",
+    "parameters": { "type": "object", "properties": {
+        "action_id": { "type": "string", "description": "行動項目 ID（從 list_open_actions 取得）" },
+    }, "required": ["action_id"] }
+}})}
+
+fn handle_complete_action(env: Arc<HarnessRequestRuntime>, args: Value) -> ToolFuture {
+    Box::pin(async move {
+        let aid = args["action_id"].as_str().unwrap_or("");
+        if aid.is_empty() { return Ok(json!({ "error": "action_id 不能為空" })); }
+        Ok(meeting_tools::complete_action(&env.db, aid).await)
     })
 }
 

@@ -39,6 +39,8 @@ pub struct DaemonState {
 
     // ── 固定 URL（從 config 計算，runtime 不變）─────────────────────────────
     pub llm_url: String,
+    /// Optional standalone draft-model server URL (None if not configured).
+    pub draft_llm_url: Option<String>,
     pub embedding_url: String,
     pub whisper_url: String,
 
@@ -72,6 +74,7 @@ impl DaemonState {
             http_client: reqwest::Client::new(),
             diarize_model: Arc::new(std::sync::RwLock::new(None)),
             llm_url: config.llm_url(),
+            draft_llm_url: config.draft_llm_url(),
             embedding_url: config.embedding_url(),
             whisper_url: config.whisper_url(),
             whisper_server: Arc::new(Mutex::new(None)),

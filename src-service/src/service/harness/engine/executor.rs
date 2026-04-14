@@ -15,6 +15,55 @@ use crate::service::harness::memory::working::WorkingMemory;
 use crate::service::harness::tools::vault_tools;
 use crate::service::harness::governance::guard::GuardOutcome;
 
+/// Format a human-readable one-line summary for a tool call.
+/// Returns "<emoji> <tool_name>(<key_arg>)" where key_arg is the most
+/// relevant argument (path, query, title, …) truncated to 60 chars.
+fn format_tool_display(name: &str, args: &Value) -> String {
+    let emoji = match name {
+        "read_note" | "search_in_note"                      => "📖",
+        "create_note"                                        => "📝",
+        "update_note" | "patch_note" | "line_range_patch"
+            | "append_to_note" | "read_then_write"          => "✏️",
+        "delete_note" | "delete_folder"                     => "🗑️",
+        "move_note"                                          => "📦",
+        "create_folder"                                      => "📁",
+        "list_structure" | "get_vault_stats"
+            | "get_vault_changes" | "find_orphan_notes"     => "🗂️",
+        "search_vault" | "list_recent_notes"
+            | "search_by_tag" | "get_note_backlinks"        => "🔍",
+        "search_past_meetings" | "get_meeting_context"      => "📅",
+        "list_open_actions" | "complete_action"             => "✅",
+        "save_meeting_extractions"                          => "💾",
+        "web_search"                                         => "🌐",
+        "query_memory" | "recall" | "save_memory_session"   => "🧠",
+        "compress_to_knowledge" | "generate_moc"
+            | "compress_context"                             => "🗜️",
+        "update_note_frontmatter"                            => "🏷️",
+        "link_notes"                                         => "🔗",
+        "schedule_task"                                      => "⏰",
+        "get_current_datetime"                               => "🕐",
+        "batch_apply"                                        => "⚡",
+        "finish"                                             => "✅",
+        "progress"                                           => "📊",
+        "search_skills" | "save_agent_knowledge"
+            | "get_agent_knowledge"                          => "🎚️",
+        "checkpoint" | "clear_checkpoint"                   => "💾",
+        "get_session_state"                                  => "📋",
+        _                                                    => "🔧",
+    };
+    // Pick the most descriptive single argument to show.
+    let key_arg = ["path", "query", "title", "folder_path", "tag", "note_path", "source_path"]
+        .iter()
+        .find_map(|k| args[k].as_str())
+        .unwrap_or("");
+    let truncated: String = key_arg.chars().take(60).collect();
+    if truncated.is_empty() {
+        format!("{} {}", emoji, name)
+    } else {
+        format!("{} {}({})", emoji, name, truncated)
+    }
+}
+
 pub struct Executor {
     registry:        Arc<ToolRegistry>,
     /// Present in interactive mode; `None` in headless eval (mock tools ignore it).
@@ -116,7 +165,7 @@ impl Executor {
                 let approved = if (self.need_confirm_fn)(&node.call.name) {
                     (self.emit_fn)(
                         "agent:write_request".to_string(),
-                        json!({ "display": node.call.name }),
+                        json!({ "display": format_tool_display(&node.call.name, &actual_args) }),
                     );
                     match tx.prepare().await {
                         Ok(rx) => {
@@ -126,7 +175,7 @@ impl Executor {
                                     let _ = tx.cancel().await;
                                     (self.emit_fn)(
                                         "agent:write_timeout".to_string(),
-                                        json!({ "display": node.call.name }),
+                                        json!({ "display": format_tool_display(&node.call.name, &actual_args) }),
                                     );
                                     should_cancel = true;
                                     break;
@@ -144,7 +193,7 @@ impl Executor {
                     } else {
                         (self.emit_fn)(
                             "agent:tool_call".to_string(),
-                            json!({ "display": node.call.name }),
+                            json!({ "display": format_tool_display(&node.call.name, &actual_args) }),
                         );
                     }
                     true

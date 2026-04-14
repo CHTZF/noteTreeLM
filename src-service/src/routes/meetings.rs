@@ -14,6 +14,7 @@ pub fn router() -> Router<ApiState> {
         .route("/meetings", get(list_meetings))
         .route("/meetings/:id", get(get_meeting).delete(delete_meeting))
         .route("/meetings/:id/rename-speaker", post(rename_speaker))
+        .route("/meetings/:id/summarize", post(summarize_meeting))
 }
 
 #[derive(Deserialize)]
@@ -187,6 +188,53 @@ async fn rename_speaker(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({ "ok": true, "speaker_names_json": updated })))
+}
+
+/// POST /meetings/:id/summarize
+/// Manually (re-)trigger the Agent post-process for a meeting.
+/// Returns immediately; emits `meeting:summarized` SSE when done.
+async fn summarize_meeting(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // Verify meeting exists
+    #[derive(serde::Deserialize)]
+    struct Row { meeting_id: String }
+    let mut r = state.db
+        .query("SELECT meeting_id FROM meetings WHERE meeting_id = $mid LIMIT 1")
+        .bind(("mid", id.clone()))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    r.take::<Vec<Row>>(0).unwrap_or_default().into_iter().next()
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "meeting not found".to_string()))?;
+
+    let mid = id.clone();
+    tokio::spawn(async move {
+        use crate::routes::ws_transcribe::{build_meeting_transcript, run_meeting_agent};
+        let Some((transcript, date, started_at, vault_id_opt, account_id_opt)) =
+            build_meeting_transcript(&state, &mid).await
+        else { return; };
+        let vault_id = match vault_id_opt.as_deref() {
+            Some(v) if !v.is_empty() => v.to_string(),
+            _ => return,
+        };
+        let account_id = account_id_opt.unwrap_or_default();
+        if let Some(rel_path) = run_meeting_agent(
+            &state, &mid, &transcript, &date, started_at, &vault_id, &account_id,
+        ).await {
+            let _ = state.db
+                .query("UPDATE meetings SET note_path = $path WHERE meeting_id = $mid")
+                .bind(("path", rel_path.clone()))
+                .bind(("mid", mid.clone()))
+                .await;
+            state.daemon.emit("meeting:summarized", serde_json::json!({
+                "meeting_id": mid,
+                "note_path":  rel_path,
+            }));
+        }
+    });
+
+    Ok(Json(json!({ "ok": true, "status": "processing" })))
 }
 
 async fn delete_meeting(

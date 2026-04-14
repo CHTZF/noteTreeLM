@@ -116,9 +116,11 @@ impl ContextPipeline {
     /// 3. Injected system messages: exec history, checkpoint, agent knowledge
     pub async fn build(
         &self,
-        input:   ContextInput<'_>,
-        client:  &reqwest::Client,
-        llm_url: &str,
+        input:        ContextInput<'_>,
+        client:       &reqwest::Client,
+        llm_url:      &str,
+        // Optional draft-model URL for cheap summarisation. Falls back to `llm_url`.
+        draft_llm_url: Option<&str>,
     ) -> BuiltContext {
         // ── Stage 1: System message ────────────────────────────────────────
         let system_content = self.build_system_content(&input);
@@ -165,12 +167,13 @@ impl ContextPipeline {
             .sum();
 
         // ── Stage 3: Trim history if over budget ───────────────────────────
+        let summarise_url = draft_llm_url.unwrap_or(llm_url);
         let (history, was_trimmed) = trim_history(
             history,
             self.budget.history_chars,
             self.budget.keep_recent,
             client,
-            llm_url,
+            summarise_url,
             input.locale,
         ).await;
 

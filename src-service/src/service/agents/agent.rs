@@ -165,6 +165,35 @@ fn inject_required_tools(mut tool_names: Vec<String>, needs_frontend: bool, use_
     tool_names
 }
 
+/// Returns true when the query is simple enough to route to the draft model.
+///
+/// Criteria (all must hold):
+///   - A draft model URL is configured
+///   - No tools are offered (tool-calling rounds always need the main model)
+///   - The last user message is short (≤ 120 chars)
+///   - No code fences, URLs, or complex-task keywords are present
+fn should_use_draft(runtime: &HarnessRequestRuntime, msgs: &[Value], has_tools: bool) -> bool {
+    let Some(ref _draft_url) = runtime.draft_llm_url else { return false };
+    if has_tools { return false }
+
+    // Extract last user message text
+    let user_text = msgs.iter().rev()
+        .find(|m| m["role"].as_str() == Some("user"))
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or("");
+
+    if user_text.len() > 120 { return false }
+
+    // Reject if contains complexity signals
+    const COMPLEX_KEYWORDS: &[&str] = &[
+        "```", "http://", "https://", "debug", "refactor", "analyze", "分析",
+        "重構", "整理", "總結", "摘要", "修復", "generate", "寫一篇", "幫我寫",
+    ];
+    if COMPLEX_KEYWORDS.iter().any(|kw| user_text.contains(kw)) { return false }
+
+    true
+}
+
 /// Single LLM invocation — handles both streaming and non-streaming, with or without tools.
 /// Returns `(full_text, tool_chunks, cite_invalid)`.
 /// `cite_invalid` is true when a streaming round detected a fabricated citation ID.
@@ -178,6 +207,14 @@ async fn run_one_llm_round(
 ) -> Result<(String, Vec<(String, String, String)>, bool), String> {
     use super::super::harness::tools::llm;
     let has_tools = tools.is_some();
+
+    // Route simple, tool-free queries to the draft model when available.
+    let effective_url = if should_use_draft(runtime, msgs, has_tools) {
+        runtime.draft_llm_url.as_deref().unwrap_or(&runtime.llm_url)
+    } else {
+        &runtime.llm_url
+    };
+
     if runtime.streaming {
         let body = match tools {
             Some(tv) => json!({ "messages": msgs, "tools": tv, "tool_choice": tool_choice,
@@ -189,12 +226,12 @@ async fn run_one_llm_round(
         let wm = if has_tools { Some(&runtime.working_memory) } else { None };
         let tnames: &[String] = if has_tools { tool_names } else { &[] };
         llm::stream_llm_round(
-            &runtime.client, &runtime.llm_url, body, emitter, &runtime.cancel, wm, tnames,
+            &runtime.client, effective_url, body, emitter, &runtime.cancel, wm, tnames,
             runtime.native_think,
         ).await.map(|(t, _, chunks, ci)| (t, chunks, ci))
     } else {
         llm::call_llm_once(
-            &runtime.client, &runtime.llm_url, msgs, tools, &runtime.cancel,
+            &runtime.client, effective_url, msgs, tools, &runtime.cancel,
         ).await.map(|(t, chunks)| (t, chunks, false))
     }
 }

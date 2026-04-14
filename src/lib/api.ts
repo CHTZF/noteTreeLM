@@ -363,6 +363,8 @@ export const api = {
     request<{ ok: boolean; speaker_names_json: string }>('POST', `/meetings/${encodeURIComponent(id)}/rename-speaker`, { speaker, name }),
   deleteMeeting: (id: string) =>
     request<{ ok: boolean }>('DELETE', `/meetings/${encodeURIComponent(id)}`),
+  summarizeMeeting: (id: string) =>
+    request<{ ok: boolean; status: string }>('POST', `/meetings/${encodeURIComponent(id)}/summarize`),
 }
 
 export interface MeetingSummary {
