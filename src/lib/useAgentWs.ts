@@ -1,4 +1,4 @@
-import { useRef, useEffect, useCallback } from 'react'
+import { useCallback } from 'react'
 
 type EventHandler = (data: unknown) => void
 
@@ -10,6 +10,7 @@ export interface RunParams {
   activeNote?: string
   selection?: string
   uiLanguage?: string
+  agent?: string
 }
 
 export interface RunResult {
@@ -22,119 +23,116 @@ function getWsUrl(): string {
   return `ws://127.0.0.1:7787/api/v1/ws${token ? `?token=${encodeURIComponent(token)}` : ''}`
 }
 
-/**
- * Shared WebSocket hook for agent chat.
- * Works for both desktop (connects to 127.0.0.1:7787) and mobile (handled separately via mobileApi.wsUrl).
- *
- * Usage:
- *   const { on, run, cancel, confirm } = useAgentWs()
- *
- *   // Register event handlers (returns unlisten fn)
- *   useEffect(() => {
- *     const off = on('llm:token', (data) => { ... })
- *     return off
- *   }, [on])
- *
- *   // Send a message
- *   const result = await run({ vaultId, input, platform: 'desktop', ... })
- *   // result.conversationId available after llm:done
- */
+// ── App-scoped singleton ───────────────────────────────────────────────────────
+// The WebSocket is opened once when this module loads and never closed until the
+// OS kills the process. Component mount/unmount has no effect on the socket.
+// Reconnect runs automatically every 3 s when the daemon is not yet ready.
+
+const _handlers = new Map<string, Set<EventHandler>>()
+const _doneResolvers: Array<(result: RunResult) => void> = []
+let _pendingSessionId = ''
+let _ws: WebSocket | null = null
+let _reconnectTimer: ReturnType<typeof setTimeout> | null = null
+
+function connect() {
+  if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null }
+  const sock = new WebSocket(getWsUrl())
+  _ws = sock
+
+  sock.onmessage = (e: MessageEvent) => {
+    try {
+      const msg = JSON.parse(e.data as string) as {
+        event: string
+        data: unknown
+        conversation_id?: string
+      }
+      const set = _handlers.get(msg.event)
+      if (set) { for (const h of set) h(msg.data) }
+
+      if (msg.event === 'llm:done' && _doneResolvers.length > 0) {
+        const resolve = _doneResolvers.shift()!
+        resolve({ sessionId: _pendingSessionId, conversationId: msg.conversation_id ?? '' })
+      }
+      if (msg.event === 'llm:error' && _doneResolvers.length > 0) {
+        const resolve = _doneResolvers.shift()!
+        resolve({ sessionId: _pendingSessionId, conversationId: '' })
+      }
+    } catch { /* ignore parse errors */ }
+  }
+
+  sock.onclose = () => {
+    _reconnectTimer = setTimeout(connect, 3000)
+  }
+
+  sock.onerror = () => {}
+}
+
+// Connect immediately on module load
+connect()
+
+// ── Hook ──────────────────────────────────────────────────────────────────────
+// Components call useAgentWs() to get stable function references.
+// No setup/teardown on mount/unmount — the singleton lives independently.
+
 export function useAgentWs() {
-  const wsRef = useRef<WebSocket | null>(null)
-  const handlersRef = useRef<Map<string, Set<EventHandler>>>(new Map())
-  // Resolvers for run() Promises — resolved when llm:done arrives
-  const doneResolversRef = useRef<Array<(result: RunResult) => void>>([])
-  const pendingSessionRef = useRef<string>('')
-
-  useEffect(() => {
-    const url = getWsUrl()
-    const ws = new WebSocket(url)
-    wsRef.current = ws
-
-    ws.onmessage = (e: MessageEvent) => {
-      try {
-        const msg = JSON.parse(e.data as string) as {
-          event: string
-          data: unknown
-          conversation_id?: string
-        }
-
-        // Dispatch to all registered handlers for this event
-        const handlers = handlersRef.current.get(msg.event)
-        if (handlers) {
-          for (const h of handlers) h(msg.data)
-        }
-
-        // Resolve the pending run() Promise on llm:done
-        if (msg.event === 'llm:done' && doneResolversRef.current.length > 0) {
-          const resolve = doneResolversRef.current.shift()!
-          resolve({
-            sessionId: pendingSessionRef.current,
-            conversationId: msg.conversation_id ?? '',
-          })
-        }
-
-        // Reject the pending run() Promise on llm:error
-        if (msg.event === 'llm:error' && doneResolversRef.current.length > 0) {
-          // Resolve with empty conversation_id; callers check for llm:error separately
-          const resolve = doneResolversRef.current.shift()!
-          resolve({ sessionId: pendingSessionRef.current, conversationId: '' })
-        }
-      } catch { /* ignore parse errors */ }
-    }
-
-    return () => {
-      ws.close()
-      wsRef.current = null
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
-  /**
-   * Register a handler for an event. Returns an unsubscribe function.
-   * Equivalent to Tauri's listen() but synchronous and no-cleanup-needed.
-   */
+  /** Register a handler for an event. Returns an unsubscribe function. */
   const on = useCallback((event: string, handler: EventHandler): (() => void) => {
-    if (!handlersRef.current.has(event)) {
-      handlersRef.current.set(event, new Set())
-    }
-    handlersRef.current.get(event)!.add(handler)
-    return () => handlersRef.current.get(event)?.delete(handler)
+    if (!_handlers.has(event)) _handlers.set(event, new Set())
+    _handlers.get(event)!.add(handler)
+    return () => _handlers.get(event)?.delete(handler)
   }, [])
 
-  /**
-   * Send a run request. Returns a Promise that resolves when llm:done is received.
-   * Equivalent to invoke('invoke_agent').
-   */
+  /** Send a run request. Resolves when llm:done is received (or on cancel). */
   const run = useCallback((params: RunParams): Promise<RunResult> => {
     const sessionId = crypto.randomUUID()
-    pendingSessionRef.current = sessionId
+    _pendingSessionId = sessionId
+    const msg = JSON.stringify({
+      type: 'run',
+      vault_id: params.vaultId,
+      session_id: sessionId,
+      input: params.input,
+      conversation_id: params.conversationId,
+      platform: params.platform,
+      active_note: params.activeNote,
+      selection: params.selection,
+      ui_language: params.uiLanguage,
+      agent: params.agent,
+    })
     return new Promise((resolve) => {
-      doneResolversRef.current.push(resolve)
-      wsRef.current?.send(JSON.stringify({
-        type: 'run',
-        vault_id: params.vaultId,
-        session_id: sessionId,
-        input: params.input,
-        conversation_id: params.conversationId,
-        platform: params.platform,
-        active_note: params.activeNote,
-        selection: params.selection,
-        ui_language: params.uiLanguage,
-      }))
+      _doneResolvers.push(resolve)
+      if (!_ws) { resolve({ sessionId, conversationId: '' }); return }
+      if (_ws.readyState === WebSocket.OPEN) {
+        _ws.send(msg)
+      } else if (_ws.readyState === WebSocket.CONNECTING) {
+        const prevOnOpen = _ws.onopen
+        _ws.onopen = (e) => {
+          if (prevOnOpen) (prevOnOpen as (e: Event) => void)(e)
+          _ws!.send(msg)
+        }
+      } else {
+        resolve({ sessionId, conversationId: '' })
+      }
     })
   }, [])
 
-  /** Cancel the current run. Equivalent to invoke('cancel_agent'). */
+  /** Cancel the current run. */
   const cancel = useCallback(() => {
-    wsRef.current?.send(JSON.stringify({ type: 'cancel' }))
-    doneResolversRef.current = []
+    if (_ws && _ws.readyState === WebSocket.OPEN) {
+      _ws.send(JSON.stringify({ type: 'cancel' }))
+    }
+    // Resolve pending promises so callers don't hang forever
+    for (const resolve of _doneResolvers) {
+      resolve({ sessionId: _pendingSessionId, conversationId: '' })
+    }
+    _doneResolvers.length = 0
   }, [])
 
-  /** Confirm or deny a write-tool request. Equivalent to invoke('confirm_write_tool'). */
+  /** Confirm or deny a write-tool request. */
   const confirm = useCallback((approved: boolean) => {
-    wsRef.current?.send(JSON.stringify({ type: 'confirm', approved }))
+    if (_ws && _ws.readyState === WebSocket.OPEN) {
+      _ws.send(JSON.stringify({ type: 'confirm', approved }))
+    }
   }, [])
 
-  return { on, run, cancel, confirm, wsRef }
+  return { on, run, cancel, confirm }
 }

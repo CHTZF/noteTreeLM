@@ -28,7 +28,6 @@ import DebugPanel from './components/Debug/DebugPanel'
 import ChatPanel from './components/Chat/ChatPanel'
 import FileViewer from './components/FileViewer/FileViewer'
 import PreviewPanel from './components/Editor/PreviewPanel'
-import LiveChatPanel from './components/LiveChat/LiveChatPanel'
 import LiveChatSheet from './components/LiveChat/LiveChatSheet'
 import NoteStatusBadge from './components/Editor/NoteStatusBadge'
 import QuickOpen from './components/QuickOpen/QuickOpen'
@@ -1159,12 +1158,7 @@ function AppMain() {
                   onOpenNote={openNoteFromChat}
                 />
               )}
-              {t.path === LIVE_CHAT_TAB && (
-                <LiveChatPanel
-                  onOpenNote={openNoteFromChat}
-                  onActiveChange={active => { chatActiveRef.current.set(t.id, active) }}
-                />
-              )}
+
               {t.path === IMPORT_TAB && (
                 <ImportPanel />
               )}
@@ -1557,12 +1551,6 @@ function AppMain() {
           open={liveChatSheetOpen}
           onClose={() => setLiveChatSheetOpen(false)}
           onOpenNote={path => { openNoteFromChat(path); setLiveChatSheetOpen(false) }}
-          onOpenTab={tab => {
-            const tabMap: Record<string, string> = {
-              settings: SETTINGS_TAB, trash: TRASH_TAB, agents: AGENTS_TAB, skills: SKILLS_TAB,
-            }
-            if (tabMap[tab]) openNote(tabMap[tab])
-          }}
           onShowResults={paths => {
             if (paths.length === 1) { openNoteFromChat(paths[0]); setLiveChatSheetOpen(false) }
           }}

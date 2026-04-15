@@ -2,6 +2,7 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import { createTranscribeSession } from '../lib/transcribeWs'
 import type { TranscribeSession } from '../lib/transcribeWs'
 import { useDebugStore } from '../stores/debugStore'
+import { useMicStore } from '../stores/micStore'
 import { toast } from '../components/common/Toast'
 
 export type VoiceState = 'idle' | 'recording' | 'transcribing' | 'done' | 'error'
@@ -79,6 +80,7 @@ export function useVoiceRecorder(
   noiseSuppressionEnabled = true,
   _previewIntervalMs = 5000,
   whisperLanguage = 'auto',
+  holderId?: string,
 ): UseVoiceRecorderReturn {
   const [state, setState] = useState<VoiceState>('idle')
   const [errorMsg, setErrorMsg] = useState('')
@@ -164,6 +166,7 @@ export function useVoiceRecorder(
       if (silenceWarnTimerRef.current !== null) clearTimeout(silenceWarnTimerRef.current)
       if (autoStopTimerRef.current !== null)    clearTimeout(autoStopTimerRef.current)
       transcribeSessionRef.current?.close()
+      if (holderId) useMicStore.getState().release(holderId)
     }
   }, [])
 
@@ -173,6 +176,13 @@ export function useVoiceRecorder(
 
   // ─── startRecording ──────────────────────────────────────────────────────────
   const startRecording = useCallback(async () => {
+    if (holderId) {
+      const claimed = useMicStore.getState().claim(holderId)
+      if (!claimed) {
+        toast.warning('麥克風已被其他功能使用中')
+        return
+      }
+    }
     setErrorMsg('')
     setSegmentsDone(0)
     speechActiveRef.current       = false
@@ -417,6 +427,7 @@ export function useVoiceRecorder(
 
     setState('done')
     setTimeout(() => setState('idle'), 2000)
+    if (holderId) useMicStore.getState().release(holderId)
   }, [])
 
   // ─── Toggle ──────────────────────────────────────────────────────────────────

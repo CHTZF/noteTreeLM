@@ -1,45 +1,32 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
 import { api } from '../../lib/api'
 import { useAuthStore } from '../../stores/authStore'
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useVoiceRecorder } from '../../hooks/useVoiceRecorder'
-import { useEditorStore } from '../../stores/editorStore'
 import { useActivityStore } from '../../stores/activityStore'
 import { useTranslation } from 'react-i18next'
+import { useAgentWs } from '../../lib/useAgentWs'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
 type SheetState = 'idle' | 'listening' | 'processing' | 'speaking'
 
-interface LiveChatAction {
-  speech: string
-  action: 'none' | 'show_results' | 'open_note' | 'open_tab' | 'show_error'
-  content?: string
-  paths?: string[]
-  path?: string
-  tab?: string
-  error?: string
-}
-
 interface LiveChatSheetProps {
   open: boolean
   onClose: () => void
   onOpenNote: (path: string) => void
-  onOpenTab: (tab: string) => void
   onShowResults: (paths: string[]) => void
 }
 
 // ── Component ────────────────────────────────────────────────────────────────
 
-export default function LiveChatSheet({ open, onClose, onOpenNote, onOpenTab, onShowResults }: LiveChatSheetProps) {
+export default function LiveChatSheet({ open, onClose, onOpenNote, onShowResults }: LiveChatSheetProps) {
   const { settings, currentVaultId } = useSettingsStore()
   const { t, i18n } = useTranslation()
-  const currentNotePath = useEditorStore(s => s.currentPath)
+  const { on, run: wsRun, cancel: wsCancel, confirm: wsConfirm } = useAgentWs()
 
-  // Read activePattern from store directly — no usePatternDetector here to avoid
-  // background Tauri invocations that compete with invoke_live_chat on llama-server.
+  // Read activePattern from store directly
   const activePattern = useActivityStore(s => s.activePattern)
   const clearPredictiveMode = useActivityStore(s => s.clearPredictiveMode)
 
@@ -81,12 +68,14 @@ export default function LiveChatSheet({ open, onClose, onOpenNote, onOpenTab, on
     setDisplayTranscript(t => t + text)
   }, [])
 
+  const liveChatHolderIdRef = useRef(crypto.randomUUID())
   const { state: voiceState, isSpeaking, toggle } = useVoiceRecorder(
     handleTranscript,
     undefined,
     settings.voice_noise_suppression ?? true,
     5000,
     i18n.language,
+    liveChatHolderIdRef.current,
   )
 
   const voiceStateRef = useRef(voiceState)
@@ -135,9 +124,6 @@ export default function LiveChatSheet({ open, onClose, onOpenNote, onOpenTab, on
 
   // ── sendToLLM ────────────────────────────────────────────────────────────
   const sendToLLM = useCallback(async (query: string) => {
-    const convId = convIdRef.current
-    if (!convId) return
-
     setSheetState('processing')
     setProcessingHint('')
     setResultContent(null)
@@ -156,90 +142,73 @@ export default function LiveChatSheet({ open, onClose, onOpenNote, onOpenTab, on
       clearPredictiveMode()
     }
 
-    const noteCtx = currentNotePath
-      ? `當前開啟的筆記路徑：${currentNotePath}`
-      : undefined
+    const speechAccum = { current: '' }
 
-    let unlistenTool: (() => void) | null = null
-    let unlistenAction: (() => void) | null = null
-    // Prevents fallback TTS from firing when live_chat:action already handled speech
-    let actionHandled = false
+    const offThink = on('agent:think', (data) => {
+      setProcessingHint((data as { thought: string }).thought ?? '')
+    })
+    const offWriteReq = on('agent:write_request', () => {
+      wsConfirm(true)
+    })
+    const offToken = on('llm:token', (data) => {
+      speechAccum.current += typeof data === 'string' ? data : ''
+    })
+    const offRefs = on('agent:refs', (data) => {
+      const d = data as { refs: { path: string }[] }
+      const paths = (d.refs ?? []).map(r => r.path)
+      if (paths.length) {
+        setResultPaths(paths)
+        setResultExpanded(true)
+        onShowResults(paths)
+      }
+    })
+    const offOpenNote = on('agent:open_note', (data) => {
+      const paths = data as string[]
+      if (paths?.length) onOpenNote(paths[0])
+    })
+
+    const cleanup = () => {
+      offThink(); offWriteReq(); offToken(); offRefs(); offOpenNote()
+      setProcessingHint('')
+    }
 
     try {
-      unlistenTool = await listen<{ display: string }>('live_chat:tool_call', (e) => {
-        setProcessingHint(e.payload.display)
+      const vaultId = await invoke<string>('get_vault_uuid')
+      const result = await wsRun({
+        vaultId,
+        input: query,
+        conversationId: convIdRef.current || undefined,
+        platform: 'desktop',
+        uiLanguage: i18n.language,
+        agent: 'live_chat',
       })
+      cleanup()
 
-      unlistenAction = await listen<LiveChatAction>('live_chat:action', (e) => {
-        const action = e.payload
-        setProcessingHint('')
+      // User paused while we were thinking — discard
+      if (sheetStateRef.current === 'idle') return
 
-        if (action.speech) {
-          actionHandled = true
-          setSheetState('speaking')
-          speakWithFallback(action.speech)
-        }
+      if (!convIdRef.current && result.conversationId) {
+        setConversationId(result.conversationId)
+      }
 
-        if (action.action === 'open_note' && action.path) {
-          onOpenNote(action.path)
-        } else if (action.action === 'open_tab' && action.tab) {
-          onOpenTab(action.tab)
-        } else if (action.action === 'show_results') {
-          if (action.content) {
-            setResultContent(action.content)
-            setResultExpanded(true)
-          }
-          if (action.paths?.length) {
-            setResultPaths(action.paths)
-            onShowResults(action.paths)
-          }
-        } else if (action.action === 'show_error' && action.error) {
-          setErrorCard(action.error)
-        } else if (action.action === 'none' && !action.speech) {
-          startListening()
-        }
-      })
-
-      const TIMEOUT_MS = 60_000
-      const speech = await Promise.race([
-        invoke<string>('invoke_live_chat', {
-          conversationId: convId,
-          input: query,
-          noteContext: noteCtx,
-          activityContext: snap.getContextString() || null,
-          language: i18n.language,
-          uiLanguage: i18n.language,
-        }),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('live_chat timeout')), TIMEOUT_MS)
-        ),
-      ])
-      // Fallback: only speak if live_chat:action did NOT already handle it
-      if (!actionHandled) {
-        if (speech && sheetStateRef.current === 'processing') {
-          setSheetState('speaking')
-          setProcessingHint('')
-          speakWithFallback(speech)
-        } else if (!speech && sheetStateRef.current === 'processing') {
-          startListening()
-        }
+      const speech = speechAccum.current.trim()
+      if (speech) {
+        setSheetState('speaking')
+        speakWithFallback(speech)
+      } else {
+        startListening()
       }
     } catch (e) {
-      console.error('[LiveChatSheet] invoke_live_chat error:', e)
-      setProcessingHint('')
-      // Rust 已 emit 錯誤 action（若來得及）；前端做最後保險：說一句話 + 顯示錯誤
+      cleanup()
+      console.error('[LiveChatSheet] sendToLLM error:', e)
       if (sheetStateRef.current !== 'idle') {
-        const isTimeout = e instanceof Error && e.message === 'live_chat timeout'
-        const errMsg = isTimeout ? '請求逾時，請稍後再試。' : '抱歉，遇到了一些問題，請稍後再試。'
+        const errMsg = '抱歉，遇到了一些問題，請稍後再試。'
         setErrorCard(errMsg)
         setSheetState('speaking')
         speakWithFallback(errMsg)
       }
-    } finally {
-      unlistenTool?.()
-      unlistenAction?.()
     }
-  }, [currentNotePath, i18n.language, startListening, speakWithFallback, onOpenNote, onOpenTab, onShowResults, clearPredictiveMode])
+  }, [on, wsRun, wsConfirm, i18n.language, startListening, speakWithFallback, onOpenNote, onShowResults, clearPredictiveMode])
 
   // ── Silence detection → send to LLM ─────────────────────────────────────
   useEffect(() => {
@@ -297,6 +266,7 @@ export default function LiveChatSheet({ open, onClose, onOpenNote, onOpenTab, on
       bargeInTimerRef.current = setTimeout(() => {
         if (sheetStateRef.current === 'speaking') {
           window.speechSynthesis.cancel()
+          wsCancel()
           setSheetState('listening')
         }
       }, 500)
@@ -314,6 +284,7 @@ export default function LiveChatSheet({ open, onClose, onOpenNote, onOpenTab, on
       startListening()
     } else {
       window.speechSynthesis.cancel()
+      wsCancel()
       if (silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current = null }
       if (voiceStateRef.current === 'recording') toggle()
       setSheetState('idle')
@@ -414,6 +385,7 @@ export default function LiveChatSheet({ open, onClose, onOpenNote, onOpenTab, on
                   startListening()
                 } else {
                   window.speechSynthesis.cancel()
+                  wsCancel()
                   if (silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current = null }
                   if (voiceStateRef.current === 'recording') toggle()
                   setSheetState('idle')

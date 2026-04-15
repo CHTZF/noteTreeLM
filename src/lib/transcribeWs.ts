@@ -1,5 +1,9 @@
 /**
- * Shared transcription WebSocket client with auto-reconnect.
+ * Shared transcription WebSocket client — app-scoped singleton.
+ *
+ * The WebSocket connection is opened once on module load and never closed.
+ * Each recording session just sends start/stop messages on the same connection.
+ * close() on a session only clears its callbacks; the socket stays alive.
  *
  * Protocol:
  *   client → text:   {"type":"start","language":"zh-TW","vault_id":"..."}
@@ -9,18 +13,18 @@
  *
  *   server → text:   {"event":"meeting:started","data":{"meeting_id":"..."}}
  *   server → text:   {"event":"whisper:done","data":{"text":"...","index":N,"ts_ms":N,"speaker":"..."}}
- *   server → text:   {"event":"whisper:flush_done"}
+ *   server → text:   {"event":"meeting:done","data":{"meeting_id":"..."}}
  *   server → text:   {"event":"whisper:error","data":"..."}
  */
 
 export interface TranscribeSession {
   /** Send a PCM16 frame (Int16Array.buffer). */
   sendPcm(buffer: ArrayBuffer): void
-  /** Tell server to flush remaining buffer; waits for flush_done internally. */
+  /** Tell server to flush remaining buffer. */
   stop(): void
-  /** Rename a speaker label to a real name (sent to server). */
+  /** Rename a speaker label to a real name. */
   renameSpeaker(speaker: string, name: string): void
-  /** Permanently close the session (no reconnect). */
+  /** End this session. Does NOT close the underlying WebSocket. */
   close(): void
 }
 
@@ -35,15 +39,78 @@ export function getTranscribeWsUrl(): string {
   return `${base}/api/v1/ws/transcribe${token ? `?token=${encodeURIComponent(token)}` : ''}`
 }
 
-const RECONNECT_DELAYS_MS = [500, 1000, 2000, 4000, 8000] // exponential backoff, capped at 8 s
-const MAX_RECONNECT_ATTEMPTS = 5
+// ── App-scoped singleton ───────────────────────────────────────────────────────
+
+type SessionCallbacks = {
+  onResult:        (text: string, index: number, speaker?: string, tsMs?: number) => void
+  onFlushDone:     () => void
+  onError:         (msg: string) => void
+  onMeetingStarted?: (meetingId: string) => void
+  onMeetingDone?:    (meetingId: string) => void
+}
+
+let _ws: WebSocket | null = null
+let _reconnectTimer: ReturnType<typeof setTimeout> | null = null
+let _callbacks: SessionCallbacks | null = null
+/** start message buffered while WS is CONNECTING */
+let _pendingStart: string | null = null
+
+function dispatchMessage(msg: { event: string; data?: unknown }) {
+  if (!_callbacks) return
+  const cb = _callbacks
+  if (msg.event === 'whisper:done') {
+    const d = msg.data as { text: string; index: number; speaker?: string; ts_ms?: number }
+    cb.onResult(d.text ?? '', d.index ?? 0, d.speaker, d.ts_ms)
+  } else if (msg.event === 'meeting:done') {
+    cb.onFlushDone()
+    const d = msg.data as { meeting_id: string }
+    cb.onMeetingDone?.(d.meeting_id)
+  } else if (msg.event === 'whisper:flush_done') {
+    cb.onFlushDone()
+  } else if (msg.event === 'whisper:error') {
+    cb.onError(String(msg.data ?? '轉錄失敗'))
+  } else if (msg.event === 'meeting:started') {
+    const d = msg.data as { meeting_id: string }
+    cb.onMeetingStarted?.(d.meeting_id)
+  }
+}
+
+function connectTranscribe() {
+  if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null }
+  const sock = new WebSocket(getTranscribeWsUrl())
+  sock.binaryType = 'arraybuffer'
+  _ws = sock
+
+  sock.onopen = () => {
+    if (_pendingStart) {
+      sock.send(_pendingStart)
+      _pendingStart = null
+    }
+  }
+
+  sock.onmessage = (e: MessageEvent) => {
+    if (typeof e.data !== 'string') return
+    try { dispatchMessage(JSON.parse(e.data) as { event: string; data?: unknown }) }
+    catch { /* ignore parse errors */ }
+  }
+
+  sock.onclose = () => {
+    _reconnectTimer = setTimeout(connectTranscribe, 3000)
+  }
+
+  sock.onerror = () => {}
+}
+
+// Connect immediately on module load
+connectTranscribe()
+
+// ── Public API ────────────────────────────────────────────────────────────────
 
 /**
- * Open a transcription WebSocket session with automatic reconnection.
+ * Begin a transcription session. Returns immediately (no await needed) since
+ * the underlying WebSocket is already open.
  *
- * On unexpected disconnect (not triggered by close()), the client reconnects
- * with exponential backoff and re-sends "start" so the server restores state.
- * In-flight PCM frames queued during reconnect are sent after re-connect.
+ * The previous session's callbacks are replaced; only one active session at a time.
  */
 export function createTranscribeSession(
   language: string,
@@ -52,149 +119,61 @@ export function createTranscribeSession(
   onError: (msg: string) => void,
   options?: {
     vaultId?: string
+    topic?: string
+    parentMeetingId?: string
     onMeetingStarted?: (meetingId: string) => void
     onMeetingDone?: (meetingId: string) => void
   },
 ): Promise<TranscribeSession> {
-  const vaultId = options?.vaultId ?? ''
-  const onMeetingStarted = options?.onMeetingStarted
-
-  function handleMessage(e: MessageEvent, onMsg: (msg: { event: string; data?: unknown }) => void) {
-    if (typeof e.data !== 'string') return
-    try {
-      onMsg(JSON.parse(e.data as string) as { event: string; data?: unknown })
-    } catch { /* ignore parse errors */ }
+  _callbacks = {
+    onResult,
+    onFlushDone,
+    onError,
+    onMeetingStarted: options?.onMeetingStarted,
+    onMeetingDone:    options?.onMeetingDone,
   }
 
-  function dispatch(msg: { event: string; data?: unknown }) {
-    if (msg.event === 'whisper:done') {
-      const d = msg.data as { text: string; index: number; speaker?: string; ts_ms?: number }
-      onResult(d.text ?? '', d.index ?? 0, d.speaker, d.ts_ms)
-    } else if (msg.event === 'whisper:flush_done' || msg.event === 'meeting:done') {
-      // meeting:done is sent after SpeakerEngine attribution completes (two-phase shutdown).
-      // whisper:flush_done kept for compatibility.
-      stopping = false
-      onFlushDone()
-      if (msg.event === 'meeting:done') {
-        const d = msg.data as { meeting_id: string }
-        options?.onMeetingDone?.(d.meeting_id)
-      }
-    } else if (msg.event === 'whisper:error') {
-      onError(String(msg.data ?? '轉錄失敗'))
-    } else if (msg.event === 'meeting:started') {
-      const d = msg.data as { meeting_id: string }
-      onMeetingStarted?.(d.meeting_id)
-    }
-  }
-
-  // These are captured by dispatch / closures below
-  let stopping = false
-
-  return new Promise((resolve, reject) => {
-    let ws: WebSocket | null = null
-    let closed = false          // set by close() — no further reconnects
-    stopping = false
-    let reconnectAttempts = 0
-    // PCM frames buffered while reconnecting
-    const pendingPcm: ArrayBuffer[] = []
-
-    function connect() {
-      if (closed) return
-      const url = getTranscribeWsUrl()
-      ws = new WebSocket(url)
-      ws.binaryType = 'arraybuffer'
-
-      ws.onopen = () => {
-        reconnectAttempts = 0
-        ws!.send(JSON.stringify({ type: 'start', language, vault_id: vaultId }))
-        // Flush any frames buffered during reconnect
-        for (const buf of pendingPcm) {
-          ws!.send(buf)
-        }
-        pendingPcm.length = 0
-      }
-
-      ws.onmessage = (e) => handleMessage(e, dispatch)
-      ws.onerror = () => {}
-
-      ws.onclose = (e) => {
-        if (closed) return
-        // During a normal stop flow the server closes cleanly — not an error.
-        if (stopping) return
-        if (e.wasClean) { onError('轉錄連線已關閉'); return }
-        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-          onError(`轉錄連線中斷，已重試 ${MAX_RECONNECT_ATTEMPTS} 次`)
-          return
-        }
-        const delay = RECONNECT_DELAYS_MS[Math.min(reconnectAttempts, RECONNECT_DELAYS_MS.length - 1)]
-        reconnectAttempts++
-        setTimeout(connect, delay)
-      }
-    }
-
-    // First connection — reject the promise if it fails immediately
-    const url = getTranscribeWsUrl()
-    const firstWs = new WebSocket(url)
-    firstWs.binaryType = 'arraybuffer'
-
-    firstWs.onopen = () => {
-      ws = firstWs
-      reconnectAttempts = 0
-      ws.send(JSON.stringify({ type: 'start', language, vault_id: vaultId }))
-      ws.onmessage = (e) => handleMessage(e, dispatch)
-      ws.onerror = () => {}
-
-      ws.onclose = (e) => {
-        if (closed) return
-        if (stopping) return
-        if (e.wasClean) { onError('轉錄連線已關閉'); return }
-        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-          onError(`轉錄連線中斷，已重試 ${MAX_RECONNECT_ATTEMPTS} 次`)
-          return
-        }
-        const delay = RECONNECT_DELAYS_MS[Math.min(reconnectAttempts, RECONNECT_DELAYS_MS.length - 1)]
-        reconnectAttempts++
-        setTimeout(connect, delay)
-      }
-
-      resolve({
-        sendPcm(buffer: ArrayBuffer) {
-          if (closed) return
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(buffer)
-          } else {
-            if (pendingPcm.length < 160) pendingPcm.push(buffer)
-          }
-        },
-        stop() {
-          if (closed || stopping) return
-          stopping = true
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'stop' }))
-          } else {
-            stopping = false
-            onFlushDone()
-          }
-        },
-        renameSpeaker(speaker: string, name: string) {
-          if (closed) return
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'rename_speaker', speaker, name }))
-          }
-        },
-        close() {
-          closed = true
-          pendingPcm.length = 0
-          ws?.close()
-          ws = null
-        },
-      })
-    }
-
-    firstWs.onerror = () => reject(new Error('無法連接轉錄服務'))
-
-    firstWs.onclose = (e) => {
-      if (!e.wasClean) reject(new Error('無法連接轉錄服務'))
-    }
+  const startMsg = JSON.stringify({
+    type: 'start',
+    language,
+    vault_id:          options?.vaultId ?? '',
+    topic:             options?.topic,
+    parent_meeting_id: options?.parentMeetingId,
   })
+
+  if (_ws && _ws.readyState === WebSocket.OPEN) {
+    _ws.send(startMsg)
+    _pendingStart = null
+  } else {
+    // WS is reconnecting — buffer the start message
+    _pendingStart = startMsg
+  }
+
+  const session: TranscribeSession = {
+    sendPcm(buffer: ArrayBuffer) {
+      if (_ws && _ws.readyState === WebSocket.OPEN) {
+        _ws.send(buffer)
+      }
+    },
+    stop() {
+      if (_ws && _ws.readyState === WebSocket.OPEN) {
+        _ws.send(JSON.stringify({ type: 'stop' }))
+      } else {
+        // WS not available — resolve immediately so caller doesn't hang
+        onFlushDone()
+      }
+    },
+    renameSpeaker(speaker: string, name: string) {
+      if (_ws && _ws.readyState === WebSocket.OPEN) {
+        _ws.send(JSON.stringify({ type: 'rename_speaker', speaker, name }))
+      }
+    },
+    close() {
+      // Clear callbacks only; do NOT close the shared WebSocket
+      if (_callbacks?.onFlushDone === onFlushDone) _callbacks = null
+      _pendingStart = null
+    },
+  }
+
+  return Promise.resolve(session)
 }

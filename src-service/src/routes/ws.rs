@@ -99,6 +99,7 @@ async fn handle_ws(socket: WebSocket, state: ApiState, token: Option<String>) {
                 let active_note = body["active_note"].as_str().map(String::from);
                 let selection = body["selection"].as_str().map(String::from);
                 let ui_language = body["ui_language"].as_str().map(String::from);
+                let agent_name = body["agent"].as_str().unwrap_or("chat").to_string();
 
                 current_session_id = Some(session_id.clone());
 
@@ -114,7 +115,7 @@ async fn handle_ws(socket: WebSocket, state: ApiState, token: Option<String>) {
                 let input2 = input.clone();
                 tokio::spawn(async move {
                     let agent_def = crate::service::helpers::load_agent_def(
-                        &state2.db, "chat", &account_id2,
+                        &state2.db, &agent_name, &account_id2,
                     ).await.unwrap_or_else(|| json!({}));
 
                     match crate::service::build_agent_runtime(
@@ -152,14 +153,36 @@ async fn handle_ws(socket: WebSocket, state: ApiState, token: Option<String>) {
                                     // Special cases add extra fields for convenience.
                                     let out = match ev.event.as_str() {
                                         "llm:done" => {
+                                            // payload is now { "t": string, "session_id": string }
+                                            // Extract text so WebSocket clients get a plain string.
                                             let data = match &ev.payload {
                                                 Value::String(s) => s.clone(),
+                                                Value::Object(m) => m.get("t")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("")
+                                                    .to_string(),
                                                 v => v.to_string(),
                                             };
                                             json!({
                                                 "event": "llm:done",
                                                 "data": data,
                                                 "conversation_id": conversation_id,
+                                            }).to_string()
+                                        }
+                                        "llm:token" => {
+                                            // payload is now { "t": string, "session_id": string }
+                                            // Extract text so WebSocket clients get a plain string.
+                                            let data = match &ev.payload {
+                                                Value::String(s) => s.clone(),
+                                                Value::Object(m) => m.get("t")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("")
+                                                    .to_string(),
+                                                _ => String::new(),
+                                            };
+                                            json!({
+                                                "event": "llm:token",
+                                                "data": data,
                                             }).to_string()
                                         }
                                         // Forward all other events as-is

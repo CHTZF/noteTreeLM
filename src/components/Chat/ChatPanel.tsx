@@ -8,6 +8,7 @@ import { useSettingsStore } from '../../stores/settingsStore'
 import { useAuthStore } from '../../stores/authStore'
 import { useEditorStore } from '../../stores/editorStore'
 import { useDebugStore } from '../../stores/debugStore'
+import { useMicStore } from '../../stores/micStore'
 import { toast } from '../common/Toast'
 import { useVoiceRecorder } from '../../hooks/useVoiceRecorder'
 import VoiceOverlay from '../common/VoiceOverlay'
@@ -139,7 +140,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
       const filtered = msgs
         .filter(m => m.role === 'user' || m.role === 'assistant')
         // Strip internal system correction messages injected by the cite validation loop
-        .filter(m => !m.content.startsWith('[系統]') && !m.content.startsWith('[System]'))
+        .filter(m => m.content != null && !m.content.startsWith('[系統]') && !m.content.startsWith('[System]'))
       const loadedMsgs = filtered.map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }))
       // Restore transient messages (think/tool/notice) cached from previous visit
       const transient = conversationTransientRef.current[id]?.msgs ?? []
@@ -242,12 +243,16 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
   const previewEnabled          = settings.voice_preview_enabled !== false
   const noiseSuppressionEnabled = settings.voice_noise_suppression !== false
   const previewIntervalMs       = settings.voice_preview_interval ?? 5000
+  const chatHolderIdRef = useRef(crypto.randomUUID())
+  const micHolder = useMicStore(s => s.holder)
+  const micBusy = micHolder !== null && micHolder !== chatHolderIdRef.current
   const { state: voiceState, isSpeaking: voiceIsSpeaking, toggle: toggleVoice } = useVoiceRecorder(
     handleTranscript,
     previewEnabled ? handlePreview : undefined,
     noiseSuppressionEnabled,
     previewIntervalMs,
     i18n.language,
+    chatHolderIdRef.current,
   )
 
   // 錄音開始時顯示 overlay，並重置轉錄文字與預覽
@@ -1338,7 +1343,7 @@ export default function ChatPanel({ liveChatActive = false, onActiveChange, onOp
           {/* 錄音按鈕 */}
           <button
             onClick={toggleVoice}
-            disabled={!whisperConfigured || voiceState === 'transcribing' || showVoiceOverlay || liveChatActive}
+            disabled={!whisperConfigured || voiceState === 'transcribing' || showVoiceOverlay || liveChatActive || micBusy}
             title={!whisperConfigured ? '請先到設定頁設定 Whisper' : voiceState === 'recording' ? '停止錄音' : '語音輸入'}
             style={{
               width: '34px', height: '34px', borderRadius: '6px', flexShrink: 0,
