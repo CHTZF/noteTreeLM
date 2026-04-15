@@ -365,6 +365,13 @@ export const api = {
     request<{ ok: boolean }>('DELETE', `/meetings/${encodeURIComponent(id)}`),
   summarizeMeeting: (id: string) =>
     request<{ ok: boolean; status: string }>('POST', `/meetings/${encodeURIComponent(id)}/summarize`),
+  preMeetingBrief: (vaultId: string, topic: string, sessionId?: string) =>
+    request<{ session_id: string }>('POST', '/meetings/pre-brief', { vault_id: vaultId, topic, session_id: sessionId }),
+  getMeetingParticipants: (vaultId: string, topic?: string) => {
+    const params = new URLSearchParams({ vault_id: vaultId })
+    if (topic) params.set('topic', topic)
+    return request<{ participants: string[] }>('GET', `/meetings/participants?${params}`)
+  },
 }
 
 export interface MeetingSummary {

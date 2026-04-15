@@ -386,7 +386,10 @@ async fn run_migrations(db: &SurrealDb) -> Result<(), surrealdb::Error> {
         "DEFINE FIELD IF NOT EXISTS wav_path          ON meetings TYPE option<string>;",
         "DEFINE FIELD IF NOT EXISTS note_path         ON meetings TYPE option<string>;",
         "DEFINE FIELD IF NOT EXISTS status            ON meetings TYPE string DEFAULT 'recording';",
-        "DEFINE FIELD IF NOT EXISTS speaker_names_json ON meetings TYPE string DEFAULT '{}';",
+        "DEFINE FIELD IF NOT EXISTS speaker_names_json  ON meetings TYPE string DEFAULT '{}';",
+        "DEFINE FIELD IF NOT EXISTS topic               ON meetings TYPE option<string>;",
+        "DEFINE FIELD IF NOT EXISTS pre_brief           ON meetings TYPE option<string>;",
+        "DEFINE FIELD IF NOT EXISTS parent_meeting_id   ON meetings TYPE option<string>;",
         "DEFINE INDEX IF NOT EXISTS idx_meetings_id        ON meetings FIELDS meeting_id UNIQUE;",
         "DEFINE INDEX IF NOT EXISTS idx_meetings_vault_ts  ON meetings FIELDS vault_id, started_at;",
 

@@ -6,6 +6,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use crate::app_state::ApiState;
 
@@ -15,6 +16,8 @@ pub fn router() -> Router<ApiState> {
         .route("/meetings/:id", get(get_meeting).delete(delete_meeting))
         .route("/meetings/:id/rename-speaker", post(rename_speaker))
         .route("/meetings/:id/summarize", post(summarize_meeting))
+        .route("/meetings/pre-brief", post(pre_meeting_brief))
+        .route("/meetings/participants", get(get_meeting_participants))
 }
 
 #[derive(Deserialize)]
@@ -235,6 +238,155 @@ async fn summarize_meeting(
     });
 
     Ok(Json(json!({ "ok": true, "status": "processing" })))
+}
+
+// ─── Pre-meeting brief ────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct PreBriefBody {
+    vault_id:  String,
+    topic:     String,
+    session_id: Option<String>,
+}
+
+const PRE_BRIEF_AGENT_SYSTEM: &str = "\
+你是一個「會前情報員」，幫助使用者在開會前快速掌握相關背景資訊。\n\
+\n\
+使用者會告訴你這次會議的主題。你的工作：\n\
+1. 用 search_past_meetings 搜尋與主題相關的歷史會議（keyword 用主題關鍵詞）。\n\
+2. 用 list_open_actions 查詢與主題相關的未完成行動項目。\n\
+3. 若找到相關歷史，用 get_meeting_context 取得最相關那場會議的完整決策與行動。\n\
+4. 選擇性：用 search_vault 搜尋 vault 中是否有相關背景文件。\n\
+5. 產出簡報（繁體中文，Markdown，控制在 500 字以內）：\n\
+   - **上次相關討論** — 條列上次會議的主要結論（若有）\n\
+   - **未完成事項** — 尚未完成的 action items，標明負責人（若有）\n\
+   - **相關決策記錄** — 過去做出的相關決策（若有）\n\
+   - **相關資料** — vault 中的相關文件（若有）\n\
+\n\
+若沒有任何相關歷史記錄，直接輸出：「尚無相關歷史記錄，這是第一次討論此主題。」\n\
+只輸出簡報內容，不要有其他說明。";
+
+/// POST /meetings/pre-brief
+/// Body: { vault_id, topic, session_id? }
+/// Spawns a pre-meeting brief Agent (streaming via llm:token events).
+/// Returns { session_id } immediately.
+async fn pre_meeting_brief(
+    State(state): State<ApiState>,
+    Json(body): Json<PreBriefBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if body.topic.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "topic is required".to_string()));
+    }
+
+    let session_id = body.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let vault_id   = body.vault_id.clone();
+    let topic      = body.topic.clone();
+    let sid        = session_id.clone();
+
+    tokio::spawn(async move {
+        use serde_json::json;
+
+        // Resolve account_id from vault
+        #[derive(serde::Deserialize)]
+        struct VaultRow { account_id: String }
+        let mut vr = state.db
+            .query("SELECT account_id FROM vaults WHERE vault_id = $vid LIMIT 1")
+            .bind(("vid", vault_id.clone()))
+            .await.ok();
+        let account_id = vr.as_mut()
+            .and_then(|r| r.take::<Vec<VaultRow>>(0).ok())
+            .and_then(|rows| rows.into_iter().next())
+            .map(|r| r.account_id)
+            .unwrap_or_default();
+
+        let agent_def = json!({
+            "name": "pre_meeting_brief",
+            "kind": "chat",
+            "system_prompt": PRE_BRIEF_AGENT_SYSTEM,
+            "tool_names": ["search_past_meetings", "list_open_actions", "get_meeting_context", "search_vault"],
+            "max_rounds": 8,
+            "enable_think": false,
+        });
+
+        let conv_id = format!("pre-brief-{}", &sid[..sid.len().min(8)]);
+        let runtime = crate::service::build_agent_runtime(
+            &state, &vault_id, &account_id,
+            Some(sid.clone()), conv_id, agent_def,
+            true, Some("zh-TW"),
+            Some("pre_brief".to_string()),
+            None,
+        ).await;
+
+        if let Some(rt) = runtime {
+            let prompt = format!("請幫我準備以下主題的會前簡報：{}", topic);
+            crate::service::run_agent(rt, prompt, None).await;
+        } else {
+            state.daemon.emit("llm:done", serde_json::json!({ "t": "" }));
+        }
+    });
+
+    Ok(Json(json!({ "session_id": session_id })))
+}
+
+/// GET /meetings/participants?vault_id=...&topic=...
+/// Returns a deduplicated list of participant names from past meetings matching the topic.
+#[derive(Deserialize)]
+struct ParticipantsQuery {
+    vault_id: String,
+    topic:    Option<String>,
+}
+
+async fn get_meeting_participants(
+    State(state): State<ApiState>,
+    Query(q): Query<ParticipantsQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // Fetch recent meetings for this vault (last 90 days)
+    let since_ms = chrono::Utc::now().timestamp_millis() - 90 * 86_400_000i64;
+
+    #[derive(serde::Deserialize)]
+    struct Row {
+        meeting_id: String,
+        speaker_names_json: String,
+        topic: Option<String>,
+    }
+
+    let mut r = state.db
+        .query("SELECT meeting_id, speaker_names_json, topic FROM meetings WHERE vault_id = $vid AND started_at >= $since ORDER BY started_at DESC LIMIT 100")
+        .bind(("vid", q.vault_id.clone()))
+        .bind(("since", since_ms))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let rows: Vec<Row> = r.take(0).unwrap_or_default();
+
+    let topic_lower = q.topic.as_deref().unwrap_or("").to_lowercase();
+
+    // Collect all unique speaker names, weighting by topic relevance
+    let mut names: std::collections::HashMap<String, u32> = Default::default();
+    for row in &rows {
+        // Topic relevance boost: if meeting topic or segments contain the query
+        let is_relevant = topic_lower.is_empty()
+            || row.topic.as_deref().unwrap_or("").to_lowercase().contains(&topic_lower);
+
+        let weight: u32 = if is_relevant { 2 } else { 1 };
+
+        let name_map: std::collections::HashMap<String, String> =
+            serde_json::from_str(&row.speaker_names_json).unwrap_or_default();
+        for name in name_map.values() {
+            let n = name.trim();
+            if !n.is_empty() && !n.starts_with("SPEAKER_") {
+                *names.entry(n.to_string()).or_insert(0) += weight;
+            }
+        }
+    }
+
+    // Sort by relevance score descending
+    let mut sorted: Vec<(String, u32)> = names.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let participants: Vec<String> = sorted.into_iter().take(20).map(|(n, _)| n).collect();
+
+    Ok(Json(json!({ "participants": participants })))
 }
 
 async fn delete_meeting(

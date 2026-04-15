@@ -638,7 +638,7 @@ impl HarnessRequestRuntime {
         session_elapsed: std::time::Duration,
     ) {
         if self.streaming {
-            self.emit("llm:done", json!(full_response));
+            self.emit("llm:done", json!({ "t": full_response }));
             if !full_response.is_empty() && crate::service::helpers::detect_response_framework(full_response) {
                 self.emit("agent:skill_suggestion", json!({
                     "query": input,

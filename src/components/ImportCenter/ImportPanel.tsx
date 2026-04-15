@@ -223,10 +223,10 @@ export default function ImportPanel() {
     let unDone: (() => void) | null = null
 
     try {
-      unToken = await listen<{ session_id: string; content: string }>('llm:token', e => {
+      unToken = await listen<{ session_id: string; t: string }>('llm:token', e => {
         if (e.payload.session_id !== queryId) return
         setMessages(sessionId, prev => prev.map(m =>
-          m.id === asstMsgId ? { ...m, content: m.content + e.payload.content } : m
+          m.id === asstMsgId ? { ...m, content: m.content + e.payload.t } : m
         ))
       })
 

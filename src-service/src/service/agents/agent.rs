@@ -492,7 +492,7 @@ async fn run_tool_loop(
                 // Check finish signal before extending (handler may have set it).
                 if let Some(answer) = runtime.take_finish_answer().await {
                     if runtime.streaming {
-                        runtime.emit("llm:token", json!(answer));
+                        runtime.emit("llm:token", json!({ "t": answer }));
                     }
                     full_response = answer;
                     break;

@@ -492,7 +492,7 @@ pub(crate) async fn stream_llm_round(
                         pending_emit.insert_str(0, &leftover);
                     }
                     if !clean.is_empty() {
-                        emitter.emit("llm:token".to_string(), json!(clean));
+                        emitter.emit("llm:token".to_string(), json!({ "t": clean }));
                     }
                 }
             }
@@ -732,7 +732,7 @@ pub(crate) async fn stream_llm_round(
         let (clean, _leftover, cites) = scan_and_strip_cites(&pending_emit);
         collected_cites.extend(cites);
         if !clean.is_empty() {
-            emitter.emit("llm:token".to_string(), json!(clean));
+            emitter.emit("llm:token".to_string(), json!({ "t": clean }));
         }
         pending_emit.clear();
     }

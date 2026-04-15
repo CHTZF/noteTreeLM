@@ -20,6 +20,8 @@ pub(crate) const GUARD_EXEMPT_WRITE_TOOLS: &[&str] = &[
     "propose_eval_case",            // writes to DB eval records, not vault files
     "run_eval_case",                // executes eval, no direct vault file write
     "update_proposed_eval_case",    // updates DB eval record
+    "save_meeting_extractions",     // writes to meeting_decisions/meeting_actions DB tables
+    "complete_action",              // updates meeting_actions.status in DB
 ];
 
 /// Non-write tools that still require user confirmation before execution

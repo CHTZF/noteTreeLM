@@ -79,15 +79,25 @@ fn spawn_transcribe(
 
 // ─── Meeting persistence helpers ─────────────────────────────────────────────
 
-async fn create_meeting(state: &ApiState, meeting_id: &str, vault_id: &str, language: &str, account_id: &str) {
+async fn create_meeting(
+    state: &ApiState,
+    meeting_id: &str,
+    vault_id: &str,
+    language: &str,
+    account_id: &str,
+    topic: Option<&str>,
+    parent_meeting_id: Option<&str>,
+) {
     let now = Utc::now().timestamp_millis();
     let _ = state.db
-        .query("INSERT INTO meetings (meeting_id, vault_id, account_id, language, started_at, status) VALUES ($mid, $vid, $aid, $lang, $now, 'recording')")
+        .query("INSERT INTO meetings (meeting_id, vault_id, account_id, language, started_at, status, topic, parent_meeting_id) VALUES ($mid, $vid, $aid, $lang, $now, 'recording', $topic, $pmid)")
         .bind(("mid", meeting_id.to_string()))
         .bind(("vid", if vault_id.is_empty() { None::<String> } else { Some(vault_id.to_string()) }))
         .bind(("aid", account_id.to_string()))
         .bind(("lang", language.to_string()))
         .bind(("now", now))
+        .bind(("topic", topic.map(|s| s.to_string())))
+        .bind(("pmid", parent_meeting_id.map(|s| s.to_string())))
         .await;
 }
 
@@ -402,6 +412,8 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
                             Some("start") => {
                                 language = body["language"].as_str().unwrap_or("auto").to_string();
                                 vault_id = body["vault_id"].as_str().unwrap_or("").to_string();
+                                let topic = body["topic"].as_str().map(|s| s.to_string());
+                                let parent_meeting_id = body["parent_meeting_id"].as_str().map(|s| s.to_string());
 
                                 pcm.clear();
                                 speech_active   = false;
@@ -419,7 +431,8 @@ async fn handle_ws_transcribe(socket: WebSocket, state: ApiState, token: Option<
                                 // Create meeting record
                                 let mid = uuid::Uuid::new_v4().to_string();
                                 meeting_start_ms.store(Utc::now().timestamp_millis(), std::sync::atomic::Ordering::Relaxed);
-                                create_meeting(&state, &mid, &vault_id, &language, &account_id).await;
+                                create_meeting(&state, &mid, &vault_id, &language, &account_id,
+                                    topic.as_deref(), parent_meeting_id.as_deref()).await;
 
                                 // Create AudioStore (WAV file for this meeting)
                                 let wav_dir = state.daemon.data_dir.join("meetings");

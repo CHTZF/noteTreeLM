@@ -74,7 +74,7 @@ pub async fn run(
     ).await {
         Some(r) => r,
         None => {
-            state.daemon.emit("llm:done", serde_json::json!(""));
+            state.daemon.emit("llm:done", serde_json::json!({ "t": "" }));
             return Ok(Json(json!({ "session_id": session_id, "conversation_id": conversation_id })));
         }
     };
