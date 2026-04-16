@@ -7,6 +7,7 @@ import mermaid from 'mermaid'
 import DOMPurify from 'dompurify'
 import { open } from '@tauri-apps/plugin-shell'
 import { useSettingsStore } from '../../stores/settingsStore'
+import { tableColWidths } from './plugins/livePreview'
 
 mermaid.initialize({ startOnLoad: false, theme: 'neutral' })
 
@@ -89,25 +90,23 @@ const processWikilinks = (renderedHtml: string) => {
   return result
 }
 
-// 將 {color:#xxx}text{/color} 和 {font:family;size;weight}text{/font} 轉為 HTML span
+// 將 {style:key=val,...}text{/style} 轉為 HTML span
 function processCustomStyle(html: string): string {
-  let result = html.replace(/\{color:([^}\n]+)\}(.*?)\{\/color\}/g, (_, color, text) =>
-    `<span style="color:${color.trim()}">${text}</span>`
-  )
-  result = result.replace(/\{font:([^}\n]*)\}(.*?)\{\/font\}/g, (_, fontSpec, text) => {
-    const parts = fontSpec.split(';')
-    const family = (parts[0] || '').trim()
-    const size = (parts[1] || '').trim()
-    const weight = (parts[2] || '').trim()
-    const styles: string[] = []
-    if (family && family !== 'inherit') {
-      styles.push(`font-family:${family.includes(' ') ? `'${family}'` : family}`)
-    }
-    if (size) styles.push(`font-size:${size}px`)
-    if (weight && weight !== 'inherit') styles.push(`font-weight:${weight}`)
-    return styles.length ? `<span style="${styles.join(';')}">${text}</span>` : text
+  return html.replace(/\{style:([^}\n]+)\}(.*?)\{\/style\}/g, (_, params, text) => {
+    const parts: string[] = []
+    params.split(',').forEach((pair: string) => {
+      const eq = pair.indexOf('=')
+      if (eq < 0) return
+      const k = pair.slice(0, eq).trim()
+      const v = pair.slice(eq + 1).trim()
+      if (!k || !v) return
+      if (k === 'color') parts.push(`color:${v}`)
+      else if (k === 'fontFamily' && v !== 'inherit') parts.push(`font-family:${v.includes(' ') ? `'${v}'` : v}`)
+      else if (k === 'fontSize') parts.push(`font-size:${v}px`)
+      else if (k === 'fontWeight' && v !== 'inherit') parts.push(`font-weight:${v}`)
+    })
+    return parts.length ? `<span style="${parts.join(';')}">${text}</span>` : text
   })
-  return result
 }
 
 // 標題 id + block id：在掛載到 DOM 前先於 detached div 處理，
@@ -432,6 +431,44 @@ export default function PreviewPanel({ content, onWikilinkClick, onEdit, pending
 
     processImages()
   }, [html, settings.system_current_vault_path])
+
+  // 表格欄寬後處理：從 <!-- col-widths: N,N,N --> 注釋或記憶體 Map 還原欄寬
+  useEffect(() => {
+    if (!containerRef.current) return
+    const tables = Array.from(containerRef.current.querySelectorAll('table'))
+    tables.forEach(table => {
+      const firstRow = table.querySelector('tr')
+      const headerCells = firstRow ? Array.from(firstRow.querySelectorAll('th, td')) as HTMLElement[] : []
+      if (!headerCells.length) return
+
+      // 優先從緊接在 table 後面的 HTML comment 讀取（持久化來源）
+      let widths: number[] | null = null
+      let node: ChildNode | null = table.nextSibling
+      // 跳過空白文字節點
+      while (node && node.nodeType === Node.TEXT_NODE && !(node.textContent ?? '').trim()) {
+        node = node.nextSibling
+      }
+      if (node && node.nodeType === Node.COMMENT_NODE) {
+        const m = (node.textContent ?? '').match(/^ col-widths: ([\d,]+) $/)
+        if (m) widths = m[1].split(',').map(Number)
+      }
+
+      // fallback：session 記憶體 Map
+      if (!widths) {
+        for (const [key, w] of tableColWidths) {
+          if (w.length !== headerCells.length) continue
+          const keyCells = key.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim())
+          const domCells = headerCells.map(c => (c.textContent ?? '').trim())
+          if (keyCells.every((k, i) => k === domCells[i])) { widths = w; break }
+        }
+      }
+
+      if (widths && widths.length === headerCells.length) {
+        headerCells.forEach((hc, i) => { hc.style.width = (widths as number[])[i] + 'px' })
+        table.style.tableLayout = 'fixed'
+      }
+    })
+  }, [html])
 
   useEffect(() => {
     if (!containerRef.current) return

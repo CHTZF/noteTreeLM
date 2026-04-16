@@ -168,15 +168,16 @@
 }
 .cm-live-link { color: var(--color-accent); text-decoration: underline; cursor: text; }
 
-/* Block widget container — overflow:hidden creates BFC so child margins
-   (table/hr/p) don't collapse outside the widget, keeping CM6 height map accurate. */
+/* Block widget container — creates BFC so child margins don't collapse outside
+   the widget, keeping CM6 height map accurate.
+   No explicit width so the widget never stretches cm-content beyond the scroller. */
 .cm-live-block-widget {
   display: block;
-  width: 100%;
   box-sizing: border-box;
   overflow: hidden;
 }
-.cm-live-block-widget table     { margin: 0; }
+/* Live editor table: auto width so it fits content, not the unbounded cm-content */
+.cm-live-block-widget table     { margin: 0; width: auto; max-width: 100%; }
 .cm-live-block-widget hr        { margin: 0; }
 .cm-live-block-widget pre       { margin: 0; }
 .cm-live-block-widget p         { margin: 0; }
@@ -586,7 +587,7 @@ body.dragging-tab * {
 .preview-content ul li { list-style-type: disc; }
 .preview-content ol li { list-style-type: decimal; }
 .preview-content table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: 0.9em; }
-.preview-content th, .preview-content td { border: 1px solid var(--color-border); padding: 6px 12px; text-align: left; }
+.preview-content th, .preview-content td { border: 1px solid var(--color-border); padding: 6px 12px; text-align: left; word-break: break-word; overflow-wrap: anywhere; }
 .preview-content th { background: var(--color-bg-elevated); font-weight: 600; }
 .preview-content tr:nth-child(even) { background: var(--color-bg-surface); }
 .preview-content hr { border: none; border-top: 1px solid var(--color-border); margin: 1.5em 0; }

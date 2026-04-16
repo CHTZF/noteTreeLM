@@ -8,7 +8,7 @@ import {
   faFileAudio, faFileVideo, faFilePdf, faFileZipper,
   faTrash, faPen, faArrowUpRightFromSquare,
   faChevronRight,
-  faPlus, faFolderPlus, faFileArrowUp,
+  faPlus, faFolderPlus, faFolderMinus, faFileArrowUp,
   faArrowDownAZ, faArrowUpZA,
 } from '@fortawesome/free-solid-svg-icons'
 import { useVaultStore } from '../../stores/vaultStore'
@@ -338,6 +338,7 @@ export default function FileTree({ onOpenNote, onOpenNoteInNewTab }: FileTreePro
           { icon: faPlus,        title: t('file_tree.new_note'),    onClick: handleNewNote },
           { icon: faFolderPlus,  title: t('file_tree.new_folder'),  onClick: handleNewFolder },
           { icon: faFileArrowUp, title: t('common.import'),         onClick: handleImportFile },
+          { icon: faFolderMinus, title: '全部收合',                 onClick: () => window.dispatchEvent(new CustomEvent('filetree:collapse-all')) },
           { icon: faArrowDownAZ, title: '依名稱升序（A→Z）', onClick: () => applySortByName(fileTree, 'asc') },
           { icon: faArrowUpZA,   title: '依名稱降序（Z→A）', onClick: () => applySortByName(fileTree, 'desc') },
         ] as const).map(btn => (
@@ -429,6 +430,14 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote, onOpenNoteI
     }
   }, [node.isFolder, node.path])
 
+  // 全部收合事件
+  useEffect(() => {
+    if (!node.isFolder) return
+    const handler = () => setIsExpanded(false)
+    window.addEventListener('filetree:collapse-all', handler)
+    return () => window.removeEventListener('filetree:collapse-all', handler)
+  }, [node.isFolder])
+
   const handleDeleteNote = async (e: React.MouseEvent) => {
     e.stopPropagation(); setMenuOpen(false)
     const confirmed = await ask(`確定要刪除「${node.path.split('/').pop() ?? node.name}」嗎？此操作無法復原。`, { title: '刪除', kind: 'warning' })
@@ -479,15 +488,130 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote, onOpenNoteI
     } catch (e: any) { toast.error(e.message || '重新命名失敗') }
   }
 
+  // ── 筆記/資產節點共用拖曳邏輯 ───────────────────────────────────────────
+  const isActive = node.path === currentPath
+  const parentFolder = node.path.includes('/') ? node.path.split('/').slice(0, -1).join('/') : ''
+  const parentEncoded = parentFolder === '' ? '__root__' : parentFolder
+
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button !== 0) { if (e.button === 2) e.preventDefault(); return }
+    e.stopPropagation()
+
+    const startX = e.clientX
+    const startY = e.clientY
+    const srcPath = node.path
+    const srcName = node.name
+    const srcParent = parentFolder
+
+    const onMove = (ev: MouseEvent) => {
+      if (!activeDrag) {
+        const dx = ev.clientX - startX
+        const dy = ev.clientY - startY
+        if (dx * dx + dy * dy > 25) {
+          document.body.style.userSelect = 'none'
+          document.body.style.webkitUserSelect = 'none'
+          document.body.style.cursor = 'default'
+
+          const ghost = document.createElement('div')
+          ghost.textContent = srcName
+          Object.assign(ghost.style, {
+            position: 'fixed', left: `${ev.clientX + 14}px`, top: `${ev.clientY - 10}px`,
+            pointerEvents: 'none', background: 'var(--color-bg-elevated)',
+            border: '1px solid var(--color-accent)', borderRadius: '6px',
+            padding: '4px 10px', fontSize: '12px', color: 'var(--color-text-primary)',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.4)', zIndex: '9999',
+            whiteSpace: 'nowrap', maxWidth: '200px', overflow: 'hidden',
+            textOverflow: 'ellipsis', userSelect: 'none',
+          })
+          document.body.appendChild(ghost)
+
+          const indicator = document.createElement('div')
+          Object.assign(indicator.style, {
+            position: 'fixed', height: '2px', background: 'var(--color-accent)',
+            pointerEvents: 'none', zIndex: '9998', borderRadius: '1px', display: 'none',
+          })
+          document.body.appendChild(indicator)
+
+          activeDrag = { sourcePath: srcPath, sourceName: srcName, sourceParent: srcParent, ghostEl: ghost, indicatorEl: indicator, dragging: true, reorderMode: false, insertBeforePath: null }
+        }
+      }
+
+      if (!activeDrag) return
+      activeDrag.ghostEl!.style.left = `${ev.clientX + 14}px`
+      activeDrag.ghostEl!.style.top = `${ev.clientY - 10}px`
+
+      const targetFolder = findFolderPath(ev.clientX, ev.clientY)
+      if (targetFolder === undefined) {
+        clearHighlights()
+        activeDrag.indicatorEl!.style.display = 'none'
+        activeDrag.reorderMode = false
+        return
+      }
+
+      if (targetFolder === srcParent) {
+        clearHighlights()
+        activeDrag.reorderMode = true
+        activeDrag.insertBeforePath = findInsertBeforePath(ev.clientY, srcParent, srcPath)
+        positionIndicator(activeDrag.indicatorEl!, ev.clientY, srcParent, srcPath)
+      } else {
+        activeDrag.indicatorEl!.style.display = 'none'
+        activeDrag.reorderMode = false
+        highlightFolder(targetFolder)
+      }
+    }
+
+    const onUp = async (ev: MouseEvent) => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+
+      document.body.style.userSelect = ''
+      document.body.style.webkitUserSelect = ''
+      document.body.style.cursor = ''
+
+      if (!activeDrag) return
+      const drag = activeDrag
+      activeDrag = null
+      dragJustEnded = true
+      setTimeout(() => { dragJustEnded = false }, 200)
+
+      clearHighlights()
+      if (drag.ghostEl) document.body.removeChild(drag.ghostEl)
+      if (drag.indicatorEl) document.body.removeChild(drag.indicatorEl)
+
+      if (!drag.dragging) return
+
+      if (drag.reorderMode) {
+        const items = getItemsInFolder(drag.sourceParent)
+        const currentPaths = items.map(i => i.path)
+        const filtered = currentPaths.filter(p => p !== drag.sourcePath)
+        const insertIdx = drag.insertBeforePath
+          ? filtered.indexOf(drag.insertBeforePath)
+          : filtered.length
+        const newOrder = [...filtered]
+        newOrder.splice(insertIdx === -1 ? filtered.length : insertIdx, 0, drag.sourcePath)
+        await saveSortOrder(drag.sourceParent, newOrder)
+        await useVaultStore.getState().loadNotes()
+      } else {
+        const folderPath = findFolderPath(ev.clientX, ev.clientY)
+        if (folderPath !== undefined) {
+          await performMove(drag.sourcePath, folderPath)
+        }
+      }
+    }
+
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }, [node.path, node.name, parentFolder])
+
   // ── 資產節點（圖片、PDF、音訊、影片等所有非筆記檔案）──────────────────
   if (!node.isFolder && !node.note) {
-    const parentEncoded = node.path.includes('/') ? node.path.split('/').slice(0, -1).join('/') : '__root__'
     const displayName = node.path.split('/').pop() ?? node.name
     return (
       <div
         data-item-path={node.path}
         data-item-parent={parentEncoded}
-        onClick={() => { if (isRenaming) return; onOpenNote(node.path) }}
+        onMouseDown={handleMouseDown}
+        onClick={() => { if (dragJustEnded || isRenaming) return; onOpenNote(node.path) }}
         onContextMenu={(e) => { if (isRenaming) return; e.preventDefault(); e.stopPropagation(); window.getSelection()?.removeAllRanges(); setMenuX(e.clientX); setMenuY(e.clientY); setMenuOpen(true) }}
         onMouseEnter={() => setIsHovered(true)}
         onMouseLeave={() => setIsHovered(false)}
@@ -755,126 +879,7 @@ function TreeNode({ node, depth, currentPath, vaultPath, onOpenNote, onOpenNoteI
     )
   }
 
-  // ── 筆記節點（mouse-event DnD）──────────────────────────────
-  const isActive = node.path === currentPath
-  const parentFolder = node.path.includes('/') ? node.path.split('/').slice(0, -1).join('/') : ''
-  const parentEncoded = parentFolder === '' ? '__root__' : parentFolder
-
-  const handleMouseDown = useCallback((e: React.MouseEvent) => {
-    if (e.button !== 0) { if (e.button === 2) e.preventDefault(); return }
-    e.stopPropagation()
-
-    const startX = e.clientX
-    const startY = e.clientY
-    const srcPath = node.path
-    const srcName = node.name
-    const srcParent = parentFolder
-
-    const onMove = (ev: MouseEvent) => {
-      if (!activeDrag) {
-        const dx = ev.clientX - startX
-        const dy = ev.clientY - startY
-        if (dx * dx + dy * dy > 25) {
-          // 鎖定文字選取 + 游標
-          document.body.style.userSelect = 'none'
-          document.body.style.webkitUserSelect = 'none'
-          document.body.style.cursor = 'default'
-
-          const ghost = document.createElement('div')
-          ghost.textContent = srcName
-          Object.assign(ghost.style, {
-            position: 'fixed', left: `${ev.clientX + 14}px`, top: `${ev.clientY - 10}px`,
-            pointerEvents: 'none', background: 'var(--color-bg-elevated)',
-            border: '1px solid var(--color-accent)', borderRadius: '6px',
-            padding: '4px 10px', fontSize: '12px', color: 'var(--color-text-primary)',
-            boxShadow: '0 4px 12px rgba(0,0,0,0.4)', zIndex: '9999',
-            whiteSpace: 'nowrap', maxWidth: '200px', overflow: 'hidden',
-            textOverflow: 'ellipsis', userSelect: 'none',
-          })
-          document.body.appendChild(ghost)
-
-          const indicator = document.createElement('div')
-          Object.assign(indicator.style, {
-            position: 'fixed', height: '2px', background: 'var(--color-accent)',
-            pointerEvents: 'none', zIndex: '9998', borderRadius: '1px', display: 'none',
-          })
-          document.body.appendChild(indicator)
-
-          activeDrag = { sourcePath: srcPath, sourceName: srcName, sourceParent: srcParent, ghostEl: ghost, indicatorEl: indicator, dragging: true, reorderMode: false, insertBeforePath: null }
-        }
-      }
-
-      if (!activeDrag) return
-      activeDrag.ghostEl!.style.left = `${ev.clientX + 14}px`
-      activeDrag.ghostEl!.style.top = `${ev.clientY - 10}px`
-
-      const targetFolder = findFolderPath(ev.clientX, ev.clientY)
-      if (targetFolder === undefined) {
-        clearHighlights()
-        activeDrag.indicatorEl!.style.display = 'none'
-        activeDrag.reorderMode = false
-        return
-      }
-
-      if (targetFolder === srcParent) {
-        // 同資料夾：排序模式
-        clearHighlights()
-        activeDrag.reorderMode = true
-        activeDrag.insertBeforePath = findInsertBeforePath(ev.clientY, srcParent, srcPath)
-        positionIndicator(activeDrag.indicatorEl!, ev.clientY, srcParent, srcPath)
-      } else {
-        // 不同資料夾：移動模式
-        activeDrag.indicatorEl!.style.display = 'none'
-        activeDrag.reorderMode = false
-        highlightFolder(targetFolder)
-      }
-    }
-
-    const onUp = async (ev: MouseEvent) => {
-      document.removeEventListener('mousemove', onMove)
-      document.removeEventListener('mouseup', onUp)
-
-      // 恢復文字選取 + 游標
-      document.body.style.userSelect = ''
-      document.body.style.webkitUserSelect = ''
-      document.body.style.cursor = ''
-
-      if (!activeDrag) return
-      const drag = activeDrag
-      activeDrag = null
-      dragJustEnded = true
-      setTimeout(() => { dragJustEnded = false }, 200)
-
-      clearHighlights()
-      if (drag.ghostEl) document.body.removeChild(drag.ghostEl)
-      if (drag.indicatorEl) document.body.removeChild(drag.indicatorEl)
-
-      if (!drag.dragging) return
-
-      if (drag.reorderMode) {
-        // 同資料夾排序
-        const items = getItemsInFolder(drag.sourceParent)
-        const currentPaths = items.map(i => i.path)
-        const filtered = currentPaths.filter(p => p !== drag.sourcePath)
-        const insertIdx = drag.insertBeforePath
-          ? filtered.indexOf(drag.insertBeforePath)
-          : filtered.length
-        const newOrder = [...filtered]
-        newOrder.splice(insertIdx === -1 ? filtered.length : insertIdx, 0, drag.sourcePath)
-        await saveSortOrder(drag.sourceParent, newOrder)
-        await useVaultStore.getState().loadNotes()
-      } else {
-        const folderPath = findFolderPath(ev.clientX, ev.clientY)
-        if (folderPath !== undefined) {
-          await performMove(drag.sourcePath, folderPath)
-        }
-      }
-    }
-
-    document.addEventListener('mousemove', onMove)
-    document.addEventListener('mouseup', onUp)
-  }, [node.path, node.name, parentFolder])
-
+  // ── 筆記節點 ──────────────────────────────────────────────────────────────
   return (
     <div
       data-item-path={node.path}

@@ -25,6 +25,135 @@ let _view: EditorView | null = null
 let _assetPaths: string[] = []
 let _assetCacheTs = 0
 
+// ── Table column width cache (survives widget re-renders) ─────────────────────
+// Key: first line of the table markdown (header row) — stable across data edits.
+// Value: array of px widths per column index.
+// Exported so PreviewPanel can apply the same widths to its rendered tables.
+export const tableColWidths = new Map<string, number[]>()
+const _tableColWidths = tableColWidths
+
+// ── Custom style syntax → HTML (shared with PreviewPanel) ────────────────────
+// ── 新樣式語法：{style:key=val,key=val}text{/style} ─────────────────────────
+// 完全扁平，無巢狀。key 可以是：color, fontFamily, fontSize, fontWeight
+// 例：{style:color=#e03030,fontSize=14,fontFamily=Arial,fontWeight=bold}hello{/style}
+
+type StyleProps = Record<string, string>
+
+function parseStyleParams(params: string): StyleProps {
+  const result: StyleProps = {}
+  params.split(',').forEach(pair => {
+    const eq = pair.indexOf('=')
+    if (eq < 0) return
+    const k = pair.slice(0, eq).trim()
+    const v = pair.slice(eq + 1).trim()
+    if (k && v) result[k] = v
+  })
+  return result
+}
+
+function buildStyleParams(props: StyleProps): string {
+  return Object.entries(props).map(([k, v]) => `${k}=${v}`).join(',')
+}
+
+function propsToCSS(props: StyleProps): string {
+  const parts: string[] = []
+  if (props.color) parts.push(`color:${props.color}`)
+  if (props.fontFamily && props.fontFamily !== 'inherit') {
+    const f = props.fontFamily
+    parts.push(`font-family:${f.includes(' ') ? `'${f}'` : f}`)
+  }
+  if (props.fontSize) parts.push(`font-size:${props.fontSize}px`)
+  if (props.fontWeight && props.fontWeight !== 'inherit') parts.push(`font-weight:${props.fontWeight}`)
+  return parts.join(';')
+}
+
+// renderCustomStyle: {style:...}text{/style} → <span style="..." data-style-params="...">
+function renderCustomStyle(text: string): string {
+  const re = /\{style:([^}\n]+)\}(.*?)\{\/style\}/g
+  return text.replace(re, (_, params, inner) => {
+    const props = parseStyleParams(params)
+    const css = propsToCSS(props)
+    return css
+      ? `<span style="${css}" data-style-params="${params}">${inner}</span>`
+      : inner
+  })
+}
+
+// cellHtmlToRaw: span innerHTML → markdown（利用 data-style-params）
+function cellHtmlToRaw(container: HTMLElement): string {
+  function walk(node: Node): string {
+    if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? ''
+    const el = node as HTMLElement
+    const children = Array.from(el.childNodes).map(walk).join('')
+    if (el === container) return children
+    const params = el.getAttribute('data-style-params')
+    if (params) return `{style:${params}}${children}{/style}`
+    return children
+  }
+  return walk(container).replace(/\n/g, ' ').trim()
+}
+
+// computeDomOffset: Range 端點 → cellSpan plain text 字元偏移
+function computeDomOffset(cellSpan: HTMLElement, targetNode: Node, targetOffset: number): number {
+  try {
+    const r = document.createRange()
+    r.setStart(cellSpan, 0)
+    r.setEnd(targetNode, targetOffset)
+    return r.toString().length
+  } catch {
+    return (cellSpan.textContent ?? '').length
+  }
+}
+
+// ── Segment-based 樣式套用 ────────────────────────────────────────────────────
+// cellRaw 的結構永遠是：plain text 和 {style:...}text{/style} 的序列（無巢狀）
+// applyStyleToRange: 在 plain text 偏移 [domStart, domEnd] 套上新樣式，並 merge 既有 props
+
+interface CellSegment { text: string; props: StyleProps | null }
+
+function parseSegments(cellRaw: string): CellSegment[] {
+  const segs: CellSegment[] = []
+  const re = /\{style:([^}]+)\}(.*?)\{\/style\}/g
+  let last = 0, m: RegExpExecArray | null
+  while ((m = re.exec(cellRaw)) !== null) {
+    if (m.index > last) segs.push({ text: cellRaw.slice(last, m.index), props: null })
+    segs.push({ text: m[2], props: parseStyleParams(m[1]) })
+    last = m.index + m[0].length
+  }
+  if (last < cellRaw.length) segs.push({ text: cellRaw.slice(last), props: null })
+  return segs
+}
+
+function serializeSegments(segs: CellSegment[]): string {
+  return segs.map(s => {
+    if (!s.props || Object.keys(s.props).length === 0) return s.text
+    return `{style:${buildStyleParams(s.props)}}${s.text}{/style}`
+  }).join('')
+}
+
+function applyStyleToRange(cellRaw: string, domStart: number, domEnd: number, newProps: StyleProps): string {
+  if (domEnd <= domStart) return cellRaw
+  const segs = parseSegments(cellRaw)
+  const newSegs: CellSegment[] = []
+  let offset = 0
+  for (const seg of segs) {
+    const segStart = offset
+    const segEnd = offset + seg.text.length
+    offset = segEnd
+    if (segEnd <= domStart || segStart >= domEnd) { newSegs.push(seg); continue }
+    const relStart = Math.max(segStart, domStart) - segStart
+    const relEnd   = Math.min(segEnd,   domEnd)   - segStart
+    const before   = seg.text.slice(0, relStart)
+    const selected = seg.text.slice(relStart, relEnd)
+    const after    = seg.text.slice(relEnd)
+    const merged   = { ...(seg.props ?? {}), ...newProps }
+    if (before)   newSegs.push({ text: before,   props: seg.props })
+    if (selected) newSegs.push({ text: selected, props: merged })
+    if (after)    newSegs.push({ text: after,    props: seg.props })
+  }
+  return serializeSegments(newSegs)
+}
+
 // ── Table cell helpers ────────────────────────────────────────────────────────
 function parseTableCells(line: string): string[] {
   let s = line.trim()
@@ -41,8 +170,9 @@ function buildTableRow(cells: string[]): string {
 // changed cell is written back to the markdown source via _view.dispatch.
 class TableWidget extends WidgetType {
   constructor(
-    private raw: string,       // markdown text of the table (no trailing \n)
-    private tableFrom: number, // doc position of the first character of the table
+    private raw: string,            // markdown text of the table (no trailing \n)
+    private tableFrom: number,      // doc position of the first character of the table
+    private colWidthsLine = '',     // e.g. "<!-- col-widths: 120,200,80 -->" or ''
   ) { super() }
 
   toDOM(): HTMLElement {
@@ -81,50 +211,588 @@ class TableWidget extends WidgetType {
     rows.forEach((tr, rowIndex) => {
       tr.querySelectorAll('th, td').forEach((cell, colIndex) => {
         const el = cell as HTMLElement
-        el.contentEditable = 'true'
-        el.spellcheck = false
-        el.style.outline = 'none'
-        el.style.minWidth = '4ch'
 
-        let originalContent = el.textContent ?? ''
+        // 把儲存格文字包在 <span contenteditable> 裡，th/td 本身不設 contenteditable。
+        // 這樣 resize handle（絕對定位的 div，th 的另一個子元素）不會讓 WebKit
+        // 誤算可輸入寬度，避免「輸入一個字就換行」的問題。
+        const rawText = el.textContent ?? ''
+        el.textContent = ''
 
-        el.addEventListener('focus', () => {
-          originalContent = el.textContent ?? ''
+        const span = document.createElement('span')
+        span.contentEditable = 'true'
+        span.spellcheck = false
+        span.style.cssText = 'display:block;outline:none;min-width:0;word-break:break-word;padding-right:6px;'
+        el.appendChild(span)
+
+        // cellRaw 追蹤真正的 markdown 原始文字（含 {color:}/{font:} 語法）
+        let cellRaw = rawText
+        const renderCell = () => {
+          span.innerHTML = DOMPurify.sanitize(
+            renderCustomStyle(cellRaw),
+            { ALLOWED_TAGS: ['span'], ADD_ATTR: ['style', 'data-style-params'] }
+          )
+        }
+        renderCell()
+
+        span.addEventListener('focus', () => {
+          // 保持樣式化 HTML，直接在 WYSIWYG 狀態下編輯
           el.style.background = 'var(--color-accent-dim)'
           el.style.outline = '1px solid var(--color-accent)'
           el.style.outlineOffset = '-1px'
         })
 
-        el.addEventListener('blur', () => {
+        span.addEventListener('blur', () => {
           el.style.background = ''
           el.style.outline = 'none'
-          const newContent = (el.innerText ?? '').replace(/\n/g, ' ').trim()
-          if (newContent !== originalContent.trim()) {
+          // 從 DOM 反向還原 markdown 語法（利用 data-style-params）
+          const newContent = cellHtmlToRaw(span)
+          const changed = newContent !== cellRaw
+          if (changed) {
+            cellRaw = newContent
             this.applyChange(rowIndex, colIndex, newContent)
           }
+          // 重新 render（確保樣式正確，並補上可能遺失的 data 屬性）
+          renderCell()
         })
 
-        el.addEventListener('keydown', (e: KeyboardEvent) => {
+        span.addEventListener('keydown', (e: KeyboardEvent) => {
           if (e.key === 'Enter') {
             e.preventDefault()
-            el.blur()
+            span.blur()
           }
           if (e.key === 'Tab') {
             e.preventDefault()
             const allCells = Array.from(table.querySelectorAll('th, td'))
             const idx = allCells.indexOf(el)
-            const next = allCells[e.shiftKey ? idx - 1 : idx + 1] as HTMLElement | undefined
-            if (next) next.focus()
-            else el.blur()
+            const nextCell = allCells[e.shiftKey ? idx - 1 : idx + 1] as HTMLElement | undefined
+            if (nextCell) (nextCell.querySelector('span[contenteditable]') as HTMLElement | null)?.focus()
+            else span.blur()
           }
           if (e.key === 'Escape') {
             e.preventDefault()
-            el.textContent = originalContent  // revert
-            el.blur()
+            renderCell()  // 還原原始內容
+            span.blur()
           }
+        })
+
+        // ── 右鍵選單 ──────────────────────────────────────────────────────────
+        el.addEventListener('contextmenu', (e: MouseEvent) => {
+          e.preventDefault()
+          e.stopPropagation()
+          const sel = window.getSelection()
+          const selText = sel?.toString() ?? ''
+          const range = sel && sel.rangeCount > 0 ? sel.getRangeAt(0) : null
+          const savedSel = (selText && range && span.contains(range.startContainer))
+            ? {
+                text: selText,
+                domStart: computeDomOffset(span, range.startContainer, range.startOffset),
+                domEnd:   computeDomOffset(span, range.endContainer,   range.endOffset),
+                currentRaw: () => cellRaw,
+              }
+            : null
+          const onApplyFormat = (newContent: string) => {
+            cellRaw = newContent
+            renderCell()
+            this.applyChange(rowIndex, colIndex, newContent)
+          }
+          this.showContextMenu(e.clientX, e.clientY, rowIndex, colIndex, span, savedSel, onApplyFormat)
         })
       })
     })
+
+    // ── 欄寬調整（在 editing 迴圈之後，handle 才不會被 textContent='' 清掉）
+    this.attachColResize(table)
+  }
+
+  // ── 欄寬 resize handles ────────────────────────────────────────────────────
+  private attachColResize(table: HTMLTableElement) {
+    const cacheKey = this.raw.split('\n')[0] // header row — stable across data edits
+
+    const firstRow = table.querySelector('tr')
+    const headerCells = firstRow ? Array.from(firstRow.querySelectorAll('th, td')) as HTMLElement[] : []
+    if (!headerCells.length) return
+
+    const saveWidths = () => {
+      const widths = headerCells.map(hc => hc.offsetWidth)
+      _tableColWidths.set(cacheKey, widths)
+      // 把欄寬寫回 markdown 的 col-widths 注釋
+      if (!_view) return
+      const newComment = `<!-- col-widths: ${widths.join(',')} -->`
+      const doc = _view.state.doc
+      let tablePos = this.tableFrom
+      if (doc.sliceString(tablePos, tablePos + this.raw.length) !== this.raw) {
+        tablePos = doc.toString().indexOf(this.raw)
+        if (tablePos < 0) return
+      }
+      const tableEnd = tablePos + this.raw.length
+      if (this.colWidthsLine) {
+        // 更新現有注釋
+        const commentStart = tableEnd + 1  // +1 for newline
+        const commentEnd = commentStart + this.colWidthsLine.length
+        if (commentEnd <= doc.length) {
+          _view.dispatch({ changes: { from: commentStart, to: commentEnd, insert: newComment } })
+        }
+      } else {
+        // 插入新注釋
+        const insertPos = tableEnd < doc.length ? tableEnd : doc.length
+        const insert = tableEnd < doc.length ? `\n${newComment}` : `\n${newComment}`
+        _view.dispatch({ changes: { from: insertPos, to: insertPos, insert } })
+      }
+    }
+
+    const applyFixedLayout = () => {
+      if (table.style.tableLayout === 'fixed') return
+      const widths = headerCells.map(hc => hc.offsetWidth)
+      table.querySelectorAll('tr').forEach(tr => {
+        const cells = tr.querySelectorAll('th, td')
+        widths.forEach((w, i) => {
+          const cell = cells[i] as HTMLElement | undefined
+          if (cell) cell.style.width = w + 'px'
+        })
+      })
+      table.style.tableLayout = 'fixed'
+      table.style.width = table.offsetWidth + 'px'
+    }
+
+    const applyWidths = (widths: number[]) => {
+      if (widths.length !== headerCells.length) return
+      _tableColWidths.set(cacheKey, widths)
+      // 套用到每一 row 的對應 cell（fixed layout 需要每欄都有明確寬度）
+      table.querySelectorAll('tr').forEach(tr => {
+        const cells = tr.querySelectorAll('th, td')
+        widths.forEach((w, i) => {
+          const cell = cells[i] as HTMLElement | undefined
+          if (cell) cell.style.width = w + 'px'
+        })
+      })
+      table.style.tableLayout = 'fixed'
+      table.style.width = '100%'
+    }
+
+    // 優先從 markdown 注釋還原欄寬（持久化來源）
+    const fromComment = this.colWidthsLine.match(/<!-- col-widths: ([\d,]+) -->/)
+    if (fromComment) {
+      applyWidths(fromComment[1].split(',').map(Number))
+    } else {
+      // fallback：session 內記憶體快取
+      const saved = _tableColWidths.get(cacheKey)
+      if (saved) applyWidths(saved)
+    }
+
+    headerCells.forEach((th, thIndex) => {
+      th.style.position = 'relative'
+
+      const handle = document.createElement('div')
+      handle.style.cssText = [
+        'position:absolute;right:0;top:10%;bottom:10%;width:4px;',
+        'cursor:col-resize;z-index:10;',
+        'background:var(--color-border);border-radius:2px;',
+        'transition:background 0.15s,width 0.15s;',
+      ].join('')
+
+      handle.addEventListener('mouseenter', () => {
+        handle.style.background = 'var(--color-accent)'
+        handle.style.width = '4px'
+      })
+      handle.addEventListener('mouseleave', () => {
+        handle.style.background = 'var(--color-border)'
+        handle.style.width = '4px'
+      })
+
+      handle.addEventListener('mousedown', (e: MouseEvent) => {
+        e.preventDefault()
+        e.stopPropagation()
+        applyFixedLayout()
+
+        const startX = e.clientX
+        const startWidth = th.offsetWidth
+
+        const onMove = (ev: MouseEvent) => {
+          const newWidth = Math.max(40, startWidth + ev.clientX - startX)
+          th.style.width = newWidth + 'px'
+          table.querySelectorAll('tr').forEach(tr => {
+            const cell = tr.querySelectorAll('th, td')[thIndex] as HTMLElement | undefined
+            if (cell && cell !== th) cell.style.width = newWidth + 'px'
+          })
+        }
+        const onUp = () => {
+          document.removeEventListener('mousemove', onMove)
+          document.removeEventListener('mouseup', onUp)
+          handle.style.background = 'transparent'
+          saveWidths()
+        }
+        document.addEventListener('mousemove', onMove)
+        document.addEventListener('mouseup', onUp)
+      })
+
+      th.appendChild(handle)
+    })
+  }
+
+  // ── 右鍵選單 ──────────────────────────────────────────────────────────────
+  private showContextMenu(
+    x: number, y: number,
+    rowIndex: number, colIndex: number,
+    _cellSpan?: HTMLElement,
+    savedSel?: { text: string; domStart: number; domEnd: number; currentRaw: () => string } | null,
+    onApplyFormat?: (newContent: string) => void,
+  ) {
+    // 移除已有選單
+    document.querySelectorAll('.cm-table-ctx-menu').forEach(el => el.remove())
+
+    const lines = this.raw.split('\n')
+    const dataRowCount = lines.filter((_, i) => i !== 1).length - 1
+    const colCount = parseTableCells(lines[0]).length
+
+    const menu = document.createElement('div')
+    menu.className = 'cm-table-ctx-menu'
+    menu.style.cssText = [
+      `position:fixed;left:${x}px;top:${y}px;`,
+      'background:var(--color-bg-elevated);border:1px solid var(--color-border);',
+      'border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,0.35);',
+      'z-index:9999;min-width:180px;overflow:hidden;padding:4px 0;',
+      'font-size:13px;',
+    ].join('')
+
+    // ── helper: 建立選單按鈕 ─────────────────────────────────────────────────
+    const makeBtn = (label: string, danger: boolean, action: () => void) => {
+      const btn = document.createElement('button')
+      btn.textContent = label
+      btn.style.cssText = [
+        'display:block;width:100%;text-align:left;background:none;border:none;',
+        'padding:6px 14px;cursor:pointer;',
+        danger ? 'color:var(--color-danger);' : 'color:var(--color-text-primary);',
+      ].join('')
+      btn.addEventListener('mouseenter', () => { btn.style.background = 'var(--color-bg-hover)' })
+      btn.addEventListener('mouseleave', () => { btn.style.background = 'none' })
+      btn.addEventListener('mousedown', (e: MouseEvent) => {
+        e.preventDefault(); e.stopPropagation()
+        menu.remove(); action()
+      })
+      return btn
+    }
+    // 純字串操作：segment-based 樣式合併，不產生巢狀
+    const applyFormatToSelection = (newProps: StyleProps) => {
+      if (!savedSel || !onApplyFormat) return
+      const currentRaw = savedSel.currentRaw()
+      const newContent = applyStyleToRange(currentRaw, savedSel.domStart, savedSel.domEnd, newProps)
+      onApplyFormat(newContent)
+    }
+
+    const makeSep = () => {
+      const sep = document.createElement('div')
+      sep.style.cssText = 'height:1px;background:var(--color-border);margin:4px 0;'
+      return sep
+    }
+
+    // ── 主選單 ───────────────────────────────────────────────────────────────
+    const mainPanel = document.createElement('div')
+    mainPanel.style.padding = '4px 0'
+
+    const rowColItems: Array<{ label: string; action: () => void; danger?: boolean }> = [
+      { label: '↑ 上方插入一行', action: () => this.insertRow(rowIndex, 'above') },
+      { label: '↓ 下方插入一行', action: () => this.insertRow(rowIndex, 'below') },
+      { label: '← 左側插入一欄', action: () => this.insertCol(colIndex, 'left') },
+      { label: '→ 右側插入一欄', action: () => this.insertCol(colIndex, 'right') },
+      { label: '', action: () => {} },
+      { label: '刪除此行' + (dataRowCount <= 1 && rowIndex > 0 ? '（最後一行）' : ''), action: () => this.deleteRow(rowIndex), danger: true },
+      { label: '刪除此欄' + (colCount <= 1 ? '（最後一欄）' : ''), action: () => this.deleteCol(colIndex), danger: true },
+    ]
+
+    rowColItems.forEach(item => {
+      if (!item.label) { mainPanel.appendChild(makeSep()); return }
+      mainPanel.appendChild(makeBtn(item.label, item.danger ?? false, item.action))
+    })
+
+    // 有框選文字時，加入改變顏色 / 改變字型
+    if (savedSel) {
+      mainPanel.appendChild(makeSep())
+
+      const makeNavBtn = (label: string, showPanel: () => void) => {
+        const btn = document.createElement('button')
+        btn.style.cssText = [
+          'display:flex;width:100%;justify-content:space-between;align-items:center;',
+          'background:none;border:none;padding:6px 14px;cursor:pointer;font-size:13px;',
+          'color:var(--color-text-primary);',
+        ].join('')
+        const lbl = document.createElement('span'); lbl.textContent = label
+        const arr = document.createElement('span'); arr.textContent = '›'; arr.style.color = 'var(--color-text-muted)'
+        btn.appendChild(lbl); btn.appendChild(arr)
+        btn.addEventListener('mouseenter', () => { btn.style.background = 'var(--color-bg-hover)' })
+        btn.addEventListener('mouseleave', () => { btn.style.background = 'none' })
+        btn.addEventListener('mousedown', (e: MouseEvent) => {
+          e.preventDefault(); e.stopPropagation()
+          mainPanel.style.display = 'none'; showPanel()
+        })
+        return btn
+      }
+
+      // ── 改變顏色 panel ─────────────────────────────────────────────────────
+      const colorPanel = document.createElement('div')
+      colorPanel.style.cssText = 'display:none;padding:12px;'
+
+      const buildColorPanel = () => {
+        colorPanel.innerHTML = ''
+        let pickedColor = '#e03030'
+        const COLORS = ['#e03030','#e07830','#d4c020','#30a850','#2080e0','#8040e0','#e030a0','#888888','#000000']
+
+        const title = document.createElement('div')
+        title.textContent = '改變顏色'
+        title.style.cssText = 'font-size:12px;font-weight:600;color:var(--color-text-secondary);margin-bottom:8px;'
+        colorPanel.appendChild(title)
+
+        // 先建 customInput 和 previewSpan，讓 swatches closure 能引用
+        const customInput = document.createElement('input')
+        customInput.type = 'color'; customInput.value = pickedColor
+        customInput.style.cssText = 'width:32px;height:24px;padding:0;border:1px solid var(--color-border);border-radius:4px;cursor:pointer;'
+
+        const previewSpan = document.createElement('span')
+        previewSpan.textContent = savedSel.text.slice(0, 30) + (savedSel.text.length > 30 ? '…' : '')
+        previewSpan.style.color = pickedColor
+
+        const swatches = document.createElement('div')
+        swatches.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;'
+        COLORS.forEach(c => {
+          const sw = document.createElement('div')
+          sw.style.cssText = `width:22px;height:22px;border-radius:4px;background:${c};cursor:pointer;box-sizing:border-box;border:2px solid ${c === pickedColor ? 'var(--color-text-primary)' : 'transparent'};`
+          sw.addEventListener('mousedown', (e) => {
+            e.preventDefault(); e.stopPropagation()
+            pickedColor = c
+            swatches.querySelectorAll('div').forEach((s, i) => {
+              (s as HTMLElement).style.border = `2px solid ${COLORS[i] === c ? 'var(--color-text-primary)' : 'transparent'}`
+            })
+            customInput.value = c
+            previewSpan.style.color = c
+          })
+          swatches.appendChild(sw)
+        })
+        colorPanel.appendChild(swatches)
+
+        const customRow = document.createElement('label')
+        customRow.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:12px;color:var(--color-text-muted);margin-bottom:8px;'
+        customRow.textContent = '自訂 '
+        customInput.addEventListener('input', () => { pickedColor = customInput.value; previewSpan.style.color = pickedColor })
+        customRow.appendChild(customInput)
+        colorPanel.appendChild(customRow)
+
+        const preview = document.createElement('div')
+        preview.style.cssText = 'padding:6px 10px;border-radius:6px;background:var(--color-bg-base);font-size:13px;border:1px solid var(--color-border);margin-bottom:8px;'
+        preview.appendChild(previewSpan)
+        colorPanel.appendChild(preview)
+
+        const btnRow = document.createElement('div')
+        btnRow.style.cssText = 'display:flex;gap:6px;'
+        const applyBtn = document.createElement('button')
+        applyBtn.textContent = '套用'
+        applyBtn.style.cssText = 'flex:1;padding:5px;border-radius:5px;background:var(--color-accent);color:white;font-size:12px;cursor:pointer;border:none;'
+        applyBtn.addEventListener('mousedown', (e) => {
+          e.preventDefault(); e.stopPropagation()
+          menu.remove()
+          applyFormatToSelection({ color: pickedColor })
+        })
+        const backBtn = document.createElement('button')
+        backBtn.textContent = '返回'
+        backBtn.style.cssText = 'flex:1;padding:5px;border-radius:5px;background:var(--color-bg-hover);color:var(--color-text-secondary);font-size:12px;cursor:pointer;border:none;'
+        backBtn.addEventListener('mousedown', (e) => {
+          e.preventDefault(); e.stopPropagation()
+          colorPanel.style.display = 'none'; mainPanel.style.display = 'block'
+        })
+        btnRow.appendChild(applyBtn); btnRow.appendChild(backBtn)
+        colorPanel.appendChild(btnRow)
+      }
+      buildColorPanel()
+
+      // ── 改變字型 panel ─────────────────────────────────────────────────────
+      const fontPanel = document.createElement('div')
+      fontPanel.style.cssText = 'display:none;padding:12px;'
+
+      const buildFontPanel = () => {
+        fontPanel.innerHTML = ''
+        const title = document.createElement('div')
+        title.textContent = '改變字型'
+        title.style.cssText = 'font-size:12px;font-weight:600;color:var(--color-text-secondary);margin-bottom:8px;'
+        fontPanel.appendChild(title)
+
+        const makeRow = (labelText: string, input: HTMLElement) => {
+          const row = document.createElement('label')
+          row.style.cssText = 'display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--color-text-muted);margin-bottom:8px;'
+          row.textContent = labelText + ' '
+          row.appendChild(input); return row
+        }
+        const selectStyle = 'padding:4px 6px;border-radius:4px;border:1px solid var(--color-border);background:var(--color-bg-base);color:var(--color-text-primary);font-size:12px;'
+
+        const familySel = document.createElement('select')
+        familySel.style.cssText = selectStyle
+        ;['inherit','Arial','Georgia','Courier New','Times New Roman','Noto Serif TC'].forEach(f => {
+          const opt = document.createElement('option'); opt.value = f; opt.textContent = f; familySel.appendChild(opt)
+        })
+        fontPanel.appendChild(makeRow('字型', familySel))
+
+        const sizeInput = document.createElement('input')
+        sizeInput.type = 'number'; sizeInput.placeholder = '預設'; sizeInput.min = '8'; sizeInput.max = '72'
+        sizeInput.style.cssText = selectStyle + 'width:100%;box-sizing:border-box;'
+        fontPanel.appendChild(makeRow('大小（px）', sizeInput))
+
+        const weightSel = document.createElement('select')
+        weightSel.style.cssText = selectStyle
+        ;['inherit','normal','bold'].forEach(w => {
+          const opt = document.createElement('option'); opt.value = w; opt.textContent = w; weightSel.appendChild(opt)
+        })
+        fontPanel.appendChild(makeRow('粗細', weightSel))
+
+        const btnRow = document.createElement('div')
+        btnRow.style.cssText = 'display:flex;gap:6px;margin-top:4px;'
+        const applyBtn = document.createElement('button')
+        applyBtn.textContent = '套用'
+        applyBtn.style.cssText = 'flex:1;padding:5px;border-radius:5px;background:var(--color-accent);color:white;font-size:12px;cursor:pointer;border:none;'
+        applyBtn.addEventListener('mousedown', (e) => {
+          e.preventDefault(); e.stopPropagation()
+          menu.remove()
+          const props: StyleProps = {}
+          if (familySel.value && familySel.value !== 'inherit') props.fontFamily = familySel.value
+          if (sizeInput.value) props.fontSize = sizeInput.value
+          if (weightSel.value && weightSel.value !== 'inherit') props.fontWeight = weightSel.value
+          applyFormatToSelection(props)
+        })
+        const backBtn = document.createElement('button')
+        backBtn.textContent = '返回'
+        backBtn.style.cssText = 'flex:1;padding:5px;border-radius:5px;background:var(--color-bg-hover);color:var(--color-text-secondary);font-size:12px;cursor:pointer;border:none;'
+        backBtn.addEventListener('mousedown', (e) => {
+          e.preventDefault(); e.stopPropagation()
+          fontPanel.style.display = 'none'; mainPanel.style.display = 'block'
+        })
+        btnRow.appendChild(applyBtn); btnRow.appendChild(backBtn)
+        fontPanel.appendChild(btnRow)
+      }
+      buildFontPanel()
+
+      mainPanel.appendChild(makeNavBtn('改變顏色', () => { colorPanel.style.display = 'block' }))
+      mainPanel.appendChild(makeNavBtn('改變字型', () => { fontPanel.style.display = 'block' }))
+      menu.appendChild(colorPanel)
+      menu.appendChild(fontPanel)
+    }
+
+    menu.appendChild(mainPanel)
+
+    document.body.appendChild(menu)
+
+    // 確保選單不超出視窗
+    const rect = menu.getBoundingClientRect()
+    if (rect.right > window.innerWidth) menu.style.left = (x - rect.width) + 'px'
+    if (rect.bottom > window.innerHeight) menu.style.top = (y - rect.height) + 'px'
+
+    const close = (e: MouseEvent) => {
+      if (!menu.contains(e.target as Node)) { menu.remove(); document.removeEventListener('mousedown', close) }
+    }
+    setTimeout(() => document.addEventListener('mousedown', close), 0)
+  }
+
+  // ── 修改 markdown 的輔助方法 ──────────────────────────────────────────────
+  private resolveTablePos(): number {
+    if (!_view) return -1
+    const doc = _view.state.doc
+    let pos = this.tableFrom
+    if (doc.sliceString(pos, pos + this.raw.length) !== this.raw) {
+      pos = doc.toString().indexOf(this.raw)
+    }
+    return pos
+  }
+
+  private replaceRaw(newRaw: string, newColWidthsLine?: string) {
+    if (!_view) return
+    const pos = this.resolveTablePos()
+    if (pos < 0) return
+    if (newColWidthsLine !== undefined) {
+      if (this.colWidthsLine) {
+        // 更新現有注釋（一次 dispatch）
+        const commentStart = pos + this.raw.length + 1
+        const commentEnd   = commentStart + this.colWidthsLine.length
+        if (commentEnd <= _view.state.doc.length) {
+          _view.dispatch({ changes: [
+            { from: pos, to: pos + this.raw.length, insert: newRaw },
+            { from: commentStart, to: commentEnd, insert: newColWidthsLine },
+          ]})
+          return
+        }
+      } else {
+        // 插入新注釋（緊接在 table 後面）
+        const tableEnd = pos + this.raw.length
+        _view.dispatch({ changes: { from: pos, to: tableEnd, insert: `${newRaw}\n${newColWidthsLine}` } })
+        return
+      }
+    }
+    _view.dispatch({ changes: { from: pos, to: pos + this.raw.length, insert: newRaw } })
+  }
+
+  private insertRow(rowIndex: number, where: 'above' | 'below') {
+    const lines = this.raw.split('\n')
+    // rowIndex 0 = header；markdown 中 index 0=header, 1=separator, 2+=data
+    const mdIndex = rowIndex === 0 ? 0 : rowIndex + 1
+    const colCount = parseTableCells(lines[0]).length
+    const emptyRow = buildTableRow(Array(colCount).fill(''))
+    const insertAt = where === 'above' ? Math.max(mdIndex, 2) : Math.min(mdIndex + 1, lines.length)
+    // 不允許插入在 separator（index 1）之前的 data 行
+    const safeInsert = Math.max(insertAt, 2)
+    lines.splice(safeInsert, 0, emptyRow)
+    this.replaceRaw(lines.join('\n'))
+  }
+
+  private deleteRow(rowIndex: number) {
+    const lines = this.raw.split('\n')
+    if (rowIndex === 0) return // 不刪 header
+    const mdIndex = rowIndex + 1
+    if (mdIndex >= lines.length) return
+    lines.splice(mdIndex, 1)
+    this.replaceRaw(lines.join('\n'))
+  }
+
+  private insertCol(colIndex: number, where: 'left' | 'right') {
+    const lines = this.raw.split('\n')
+    const newLines = lines.map((line, i) => {
+      const cells = parseTableCells(line)
+      if (i === 1) {
+        const newCell = cells[colIndex]?.replace(/[^-:]/g, '-') || '---'
+        cells.splice(where === 'left' ? colIndex : colIndex + 1, 0, newCell)
+      } else {
+        cells.splice(where === 'left' ? colIndex : colIndex + 1, 0, '')
+      }
+      return buildTableRow(cells)
+    })
+
+    // 更新欄寬注釋：在對應位置插入預設寬度 100
+    const insertAt = where === 'left' ? colIndex : colIndex + 1
+    const existingWidths = this.colWidthsLine.match(/<!-- col-widths: ([\d,]+) -->/)
+    const baseWidths = existingWidths
+      ? existingWidths[1].split(',').map(Number)
+      : Array(parseTableCells(this.raw.split('\n')[0]).length).fill(100) as number[]
+    baseWidths.splice(insertAt, 0, 100)
+    const newColWidthsLine = `<!-- col-widths: ${baseWidths.join(',')} -->`
+
+    this.replaceRaw(newLines.join('\n'), newColWidthsLine)
+  }
+
+  private deleteCol(colIndex: number) {
+    const lines = this.raw.split('\n')
+    const colCount = parseTableCells(lines[0]).length
+    if (colCount <= 1) return
+    const newLines = lines.map(line => {
+      const cells = parseTableCells(line)
+      cells.splice(colIndex, 1)
+      return buildTableRow(cells)
+    })
+
+    // 更新欄寬注釋：移除對應欄
+    let newColWidthsLine: string | undefined
+    if (this.colWidthsLine) {
+      const m = this.colWidthsLine.match(/<!-- col-widths: ([\d,]+) -->/)
+      if (m) {
+        const widths = m[1].split(',').map(Number)
+        widths.splice(colIndex, 1)
+        newColWidthsLine = widths.length > 0 ? `<!-- col-widths: ${widths.join(',')} -->` : ''
+      }
+    }
+
+    this.replaceRaw(newLines.join('\n'), newColWidthsLine)
   }
 
   private applyChange(rowIndex: number, colIndex: number, newContent: string) {
@@ -163,7 +831,8 @@ class TableWidget extends WidgetType {
             'keydown', 'keyup', 'keypress',
             'input', 'focus', 'blur',
             'compositionstart', 'compositionend',
-            'paste', 'cut', 'copy'].includes(e.type)
+            'paste', 'cut', 'copy',
+            'contextmenu'].includes(e.type)
   }
 
   private deleteBlock() {
@@ -174,7 +843,11 @@ class TableWidget extends WidgetType {
       pos = doc.toString().indexOf(this.raw)
       if (pos < 0) return
     }
-    const endPos = Math.min(pos + this.raw.length + 1, doc.length)
+    // 若緊接有 col-widths 注釋，一起刪除
+    let endPos = Math.min(pos + this.raw.length + 1, doc.length)
+    if (this.colWidthsLine) {
+      endPos = Math.min(endPos + this.colWidthsLine.length + 1, doc.length)
+    }
     _view.dispatch({ changes: { from: pos, to: endPos, insert: '' } })
   }
 
@@ -190,7 +863,9 @@ class TableWidget extends WidgetType {
   // This allows CM6 to reuse the widget DOM when only the position shifts
   // (e.g. text inserted before the table), keeping the height map stable.
   eq(other: WidgetType): boolean {
-    return other instanceof TableWidget && (other as TableWidget).raw === this.raw
+    if (!(other instanceof TableWidget)) return false
+    const o = other as TableWidget
+    return o.raw === this.raw && o.colWidthsLine === this.colWidthsLine
   }
 }
 
@@ -584,11 +1259,22 @@ function buildBlockDecos(state: EditorState): DecorationSet {
         const tableFirstLine = doc.lineAt(from)
         const effTo          = to > from && doc.lineAt(to).from === to ? to - 1 : to
         const tableLastLine  = doc.lineAt(effTo)
-        const tableBlockTo   = tableLastLine.to < doc.length ? tableLastLine.to + 1 : doc.length
-        const raw = doc.sliceString(tableFirstLine.from, tableLastLine.to)
+        let tableBlockTo     = tableLastLine.to < doc.length ? tableLastLine.to + 1 : doc.length
+        let raw = doc.sliceString(tableFirstLine.from, tableLastLine.to)
+
+        // 若緊接的下一行是 col-widths 注釋，把它納入 widget 範圍
+        let colWidthsLine = ''
+        if (tableLastLine.to + 1 < doc.length) {
+          const nextLine = doc.lineAt(tableLastLine.to + 1)
+          if (/^<!-- col-widths: [\d,]+ -->$/.test(nextLine.text.trim())) {
+            colWidthsLine = nextLine.text.trim()
+            tableBlockTo = nextLine.to < doc.length ? nextLine.to + 1 : doc.length
+          }
+        }
+
         decos.push({
           from: tableFirstLine.from, to: tableBlockTo,
-          deco: Decoration.replace({ widget: new TableWidget(raw, tableFirstLine.from), block: true }),
+          deco: Decoration.replace({ widget: new TableWidget(raw, tableFirstLine.from, colWidthsLine), block: true }),
         })
         return false
       }

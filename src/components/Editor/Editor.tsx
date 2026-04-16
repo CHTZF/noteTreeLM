@@ -3,7 +3,7 @@ import { EditorView, basicSetup } from 'codemirror'
 import { EditorState, Compartment } from '@codemirror/state'
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { languages } from '@codemirror/language-data'
-import { keymap } from '@codemirror/view'
+import { keymap, EditorView as EditorViewCm } from '@codemirror/view'
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { open as openPath } from '@tauri-apps/plugin-shell'
@@ -78,7 +78,11 @@ export default function Editor({ onOpenNote }: EditorProps) {
   const [qcFontWeight, setQcFontWeight] = useState('inherit')
   const [qcCopyContent, setQcCopyContent] = useState('')
 
-  // ── Image modal state ─────────────────────────────────────────────────────
+  // ── Image resize modal（右鍵已有圖片時）─────────────────────────────────────
+  const [imgResizeModal, setImgResizeModal] = useState<{ from: number; to: number; altBase: string } | null>(null)
+  const [imgResizeSize, setImgResizeSize] = useState('')
+
+  // ── Image insert modal（工具列插入新圖片時）──────────────────────────────────
   const [imageModal, setImageModal] = useState<{ from: number; to: number } | null>(null)
   const [imgSize, setImgSize] = useState('')
   const [vaultImages, setVaultImages] = useState<string[]>([])
@@ -153,6 +157,49 @@ export default function Editor({ onOpenNote }: EditorProps) {
   useEffect(() => {
     if (!editorRef.current) return
 
+    const IMAGE_EXTS = new Set(['png','jpg','jpeg','gif','webp','svg','bmp','ico','tiff','avif'])
+    const isImageMime = (mime: string) => mime.startsWith('image/')
+    const isImageFilename = (name: string) => {
+      const ext = name.split('.').pop()?.toLowerCase() ?? ''
+      return IMAGE_EXTS.has(ext)
+    }
+
+    const handleFilePaste = async (files: FileList, view: EditorView) => {
+      for (const file of Array.from(files)) {
+        try {
+          // 讀成 base64
+          const arrayBuf = await file.arrayBuffer()
+          const bytes = new Uint8Array(arrayBuf)
+          let binary = ''
+          bytes.forEach(b => { binary += String.fromCharCode(b) })
+          const b64 = btoa(binary)
+
+          const isImage = isImageMime(file.type) || isImageFilename(file.name)
+          const folder = isImage ? 'assets' : ''
+
+          const relPath = await invoke<string>('import_file_from_bytes', {
+            filename: file.name,
+            folder,
+            dataBase64: b64,
+          })
+
+          // 插入 wikilink 或圖片語法到游標
+          const insert = isImage
+            ? `![[${relPath}]]`
+            : `[[${relPath}]]`
+
+          const { from } = view.state.selection.main
+          view.dispatch({
+            changes: { from, to: from, insert: insert + ' ' },
+            selection: { anchor: from + insert.length + 1 },
+          })
+        } catch (err) {
+          toast.error(`匯入失敗：${file.name}`)
+          console.error(err)
+        }
+      }
+    }
+
     const view = new EditorView({
       state: EditorState.create({
         doc: '',
@@ -163,6 +210,7 @@ export default function Editor({ onOpenNote }: EditorProps) {
           livePreviewTheme,
           wikilinkPlugin,
           liveCompartment.current.of([]), // initially no live preview
+          EditorViewCm.lineWrapping,
           keymap.of([...defaultKeymap, ...historyKeymap]),
           EditorView.updateListener.of((update) => {
             if (update.docChanged && !isLoadingRef.current) {
@@ -170,6 +218,16 @@ export default function Editor({ onOpenNote }: EditorProps) {
               setContent(newContent)
               triggerAutoSaveRef.current(newContent)
             }
+          }),
+          EditorViewCm.domEventHandlers({
+            paste(event, view) {
+              const files = event.clipboardData?.files
+              if (!files || files.length === 0) return false
+              // 只攔截含有檔案的 paste（純文字讓 CM6 自己處理）
+              event.preventDefault()
+              handleFilePaste(files, view)
+              return true
+            },
           }),
         ],
       }),
@@ -468,34 +526,18 @@ export default function Editor({ onOpenNote }: EditorProps) {
   }, [])
 
   // Register live-mode right-click edit handler for image widgets
+  // 右鍵已有圖片 → 只開輕量 resize modal
   useEffect(() => {
     setLiveEditImageHandler((data) => {
-      // Parse alt — may contain |size suffix, e.g. "photo|300"
       const barIdx = data.alt.lastIndexOf('|')
       const hasSize = barIdx !== -1 && /^\d/.test(data.alt.slice(barIdx + 1))
-      const size     = hasSize ? data.alt.slice(barIdx + 1) : data.alt
-      setImgSize(size)
-      // If the src is a vault:// URL, pre-select the vault image
-      const vaultPrefix = 'vault://localhost/'
-      if (data.src.startsWith(vaultPrefix)) {
-        const relPath = decodeURIComponent(data.src.slice(vaultPrefix.length))
-        setVaultImgSelected(relPath)
-      } else {
-        setVaultImgSelected('')
-      }
-      setVaultImgFilter('')
-      setImportPage(false)
-      setImportMode(null)
-      setImportUrl('')
-      setImportUrlError('')
-      setImportError('')
-      setImportName('')
-      setImportFilePath('')
-      setImageModal({ from: data.from, to: data.to })
-      loadVaultImages()
+      const altBase = hasSize ? data.alt.slice(0, barIdx) : data.alt
+      const size    = hasSize ? data.alt.slice(barIdx + 1) : ''
+      setImgResizeSize(size)
+      setImgResizeModal({ from: data.from, to: data.to, altBase })
     })
     return () => setLiveEditImageHandler(null)
-  }, [loadVaultImages])
+  }, [])
 
   const handlePickFile = useCallback(async () => {
     try {
@@ -580,6 +622,27 @@ export default function Editor({ onOpenNote }: EditorProps) {
     setImageModal(null)
     view.focus()
   }, [imageModal, vaultImgSelected, imgSize])
+
+  const confirmImgResize = useCallback(() => {
+    if (!imgResizeModal) return
+    const view = viewRef.current
+    if (!view) return
+    const size = imgResizeSize.trim()
+    const suffix = size ? `|${size}` : ''
+    // 重建 wikilink：保留原本的 relPath，只改 size
+    // 原來的 markdown 是 ![[relPath]] 或 ![[relPath|oldSize]]
+    // 從 doc 中讀出原始文字，取得 relPath
+    const orig = view.state.doc.sliceString(imgResizeModal.from, imgResizeModal.to)
+    const m = orig.match(/^!\[\[(.+?)(?:\|\d+)?\]\]$/)
+    const relPath = m ? m[1] : imgResizeModal.altBase
+    const insert = `![[${relPath}${suffix}]]`
+    view.dispatch({
+      changes: { from: imgResizeModal.from, to: imgResizeModal.to, insert },
+      selection: { anchor: imgResizeModal.from + insert.length },
+    })
+    setImgResizeModal(null)
+    view.focus()
+  }, [imgResizeModal, imgResizeSize])
 
   // 每次 handleAction 更新時同步給 ref（供 keydown handler 使用）
   useEffect(() => { handleActionRef.current = handleAction }, [handleAction])
@@ -1042,6 +1105,39 @@ export default function Editor({ onOpenNote }: EditorProps) {
             </div>
           )}
 
+        </div>
+      )}
+
+      {/* Image Resize Modal（右鍵已有圖片） */}
+      {imgResizeModal && (
+        <div style={{ position:'fixed',inset:0,background:'rgba(0,0,0,0.5)',zIndex:99998,display:'flex',alignItems:'center',justifyContent:'center' }}
+          onMouseDown={() => setImgResizeModal(null)}>
+          <div onMouseDown={e => e.stopPropagation()}
+            style={{ background:'var(--color-bg-elevated)',border:'1px solid var(--color-border)',borderRadius:10,padding:'20px 24px',minWidth:260,display:'flex',flexDirection:'column',gap:14 }}>
+            <div style={{ fontSize:14,fontWeight:600,color:'var(--color-text-primary)' }}>調整圖片大小</div>
+            <label style={{ display:'flex',flexDirection:'column',gap:6,fontSize:12,color:'var(--color-text-muted)' }}>
+              寬度（px，留空為原始大小）
+              <input
+                type="number" min={1} max={9999}
+                value={imgResizeSize}
+                onChange={e => setImgResizeSize(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') confirmImgResize(); if (e.key === 'Escape') setImgResizeModal(null) }}
+                autoFocus
+                placeholder="例如 300"
+                style={{ padding:'6px 10px',borderRadius:6,border:'1px solid var(--color-border)',background:'var(--color-bg-base)',color:'var(--color-text-primary)',fontSize:13 }}
+              />
+            </label>
+            <div style={{ display:'flex',gap:8,justifyContent:'flex-end' }}>
+              <button onClick={() => setImgResizeModal(null)}
+                style={{ padding:'6px 14px',borderRadius:6,border:'1px solid var(--color-border)',background:'none',color:'var(--color-text-secondary)',fontSize:13,cursor:'pointer' }}>
+                取消
+              </button>
+              <button onClick={confirmImgResize}
+                style={{ padding:'6px 14px',borderRadius:6,border:'none',background:'var(--color-accent)',color:'white',fontSize:13,cursor:'pointer' }}>
+                套用
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

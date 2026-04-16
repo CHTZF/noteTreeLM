@@ -384,6 +384,7 @@ pub fn run() {
             list_folders,
             delete_folder,
             import_image,
+            import_file_from_bytes,
             list_assets,
             download_asset_to_vault,
             delete_asset,

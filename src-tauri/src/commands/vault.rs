@@ -714,6 +714,42 @@ pub async fn import_image(
     Ok(rel_path)
 }
 
+/// 將 base64 bytes 寫入 Vault 指定資料夾，回傳相對路徑（用於前端 paste 上傳）
+#[tauri::command]
+pub async fn import_file_from_bytes(
+    state: State<'_, AppState>,
+    filename: String,
+    folder: String,
+    data_base64: String,
+) -> Result<String, AppError> {
+    let vault_path = state.get_vault_path().await;
+    if vault_path.is_empty() {
+        return Err(AppError::Vault("尚未設定 Vault 路徑".to_string()));
+    }
+    if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
+        return Err(AppError::Vault("無效的檔名".to_string()));
+    }
+    use base64::{Engine as _, engine::general_purpose};
+    let bytes = general_purpose::STANDARD
+        .decode(data_base64.trim())
+        .map_err(|e| AppError::Vault(format!("base64 解碼失敗：{}", e)))?;
+
+    let rel_path = if folder.is_empty() {
+        filename.clone()
+    } else {
+        format!("{}/{}", folder.trim_end_matches('/'), filename)
+    };
+    let dest = PathBuf::from(&vault_path).join(&rel_path);
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&dest, &bytes).await
+        .map_err(|e| AppError::Vault(format!("寫入檔案失敗：{}", e)))?;
+
+    daemon_scan_vault(&state).await;
+    Ok(rel_path)
+}
+
 /// 列出 Vault 中所有圖片資源的相對路徑
 #[tauri::command]
 pub async fn list_assets(
